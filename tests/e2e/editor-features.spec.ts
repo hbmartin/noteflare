@@ -63,9 +63,7 @@ test("unsupported initial and received code embeds preserve shared bytes and blo
   ]);
 });
 
-test("ordinary edits inspect only changed code scopes and structural changes retain full validation", async ({
-  page,
-}) => {
+test("ordinary edits inspect changed code scopes and new empty structure needs no code rescan", async ({ page }) => {
   await signInOwner(page);
   const result = await page.evaluate(async () => {
     const path = "/tests/e2e/fixtures/editor-code-reconciliation.mjs";
@@ -75,7 +73,7 @@ test("ordinary edits inspect only changed code scopes and structural changes ret
   expect(result.unrelated).toEqual([0, 0]);
   expect(result.affected).toBeGreaterThan(0);
   expect(result.untouched).toBe(0);
-  expect(result.structural).toEqual([1, 1]);
+  expect(result.structural).toEqual([0, 0]);
   expect(result.forced).toEqual([2, 2]);
   expect(result.listenerRemoved).toBe(true);
 });

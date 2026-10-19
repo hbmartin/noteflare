@@ -100,6 +100,38 @@ describe("legacy code content normalization", () => {
     );
   });
 
+  it.each(["cjs", "esm"])("validates linearly while the %s reader merges adjacent paragraph texts", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y=require("yjs"),{Schema}=require("prosemirror-model"),p=require("y-prosemirror");'
+        : 'import * as Y from "yjs";import {Schema} from "prosemirror-model";import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema=new Schema({nodes:{doc:{content:"block+"},paragraph:{content:"text*",group:"block"},codeBlock:{content:"text*",group:"block"},text:{}}});
+      const results=[];
+      for(const count of [50,100,200]) {
+        const doc=new Y.Doc(),root=doc.getXmlFragment("document-store");let reads=0;
+        doc.transact(()=>{for(let index=0;index<count;index++) {
+          const paragraph=new Y.XmlElement("paragraph");paragraph.insert(0,["left","right"].map(value=>{const text=new Y.XmlText();text.insert(0,value);return text;}));
+          const code=new Y.XmlElement("codeBlock"),text=new Y.XmlText();text.insert(0,"safe");code.insert(0,[text]);root.insert(root.length,[paragraph,code]);
+          const delta=text.toDelta.bind(text);text.toDelta=(...args)=>{reads++;return delta(...args)};
+        }});
+        const pm=p.initProseMirrorDoc(root,schema).doc;
+        results.push({count,reads,paragraph:pm.firstChild.textContent,blocks:pm.childCount});doc.destroy();
+      }
+      console.log(JSON.stringify(results));`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual(
+      [50, 100, 200].map((count) => ({ count, reads: 2 * count, paragraph: "leftright", blocks: 2 * count })),
+    );
+  });
+
   it.each(["cjs", "esm"])("invalidates an active unbound %s preflight after observer mutations", (format) => {
     const imports =
       format === "cjs"
@@ -172,7 +204,7 @@ describe("legacy code content normalization", () => {
       bindingStartup: [1, 1],
       unrelated: [0, 0],
       changedCode: [1, 0, 0],
-      structural: [1, 1],
+      structural: [0, 0],
       unknown: [1, 1],
       observersRetained: true,
     });

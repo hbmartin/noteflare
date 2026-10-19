@@ -211,13 +211,13 @@ describe("segmented code collaboration", () => {
       expect(originalInspect.mock.calls.length).toBeGreaterThan(0);
       expect(otherInspect).not.toHaveBeenCalled();
       originalInspect.mockClear();
-      // Replacing a child is structural and must revisit every code scope.
+      // An inserted empty paragraph cannot invalidate existing code scopes.
       const added = new Y.XmlElement("blockContainer");
       added.setAttribute("id", "structural");
       added.insert(0, [new Y.XmlElement("paragraph")]);
       group.insert(2, [added]);
-      expect(originalInspect.mock.calls.length).toBeGreaterThan(0);
-      expect(otherInspect.mock.calls.length).toBeGreaterThan(0);
+      expect(originalInspect).not.toHaveBeenCalled();
+      expect(otherInspect).not.toHaveBeenCalled();
       originalInspect.mockClear();
       otherInspect.mockClear();
       const binding = ySyncPluginKey.getState(mounted.editor.prosemirrorState).binding;
