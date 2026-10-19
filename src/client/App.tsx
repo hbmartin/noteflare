@@ -1,5 +1,6 @@
 import { slackAuthErrorMessage } from "./slack-auth-errors";
 import { ActivityView } from "./ActivityView";
+import { PendingDeletions } from "./PendingDeletions";
 import { TasksView } from "./TasksView";
 import { ActionMenu, Icon, RecentPages, readPreference, savePreference } from "./WorkspaceUI";
 import { CommandPalette, type AppCommand, type PaletteMode } from "./CommandPalette";
@@ -4446,6 +4447,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         ) : view === "trash" ? (
           <TrashView
             pages={trash}
+            workspaceId={member.workspace.id}
             owner={member.role === "owner"}
             loading={trashLoading}
             loadFailed={trashLoadFailed}
@@ -4871,6 +4873,7 @@ function MentionsView({ onSelect, onRead }: { onSelect: (id: string) => void; on
 
 function TrashView({
   pages,
+  workspaceId,
   owner,
   loading,
   loadFailed,
@@ -4879,6 +4882,7 @@ function TrashView({
   onDelete,
 }: {
   pages: Page[];
+  workspaceId: string;
   owner: boolean;
   loading: boolean;
   loadFailed: boolean;
@@ -4914,6 +4918,7 @@ function TrashView({
         })}
       </div>
       {!pages.length && !loading && !loadFailed && <p className="empty-copy">Trash is empty.</p>}
+      {owner && <PendingDeletions key={workspaceId} />}
     </main>
   );
 }
