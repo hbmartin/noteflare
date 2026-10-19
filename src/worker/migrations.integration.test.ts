@@ -27,6 +27,9 @@ describe("D1 migrations", () => {
       ...job,
       phase: "cleanup",
       actor_id: null,
+      failure_code: null,
+      blocked_at: null,
+      root_title: null,
     });
     expect((await env.DB.prepare("SELECT * FROM deletion_targets ORDER BY kind,target").all()).results).toEqual(
       targets,

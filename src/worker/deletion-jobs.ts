@@ -72,7 +72,8 @@ export async function listDeletionJobs(
   return {
     jobs: page.map((row) => {
       const blocked = row.blocked_at !== null;
-      const code = failureCode(row.failure_code, blocked);
+      const code =
+        failureCode(row.failure_code, blocked) ?? (row.last_error !== null ? "deletion_cleanup_unavailable" : null);
       return {
         id: row.id,
         rootPageId: row.root_page_id,

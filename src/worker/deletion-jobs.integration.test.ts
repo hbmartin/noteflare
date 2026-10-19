@@ -65,6 +65,7 @@ describe("deletion job recovery", () => {
     await env.DB.prepare("UPDATE deletion_jobs SET blocked_at=2,next_attempt_at=? WHERE id='job-52'")
       .bind(Number.MAX_SAFE_INTEGER)
       .run();
+    await env.DB.prepare("UPDATE deletion_jobs SET failure_code=NULL WHERE id='job-51'").run();
     const first = await listDeletionJobs(env, "workspace", null);
     expect(first.jobs).toHaveLength(50);
     expect(first.jobs[0]).toMatchObject({
@@ -74,6 +75,11 @@ describe("deletion job recovery", () => {
       reasonCode: "deletion_recheck_required",
       nextAttemptAt: null,
       canRetry: true,
+    });
+    expect(first.jobs[1]).toMatchObject({
+      status: "retrying",
+      reasonCode: "deletion_cleanup_unavailable",
+      reason: expect.any(String),
     });
     expect(JSON.stringify(first)).not.toMatch(/D1_ERROR|private diagnostics|unrecognized_internal_code|last_error/);
     const second = await listDeletionJobs(env, "workspace", first.nextCursor);
