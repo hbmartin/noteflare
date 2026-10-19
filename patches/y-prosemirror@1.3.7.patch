@@ -42,10 +42,10 @@ index c1f9468..c5f87b6 100644
 +export { ySyncPlugin, isVisible, getRelativeSelection, ProsemirrorBinding, updateYFragment, UnsupportedCodeContentError, assertSupportedCodeContent, observeUnsupportedCodeContent } from "./plugins/sync-plugin.js";
  export { absolutePositionToRelativePosition, relativePositionToAbsolutePosition, setMeta, prosemirrorJSONToYDoc, yDocToProsemirrorJSON, yDocToProsemirror, prosemirrorToYDoc, prosemirrorJSONToYXmlFragment, yXmlFragmentToProsemirrorJSON, yXmlFragmentToProsemirror, prosemirrorToYXmlFragment, yXmlFragmentToProseMirrorRootNode, yXmlFragmentToProseMirrorFragment, initProseMirrorDoc } from "./lib.js";
 diff --git a/dist/y-prosemirror.cjs b/dist/y-prosemirror.cjs
-index de4d1e6..d8aeace 100644
+index de4d1e6..56adb37 100644
 --- a/dist/y-prosemirror.cjs
 +++ b/dist/y-prosemirror.cjs
-@@ -111,6 +111,194 @@ const createEmptyMeta = () => ({
+@@ -111,6 +111,199 @@ const createEmptyMeta = () => ({
    isOMark: new Map()
  });
 
@@ -135,7 +135,7 @@ index de4d1e6..d8aeace 100644
 +      if (node !== context.root) {
 +        let root = struct.parent
 +        while (root.parent != null) root = root.parent
-+        if (root.doc !== doc || !Array.from(doc.share.values()).includes(root)) context.full = true
++        if (root._item !== null || root.doc !== doc) context.full = true
 +        continue
 +      }
 +      if (code !== null) context.dirty.add(code)
@@ -195,6 +195,11 @@ index de4d1e6..d8aeace 100644
 +    while (node != null && node !== active.root) node = node.parent
 +    if (node === active.root) {
 +      const context = active.context
++      // Nested writes reuse an open transaction without emitting beforeTransaction.
++      // Only a quiescent document can use the epoch alone to skip struct inspection.
++      if (context.root.doc?._transaction === null && active.epoch === context.epoch && !context.full && context.dirty.size === 0) {
++        return operation()
++      }
 +      collectCodeStructs(context)
 +      if (active.epoch !== context.epoch || context.full || context.dirty.size > 0) {
 +        checkBindingCode(context, snapshot, prevSnapshot)
@@ -240,7 +245,7 @@ index de4d1e6..d8aeace 100644
  /**
   * @param {Y.Item} item
   * @param {Y.Snapshot} [snapshot]
-@@ -187,7 +375,7 @@ const ySyncPlugin = (yXmlFragment, {
+@@ -187,7 +380,7 @@ const ySyncPlugin = (yXmlFragment, {
      props: {
        editable: (state) => {
          const syncState = ySyncPluginKey.getState(state);
@@ -249,7 +254,7 @@ index de4d1e6..d8aeace 100644
        }
      },
      key: ySyncPluginKey,
-@@ -263,11 +451,18 @@ const ySyncPlugin = (yXmlFragment, {
+@@ -263,11 +456,18 @@ const ySyncPlugin = (yXmlFragment, {
      },
      view: (view) => {
        binding.initView(view);
@@ -272,7 +277,7 @@ index de4d1e6..d8aeace 100644
        return {
          update: () => {
            const pluginState = plugin.getState(view.state);
-@@ -396,6 +591,7 @@ class ProsemirrorBinding {
+@@ -396,6 +596,7 @@ class ProsemirrorBinding {
       * @type {Map<import('prosemirror-model').MarkType, boolean>}
       */
      this.isOMark = new Map();
@@ -280,7 +285,7 @@ index de4d1e6..d8aeace 100644
      this._observeFunction = this._typeChanged.bind(this);
      /**
       * @type {Y.Doc}
-@@ -407,7 +603,7 @@ class ProsemirrorBinding {
+@@ -407,7 +608,7 @@ class ProsemirrorBinding {
       */
      this.beforeTransactionSelection = null;
      this.beforeAllTransactions = () => {
@@ -289,7 +294,7 @@ index de4d1e6..d8aeace 100644
          this.beforeTransactionSelection = getRelativeSelection(
            this,
            this.prosemirrorView.state
-@@ -484,6 +680,11 @@ class ProsemirrorBinding {
+@@ -484,6 +685,11 @@ class ProsemirrorBinding {
    }
 
    unrenderSnapshot () {
@@ -301,7 +306,7 @@ index de4d1e6..d8aeace 100644
      this.mapping.clear();
      this.mux(() => {
        const fragmentContent = this.type.toArray().map((t) =>
-@@ -505,6 +706,11 @@ class ProsemirrorBinding {
+@@ -505,6 +711,11 @@ class ProsemirrorBinding {
    }
 
    _forceRerender () {
@@ -313,7 +318,7 @@ index de4d1e6..d8aeace 100644
      this.mapping.clear();
      this.mux(() => {
        // If this is a forced rerender, this might neither happen as a pm change nor within a Yjs
-@@ -547,6 +753,7 @@ class ProsemirrorBinding {
+@@ -547,6 +758,7 @@ class ProsemirrorBinding {
     * @param {Object} pluginState
     */
    _renderSnapshot (snapshot, prevSnapshot, pluginState) {
@@ -321,7 +326,7 @@ index de4d1e6..d8aeace 100644
      /**
       * The document that contains the full history of this document.
       * @type {Y.Doc}
-@@ -590,72 +797,75 @@ class ProsemirrorBinding {
+@@ -590,72 +802,75 @@ class ProsemirrorBinding {
          historyType = /** @type {Y.XmlFragment} */ (content.type);
        }
      }
@@ -462,7 +467,7 @@ index de4d1e6..d8aeace 100644
      });
    }
 
-@@ -664,7 +874,7 @@ class ProsemirrorBinding {
+@@ -664,7 +879,7 @@ class ProsemirrorBinding {
     * @param {Y.Transaction} transaction
     */
    _typeChanged (events, transaction) {
@@ -471,7 +476,7 @@ index de4d1e6..d8aeace 100644
      const syncState = ySyncPluginKey.getState(this.prosemirrorView.state);
      if (
        events.length === 0 || syncState.snapshot != null ||
-@@ -720,6 +930,7 @@ class ProsemirrorBinding {
+@@ -720,6 +935,7 @@ class ProsemirrorBinding {
     * @param {import('prosemirror-model').Node} doc
     */
    _prosemirrorChanged (doc) {
@@ -479,7 +484,7 @@ index de4d1e6..d8aeace 100644
      this.doc.transact(() => {
        updateYFragment(this.doc, this.type, doc, this);
        this.beforeTransactionSelection = getRelativeSelection(
-@@ -729,6 +940,20 @@ class ProsemirrorBinding {
+@@ -729,6 +945,20 @@ class ProsemirrorBinding {
      }, ySyncPluginKey);
    }
 
@@ -500,7 +505,7 @@ index de4d1e6..d8aeace 100644
    /**
     * View is ready to listen to changes. Register observers.
     * @param {any} prosemirrorView
-@@ -736,6 +961,9 @@ class ProsemirrorBinding {
+@@ -736,6 +966,9 @@ class ProsemirrorBinding {
    initView (prosemirrorView) {
      if (this.prosemirrorView != null) this.destroy();
      this.prosemirrorView = prosemirrorView;
@@ -510,7 +515,7 @@ index de4d1e6..d8aeace 100644
      this.doc.on('beforeAllTransactions', this.beforeAllTransactions);
      this.doc.on('afterAllTransactions', this.afterAllTransactions);
      this.type.observeDeep(this._observeFunction);
-@@ -745,6 +973,9 @@ class ProsemirrorBinding {
+@@ -745,6 +978,9 @@ class ProsemirrorBinding {
      if (this.prosemirrorView == null) return
      this.prosemirrorView = null;
      this.type.unobserveDeep(this._observeFunction);
@@ -520,7 +525,7 @@ index de4d1e6..d8aeace 100644
      this.doc.off('beforeAllTransactions', this.beforeAllTransactions);
      this.doc.off('afterAllTransactions', this.afterAllTransactions);
    }
-@@ -804,6 +1035,12 @@ const createNodeFromYElement = (
+@@ -804,6 +1040,12 @@ const createNodeFromYElement = (
    prevSnapshot,
    computeYChange
  ) => {
@@ -533,7 +538,7 @@ index de4d1e6..d8aeace 100644
    const children = [];
    /**
     * @param {Y.XmlElement | Y.XmlText} type
-@@ -826,7 +1063,7 @@ const createNodeFromYElement = (
+@@ -826,7 +1068,7 @@ const createNodeFromYElement = (
        // This is a fix for #160 -- duplication of characters when two Y.Text exist next to each
        // other.
        const nextytext = /** @type {Y.ContentType} */ (type._item.right?.content)?.type;
@@ -542,7 +547,7 @@ index de4d1e6..d8aeace 100644
          type.applyDelta([
            { retain: type.length },
            ...nextytext.toDelta()
-@@ -1146,23 +1383,27 @@ const ytextTrans = (ytext) => {
+@@ -1146,23 +1388,27 @@ const ytextTrans = (ytext) => {
   * @param {Array<any>} ptexts
   * @param {BindingMetadata} meta
   */
@@ -579,7 +584,7 @@ index de4d1e6..d8aeace 100644
 
  const hashedMarkNameRegex = /(.*)(--[a-zA-Z0-9+/=]{8})$/;
  /**
-@@ -1203,6 +1444,96 @@ const marksToAttributes = (marks, meta) => {
+@@ -1203,6 +1449,96 @@ const marksToAttributes = (marks, meta) => {
    return pattrs
  };
 
@@ -676,7 +681,7 @@ index de4d1e6..d8aeace 100644
  /**
   * Update a yDom node by syncing the current content of the prosemirror node.
   *
-@@ -1216,7 +1547,10 @@ const marksToAttributes = (marks, meta) => {
+@@ -1216,7 +1552,10 @@ const marksToAttributes = (marks, meta) => {
   * @param {any} pNode
   * @param {BindingMetadata} meta
   */
@@ -688,7 +693,7 @@ index de4d1e6..d8aeace 100644
    if (
      yDomFragment instanceof Y__namespace.XmlElement &&
      yDomFragment.nodeName !== pNode.type.name
-@@ -1249,6 +1583,14 @@ const updateYFragment = (y, yDomFragment, pNode, meta) => {
+@@ -1249,6 +1588,14 @@ const updateYFragment = (y, yDomFragment, pNode, meta) => {
    const pChildCnt = pChildren.length;
    const yChildren = yDomFragment.toArray();
    const yChildCnt = yChildren.length;
@@ -703,7 +708,7 @@ index de4d1e6..d8aeace 100644
    const minCnt = math__namespace.min(pChildCnt, yChildCnt);
    let left = 0;
    let right = 0;
-@@ -1571,15 +1913,18 @@ const relativePositionToAbsolutePosition = (y, documentType, relPos, mapping) =>
+@@ -1571,15 +1918,18 @@ const relativePositionToAbsolutePosition = (y, documentType, relPos, mapping) =>
   * @param {Schema} schema
   */
  const yXmlFragmentToProseMirrorFragment = (yXmlFragment, schema) => {
@@ -731,7 +736,7 @@ index de4d1e6..d8aeace 100644
 
  /**
   * Utility function for converting an Y.Fragment to a ProseMirror node.
-@@ -1600,17 +1945,19 @@ const yXmlFragmentToProseMirrorRootNode = (yXmlFragment, schema) =>
+@@ -1600,17 +1950,19 @@ const yXmlFragmentToProseMirrorRootNode = (yXmlFragment, schema) =>
   * @todo deprecate mapping property
   */
  const initProseMirrorDoc = (yXmlFragment, schema) => {
@@ -762,7 +767,7 @@ index de4d1e6..d8aeace 100644
 
  /**
   * Utility method to convert a Prosemirror Doc Node into a Y.Doc.
-@@ -2186,6 +2533,9 @@ const yUndoPlugin = ({ protectedNodes = defaultProtectedNodes, trackedOrigins =
+@@ -2186,6 +2538,9 @@ const yUndoPlugin = ({ protectedNodes = defaultProtectedNodes, trackedOrigins =
    }
  });
 
@@ -836,10 +841,10 @@ index 3f48497..ae54a6b 100644
 
  /**
 diff --git a/src/plugins/sync-plugin.js b/src/plugins/sync-plugin.js
-index dccfb76..c1cbc5b 100644
+index dccfb76..1b10016 100644
 --- a/src/plugins/sync-plugin.js
 +++ b/src/plugins/sync-plugin.js
-@@ -37,6 +37,194 @@ export const createEmptyMeta = () => ({
+@@ -37,6 +37,199 @@ export const createEmptyMeta = () => ({
    isOMark: new Map()
  })
 
@@ -929,7 +934,7 @@ index dccfb76..c1cbc5b 100644
 +      if (node !== context.root) {
 +        let root = struct.parent
 +        while (root.parent != null) root = root.parent
-+        if (root.doc !== doc || !Array.from(doc.share.values()).includes(root)) context.full = true
++        if (root._item !== null || root.doc !== doc) context.full = true
 +        continue
 +      }
 +      if (code !== null) context.dirty.add(code)
@@ -989,6 +994,11 @@ index dccfb76..c1cbc5b 100644
 +    while (node != null && node !== active.root) node = node.parent
 +    if (node === active.root) {
 +      const context = active.context
++      // Nested writes reuse an open transaction without emitting beforeTransaction.
++      // Only a quiescent document can use the epoch alone to skip struct inspection.
++      if (context.root.doc?._transaction === null && active.epoch === context.epoch && !context.full && context.dirty.size === 0) {
++        return operation()
++      }
 +      collectCodeStructs(context)
 +      if (active.epoch !== context.epoch || context.full || context.dirty.size > 0) {
 +        checkBindingCode(context, snapshot, prevSnapshot)
@@ -1034,7 +1044,7 @@ index dccfb76..c1cbc5b 100644
  /**
   * @param {Y.Item} item
   * @param {Y.Snapshot} [snapshot]
-@@ -113,7 +301,7 @@ export const ySyncPlugin = (yXmlFragment, {
+@@ -113,7 +306,7 @@ export const ySyncPlugin = (yXmlFragment, {
      props: {
        editable: (state) => {
          const syncState = ySyncPluginKey.getState(state)
@@ -1043,7 +1053,7 @@ index dccfb76..c1cbc5b 100644
        }
      },
      key: ySyncPluginKey,
-@@ -189,11 +377,18 @@ export const ySyncPlugin = (yXmlFragment, {
+@@ -189,11 +382,18 @@ export const ySyncPlugin = (yXmlFragment, {
      },
      view: (view) => {
        binding.initView(view)
@@ -1066,7 +1076,7 @@ index dccfb76..c1cbc5b 100644
        return {
          update: () => {
            const pluginState = plugin.getState(view.state)
-@@ -322,6 +517,8 @@ export class ProsemirrorBinding {
+@@ -322,6 +522,8 @@ export class ProsemirrorBinding {
       * @type {Map<import('prosemirror-model').MarkType, boolean>}
       */
      this.isOMark = new Map()
@@ -1075,7 +1085,7 @@ index dccfb76..c1cbc5b 100644
      this._observeFunction = this._typeChanged.bind(this)
      /**
       * @type {Y.Doc}
-@@ -333,7 +530,7 @@ export class ProsemirrorBinding {
+@@ -333,7 +535,7 @@ export class ProsemirrorBinding {
       */
      this.beforeTransactionSelection = null
      this.beforeAllTransactions = () => {
@@ -1084,7 +1094,7 @@ index dccfb76..c1cbc5b 100644
          this.beforeTransactionSelection = getRelativeSelection(
            this,
            this.prosemirrorView.state
-@@ -410,6 +607,11 @@ export class ProsemirrorBinding {
+@@ -410,6 +612,11 @@ export class ProsemirrorBinding {
    }
 
    unrenderSnapshot () {
@@ -1096,7 +1106,7 @@ index dccfb76..c1cbc5b 100644
      this.mapping.clear()
      this.mux(() => {
        const fragmentContent = this.type.toArray().map((t) =>
-@@ -431,6 +633,11 @@ export class ProsemirrorBinding {
+@@ -431,6 +638,11 @@ export class ProsemirrorBinding {
    }
 
    _forceRerender () {
@@ -1108,7 +1118,7 @@ index dccfb76..c1cbc5b 100644
      this.mapping.clear()
      this.mux(() => {
        // If this is a forced rerender, this might neither happen as a pm change nor within a Yjs
-@@ -473,6 +680,7 @@ export class ProsemirrorBinding {
+@@ -473,6 +685,7 @@ export class ProsemirrorBinding {
     * @param {Object} pluginState
     */
    _renderSnapshot (snapshot, prevSnapshot, pluginState) {
@@ -1116,7 +1126,7 @@ index dccfb76..c1cbc5b 100644
      /**
       * The document that contains the full history of this document.
       * @type {Y.Doc}
-@@ -516,72 +724,75 @@ export class ProsemirrorBinding {
+@@ -516,72 +729,75 @@ export class ProsemirrorBinding {
          historyType = /** @type {Y.XmlFragment} */ (content.type)
        }
      }
@@ -1256,7 +1266,7 @@ index dccfb76..c1cbc5b 100644
      })
    }
 
-@@ -590,7 +801,7 @@ export class ProsemirrorBinding {
+@@ -590,7 +806,7 @@ export class ProsemirrorBinding {
     * @param {Y.Transaction} transaction
     */
    _typeChanged (events, transaction) {
@@ -1265,7 +1275,7 @@ index dccfb76..c1cbc5b 100644
      const syncState = ySyncPluginKey.getState(this.prosemirrorView.state)
      if (
        events.length === 0 || syncState.snapshot != null ||
-@@ -646,6 +857,7 @@ export class ProsemirrorBinding {
+@@ -646,6 +862,7 @@ export class ProsemirrorBinding {
     * @param {import('prosemirror-model').Node} doc
     */
    _prosemirrorChanged (doc) {
@@ -1273,7 +1283,7 @@ index dccfb76..c1cbc5b 100644
      this.doc.transact(() => {
        updateYFragment(this.doc, this.type, doc, this)
        this.beforeTransactionSelection = getRelativeSelection(
-@@ -655,6 +867,20 @@ export class ProsemirrorBinding {
+@@ -655,6 +872,20 @@ export class ProsemirrorBinding {
      }, ySyncPluginKey)
    }
 
@@ -1294,7 +1304,7 @@ index dccfb76..c1cbc5b 100644
    /**
     * View is ready to listen to changes. Register observers.
     * @param {any} prosemirrorView
-@@ -662,6 +888,9 @@ export class ProsemirrorBinding {
+@@ -662,6 +893,9 @@ export class ProsemirrorBinding {
    initView (prosemirrorView) {
      if (this.prosemirrorView != null) this.destroy()
      this.prosemirrorView = prosemirrorView
@@ -1304,7 +1314,7 @@ index dccfb76..c1cbc5b 100644
      this.doc.on('beforeAllTransactions', this.beforeAllTransactions)
      this.doc.on('afterAllTransactions', this.afterAllTransactions)
      this.type.observeDeep(this._observeFunction)
-@@ -671,6 +900,9 @@ export class ProsemirrorBinding {
+@@ -671,6 +905,9 @@ export class ProsemirrorBinding {
      if (this.prosemirrorView == null) return
      this.prosemirrorView = null
      this.type.unobserveDeep(this._observeFunction)
@@ -1314,7 +1324,7 @@ index dccfb76..c1cbc5b 100644
      this.doc.off('beforeAllTransactions', this.beforeAllTransactions)
      this.doc.off('afterAllTransactions', this.afterAllTransactions)
    }
-@@ -730,6 +962,12 @@ export const createNodeFromYElement = (
+@@ -730,6 +967,12 @@ export const createNodeFromYElement = (
    prevSnapshot,
    computeYChange
  ) => {
@@ -1327,7 +1337,7 @@ index dccfb76..c1cbc5b 100644
    const children = []
    /**
     * @param {Y.XmlElement | Y.XmlText} type
-@@ -752,7 +990,7 @@ export const createNodeFromYElement = (
+@@ -752,7 +995,7 @@ export const createNodeFromYElement = (
        // This is a fix for #160 -- duplication of characters when two Y.Text exist next to each
        // other.
        const nextytext = /** @type {Y.ContentType} */ (type._item.right?.content)?.type
@@ -1336,7 +1346,7 @@ index dccfb76..c1cbc5b 100644
          type.applyDelta([
            { retain: type.length },
            ...nextytext.toDelta()
-@@ -1072,7 +1310,7 @@ const ytextTrans = (ytext) => {
+@@ -1072,7 +1315,7 @@ const ytextTrans = (ytext) => {
   * @param {Array<any>} ptexts
   * @param {BindingMetadata} meta
   */
@@ -1345,7 +1355,7 @@ index dccfb76..c1cbc5b 100644
    meta.mapping.set(ytext, ptexts)
    const { nAttrs, str } = ytextTrans(ytext)
    const content = ptexts.map((p) => ({
-@@ -1085,6 +1323,10 @@ const updateYText = (ytext, ptexts, meta) => {
+@@ -1085,6 +1328,10 @@ const updateYText = (ytext, ptexts, meta) => {
    )
    ytext.delete(index, remove)
    ytext.insert(index, insert)
@@ -1356,7 +1366,7 @@ index dccfb76..c1cbc5b 100644
    ytext.applyDelta(
      content.map((c) => ({ retain: c.insert.length, attributes: c.attributes }))
    )
-@@ -1129,6 +1371,96 @@ const marksToAttributes = (marks, meta) => {
+@@ -1129,6 +1376,96 @@ const marksToAttributes = (marks, meta) => {
    return pattrs
  }
 
@@ -1453,7 +1463,7 @@ index dccfb76..c1cbc5b 100644
  /**
   * Update a yDom node by syncing the current content of the prosemirror node.
   *
-@@ -1142,7 +1474,10 @@ const marksToAttributes = (marks, meta) => {
+@@ -1142,7 +1479,10 @@ const marksToAttributes = (marks, meta) => {
   * @param {any} pNode
   * @param {BindingMetadata} meta
   */
@@ -1465,7 +1475,7 @@ index dccfb76..c1cbc5b 100644
    if (
      yDomFragment instanceof Y.XmlElement &&
      yDomFragment.nodeName !== pNode.type.name
-@@ -1175,6 +1510,14 @@ export const updateYFragment = (y, yDomFragment, pNode, meta) => {
+@@ -1175,6 +1515,14 @@ export const updateYFragment = (y, yDomFragment, pNode, meta) => {
    const pChildCnt = pChildren.length
    const yChildren = yDomFragment.toArray()
    const yChildCnt = yChildren.length

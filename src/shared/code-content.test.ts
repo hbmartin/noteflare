@@ -132,6 +132,68 @@ describe("legacy code content normalization", () => {
     );
   });
 
+  it.each(["cjs", "esm"])("avoids repeated historical client scans in the %s reader", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y=require("yjs"),{Schema}=require("prosemirror-model"),p=require("y-prosemirror");'
+        : 'import * as Y from "yjs";import {Schema} from "prosemirror-model";import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema=new Schema({nodes:{doc:{content:"paragraph+"},paragraph:{content:"text*"},text:{}}}), results=[];
+      for (const count of [50,200,800]) {
+        const doc=new Y.Doc(),root=doc.getXmlFragment("document-store");
+        doc.transact(()=>{for(let index=0;index<count;index++) {
+          const paragraph=new Y.XmlElement("paragraph"),text=new Y.XmlText();text.insert(0,"safe");paragraph.insert(0,[text]);root.insert(root.length,[paragraph]);
+        }});
+        for(let index=1;index<1000;index++) {
+          const peer=new Y.Doc();peer.clientID=200000+index;peer.getMap("presence").set(String(index),index);
+          Y.applyUpdate(doc,Y.encodeStateAsUpdate(peer));peer.destroy();
+        }
+        let scans=0,visits=0;const entries=doc.store.clients[Symbol.iterator].bind(doc.store.clients);
+        doc.store.clients[Symbol.iterator]=function*(){scans++;for(const entry of entries()){visits++;yield entry;}};
+        const pm=p.initProseMirrorDoc(root,schema).doc;
+        results.push({count,scans,visits,blocks:pm.childCount});doc.destroy();
+      }
+      console.log(JSON.stringify(results));`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual(
+      [50, 200, 800].map((count) => ({ count, scans: 1, visits: 1000, blocks: count })),
+    );
+  });
+
+  it.each(["cjs", "esm"])("detects mutations inside an open transaction during the %s reader", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y=require("yjs"),{Schema}=require("prosemirror-model"),p=require("y-prosemirror");'
+        : 'import * as Y from "yjs";import {Schema} from "prosemirror-model";import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema=new Schema({nodes:{doc:{content:"paragraph codeBlock"},paragraph:{content:"text*"},codeBlock:{content:"text*"},text:{}}});
+      const doc=new Y.Doc(),root=doc.getXmlFragment("document-store"),paragraph=new Y.XmlElement("paragraph"),plain=new Y.XmlText(),code=new Y.XmlElement("codeBlock"),text=new Y.XmlText();
+      plain.insert(0,"plain");paragraph.insert(0,[plain]);text.insert(0,"safe");code.insert(0,[text]);root.insert(0,[paragraph,code]);
+      const attributes=paragraph.getAttributes.bind(paragraph);let injected=false,rejected=false;
+      // A descendant read mutates a later code block after root preflight, while
+      // the existing transaction suppresses a second beforeTransaction event.
+      paragraph.getAttributes=(...args)=>{if(!injected){injected=true;text.insertEmbed(0,false);}return attributes(...args);};
+      try {doc.transact(()=>p.initProseMirrorDoc(root,schema));}
+      catch(error) {if(!(error instanceof p.UnsupportedCodeContentError))throw error;rejected=true;}
+      console.log(JSON.stringify({injected,rejected,retained:text.toDelta().some(delta=>delta.insert===false)}));doc.destroy();`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual({ injected: true, rejected: true, retained: true });
+  });
+
   it.each(["cjs", "esm"])("invalidates an active unbound %s preflight after observer mutations", (format) => {
     const imports =
       format === "cjs"
