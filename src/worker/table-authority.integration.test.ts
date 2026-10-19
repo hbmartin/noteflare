@@ -1858,31 +1858,40 @@ describe("per-table authority", () => {
         },
         { cancelRowOnPublicationFailure: "checkpoint-row" },
       );
-      let artifact = "";
-      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
-        artifact = state.storage.sql
-          .exec<{ value: string }>(
-            "SELECT value FROM projection_steps WHERE revision=? AND position=0",
-            pending.revision,
-          )
-          .one().value;
-      });
-      await env.DB.prepare("DROP TRIGGER hold_checkpoint").run();
-      await runDurableObjectAlarm(env.TABLE.getByName(pageId));
-      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
-        const meta = JSON.parse(
-          state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
-        );
-        state.storage.sql.exec(
-          "UPDATE meta SET value=? WHERE id=1",
-          JSON.stringify({ ...meta, projectedRevision: pending.revision - 1 }),
-        );
-        state.storage.sql.exec("UPDATE events SET next_step=1 WHERE revision=?", pending.revision);
-        state.storage.sql.exec("INSERT INTO projection_steps VALUES(?,0,?)", pending.revision, artifact);
+      const retainedCount = await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+        const internal = instance as unknown as {
+          project(): Promise<boolean>;
+          finishProjectionEvent(revision: number, workspaceId: string, pageId: string): Promise<void>;
+        };
+        const finish = internal.finishProjectionEvent;
+        internal.finishProjectionEvent = async () => {
+          throw new Error("Interrupted before local publication finalization");
+        };
+        try {
+          await state.storage.deleteAlarm();
+          await env.DB.prepare("DROP TRIGGER hold_checkpoint").run();
+          await expect(internal.project()).rejects.toThrow("Interrupted before local publication finalization");
+        } finally {
+          internal.finishProjectionEvent = finish;
+        }
+        expect(
+          state.storage.sql
+            .exec<{ next_step: number }>("SELECT next_step FROM events WHERE revision=?", pending.revision)
+            .one().next_step,
+        ).toBe(1);
+        const artifacts = state.storage.sql
+          .exec<{ position: number }>("SELECT position FROM projection_steps WHERE revision=?", pending.revision)
+          .toArray();
+        expect(artifacts.some((step) => step.position < 0)).toBe(true);
+        expect(artifacts.filter((step) => step.position >= 0)).toEqual([{ position: 0 }]);
         if (mode === "multi-step")
           state.storage.sql.exec("INSERT INTO projection_steps VALUES(?,1,'[]')", pending.revision);
         if (mode === "malformed artifact")
-          state.storage.sql.exec("UPDATE projection_steps SET value='{' WHERE revision=?", pending.revision);
+          state.storage.sql.exec(
+            "UPDATE projection_steps SET value='{' WHERE revision=? AND position=0",
+            pending.revision,
+          );
+        return artifacts.length + Number(mode === "multi-step");
       });
       if (mode === "wrong generation")
         await env.DB.prepare("UPDATE table_authority SET generation=generation+1 WHERE page_id=?").bind(pageId).run();
@@ -1890,35 +1899,54 @@ describe("per-table authority", () => {
         await env.DB.prepare("UPDATE table_authority SET projected_revision=? WHERE page_id=?")
           .bind(pending.revision - 1, pageId)
           .run();
-      await evictDurableObject(env.TABLE.getByName(pageId));
-      const recovered = await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
-        const internal = instance as unknown as { project(): Promise<boolean> };
-        const success = await internal.project().then(
-          () => true,
-          (error: unknown) => {
-            if ((error as { code?: string }).code !== "table_projection_blocked") throw error;
-            return false;
-          },
-        );
-        return {
-          success,
-          meta: JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value),
-          steps: state.storage.sql
-            .exec("SELECT revision FROM projection_steps WHERE revision=?", pending.revision)
-            .toArray().length,
-        };
-      });
-      expect(recovered.success).toBe(mode === "published");
-      expect(recovered.meta.projectedRevision).toBe(mode === "published" ? pending.revision : pending.revision - 1);
-      expect(recovered.steps).toBe(mode === "published" ? 0 : mode === "multi-step" ? 2 : 1);
-      expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id='checkpoint-row'").first()).toEqual({
-        id: "checkpoint-row",
-      });
-      const later =
-        mode === "published"
-          ? await write(pageId, member, "create_column", { id: "later", name: "Later", type: "text" })
-          : undefined;
-      expect(later?.projectionPending).toBe(mode === "published" ? false : undefined);
+      const publication = await env.DB.prepare(
+        "SELECT generation,projected_revision FROM table_authority WHERE page_id=?",
+      )
+        .bind(pageId)
+        .first();
+      await env.DB.prepare(
+        "CREATE TRIGGER reject_checkpoint_replay BEFORE INSERT ON table_rows WHEN NEW.id='checkpoint-row' BEGIN SELECT RAISE(ABORT,'publication_replayed'); END",
+      ).run();
+      try {
+        await evictDurableObject(env.TABLE.getByName(pageId));
+        const recovered = await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+          const internal = instance as unknown as { project(): Promise<boolean> };
+          const success = await internal.project().then(
+            () => true,
+            (error: unknown) => {
+              if ((error as { code?: string }).code !== "table_projection_blocked") throw error;
+              return false;
+            },
+          );
+          return {
+            success,
+            meta: JSON.parse(
+              state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+            ),
+            steps: state.storage.sql
+              .exec("SELECT revision FROM projection_steps WHERE revision=?", pending.revision)
+              .toArray().length,
+          };
+        });
+        expect(recovered.success).toBe(mode === "published");
+        expect(recovered.meta.projectedRevision).toBe(mode === "published" ? pending.revision : pending.revision - 1);
+        expect(recovered.steps).toBe(mode === "published" ? 0 : retainedCount);
+        expect(
+          await env.DB.prepare("SELECT generation,projected_revision FROM table_authority WHERE page_id=?")
+            .bind(pageId)
+            .first(),
+        ).toEqual(publication);
+        expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id='checkpoint-row'").first()).toEqual({
+          id: "checkpoint-row",
+        });
+        const later =
+          mode === "published"
+            ? await write(pageId, member, "create_column", { id: "later", name: "Later", type: "text" })
+            : undefined;
+        expect(later?.projectionPending).toBe(mode === "published" ? false : undefined);
+      } finally {
+        await env.DB.prepare("DROP TRIGGER reject_checkpoint_replay").run();
+      }
     },
   );
 

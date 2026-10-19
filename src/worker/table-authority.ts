@@ -2844,7 +2844,7 @@ export class TableAuthority extends DurableObject<Env> {
         try {
           if (event.cancel_row_id && event.next_step === 1 && artifactSteps === 1) {
             const original = this.rows<{ position: number; value: string }>(
-              "SELECT position,value FROM projection_steps WHERE revision=?",
+              "SELECT position,value FROM projection_steps WHERE revision=? AND position>=0",
               event.revision,
             );
             const publication = await this.env.DB.prepare(
@@ -2858,7 +2858,7 @@ export class TableAuthority extends DurableObject<Env> {
               event.revision,
             )[0];
             const retained = this.rows<{ position: number; value: string }>(
-              "SELECT position,value FROM projection_steps WHERE revision=?",
+              "SELECT position,value FROM projection_steps WHERE revision=? AND position>=0",
               event.revision,
             );
             let validStep = false;
