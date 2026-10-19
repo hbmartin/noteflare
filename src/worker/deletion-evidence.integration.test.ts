@@ -1,5 +1,7 @@
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { processDueDeletionJobs } from "./cleanup";
+import { evidenceValidationCases } from "../../tests/helpers/deletion-evidence-fixtures";
 
 beforeEach(() => reset());
 
@@ -37,7 +39,130 @@ const lookup = () =>
     "SELECT job_id,table_id,workspace_id,generation,detail_page_id,row_id,source_kind FROM deletion_evidence_lookup ORDER BY detail_page_id",
   ).all();
 
+async function legacyStagingEvidence(indexed: boolean) {
+  await foundation("staging");
+  const mixed = evidence(0, [{ detailPageId: "detail", rowId: "row", kind: "row" }, "unsupported"]);
+  await insert(mixed);
+  if (indexed) {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0093"),
+    );
+  }
+  await upgrade();
+  expect((await lookup()).results).toMatchObject([{ detail_page_id: "detail", row_id: "row", source_kind: "row" }]);
+  return mixed;
+}
+
+async function acceptsValidation(operation: Promise<unknown>, errorText: string) {
+  try {
+    await operation;
+    return true;
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes(errorText)) throw error;
+    return false;
+  }
+}
+
 describe("indexed deletion evidence migration", () => {
+  it.each(evidenceValidationCases)(
+    "keeps all validation contexts consistent for $name",
+    async ({ patch, valid, indexed }) => {
+      const target = JSON.stringify({ ...JSON.parse(evidence()), ...patch });
+      await foundation();
+      await insert(target);
+      expect(await acceptsValidation(upgrade(), "CHECK constraint failed")).toBe(valid);
+      await reset();
+      await foundation("staging");
+      await insert(target);
+      await upgrade();
+      expect((await lookup()).results).toHaveLength(indexed);
+      expect(
+        await acceptsValidation(
+          env.DB.prepare("UPDATE deletion_jobs SET phase='rows' WHERE id='job'").run(),
+          "deletion_evidence_incompatible",
+        ),
+      ).toBe(valid);
+      await env.DB.prepare("DELETE FROM deletion_targets WHERE job_id='job'").run();
+      expect(await acceptsValidation(insert(target), "deletion_evidence_incompatible")).toBe(valid);
+      if (!valid) await insert(evidence());
+      const current = valid ? target : evidence();
+      const next = valid ? JSON.stringify({ ...JSON.parse(target), index: 1 }) : target;
+      expect(
+        await acceptsValidation(
+          env.DB.prepare("UPDATE deletion_targets SET target=? WHERE target=?").bind(next, current).run(),
+          "deletion_evidence_incompatible",
+        ),
+      ).toBe(valid);
+      expect((await lookup()).results).toHaveLength(valid ? indexed : 1);
+    },
+  );
+
+  it("counts retained chunks through the partial index without executing JSON functions", async () => {
+    await foundation();
+    await upgrade();
+    for (let index = 0; index < 12; index++)
+      await insert(evidence(index, [{ detailPageId: `detail-${index}-${"x".repeat(900000)}`, kind: "provenance" }]));
+    const query =
+      "SELECT count(*) count FROM deletion_targets INDEXED BY idx_deletion_evidence_chunks WHERE job_id=? AND kind='table_do' AND json_valid(target) AND json_extract(target,'$.stage')='evidence' AND json_extract(target,'$.pageId')=?";
+    expect(await env.DB.prepare(query).bind("job", "table").first()).toEqual({ count: 12 });
+    const instructions = await env.DB.prepare(`EXPLAIN ${query}`)
+      .bind("job", "table")
+      .all<{ opcode: string; p4: string | null }>();
+    expect(instructions.results.filter((row) => row.opcode === "Function")).toEqual([]);
+    const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${query}`).bind("job", "table").all<{ detail: string }>();
+    expect(plan.results.some((row) => row.detail.includes("idx_deletion_evidence_chunks"))).toBe(true);
+  });
+
+  describe.each([false, true])("legacy staging removal with 0092 already applied=%s", (indexed) => {
+    it("replaces mixed evidence while preserving identities still owned by another chunk", async () => {
+      const mixed = await legacyStagingEvidence(indexed);
+      await insert(evidence(1));
+      const replacement = evidence(0, [{ detailPageId: "replacement", kind: "provenance" }]);
+      await env.DB.prepare("UPDATE deletion_targets SET target=? WHERE target=?").bind(replacement, mixed).run();
+      expect((await lookup()).results).toMatchObject([
+        { detail_page_id: "detail", row_id: "row", source_kind: "row" },
+        { detail_page_id: "replacement", row_id: null, source_kind: "provenance" },
+      ]);
+      await env.DB.prepare("DELETE FROM deletion_targets WHERE target=?").bind(evidence(1)).run();
+      expect((await lookup()).results).toMatchObject([{ detail_page_id: "replacement" }]);
+    });
+
+    it("deletes mixed evidence and its lookup row", async () => {
+      const mixed = await legacyStagingEvidence(indexed);
+      await env.DB.prepare("DELETE FROM deletion_targets WHERE target=?").bind(mixed).run();
+      expect((await lookup()).results).toEqual([]);
+      expect((await env.DB.prepare("SELECT target FROM deletion_targets").all()).results).toEqual([]);
+    });
+
+    it("cascades deletion of a job containing mixed evidence", async () => {
+      await legacyStagingEvidence(indexed);
+      await env.DB.prepare("DELETE FROM deletion_jobs WHERE id='job'").run();
+      expect((await lookup()).results).toEqual([]);
+      expect((await env.DB.prepare("SELECT target FROM deletion_targets").all()).results).toEqual([]);
+      expect((await env.DB.prepare("SELECT id FROM deletion_jobs").all()).results).toEqual([]);
+    });
+
+    it("removes stale staging evidence before completing an accepted cleanup job", async () => {
+      await legacyStagingEvidence(indexed);
+      const objectKey = "deletion-evidence-regression";
+      await env.BUCKET.put(objectKey, "pending cleanup");
+      await env.DB.batch([
+        env.DB
+          .prepare(`INSERT INTO deletion_jobs(id,workspace_id,root_page_id,next_attempt_at,created_at,updated_at,phase)
+          VALUES('accepted','workspace','other',0,1,1,'cleanup')`),
+        env.DB.prepare("INSERT INTO deletion_targets(job_id,kind,target) VALUES('accepted','r2_object',?)").bind(
+          objectKey,
+        ),
+      ]);
+      await processDueDeletionJobs(env);
+      expect(await env.BUCKET.get(objectKey)).toBeNull();
+      expect((await env.DB.prepare("SELECT id FROM deletion_jobs").all()).results).toEqual([]);
+      expect((await env.DB.prepare("SELECT target FROM deletion_targets").all()).results).toEqual([]);
+      expect((await lookup()).results).toEqual([]);
+    });
+  });
+
   it("backfills nullable generations and deduplicates identical legacy chunks without changing their bytes", async () => {
     await foundation();
     const first = evidence(0, [{ detailPageId: "detail", kind: "provenance" }], null);

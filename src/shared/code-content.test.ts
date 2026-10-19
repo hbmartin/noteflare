@@ -34,6 +34,104 @@ function legacyDocument(content: ProseMirrorJson[]) {
 }
 
 describe("legacy code content normalization", () => {
+  it.each(["cjs", "esm"])("keeps the live %s binding usable after rejecting unsupported history", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const { JSDOM } = require("jsdom"), Y = require("yjs"), { Schema } = require("prosemirror-model"), { EditorState } = require("prosemirror-state"), { EditorView } = require("prosemirror-view"), p = require("y-prosemirror");'
+        : 'import { JSDOM } from "jsdom"; import * as Y from "yjs"; import { Schema } from "prosemirror-model"; import { EditorState } from "prosemirror-state"; import { EditorView } from "prosemirror-view"; import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const dom = new JSDOM('<!doctype html><div id="editor"></div>');
+      for (const key of ["window", "document", "MutationObserver", "HTMLElement", "Node", "Element"]) {
+        globalThis[key] = key === "window" ? dom.window : key === "document" ? dom.window.document : dom.window[key];
+      }
+      globalThis.getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
+      const schema = new Schema({ nodes: { doc: { content: "codeBlock+" }, codeBlock: { content: "text*", code: true, toDOM: () => ["pre", ["code", 0]] }, text: {} } });
+      const results = [];
+      for (const encoded of [false, true]) {
+        const doc = new Y.Doc({ gc: false }), root = doc.getXmlFragment("document-store"), code = new Y.XmlElement("codeBlock"), text = new Y.XmlText();
+        let view;
+        try {
+          text.insert(0, "safe"); code.insert(0, [text]); root.insert(0, [code]);
+          text.insertEmbed(2, { unsupported: "image" });
+          const bad = encoded ? Y.encodeStateAsUpdateV2(doc) : Y.snapshot(doc);
+          text.delete(2, 1);
+          const clean = encoded ? Y.encodeStateAsUpdateV2(doc) : Y.snapshot(doc);
+          const initial = p.initProseMirrorDoc(root, schema), plugin = p.ySyncPlugin(root, { mapping: initial.meta.mapping });
+          view = new EditorView(document.querySelector("#editor"), { state: EditorState.create({ schema, doc: initial.doc, plugins: [plugin] }) });
+          const binding = p.ySyncPluginKey.getState(view.state).binding;
+          view.dispatch(view.state.tr.insertText("before-", 1));
+          const before = Buffer.from(Y.encodeStateAsUpdate(doc)), pmBefore = view.state.doc;
+          let events = 0, rejected = false;
+          const unobserve = p.observeUnsupportedCodeContent(doc, () => events++);
+          try { binding._renderSnapshot(clean, bad, p.ySyncPluginKey.getState(view.state)); }
+          catch (error) { if (!(error instanceof p.UnsupportedCodeContentError)) throw error; rejected = true; }
+          p.assertSupportedCodeContent(root);
+          const unchanged = Buffer.from(Y.encodeStateAsUpdate(doc)).equals(before) && view.state.doc.eq(pmBefore);
+          const usable = binding.unsupportedCodeContent === null && plugin.props.editable(view.state);
+          const stateBeforeExit = view.state;
+          binding.unrenderSnapshot();
+          const exited = view.state !== stateBeforeExit && p.ySyncPluginKey.getState(view.state).snapshot === null;
+          view.dispatch(view.state.tr.insertText("after-", 1));
+          results.push({ encoded, rejected, events, unchanged, usable, exited, editable: view.editable, yjs: text.toString(), pm: view.state.doc.textContent });
+          unobserve();
+        } finally { view?.destroy(); doc.destroy(); }
+      }
+      dom.window.close(); console.log(JSON.stringify(results));`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual(
+      [false, true].map((encoded) => ({
+        encoded,
+        rejected: true,
+        events: 0,
+        unchanged: true,
+        usable: true,
+        exited: true,
+        editable: true,
+        yjs: "after-before-safe",
+        pm: "after-before-safe",
+      })),
+    );
+  });
+
+  it.each(["cjs", "esm"])("validates linearly while the %s reader merges adjacent paragraph texts", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y=require("yjs"),{Schema}=require("prosemirror-model"),p=require("y-prosemirror");'
+        : 'import * as Y from "yjs";import {Schema} from "prosemirror-model";import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema=new Schema({nodes:{doc:{content:"block+"},paragraph:{content:"text*",group:"block"},codeBlock:{content:"text*",group:"block"},text:{}}});
+      const results=[];
+      for(const count of [50,100,200]) {
+        const doc=new Y.Doc(),root=doc.getXmlFragment("document-store");let reads=0;
+        doc.transact(()=>{for(let index=0;index<count;index++) {
+          const paragraph=new Y.XmlElement("paragraph");paragraph.insert(0,["left","right"].map(value=>{const text=new Y.XmlText();text.insert(0,value);return text;}));
+          const code=new Y.XmlElement("codeBlock"),text=new Y.XmlText();text.insert(0,"safe");code.insert(0,[text]);root.insert(root.length,[paragraph,code]);
+          const delta=text.toDelta.bind(text);text.toDelta=(...args)=>{reads++;return delta(...args)};
+        }});
+        const pm=p.initProseMirrorDoc(root,schema).doc;
+        results.push({count,reads,paragraph:pm.firstChild.textContent,blocks:pm.childCount});doc.destroy();
+      }
+      console.log(JSON.stringify(results));`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual(
+      [50, 100, 200].map((count) => ({ count, reads: 2 * count, paragraph: "leftright", blocks: 2 * count })),
+    );
+  });
+
   it.each(["cjs", "esm"])("invalidates an active unbound %s preflight after observer mutations", (format) => {
     const imports =
       format === "cjs"
@@ -106,7 +204,7 @@ describe("legacy code content normalization", () => {
       bindingStartup: [1, 1],
       unrelated: [0, 0],
       changedCode: [1, 0, 0],
-      structural: [1, 1],
+      structural: [0, 0],
       unknown: [1, 1],
       observersRetained: true,
     });

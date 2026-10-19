@@ -114,7 +114,38 @@ Table deletion captures linked row identities through a paged internal manifest;
 are not exported. `deletion_evidence_lookup` indexes the retained JSON evidence and is removed with
 its job. A dependent row deletion can recover an exact generation proof from the table's purge
 tombstone after the whole-table job is gone. If that proof is unavailable, the accepted job keeps its
-locks and parks with a diagnostic. An authorized repeat of permanent deletion rechecks the same job.
+locks and parks with a diagnostic. Owners can inspect **Pending permanent deletions** in Trash and
+choose **Check again**. The action rechecks the same job; it never creates a replacement deletion,
+changes captured evidence, or overrides an active cleanup lease. Accepted pages remain unavailable
+for restore. Pending and retrying jobs refresh every five seconds while Trash is open; paused jobs
+wait for an explicit refresh or recheck.
+
+`GET /api/deletion-jobs` lists accepted jobs for the current workspace (owners only, 50 per page,
+with an opaque `nextCursor`). `POST /api/deletion-jobs/:id/retry` requests a recheck and returns `202`.
+The existing repeat-permanent-delete endpoint uses the same retry guard. Summaries expose a safe
+reason instead of the raw stored `last_error`:
+
+| Reason code                    | Recovery                                                                            |
+| ------------------------------ | ----------------------------------------------------------------------------------- |
+| `deletion_proof_unavailable`   | Restore or investigate the original purge tombstone, then recheck.                  |
+| `deletion_proof_invalid`       | Investigate the malformed successful proof response, then recheck.                  |
+| `deletion_generation_conflict` | Reconcile the original captured generation; a newer tombstone is never substituted. |
+| `deletion_evidence_conflict`   | Investigate retained versus recaptured identities; evidence is not overwritten.     |
+| `deletion_ownership_conflict`  | Resolve the captured identity's ownership before rechecking.                        |
+| `deletion_recheck_required`    | Historical parking has no classified cause; recheck to obtain a current diagnosis.  |
+
+Malformed successful proofs and missing proofs pause immediately. Network failures, rate limits,
+and ordinary service outages retain automatic retry backoff. A table that has not been seeded is
+not evidence that its captured rows were deleted. These failures preserve accepted page locks.
+
+Apply migration `0094_deletion_recovery.sql` before deploying the recovery code. It preserves the
+existing migration history, backfills available root titles and historical parked-job markers,
+and indexes evidence chunk counts without parsing retained JSON on every count.
+
+Structured events `deletion.job.blocked`, `deletion.job.retry_requested`,
+`deletion.job.retry_scheduled`, and `deletion.job.completed` carry the job ID, root page, and phase.
+Failure events also carry a stable failure code and the table ID when available. Inspect those events
+alongside the queue queries above; repeated owner rechecks do not repair absent or conflicting proof.
 
 ### Abandoned uploads
 

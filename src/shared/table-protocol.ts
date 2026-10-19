@@ -2,17 +2,25 @@ import type { ComputedValue } from "./formula";
 import { CALCULATION_KINDS, type CalculationKind, type CalculationResult } from "./table-computed";
 import type { ColumnType } from "./types";
 
+/** Only deliberate table input and state errors may cross the authority boundary. */
+export class TableRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string,
+  ) {
+    super(message);
+  }
+}
+
 export const TABLE_PROTOCOL_VERSION = 1;
 const TABLE_PROPERTY_CONFIG_VERSION = 1;
 export function versionedPropertyConfig(input: unknown): Record<string, unknown> {
   if (input !== undefined && input !== null && (typeof input !== "object" || Array.isArray(input)))
-    throw Object.assign(new Error("Invalid property configuration."), { status: 422, code: "table_validation" });
+    throw new TableRequestError("Invalid property configuration.", 422, "table_validation");
   const config = (input ?? {}) as Record<string, unknown>;
   if (config.version !== undefined && config.version !== TABLE_PROPERTY_CONFIG_VERSION)
-    throw Object.assign(new Error("Unsupported property configuration version."), {
-      status: 422,
-      code: "property_config_version",
-    });
+    throw new TableRequestError("Unsupported property configuration version.", 422, "property_config_version");
   return { ...config, version: TABLE_PROPERTY_CONFIG_VERSION };
 }
 export function allowedCalculationKinds(property: Pick<CollaborativeColumn, "type" | "config">): CalculationKind[] {
@@ -170,51 +178,41 @@ export function normalizedColumnName(value: string) {
 }
 export function validateTableValue(column: CollaborativeColumn, input: unknown): TableValue {
   if (metadataColumns.has(column.type) || column.type === "formula")
-    throw Object.assign(new Error("Computed properties are maintained by the server."), {
-      status: 422,
-      code: "computed_property",
-    });
+    throw new TableRequestError("Computed properties are maintained by the server.", 422, "computed_property");
   if (input === null || input === "" || input === undefined) return null;
   if (column.type === "number") {
     if (typeof input !== "number" || !Number.isFinite(input))
-      throw Object.assign(new Error("Enter a finite number."), { status: 422, code: "table_validation" });
+      throw new TableRequestError("Enter a finite number.", 422, "table_validation");
     return input;
   }
   if (column.type === "checkbox") {
-    if (typeof input !== "boolean")
-      throw Object.assign(new Error("Enter a checkbox value."), { status: 422, code: "table_validation" });
+    if (typeof input !== "boolean") throw new TableRequestError("Enter a checkbox value.", 422, "table_validation");
     return input;
   }
   if (column.type === "person" || column.type === "multi_select") {
     if (!Array.isArray(input) || input.length > 100 || input.some((id) => typeof id !== "string" || id.length > 100))
-      throw Object.assign(new Error("Enter at most 100 IDs."), { status: 422, code: "table_validation" });
+      throw new TableRequestError("Enter at most 100 IDs.", 422, "table_validation");
     const ids = [...new Set(input as string[])].sort();
     if (column.type === "multi_select" && ids.some((id) => !column.options.some((option) => option.id === id)))
-      throw Object.assign(new Error("An option no longer belongs to this property."), {
-        status: 422,
-        code: "table_validation",
-      });
+      throw new TableRequestError("An option no longer belongs to this property.", 422, "table_validation");
     return ids;
   }
   if (typeof input !== "string" || input.length > 10_000)
-    throw Object.assign(new Error("Enter text of up to 10,000 characters."), { status: 422, code: "table_validation" });
+    throw new TableRequestError("Enter text of up to 10,000 characters.", 422, "table_validation");
   if ((column.type === "select" || column.type === "status") && !column.options.some((option) => option.id === input))
-    throw Object.assign(new Error("The selected option does not belong to this property."), {
-      status: 422,
-      code: "table_validation",
-    });
+    throw new TableRequestError("The selected option does not belong to this property.", 422, "table_validation");
   if (column.type === "url") {
     let url: URL;
     try {
       url = new URL(input);
     } catch {
-      throw Object.assign(new Error("Enter an absolute HTTP(S) URL."), { status: 422, code: "table_validation" });
+      throw new TableRequestError("Enter an absolute HTTP(S) URL.", 422, "table_validation");
     }
     if (!["http:", "https:"].includes(url.protocol))
-      throw Object.assign(new Error("Enter an absolute HTTP(S) URL."), { status: 422, code: "table_validation" });
+      throw new TableRequestError("Enter an absolute HTTP(S) URL.", 422, "table_validation");
   }
   if (column.type === "date" && (!Number.isFinite(Date.parse(input)) || !/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(input)))
-    throw Object.assign(new Error("Enter an ISO date or timestamp."), { status: 422, code: "table_validation" });
+    throw new TableRequestError("Enter an ISO date or timestamp.", 422, "table_validation");
   return input;
 }
 

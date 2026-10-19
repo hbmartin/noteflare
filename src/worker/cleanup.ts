@@ -5,6 +5,8 @@ import { HttpError, safeHttpError } from "./http";
 import type { PageRow } from "./page-access";
 import { acceptedPageDeletionSql } from "./deletion-policy";
 import { decodeTableResponse, tableReadPages } from "./table-transport";
+import { CLEANUP_LEASE_MS, deletionFailure, queueDeletionRetry } from "./deletion-jobs";
+import { DELETION_FAILURE_MESSAGES } from "../shared/deletion-jobs";
 
 type DeletionTargetKind = "document_do" | "table_do" | "table_row" | "r2_object" | "r2_prefix";
 
@@ -70,6 +72,17 @@ const EVIDENCE_FAILURE = {
   message: "Table deletion evidence is temporarily unavailable. Please retry shortly.",
 };
 
+/** A successful response must contain proof we can retain; outages remain retryable. */
+async function decodeDeletionProof<T>(response: Response, unavailable?: { code: string; message: string }): Promise<T> {
+  try {
+    return await decodeTableResponse<T>(response, unavailable);
+  } catch (error) {
+    if (response.ok)
+      throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
+    throw error;
+  }
+}
+
 async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUntil: number) {
   const locked = await env.DB.prepare("SELECT page_id FROM deletion_job_pages WHERE job_id=?")
     .bind(job.id)
@@ -108,6 +121,7 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
       if (!evidence.has(row.detailPageId)) evidence.set(row.detailPageId, { ...row, kind: "provenance" });
     if (table.generation !== null) {
       const canonicalLinks = new Map<string, string>();
+      const cursors = new Set<string>();
       try {
         for await (const snapshot of tableReadPages(async (params) => {
           params.set("deletionJob", job.id);
@@ -119,7 +133,7 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
               signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
             }),
           );
-          const manifest = await decodeTableResponse<{
+          const manifest = await decodeDeletionProof<{
             pageId: string;
             workspaceId: string;
             generation: number;
@@ -128,12 +142,30 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
             nextCursor: string | null;
           }>(response, EVIDENCE_FAILURE);
           if (
-            manifest.pageId !== table.pageId ||
-            manifest.workspaceId !== table.workspaceId ||
-            manifest.generation !== table.generation ||
+            !manifest ||
+            typeof manifest.pageId !== "string" ||
+            !manifest.pageId ||
+            typeof manifest.workspaceId !== "string" ||
+            !manifest.workspaceId ||
+            !Number.isSafeInteger(manifest.generation) ||
+            manifest.generation < 1 ||
+            !Number.isSafeInteger(manifest.revision) ||
+            manifest.revision < 0 ||
+            (manifest.nextCursor !== null &&
+              (typeof manifest.nextCursor !== "string" || !manifest.nextCursor || cursors.has(manifest.nextCursor))) ||
             !Array.isArray(manifest.rows) ||
             manifest.rows.length > EVIDENCE_MAX_RECORDS ||
-            manifest.rows.some((row) => typeof row.id !== "string" || typeof row.detailPageId !== "string")
+            manifest.rows.some(
+              (row) =>
+                !row || typeof row !== "object" || typeof row.id !== "string" || typeof row.detailPageId !== "string",
+            )
+          )
+            throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
+          if (manifest.nextCursor !== null) cursors.add(manifest.nextCursor);
+          if (
+            manifest.pageId !== table.pageId ||
+            manifest.workspaceId !== table.workspaceId ||
+            manifest.generation !== table.generation
           )
             throw new HttpError(409, "deletion_pending", "The page subtree changed. Reload before retrying.");
           return manifest;
@@ -142,7 +174,11 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
             if (ownedPages.has(row.detailPageId)) continue;
             const priorRow = canonicalLinks.get(row.detailPageId);
             if (priorRow !== undefined && priorRow !== row.id)
-              throw new HttpError(503, EVIDENCE_FAILURE.code, EVIDENCE_FAILURE.message);
+              throw new HttpError(
+                503,
+                "deletion_evidence_conflict",
+                DELETION_FAILURE_MESSAGES.deletion_evidence_conflict,
+              );
             canonicalLinks.set(row.detailPageId, row.id);
             evidence.set(row.detailPageId, { kind: "row", rowId: row.id, detailPageId: row.detailPageId });
           }
@@ -175,13 +211,14 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
         record.generation !== table.generation ||
         (current && (current.kind !== record.source_kind || (current.rowId ?? null) !== record.row_id))
       )
-        throw new HttpError(503, EVIDENCE_FAILURE.code, EVIDENCE_FAILURE.message);
+        throw new HttpError(503, "deletion_evidence_conflict", DELETION_FAILURE_MESSAGES.deletion_evidence_conflict);
       if (current) evidence.delete(record.detail_page_id);
     }
-    const stored = await env.DB.prepare(`SELECT count(*) count FROM deletion_targets WHERE job_id=? AND kind='table_do'
+    const stored =
+      await env.DB.prepare(`SELECT count(*) count FROM deletion_targets INDEXED BY idx_deletion_evidence_chunks WHERE job_id=? AND kind='table_do'
       AND json_valid(target) AND json_extract(target,'$.stage')='evidence' AND json_extract(target,'$.pageId')=?`)
-      .bind(job.id, table.pageId)
-      .first<{ count: number }>();
+        .bind(job.id, table.pageId)
+        .first<{ count: number }>();
     const firstIndex = stored!.count;
     // Keep all chunks bounded, including the final empty snapshot checkpoint.
     const chunks: ExternalRowEvidence[][] = [[]];
@@ -212,7 +249,7 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
         records,
         sealed: offset === chunks.length - 1,
       });
-      if (new TextEncoder().encode(value).byteLength > EVIDENCE_MAX_BYTES)
+      if (encoder.encode(value).byteLength > EVIDENCE_MAX_BYTES)
         throw new Error("Deletion evidence exceeds its checkpoint limit");
       statements.push(
         env.DB.prepare(`INSERT INTO deletion_targets(job_id,kind,target,completed_at)
@@ -222,7 +259,7 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
           WHERE whole.id=? AND whole.phase=? AND whole.next_attempt_at=? AND page.id=? AND authority.generation IS ?
             AND page.archived_at IS locked.archived_at AND page.archive_operation_id IS locked.archive_operation_id
             AND EXISTS(SELECT 1 FROM deletion_targets WHERE job_id=whole.id AND kind='table_do' AND target=?))
-          AND (SELECT count(*) FROM deletion_targets WHERE job_id=? AND kind='table_do' AND json_valid(target)
+          AND (SELECT count(*) FROM deletion_targets INDEXED BY idx_deletion_evidence_chunks WHERE job_id=? AND kind='table_do' AND json_valid(target)
             AND json_extract(target,'$.stage')='evidence' AND json_extract(target,'$.pageId')=?)=?`).bind(
           job.id,
           value,
@@ -505,7 +542,6 @@ function missingTableStopsSql(completed: boolean) {
         AND json_extract(purge.target,'$.generation') IS authority.generation)))`;
 }
 
-const CLEANUP_LEASE_MS = 15 * 60_000;
 const DOCUMENT_PURGE_TIMEOUT_MS = 30_000;
 
 const DELETION_ANCESTRY_SQL = `WITH RECURSIVE ancestors(id,workspace_id,job_id) AS (
@@ -663,9 +699,18 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
   const jobId = crypto.randomUUID();
   const timestamp = Date.now();
   try {
-    await env.DB.prepare(`INSERT INTO deletion_jobs(id,workspace_id,root_page_id,next_attempt_at,created_at,updated_at,phase,actor_id)
-      VALUES(?,?,?,?,?,?,'staging',?)`)
-      .bind(jobId, workspaceId, rootId, Number.MAX_SAFE_INTEGER, timestamp, timestamp, actorId)
+    await env.DB.prepare(`INSERT INTO deletion_jobs(id,workspace_id,root_page_id,next_attempt_at,created_at,updated_at,phase,actor_id,root_title)
+      VALUES(?,?,?,?,?,?,'staging',?,?)`)
+      .bind(
+        jobId,
+        workspaceId,
+        rootId,
+        Number.MAX_SAFE_INTEGER,
+        timestamp,
+        timestamp,
+        actorId,
+        pages.results.find((page) => page.id === rootId)!.title,
+      )
       .run();
     const statements = [
       ...pages.results.map((page) =>
@@ -689,12 +734,30 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
         Number.MAX_SAFE_INTEGER,
       );
     } catch (error) {
-      if (safeHttpError(error)) throw error;
-      throw new HttpError(
-        503,
-        "deletion_evidence_unavailable",
-        "Table deletion evidence is temporarily unavailable. Please retry shortly.",
+      const failure = safeHttpError(error);
+      logger.warn(
+        "deletion.evidence.failed",
+        "cleanup",
+        "Deletion evidence capture failed.",
+        { jobId, rootPageId: rootId, phase: "staging", failureCode: failure?.code ?? EVIDENCE_FAILURE.code },
+        error,
       );
+      if (
+        failure &&
+        [
+          "deletion_pending",
+          "table_forbidden",
+          "table_purged",
+          "table_generation_conflict",
+          "table_snapshot_changed",
+        ].includes(failure.code)
+      )
+        throw new HttpError(
+          409,
+          "deletion_pending",
+          "The deletion ownership or table snapshot changed. Reload before retrying.",
+        );
+      throw new HttpError(503, EVIDENCE_FAILURE.code, EVIDENCE_FAILURE.message);
     }
     if (await captureRowHandoffs(env, { dependentJobId: jobId }))
       throw new HttpError(409, "deletion_pending", "The containing table deletion changed. Retry after it completes.");
@@ -924,7 +987,7 @@ async function processTarget(
           signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
         }),
       );
-      const proof = await decodeTableResponse<{
+      const proof = await decodeDeletionProof<{
         purged: unknown;
         pageId: string;
         workspaceId: string;
@@ -934,6 +997,9 @@ async function processTarget(
         archiveOperationId: string | null;
       }>(proofResponse);
       if (
+        !proof ||
+        typeof proof !== "object" ||
+        Array.isArray(proof) ||
         proof.purged !== true ||
         proof.pageId !== tuple.tableId ||
         proof.workspaceId !== dependent.workspace_id ||
@@ -942,11 +1008,7 @@ async function processTarget(
         !Number.isSafeInteger(proof.archivedAt) ||
         (proof.archiveOperationId !== null && typeof proof.archiveOperationId !== "string")
       )
-        throw new HttpError(
-          503,
-          "table_deletion_proof_unavailable",
-          "Deletion proof is unavailable. An owner can retry this deletion.",
-        );
+        throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
       const next = encodedRowHandoff(target.target, {
         version: 1,
         jobId: proof.purgeJobId,
@@ -1027,8 +1089,7 @@ async function processTarget(
         signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
       }),
     );
-    if (!response.ok) throw new Error(`Table ${stop ? "stop" : "purge"} failed with ${response.status}`);
-    const result = await response.json<{
+    const result = await decodeDeletionProof<{
       ok?: unknown;
       stopped?: unknown;
       generation?: unknown;
@@ -1036,9 +1097,9 @@ async function processTarget(
       jobId?: unknown;
       pageId?: unknown;
       workspaceId?: unknown;
-    }>();
-    if (result.ok !== true || (stop && (result.stopped !== true || result.generation !== tuple!.generation)))
-      throw new Error("Table deletion acknowledgment is invalid");
+    }>(response);
+    if (!result || result.ok !== true || (stop && (result.stopped !== true || result.generation !== tuple!.generation)))
+      throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
     if (tuple && !stop) {
       if (
         result.purged !== true ||
@@ -1047,7 +1108,7 @@ async function processTarget(
         result.workspaceId !== tuple.workspaceId ||
         result.generation !== tuple.generation
       )
-        throw new Error("Table purge acknowledgment is invalid");
+        throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
       await publishRowHandoffProofs(env, jobId!, tuple, target.target, leaseUntil!);
     }
     return;
@@ -1143,8 +1204,7 @@ async function reconcileDeletionRowTargets(env: Env, job: DeletionJobRow, leaseU
         .bind(job.id, row.tableId)
         .all<{ generation: number }>();
     if (evidence.results.length !== 1 || evidence.results[0]?.generation !== row.generation) {
-      incomplete = "Deletion row target generation is unavailable";
-      continue;
+      throw new HttpError(409, "table_generation_conflict", "Deletion row target generation is unavailable");
     }
     const inserted = await env.DB.prepare(`INSERT OR IGNORE INTO deletion_targets(job_id,kind,target)
       SELECT ?,'table_row',? WHERE EXISTS(SELECT 1 FROM deletion_jobs WHERE id=? AND phase='rows' AND next_attempt_at=?)
@@ -1183,32 +1243,55 @@ async function reconcileDeletionRowTargets(env: Env, job: DeletionJobRow, leaseU
 }
 
 export async function processDeletionJob(env: Env, jobId: string, { retryFailedRows = false } = {}) {
+  if (retryFailedRows) {
+    const previous = await env.DB.prepare("SELECT workspace_id FROM deletion_jobs WHERE id=? AND phase='rows'")
+      .bind(jobId)
+      .first<{ workspace_id: string }>();
+    if (!previous) return;
+    await queueDeletionRetry(env, previous.workspace_id, jobId);
+  }
   const claimedAt = Date.now();
   const leaseUntil = claimedAt + CLEANUP_LEASE_MS;
-  // Older claims retained last_error; their exact lease timestamps still cannot
-  // be mistaken for failure backoff. New claims clear the failure marker atomically.
   const job = await env.DB.prepare(
-    `UPDATE deletion_jobs
-        SET next_attempt_at = ?, updated_at = ?, last_error = NULL
-      WHERE id = ? AND phase<>'staging' AND (next_attempt_at <= ? OR
-        (?=1 AND phase='rows' AND last_error IS NOT NULL AND next_attempt_at<>updated_at+?))
-      RETURNING id, attempts, workspace_id, phase, root_page_id`,
+    `UPDATE deletion_jobs SET next_attempt_at=?,updated_at=?,last_error=NULL,failure_code=NULL,blocked_at=NULL
+      WHERE id=? AND phase<>'staging' AND blocked_at IS NULL AND next_attempt_at<=?
+      RETURNING id,attempts,workspace_id,phase,root_page_id`,
   )
-    .bind(leaseUntil, claimedAt, jobId, claimedAt, retryFailedRows ? 1 : 0, CLEANUP_LEASE_MS)
+    .bind(leaseUntil, claimedAt, jobId, claimedAt)
     .first<DeletionJobRow>();
   if (!job) return;
 
   let phaseFailure: string | undefined;
-  let parked = false;
+  let failure = deletionFailure(undefined);
+  const rememberFailure = (error: unknown, tableId?: string) => {
+    const next = deletionFailure(error);
+    if (!failure.blocked) failure = next;
+    logger.warn(
+      "deletion.job.failure",
+      "cleanup",
+      "Deletion work could not complete.",
+      {
+        jobId,
+        rootPageId: job.root_page_id,
+        phase: job.phase,
+        failureCode: next.code,
+        ...(tableId ? { tableId } : {}),
+      },
+      error,
+    );
+  };
   try {
     phaseFailure = job.phase === "rows" ? await upgradeDeletionTableTargets(env, job, leaseUntil) : undefined;
     if (job.phase === "cleanup") phaseFailure = await captureLegacyCleanupHandoffs(env, job, leaseUntil);
+    if (phaseFailure) rememberFailure(new HttpError(409, "deletion_pending", phaseFailure));
     if (job.phase === "rows" && !phaseFailure) {
       try {
         await captureExternalRowEvidence(env, job, leaseUntil);
         phaseFailure = await captureRowHandoffs(env, { wholeJobId: job.id, leaseUntil });
+        if (phaseFailure) rememberFailure(new HttpError(409, "deletion_pending", phaseFailure));
       } catch (error) {
         phaseFailure = safeTelemetryErrorMessage(error, "Deletion handoff capture failed");
+        rememberFailure(error);
       }
     }
 
@@ -1249,7 +1332,16 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
           if (d1 && !completed.meta.changes) throw new Error("D1 table deletion ownership changed");
         } catch (error) {
           const message = safeTelemetryErrorMessage(error, "Unknown cleanup failure");
-          parked ||= safeHttpError(error)?.code === "table_deletion_proof_unavailable";
+          let tableId: string | undefined;
+          if (target.kind === "table_do" || target.kind === "table_row") {
+            try {
+              const tuple = JSON.parse(target.target);
+              tableId = tuple.pageId ?? tuple.tableId;
+            } catch {
+              /* Legacy plain table identity. */
+            }
+          }
+          rememberFailure(error, tableId);
           phaseFailure ??= message;
           await env.DB.prepare(
             `UPDATE deletion_targets
@@ -1274,7 +1366,10 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
       // Owned tables cannot restore links while external row targets are reconciled.
       if (targets.results.every((target) => target.kind !== "table_row")) {
         phaseFailure = await reconcileDeletionRowTargets(env, job, leaseUntil);
-        if (phaseFailure) break;
+        if (phaseFailure) {
+          rememberFailure(new HttpError(409, "deletion_pending", phaseFailure));
+          break;
+        }
         targets = await env.DB.prepare(
           "SELECT kind,target FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL ORDER BY target",
         )
@@ -1305,6 +1400,7 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
         }
       } catch (error) {
         phaseFailure = safeTelemetryErrorMessage(error, "Deletion metadata cleanup failed");
+        rememberFailure(error);
         break;
       }
     }
@@ -1314,27 +1410,34 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
     )
       .bind(job.id)
       .first<{ count: number }>();
-    if (!pending?.count && job.phase !== "rows") {
-      await env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?`)
+    if (!phaseFailure && !pending?.count && job.phase !== "rows") {
+      const deleted = await env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?`)
         .bind(job.id, leaseUntil)
         .run();
+      if (deleted.meta.changes)
+        logger.info("deletion.job.completed", "cleanup", "Deletion completed.", {
+          jobId,
+          rootPageId: job.root_page_id,
+          phase: job.phase,
+        });
       return;
     }
   } catch (error) {
     phaseFailure = safeTelemetryErrorMessage(error, "Deletion processing failed");
-    parked ||= safeHttpError(error)?.code === "table_deletion_proof_unavailable";
+    rememberFailure(error);
   }
 
-  await recordDeletionFailure(env, job.id, leaseUntil, phaseFailure, parked);
+  await recordDeletionFailure(env, job, leaseUntil, phaseFailure, failure);
 }
 
 async function recordDeletionFailure(
   env: Env,
-  jobId: string,
+  context: DeletionJobRow,
   leaseUntil: number,
-  phaseFailure?: string,
-  parked = false,
+  phaseFailure: string | undefined,
+  failure: ReturnType<typeof deletionFailure>,
 ) {
+  const jobId = context.id;
   try {
     // Metadata finalization can commit even when its response is lost.
     const job = await env.DB.prepare("SELECT phase,attempts FROM deletion_jobs WHERE id=? AND next_attempt_at=?")
@@ -1350,22 +1453,35 @@ async function recordDeletionFailure(
     )
       .bind(jobId)
       .first<{ last_error: string }>();
-    await env.DB.prepare(
+    const recorded = await env.DB.prepare(
       `UPDATE deletion_jobs
-        SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+        SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?, failure_code=?,blocked_at=?
       WHERE id = ? AND next_attempt_at = ?`,
     )
       .bind(
         attempts,
-        parked ? Number.MAX_SAFE_INTEGER : Date.now() + delay,
+        failure.blocked ? Number.MAX_SAFE_INTEGER : Date.now() + delay,
         phaseFailure ?? failed?.last_error ?? "Cleanup incomplete",
         Date.now(),
+        failure.code,
+        failure.blocked ? Date.now() : null,
         jobId,
         leaseUntil,
       )
       .run();
+    if (!recorded.meta.changes) return;
+    logger.info(
+      failure.blocked ? "deletion.job.blocked" : "deletion.job.retry_scheduled",
+      "cleanup",
+      failure.blocked ? "Deletion requires an owner recheck." : "Deletion will retry automatically.",
+      { jobId, rootPageId: context.root_page_id, phase: job.phase, failureCode: failure.code },
+    );
   } catch (error) {
     logger.warn("cleanup.failure_checkpoint", "cleanup", "Deletion failure checkpoint unavailable", {
+      jobId,
+      rootPageId: context.root_page_id,
+      phase: context.phase,
+      failureCode: failure.code,
       error: safeTelemetryErrorMessage(error, "Cleanup retry checkpoint failed"),
     });
   }
@@ -1376,7 +1492,7 @@ export async function processDueDeletionJobs(env: Env, limit = 10) {
     .bind(Date.now() - 24 * 60 * 60_000)
     .run();
   const jobs = await env.DB.prepare(
-    `SELECT id FROM deletion_jobs WHERE next_attempt_at <= ? AND phase<>'staging' ORDER BY next_attempt_at,created_at,id LIMIT ?`,
+    `SELECT id FROM deletion_jobs WHERE next_attempt_at <= ? AND phase<>'staging' AND blocked_at IS NULL ORDER BY next_attempt_at,created_at,id LIMIT ?`,
   )
     .bind(Date.now(), limit)
     .all<{ id: string }>();
@@ -1385,6 +1501,8 @@ export async function processDueDeletionJobs(env: Env, limit = 10) {
       await processDeletionJob(env, job.id);
     } catch (error) {
       logger.warn("cleanup.job_unavailable", "cleanup", "Deletion job processing unavailable", {
+        jobId: job.id,
+        failureCode: deletionFailure(error).code,
         error: safeTelemetryErrorMessage(error, "Cleanup processing failed"),
       });
     }
