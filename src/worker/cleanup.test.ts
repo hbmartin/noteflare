@@ -25,8 +25,14 @@ describe("deletion job cleanup", () => {
         binds.push(statement);
         return {
           first: vi.fn(async () => {
-            if (query.includes("RETURNING id, attempts, workspace_id")) {
-              return { id: "job-1", attempts: 0, workspace_id: "workspace-1" };
+            if (query.includes("RETURNING id,attempts,workspace_id")) {
+              return {
+                id: "job-1",
+                attempts: 0,
+                workspace_id: "workspace-1",
+                phase: "cleanup",
+                root_page_id: "page-1",
+              };
             }
             if (query.includes("SELECT location_hint FROM workspaces")) {
               return { location_hint: "weur" };
@@ -35,12 +41,13 @@ describe("deletion job cleanup", () => {
             return null;
           }),
           all: vi.fn(async () =>
-            query.includes("FROM deletion_targets")
+            query.includes("SELECT kind, target FROM deletion_targets")
               ? { results: [{ kind: "document_do", target: "page-1~1" }] }
               : { results: [] },
           ),
           run: vi.fn(async () => {
             runs.push(statement);
+            return { meta: { changes: 1 } };
           }),
         };
       }),
@@ -60,7 +67,7 @@ describe("deletion job cleanup", () => {
     expect(capturedRequest?.signal.aborted).toBe(false);
     timeout.abort();
     expect(capturedRequest?.signal.aborted).toBe(true);
-    const claim = binds.find(({ query }) => query.includes("RETURNING id, attempts, workspace_id"));
+    const claim = binds.find(({ query }) => query.includes("RETURNING id,attempts,workspace_id"));
     const deletion = runs.find(({ query }) => query.includes("DELETE FROM deletion_jobs"));
     expect(deletion?.query).toMatch(/next_attempt_at = \?/);
     expect(deletion?.args).toEqual(["job-1", claim?.args[0]]);
@@ -73,18 +80,24 @@ describe("deletion job cleanup", () => {
       return {
         bind: vi.fn(() => ({
           first: vi.fn(async () => {
-            if (query.includes("RETURNING id, attempts, workspace_id")) {
-              return { id: "job-1", attempts: 0, workspace_id: "workspace-1" };
+            if (query.includes("RETURNING id,attempts,workspace_id")) {
+              return {
+                id: "job-1",
+                attempts: 0,
+                workspace_id: "workspace-1",
+                phase: "cleanup",
+                root_page_id: "page-1",
+              };
             }
             if (query.includes("SELECT COUNT(*) count")) return { count: 0 };
             return null;
           }),
           all: vi.fn(async () =>
-            query.includes("FROM deletion_targets")
+            query.includes("SELECT kind, target FROM deletion_targets")
               ? { results: [{ kind: "r2_object", target: "attachments/file" }] }
               : { results: [] },
           ),
-          run: vi.fn(async () => undefined),
+          run: vi.fn(async () => ({ meta: { changes: 1 } })),
         })),
       };
     });
@@ -107,19 +120,25 @@ describe("deletion job cleanup", () => {
         binds.push({ query, args });
         return {
           first: vi.fn(async () => {
-            if (query.includes("RETURNING id, attempts, workspace_id")) {
-              return { id: "job-1", attempts: 0, workspace_id: "workspace-1" };
+            if (query.includes("RETURNING id,attempts,workspace_id")) {
+              return {
+                id: "job-1",
+                attempts: 0,
+                workspace_id: "workspace-1",
+                phase: "cleanup",
+                root_page_id: "page-1",
+              };
             }
             if (query.includes("SELECT COUNT(*) count")) return { count: 1 };
             if (query.includes("SELECT last_error")) return { last_error: "retry pending" };
             return null;
           }),
           all: vi.fn(async () =>
-            query.includes("FROM deletion_targets")
+            query.includes("SELECT kind, target FROM deletion_targets")
               ? { results: [{ kind: "r2_object", target: "attachments/file" }] }
               : { results: [] },
           ),
-          run: vi.fn(async () => undefined),
+          run: vi.fn(async () => ({ meta: { changes: 1 } })),
         };
       }),
     }));

@@ -20,6 +20,7 @@ import {
 } from "./table-service";
 import { mutateTask, taskListStatements, listTasks } from "./tasks";
 import { acceptPageDeletion, processDeletionJob } from "./cleanup";
+import { logger } from "./observability";
 import type { ProjectionStatement, TableActor } from "./table-authority";
 
 beforeEach(async () => {
@@ -1790,6 +1791,137 @@ describe("per-table authority", () => {
       await env.DB.prepare("DROP TRIGGER IF EXISTS unrelated_publication_error").run();
     }
   });
+  it("sanitizes and logs unexpected authority exceptions", async () => {
+    const { pageId } = await fixture();
+    const error = new Error("D1_ERROR: private connection diagnostics");
+    const output = vi.spyOn(logger, "error");
+    try {
+      await runInDurableObject(env.TABLE.getByName(pageId), async (instance) => {
+        const internal = instance as unknown as { env: Env };
+        const original = internal.env;
+        internal.env = {
+          ...original,
+          DB: new Proxy(original.DB, {
+            get(target, key) {
+              if (key === "prepare")
+                return () => {
+                  throw error;
+                };
+              const value = Reflect.get(target, key, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          }),
+        };
+        try {
+          const response = await instance.fetch(
+            new Request("https://table.internal/deletion-evidence?deletionJob=job&stopTarget=target&generation=1", {
+              headers: { "x-table-internal": env.BETTER_AUTH_SECRET },
+            }),
+          );
+          expect(response.status).toBe(500);
+          const body = await response.text();
+          expect(body).not.toContain("D1_ERROR");
+          expect(body).toContain("table_failed");
+        } finally {
+          internal.env = original;
+        }
+      });
+      expect(output).toHaveBeenCalledWith(
+        "table.request.unhandled_error",
+        "table",
+        expect.any(String),
+        expect.objectContaining({ tableId: pageId }),
+        error,
+      );
+    } finally {
+      output.mockRestore();
+    }
+  });
+
+  it.each(["published", "wrong generation", "unconfirmed", "multi-step", "malformed artifact"])(
+    "recovers a completed cancellable checkpoint only when %s",
+    async (mode) => {
+      const { pageId, member } = await fixture();
+      await enableTableAuthority(env, member, pageId);
+      await write(pageId, member, "create_column", { id: "checkpoint-title", name: "Title", type: "text" });
+      await env.DB.prepare(
+        "CREATE TRIGGER hold_checkpoint BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+      ).run();
+      const pending = await tableCommand(
+        env,
+        member,
+        pageId,
+        {
+          kind: "create_row",
+          operationId: "checkpoint-row",
+          payload: { id: "checkpoint-row", values: { "checkpoint-title": "Keep" } },
+        },
+        { cancelRowOnPublicationFailure: "checkpoint-row" },
+      );
+      let artifact = "";
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        artifact = state.storage.sql
+          .exec<{ value: string }>(
+            "SELECT value FROM projection_steps WHERE revision=? AND position=0",
+            pending.revision,
+          )
+          .one().value;
+      });
+      await env.DB.prepare("DROP TRIGGER hold_checkpoint").run();
+      await runDurableObjectAlarm(env.TABLE.getByName(pageId));
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        const meta = JSON.parse(
+          state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+        );
+        state.storage.sql.exec(
+          "UPDATE meta SET value=? WHERE id=1",
+          JSON.stringify({ ...meta, projectedRevision: pending.revision - 1 }),
+        );
+        state.storage.sql.exec("UPDATE events SET next_step=1 WHERE revision=?", pending.revision);
+        state.storage.sql.exec("INSERT INTO projection_steps VALUES(?,0,?)", pending.revision, artifact);
+        if (mode === "multi-step")
+          state.storage.sql.exec("INSERT INTO projection_steps VALUES(?,1,'[]')", pending.revision);
+        if (mode === "malformed artifact")
+          state.storage.sql.exec("UPDATE projection_steps SET value='{' WHERE revision=?", pending.revision);
+      });
+      if (mode === "wrong generation")
+        await env.DB.prepare("UPDATE table_authority SET generation=generation+1 WHERE page_id=?").bind(pageId).run();
+      if (mode === "unconfirmed")
+        await env.DB.prepare("UPDATE table_authority SET projected_revision=? WHERE page_id=?")
+          .bind(pending.revision - 1, pageId)
+          .run();
+      await evictDurableObject(env.TABLE.getByName(pageId));
+      const recovered = await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+        const internal = instance as unknown as { project(): Promise<boolean> };
+        const success = await internal.project().then(
+          () => true,
+          (error: unknown) => {
+            if ((error as { code?: string }).code !== "table_projection_blocked") throw error;
+            return false;
+          },
+        );
+        return {
+          success,
+          meta: JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value),
+          steps: state.storage.sql
+            .exec("SELECT revision FROM projection_steps WHERE revision=?", pending.revision)
+            .toArray().length,
+        };
+      });
+      expect(recovered.success).toBe(mode === "published");
+      expect(recovered.meta.projectedRevision).toBe(mode === "published" ? pending.revision : pending.revision - 1);
+      expect(recovered.steps).toBe(mode === "published" ? 0 : mode === "multi-step" ? 2 : 1);
+      expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id='checkpoint-row'").first()).toEqual({
+        id: "checkpoint-row",
+      });
+      const later =
+        mode === "published"
+          ? await write(pageId, member, "create_column", { id: "later", name: "Later", type: "text" })
+          : undefined;
+      expect(later?.projectionPending).toBe(mode === "published" ? false : undefined);
+    },
+  );
+
   it("blocks a multi-step cancellable artifact before legacy normalization can merge it", async () => {
     const { pageId, member } = await fixture();
     await enableTableAuthority(env, member, pageId);

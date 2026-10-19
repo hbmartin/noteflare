@@ -1,6 +1,7 @@
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { processDueDeletionJobs } from "./cleanup";
+import { evidenceValidationCases } from "../../tests/helpers/deletion-evidence-fixtures";
 
 beforeEach(() => reset());
 
@@ -53,7 +54,66 @@ async function legacyStagingEvidence(indexed: boolean) {
   return mixed;
 }
 
+async function acceptsValidation(operation: Promise<unknown>, errorText: string) {
+  try {
+    await operation;
+    return true;
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes(errorText)) throw error;
+    return false;
+  }
+}
+
 describe("indexed deletion evidence migration", () => {
+  it.each(evidenceValidationCases)(
+    "keeps all validation contexts consistent for $name",
+    async ({ patch, valid, indexed }) => {
+      const target = JSON.stringify({ ...JSON.parse(evidence()), ...patch });
+      await foundation();
+      await insert(target);
+      expect(await acceptsValidation(upgrade(), "CHECK constraint failed")).toBe(valid);
+      await reset();
+      await foundation("staging");
+      await insert(target);
+      await upgrade();
+      expect((await lookup()).results).toHaveLength(indexed);
+      expect(
+        await acceptsValidation(
+          env.DB.prepare("UPDATE deletion_jobs SET phase='rows' WHERE id='job'").run(),
+          "deletion_evidence_incompatible",
+        ),
+      ).toBe(valid);
+      await env.DB.prepare("DELETE FROM deletion_targets WHERE job_id='job'").run();
+      expect(await acceptsValidation(insert(target), "deletion_evidence_incompatible")).toBe(valid);
+      if (!valid) await insert(evidence());
+      const current = valid ? target : evidence();
+      const next = valid ? JSON.stringify({ ...JSON.parse(target), index: 1 }) : target;
+      expect(
+        await acceptsValidation(
+          env.DB.prepare("UPDATE deletion_targets SET target=? WHERE target=?").bind(next, current).run(),
+          "deletion_evidence_incompatible",
+        ),
+      ).toBe(valid);
+      expect((await lookup()).results).toHaveLength(valid ? indexed : 1);
+    },
+  );
+
+  it("counts retained chunks through the partial index without executing JSON functions", async () => {
+    await foundation();
+    await upgrade();
+    for (let index = 0; index < 12; index++)
+      await insert(evidence(index, [{ detailPageId: `detail-${index}-${"x".repeat(900000)}`, kind: "provenance" }]));
+    const query =
+      "SELECT count(*) count FROM deletion_targets INDEXED BY idx_deletion_evidence_chunks WHERE job_id=? AND kind='table_do' AND json_valid(target) AND json_extract(target,'$.stage')='evidence' AND json_extract(target,'$.pageId')=?";
+    expect(await env.DB.prepare(query).bind("job", "table").first()).toEqual({ count: 12 });
+    const instructions = await env.DB.prepare(`EXPLAIN ${query}`)
+      .bind("job", "table")
+      .all<{ opcode: string; p4: string | null }>();
+    expect(instructions.results.filter((row) => row.opcode === "Function")).toEqual([]);
+    const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${query}`).bind("job", "table").all<{ detail: string }>();
+    expect(plan.results.some((row) => row.detail.includes("idx_deletion_evidence_chunks"))).toBe(true);
+  });
+
   describe.each([false, true])("legacy staging removal with 0092 already applied=%s", (indexed) => {
     it("replaces mixed evidence while preserving identities still owned by another chunk", async () => {
       const mixed = await legacyStagingEvidence(indexed);

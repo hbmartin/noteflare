@@ -21,6 +21,7 @@ import { acceptedPageDeletionSql } from "./deletion-policy";
 import { mutateTask, taskListStatements } from "./tasks";
 import { classifyError, HttpError } from "./http";
 import { logger } from "./observability";
+import { queueDeletionRetry } from "./deletion-jobs";
 
 beforeEach(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
@@ -238,6 +239,113 @@ describe("deletion handoff policy", () => {
       expect(
         await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(f.dependent.jobId).first(),
       ).toBeNull();
+    },
+  );
+
+  it.each(["invalid JSON", "null proof", "missing fields", "generation conflict", "network", "service outage"])(
+    "classifies %s proof failure and permits a verified owner recheck",
+    async (problem) => {
+      const f = await handoffFixture();
+      await processDeletionJob(env, f.whole.jobId);
+      await env.DB.prepare(
+        "UPDATE deletion_targets SET target=json_remove(target,'$.handoff') WHERE job_id=? AND kind='table_row'",
+      )
+        .bind(f.dependent.jobId)
+        .run();
+      const before = (await rowTarget(f.dependent.jobId)).target;
+      const bindings = {
+        ...env,
+        TABLE: {
+          getByName: (name: string) => ({
+            fetch: async (request: Request) => {
+              if (new URL(request.url).pathname !== "/row-deletion-proof")
+                return env.TABLE.getByName(name).fetch(request);
+              if (problem === "network") throw new TypeError("Connection lost");
+              if (problem === "service outage") return new Response("temporarily unavailable", { status: 503 });
+              if (problem === "generation conflict")
+                return Response.json(
+                  { error: { code: "table_generation_conflict", message: "Wrong generation" } },
+                  { status: 409 },
+                );
+              return new Response(problem === "invalid JSON" ? "{" : problem === "null proof" ? "null" : "{}", {
+                status: 200,
+              });
+            },
+          }),
+        },
+      } as unknown as Env;
+      await processDeletionJob(bindings, f.dependent.jobId);
+      const blocked = !["network", "service outage"].includes(problem);
+      expect(
+        await env.DB.prepare("SELECT failure_code,blocked_at IS NOT NULL blocked FROM deletion_jobs WHERE id=?")
+          .bind(f.dependent.jobId)
+          .first(),
+      ).toEqual({
+        failure_code: blocked
+          ? problem === "generation conflict"
+            ? "deletion_generation_conflict"
+            : "deletion_proof_invalid"
+          : "deletion_cleanup_unavailable",
+        blocked: blocked ? 1 : 0,
+      });
+      expect((await rowTarget(f.dependent.jobId)).target).toBe(before);
+      expect(await pendingPageDeletion(env, f.detailId)).toEqual({ id: f.dependent.jobId });
+      await processDeletionJob(env, f.dependent.jobId, { retryFailedRows: true });
+      expect(
+        await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(f.dependent.jobId).first(),
+      ).toBeNull();
+    },
+  );
+
+  it.each(["conflicting row", "malformed manifest"])(
+    "blocks %s recapture without replacing historical evidence",
+    async (problem) => {
+      const f = await handoffFixture();
+      await env.DB.prepare(
+        "UPDATE deletion_targets SET target=json_set(target,'$.sealed',json('false')) WHERE job_id=? AND kind='table_do' AND json_extract(target,'$.stage')='evidence'",
+      )
+        .bind(f.whole.jobId)
+        .run();
+      const prior = (
+        await env.DB.prepare("SELECT detail_page_id,row_id FROM deletion_evidence_lookup WHERE job_id=?")
+          .bind(f.whole.jobId)
+          .all()
+      ).results;
+      const bindings = {
+        ...env,
+        TABLE: {
+          getByName: (name: string) => ({
+            fetch: async (request: Request) => {
+              const response = await env.TABLE.getByName(name).fetch(request);
+              if (new URL(request.url).pathname !== "/deletion-evidence") return response;
+              const data = await response.json<Record<string, unknown>>();
+              return Response.json({
+                ...data,
+                rows: problem === "malformed manifest" ? {} : [{ id: "conflicting-row", detailPageId: f.detailId }],
+              });
+            },
+          }),
+        },
+      } as unknown as Env;
+      await processDeletionJob(bindings, f.whole.jobId);
+      expect(
+        await env.DB.prepare("SELECT failure_code,blocked_at IS NOT NULL blocked FROM deletion_jobs WHERE id=?")
+          .bind(f.whole.jobId)
+          .first(),
+      ).toEqual({
+        failure_code: problem === "malformed manifest" ? "deletion_proof_invalid" : "deletion_evidence_conflict",
+        blocked: 1,
+      });
+      expect(
+        (
+          await env.DB.prepare("SELECT detail_page_id,row_id FROM deletion_evidence_lookup WHERE job_id=?")
+            .bind(f.whole.jobId)
+            .all()
+        ).results,
+      ).toEqual(prior);
+      expect(await pendingPageDeletion(env, f.listId)).toEqual({ id: f.whole.jobId });
+      await processDeletionJob(env, f.whole.jobId, { retryFailedRows: true });
+      expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).toBeNull();
     },
   );
 
@@ -615,7 +723,13 @@ describe("deletion handoff policy", () => {
     } as unknown as Env;
     await processDeletionJob(bindings, f.whole.jobId);
     expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("pending");
-    await retry(f.whole.jobId);
+    expect(
+      await env.DB.prepare("SELECT failure_code,blocked_at IS NOT NULL blocked FROM deletion_jobs WHERE id=?")
+        .bind(f.whole.jobId)
+        .first(),
+    ).toEqual({ failure_code: "deletion_proof_invalid", blocked: 1 });
+    await queueDeletionRetry(env, f.member.workspace.id, f.whole.jobId);
+    await processDeletionJob(env, f.whole.jobId);
     expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("purged");
   });
 
@@ -832,6 +946,60 @@ describe("deletion handoff policy", () => {
     });
   });
 
+  it.each([
+    "raw failure",
+    "non-array rows",
+    "oversized rows",
+    "invalid ids",
+    "missing identity",
+    "malformed generation",
+  ])("normalizes %s at evidence acceptance", async (problem) => {
+    const f = await fixture();
+    await archiveTable(f);
+    const warning = vi.spyOn(logger, "warn");
+    const bindings = {
+      ...env,
+      TABLE: {
+        getByName: (name: string) => ({
+          fetch: async (request: Request) => {
+            if (problem === "raw failure")
+              return Response.json({ error: { code: "table_failed", message: "D1_ERROR: private" } }, { status: 500 });
+            const response = await env.TABLE.getByName(name).fetch(request);
+            const data = await response.json<Record<string, unknown>>();
+            return Response.json({
+              ...data,
+              ...(problem === "missing identity" ? { pageId: null } : {}),
+              ...(problem === "malformed generation" ? { generation: "1" } : {}),
+              rows:
+                problem === "non-array rows"
+                  ? {}
+                  : problem === "oversized rows"
+                    ? Array.from({ length: 1001 }, () => ({ id: "row", detailPageId: "detail" }))
+                    : problem === "invalid ids"
+                      ? [{ id: 42, detailPageId: "detail" }]
+                      : data.rows,
+            });
+          },
+        }),
+      },
+    } as unknown as Env;
+    const error = await acceptPageDeletion(bindings, f.member.workspace.id, f.member.user.id, f.listId).catch(
+      (failure: unknown) => failure,
+    );
+    expect(classifyError(error)).toMatchObject({
+      status: 503,
+      body: { error: { code: "deletion_evidence_unavailable" } },
+    });
+    expect(JSON.stringify(classifyError(error))).not.toContain("D1_ERROR");
+    expect(warning).toHaveBeenCalledWith(
+      "deletion.evidence.failed",
+      "cleanup",
+      expect.any(String),
+      expect.objectContaining({ jobId: expect.any(String), phase: "staging" }),
+      expect.anything(),
+    );
+  });
+
   it("accepts evidence fallback only for the explicit unseeded-table response", async () => {
     const f = await fixture(false);
     await archiveTable(f);
@@ -881,7 +1049,7 @@ describe("deletion handoff policy", () => {
     expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).not.toBeNull();
   });
 
-  it.each([false, true])("preserves existing evidence HttpErrors (transported=%s)", async (transported) => {
+  it.each([false, true])("normalizes evidence ownership errors (transported=%s)", async (transported) => {
     const f = await fixture();
     await archiveTable(f);
     const error = new HttpError(403, "table_forbidden", "Table access changed.");
@@ -901,8 +1069,7 @@ describe("deletion handoff policy", () => {
     const result = await acceptPageDeletion(bindings, f.member.workspace.id, f.member.user.id, f.listId).catch(
       (caught: unknown) => caught,
     );
-    expect(result).toBe(thrown);
-    expect(classifyError(result)).toMatchObject({ status: 403, body: { error: { code: "table_forbidden" } } });
+    expect(classifyError(result)).toMatchObject({ status: 409, body: { error: { code: "deletion_pending" } } });
     expect(await env.DB.prepare("SELECT id FROM deletion_jobs").all()).toMatchObject({ results: [] });
   });
 
@@ -1583,7 +1750,7 @@ describe("whole-table deletion recovery", () => {
     expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).not.toBeNull();
     expect(
       await env.DB.prepare("SELECT phase,last_error FROM deletion_jobs WHERE id=?").bind(accepted.jobId).first(),
-    ).toEqual({ phase: "rows", last_error: "Table stop failed with 503" });
+    ).toEqual({ phase: "rows", last_error: "Table data is temporarily unavailable. Please retry shortly." });
     await processDeletionJob(env, accepted.jobId, { retryFailedRows: true });
     expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(accepted.jobId).first()).toBeNull();
   });

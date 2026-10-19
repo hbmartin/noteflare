@@ -65,6 +65,7 @@ import {
   processDueDeletionJobs,
 } from "./cleanup";
 import { linkPreview, linkPreviewImage, pruneLinkPreviews } from "./link-previews";
+import { listDeletionJobs, queueDeletionRetry } from "./deletion-jobs";
 import {
   deleteDateReminder,
   getDateReminder,
@@ -4742,14 +4743,34 @@ app.post("/api/pages/:id/restore", async (c) => {
   return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
 });
 
+app.get("/api/deletion-jobs", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json(await listDeletionJobs(c.env, member.workspace.id, c.req.query("cursor") ?? null));
+});
+
+app.post("/api/deletion-jobs/:id/retry", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const jobId = c.req.param("id");
+  await queueDeletionRetry(c.env, member.workspace.id, jobId);
+  c.executionCtx.waitUntil(
+    processDeletionJob(c.env, jobId).catch((error) => {
+      logger.error("deletion.cleanup.failed", "deletion", "Deletion recheck failed.", { jobId }, error);
+    }),
+  );
+  return c.json({ ok: true }, 202);
+});
+
 app.post("/api/pages/:id/permanent-delete", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   const rootId = c.req.param("id");
   const existing = await acceptedDeletionJob(c.env, member.workspace.id, rootId);
   if (existing) {
+    await queueDeletionRetry(c.env, member.workspace.id, existing.jobId);
     c.executionCtx.waitUntil(
-      processDeletionJob(c.env, existing.jobId, { retryFailedRows: true }).catch((error) => {
+      processDeletionJob(c.env, existing.jobId).catch((error) => {
         logger.error(
           "deletion.cleanup.failed",
           "deletion",

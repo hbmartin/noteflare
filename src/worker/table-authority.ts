@@ -5,6 +5,7 @@ import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import { TABLE_MAX_ROWS, TABLE_PAGE_MAX, TABLE_BULK_MAX_BODY_BYTES } from "../shared/table-limits";
 import {
   TABLE_COLUMN_TYPES,
+  TableRequestError,
   TABLE_PROTOCOL_VERSION,
   metadataColumns,
   normalizedColumnName,
@@ -35,6 +36,7 @@ import { broadcastWorkspaceEvent } from "./workspace-events";
 import { calendarDay, moveCalendarDate, validateCalendarZone } from "../shared/table-calendar";
 import { validateTaskTableCommand } from "../shared/task-table-policy";
 import { acceptedPageDeletionSql } from "./deletion-policy";
+import { logger } from "./observability";
 
 export type ProjectionStatement = { sql: string; binds: (string | number | null)[] };
 const TABLE_ID_PATTERN = /^[\w:-]{1,300}$/;
@@ -150,7 +152,7 @@ type StoredRow = {
 };
 type LinkTarget = [rowId: string, detailPageId: string | null, createdAt: number, oldPageId: string | null];
 function fail(message: string, status = 422, code = "table_validation"): never {
-  throw Object.assign(new Error(message), { status, code });
+  throw new TableRequestError(message, status, code);
 }
 function id(value: unknown, name = "ID"): string {
   if (typeof value !== "string" || !TABLE_ID_PATTERN.test(value)) return fail(`${name} is invalid.`);
@@ -392,15 +394,7 @@ export class TableAuthority extends DurableObject<Env> {
         );
       }
       if (this.purged) return fail("This table was permanently deleted.", 410, "table_purged");
-      if (
-        path === "/export" &&
-        request.method === "GET" &&
-        request.headers.get("x-table-internal") === this.env.BETTER_AUTH_SECRET &&
-        this.deletionIntent?.stopped &&
-        url.searchParams.get("deletionJob") === this.deletionIntent.jobId
-      ) {
-        await this.authorizeDeletion(this.deletionIntent, "stop");
-      } else this.requireActive();
+      this.requireActive();
       if (
         [
           "/seed",
@@ -616,10 +610,18 @@ export class TableAuthority extends DurableObject<Env> {
       }
       return new Response("Not found", { status: 404 });
     } catch (error) {
-      const failure = error as Error & { status?: number; code?: string };
+      if (error instanceof TableRequestError)
+        return Response.json({ error: { code: error.code, message: error.message } }, { status: error.status });
+      logger.error(
+        "table.request.unhandled_error",
+        "table",
+        "Unhandled table request error.",
+        { tableId: this.ctx.id.name, requestPath: new URL(request.url).pathname },
+        error,
+      );
       return Response.json(
-        { error: { code: failure.code ?? "table_failed", message: failure.message } },
-        { status: failure.status ?? 500 },
+        { error: { code: "table_failed", message: "Table data is temporarily unavailable. Please retry shortly." } },
+        { status: 500 },
       );
     }
   }
@@ -2084,10 +2086,11 @@ export class TableAuthority extends DurableObject<Env> {
       rows: [] as Array<{ id: string; detailPageId: string }>,
       nextCursor: null as string | null,
     };
-    let bytes = new TextEncoder().encode(JSON.stringify(result)).byteLength;
+    const encoder = new TextEncoder();
+    let bytes = encoder.encode(JSON.stringify(result)).byteLength;
     for (const row of linked.slice(0, 1000)) {
       const value = { id: row.id, detailPageId: row.detail_page_id },
-        size = new TextEncoder().encode(JSON.stringify(value)).byteLength + 1;
+        size = encoder.encode(JSON.stringify(value)).byteLength + 1;
       // Include the encoded cursor and framing in the response limit.
       if (bytes + size + 2000 > PROJECTION_MAX_BYTES) break;
       result.rows.push(value);
@@ -2839,6 +2842,54 @@ export class TableAuthority extends DurableObject<Env> {
         )[0]!.count;
         let atomicCancellation = false;
         try {
+          if (event.cancel_row_id && event.next_step === 1 && artifactSteps === 1) {
+            const original = this.rows<{ position: number; value: string }>(
+              "SELECT position,value FROM projection_steps WHERE revision=?",
+              event.revision,
+            );
+            const publication = await this.env.DB.prepare(
+              "SELECT generation,projected_revision FROM table_authority WHERE page_id=?",
+            )
+              .bind(meta.pageId)
+              .first<{ generation: number; projected_revision: number }>();
+            this.requireActive();
+            const current = this.rows<PendingEvent>(
+              "SELECT revision,operation_id,value,cancel_row_id,next_step FROM events WHERE revision=?",
+              event.revision,
+            )[0];
+            const retained = this.rows<{ position: number; value: string }>(
+              "SELECT position,value FROM projection_steps WHERE revision=?",
+              event.revision,
+            );
+            let validStep = false;
+            try {
+              const statements: unknown = JSON.parse(original[0]?.value ?? "null");
+              validStep =
+                Array.isArray(statements) &&
+                statements.every(
+                  (statement) => statement && typeof statement.sql === "string" && Array.isArray(statement.binds),
+                );
+            } catch {
+              /* Invalid retained artifacts stay blocked. */
+            }
+            if (
+              original.length !== 1 ||
+              original[0]!.position !== 0 ||
+              !validStep ||
+              retained.length !== 1 ||
+              retained[0]!.position !== 0 ||
+              retained[0]!.value !== original[0]!.value ||
+              this.meta().generation !== meta.generation ||
+              current?.next_step !== 1 ||
+              current.cancel_row_id !== event.cancel_row_id ||
+              current.value !== event.value ||
+              publication?.generation !== meta.generation ||
+              publication.projected_revision < event.revision
+            )
+              fail("Completed publication cannot be verified.", 503, "table_projection_blocked");
+            await this.finishProjectionEvent(event.revision, meta.workspaceId, meta.pageId);
+            continue;
+          }
           if (event.cancel_row_id && (artifactSteps !== 1 || event.next_step !== 0))
             fail("Cancellable publication has a non-atomic projection artifact.", 503, "table_projection_blocked");
           this.normalizeEventProjection(event);
@@ -2944,15 +2995,7 @@ export class TableAuthority extends DurableObject<Env> {
           await this.applyProjection([], event.revision);
         }
         if (this.purged || this.deletionIntent) return false;
-        this.ctx.storage.transactionSync(() => {
-          this.putMeta({ ...this.meta(), projectedRevision: event.revision });
-          this.ctx.storage.sql.exec("DELETE FROM projection_steps WHERE revision=?", event.revision);
-        });
-        await broadcastWorkspaceEvent(this.env, meta.workspaceId, {
-          type: "task-list-invalidated",
-          pageId: meta.pageId,
-          forceRefresh: true,
-        });
+        await this.finishProjectionEvent(event.revision, meta.workspaceId, meta.pageId);
       }
       if (this.pruneCompletedProjection() && !this.purged) await this.scheduleAlarm(1000);
       return true;
@@ -2962,6 +3005,13 @@ export class TableAuthority extends DurableObject<Env> {
     } finally {
       this.projecting = null;
     }
+  }
+  private async finishProjectionEvent(revision: number, workspaceId: string, pageId: string) {
+    this.ctx.storage.transactionSync(() => {
+      this.putMeta({ ...this.meta(), projectedRevision: Math.max(this.meta().projectedRevision, revision) });
+      this.ctx.storage.sql.exec("DELETE FROM projection_steps WHERE revision=?", revision);
+    });
+    await broadcastWorkspaceEvent(this.env, workspaceId, { type: "task-list-invalidated", pageId, forceRefresh: true });
   }
   private repairHeaders(seedBaseline: boolean): ProjectionStatement[] {
     const meta = this.meta();
@@ -3480,8 +3530,9 @@ export class TableAuthority extends DurableObject<Env> {
       generation: body.generation,
     };
     id(body.jobId);
-    if (target.tableId !== meta.pageId || target.generation !== meta.generation || !meta.seeded)
+    if (target.tableId !== meta.pageId || target.generation !== meta.generation)
       return fail("Deletion target generation changed.", 409, "table_generation_conflict");
+    if (!meta.seeded) return fail("The table seed is not yet complete.", 503, "table_seed_pending");
     const userId = `deletion-job:${body.jobId}`;
     const command: TableCommand = {
       kind: "delete_row",

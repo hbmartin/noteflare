@@ -1,10 +1,11 @@
-import type { TableCommand } from "./table-protocol";
+import { TableRequestError, type TableCommand } from "./table-protocol";
 import { taskColumns } from "./tasks";
 
 function reject(): never {
-  throw Object.assign(
-    new Error("Use the task editor to change tasks. Fixed task properties and status options are protected."),
-    { status: 422, code: "task_service_required" },
+  throw new TableRequestError(
+    "Use the task editor to change tasks. Fixed task properties and status options are protected.",
+    422,
+    "task_service_required",
   );
 }
 
