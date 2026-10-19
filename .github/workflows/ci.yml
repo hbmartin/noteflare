@@ -85,7 +85,9 @@ jobs:
   worker:
     name: Worker integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # All test files finish near 20 minutes on hosted runners; leave room for
+    # coverage aggregation and artifact upload without relaxing test timeouts.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

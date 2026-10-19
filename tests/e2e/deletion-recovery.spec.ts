@@ -3,6 +3,10 @@ import { openNavigation, signInOwner } from "./security-helpers";
 
 test.use({ serviceWorkers: "block" });
 
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: "wait" });
+});
+
 test("owners can inspect and recheck paused deletions separately from Trash pages", async ({ page }) => {
   await signInOwner(page);
   let completed = false;
@@ -56,11 +60,10 @@ test("owners can inspect and recheck paused deletions separately from Trash page
 
 test("non-owners never load owner deletion status", async ({ page }) => {
   await signInOwner(page);
-  await page.route("**/api/me", async (route) => {
-    const response = await route.fetch();
-    const body = await response.json();
-    await route.fulfill({ response, json: { ...body, role: "editor" } });
-  });
+  const response = await page.request.get("/api/me");
+  expect(response.ok()).toBe(true);
+  const member = await response.json();
+  await page.route("**/api/me", (route) => route.fulfill({ json: { ...member, role: "editor" } }));
   let ownerRequests = 0;
   await page.route("**/api/deletion-jobs**", async (route) => {
     ownerRequests++;

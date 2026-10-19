@@ -145,7 +145,7 @@ describe("legacy code content normalization", () => {
         `${imports}
       const schema=new Schema({nodes:{doc:{content:"paragraph+"},paragraph:{content:"text*"},text:{}}}), results=[];
       for (const count of [50,200,800]) {
-        const doc=new Y.Doc(),root=doc.getXmlFragment("document-store");
+        const doc=new Y.Doc(),root=doc.getXmlFragment("document-store");doc.clientID=1;
         doc.transact(()=>{for(let index=0;index<count;index++) {
           const paragraph=new Y.XmlElement("paragraph"),text=new Y.XmlText();text.insert(0,"safe");paragraph.insert(0,[text]);root.insert(root.length,[paragraph]);
         }});

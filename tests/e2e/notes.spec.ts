@@ -426,6 +426,9 @@ test("refreshes an old import preview and imports only after a second confirmati
 
 test("creates, renames, archives, and restores a page through the UI @mobile-sidebar", async ({ page }, testInfo) => {
   await signIn(page);
+  const trashResponse = await page.request.get("/api/pages/tree?archived=true");
+  expect(trashResponse.ok()).toBe(true);
+  const initialTrash: { pages: Array<{ title: string }> } = await trashResponse.json();
   const title = `Lifecycle ${testInfo.project.name} ${Date.now()}`;
   await createPage(page, "Document");
   const titleInput = page.getByLabel("Page title");
@@ -455,7 +458,11 @@ test("creates, renames, archives, and restores a page through the UI @mobile-sid
   await trashEntry.getByRole("button", { name: "Restore" }).click();
   expect((await restored).ok()).toBe(true);
   await expect(trashEntry).toHaveCount(0, { timeout: 10_000 });
-  await expect(page.getByText("Trash is empty.")).toBeVisible();
+  await expect(treeLink(page, title)).toBeAttached();
+  await expect(page.locator("main.utility-view > .trash-list > div > strong")).toHaveText(
+    initialTrash.pages.map((entry) => entry.title),
+  );
+  if (!initialTrash.pages.length) await expect(page.getByText("Trash is empty.")).toBeVisible();
 });
 
 test("propagates page metadata to an invited editor in realtime", async ({ browser, page }, testInfo) => {
