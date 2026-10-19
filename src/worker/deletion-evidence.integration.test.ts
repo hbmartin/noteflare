@@ -1,5 +1,6 @@
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { processDueDeletionJobs } from "./cleanup";
 
 beforeEach(() => reset());
 
@@ -37,7 +38,71 @@ const lookup = () =>
     "SELECT job_id,table_id,workspace_id,generation,detail_page_id,row_id,source_kind FROM deletion_evidence_lookup ORDER BY detail_page_id",
   ).all();
 
+async function legacyStagingEvidence(indexed: boolean) {
+  await foundation("staging");
+  const mixed = evidence(0, [{ detailPageId: "detail", rowId: "row", kind: "row" }, "unsupported"]);
+  await insert(mixed);
+  if (indexed) {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0093"),
+    );
+  }
+  await upgrade();
+  expect((await lookup()).results).toMatchObject([{ detail_page_id: "detail", row_id: "row", source_kind: "row" }]);
+  return mixed;
+}
+
 describe("indexed deletion evidence migration", () => {
+  describe.each([false, true])("legacy staging removal with 0092 already applied=%s", (indexed) => {
+    it("replaces mixed evidence while preserving identities still owned by another chunk", async () => {
+      const mixed = await legacyStagingEvidence(indexed);
+      await insert(evidence(1));
+      const replacement = evidence(0, [{ detailPageId: "replacement", kind: "provenance" }]);
+      await env.DB.prepare("UPDATE deletion_targets SET target=? WHERE target=?").bind(replacement, mixed).run();
+      expect((await lookup()).results).toMatchObject([
+        { detail_page_id: "detail", row_id: "row", source_kind: "row" },
+        { detail_page_id: "replacement", row_id: null, source_kind: "provenance" },
+      ]);
+      await env.DB.prepare("DELETE FROM deletion_targets WHERE target=?").bind(evidence(1)).run();
+      expect((await lookup()).results).toMatchObject([{ detail_page_id: "replacement" }]);
+    });
+
+    it("deletes mixed evidence and its lookup row", async () => {
+      const mixed = await legacyStagingEvidence(indexed);
+      await env.DB.prepare("DELETE FROM deletion_targets WHERE target=?").bind(mixed).run();
+      expect((await lookup()).results).toEqual([]);
+      expect((await env.DB.prepare("SELECT target FROM deletion_targets").all()).results).toEqual([]);
+    });
+
+    it("cascades deletion of a job containing mixed evidence", async () => {
+      await legacyStagingEvidence(indexed);
+      await env.DB.prepare("DELETE FROM deletion_jobs WHERE id='job'").run();
+      expect((await lookup()).results).toEqual([]);
+      expect((await env.DB.prepare("SELECT target FROM deletion_targets").all()).results).toEqual([]);
+      expect((await env.DB.prepare("SELECT id FROM deletion_jobs").all()).results).toEqual([]);
+    });
+
+    it("removes stale staging evidence before completing an accepted cleanup job", async () => {
+      await legacyStagingEvidence(indexed);
+      const objectKey = "deletion-evidence-regression";
+      await env.BUCKET.put(objectKey, "pending cleanup");
+      await env.DB.batch([
+        env.DB
+          .prepare(`INSERT INTO deletion_jobs(id,workspace_id,root_page_id,next_attempt_at,created_at,updated_at,phase)
+          VALUES('accepted','workspace','other',0,1,1,'cleanup')`),
+        env.DB.prepare("INSERT INTO deletion_targets(job_id,kind,target) VALUES('accepted','r2_object',?)").bind(
+          objectKey,
+        ),
+      ]);
+      await processDueDeletionJobs(env);
+      expect(await env.BUCKET.get(objectKey)).toBeNull();
+      expect((await env.DB.prepare("SELECT id FROM deletion_jobs").all()).results).toEqual([]);
+      expect((await env.DB.prepare("SELECT target FROM deletion_targets").all()).results).toEqual([]);
+      expect((await lookup()).results).toEqual([]);
+    });
+  });
+
   it("backfills nullable generations and deduplicates identical legacy chunks without changing their bytes", async () => {
     await foundation();
     const first = evidence(0, [{ detailPageId: "detail", kind: "provenance" }], null);

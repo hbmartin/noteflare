@@ -362,7 +362,7 @@ index de4d1e6..3f312cb 100644
 -            // If a client adds and deletes content in the same snapshot the element is not visible by either snapshot.
 -            return null
 +    const meta = createEmptyMeta();
-+    this._checkCodeContent(historyType, snapshot, prevSnapshot, () => {
++    withCodeContent(historyType, meta, snapshot, prevSnapshot, () => {
 +      // clear mapping because we are going to rerender
 +      this.mapping.clear();
 +      this.mux(() => {
@@ -442,7 +442,7 @@ index de4d1e6..3f312cb 100644
 +          );
 +        }, ySyncPluginKey);
 +      });
-+    }, meta);
++    });
    }
 
    /**
@@ -1118,7 +1118,7 @@ index dccfb76..f493f7e 100644
 -              user
 -            )
 +    const meta = createEmptyMeta()
-+    this._checkCodeContent(historyType, snapshot, prevSnapshot, () => {
++    withCodeContent(historyType, meta, snapshot, prevSnapshot, () => {
 +      // clear mapping because we are going to rerender
 +      this.mapping.clear()
 +      this.mux(() => {
@@ -1220,7 +1220,7 @@ index dccfb76..f493f7e 100644
 +          )
 +        }, ySyncPluginKey)
 +      })
-+    }, meta)
++    })
    }
 
    /**
