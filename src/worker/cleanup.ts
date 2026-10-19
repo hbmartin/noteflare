@@ -1098,7 +1098,7 @@ async function processTarget(
       pageId?: unknown;
       workspaceId?: unknown;
     }>(response);
-    if (!result || result.ok !== true || (stop && (result.stopped !== true || result.generation !== tuple!.generation)))
+    if (result?.ok !== true || (stop && (result.stopped !== true || result.generation !== tuple!.generation)))
       throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
     if (tuple && !stop) {
       if (

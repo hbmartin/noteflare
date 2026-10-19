@@ -21,7 +21,8 @@ export function deletionFailure(error: unknown): { code: DeletionFailureCode; bl
 
 function failureCode(value: string | null, blocked: boolean): DeletionFailureCode | null {
   if (value && Object.hasOwn(DELETION_FAILURE_MESSAGES, value)) return value as DeletionFailureCode;
-  return blocked ? "deletion_recheck_required" : value ? "deletion_cleanup_unavailable" : null;
+  if (blocked) return "deletion_recheck_required";
+  return value ? "deletion_cleanup_unavailable" : null;
 }
 
 export async function listDeletionJobs(
@@ -74,13 +75,14 @@ export async function listDeletionJobs(
       const blocked = row.blocked_at !== null;
       const code =
         failureCode(row.failure_code, blocked) ?? (row.last_error !== null ? "deletion_cleanup_unavailable" : null);
+      const unblockedStatus = row.last_error !== null ? "retrying" : "pending";
       return {
         id: row.id,
         rootPageId: row.root_page_id,
         title: row.title,
         pageCount: row.page_count,
         phase: row.phase,
-        status: blocked ? "blocked" : row.last_error !== null ? "retrying" : "pending",
+        status: blocked ? "blocked" : unblockedStatus,
         reasonCode: code,
         reason: code ? DELETION_FAILURE_MESSAGES[code] : null,
         nextAttemptAt: blocked ? null : row.next_attempt_at,

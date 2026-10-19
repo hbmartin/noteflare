@@ -2,6 +2,31 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { DeletionJobSummary, DeletionJobsPage } from "../shared/deletion-jobs";
 import { api, apiErrorMessage, ApiClientError } from "./api";
 
+const STATUS_LABELS: Record<DeletionJobSummary["status"], string> = {
+  blocked: "Paused",
+  retrying: "Retry scheduled",
+  pending: "Deleting",
+};
+
+async function fetchDeletionPages(
+  cursor: string | undefined,
+  pageLimit: number,
+  signal: AbortSignal,
+): Promise<DeletionJobsPage> {
+  let after = cursor ?? null;
+  const jobs: DeletionJobSummary[] = [];
+  for (let page = 0; page < pageLimit; page++) {
+    signal.throwIfAborted();
+    const query = after ? `?cursor=${encodeURIComponent(after)}` : "";
+    const result = await api<DeletionJobsPage>(`/api/deletion-jobs${query}`, { signal });
+    signal.throwIfAborted();
+    jobs.push(...result.jobs);
+    after = result.nextCursor;
+    if (!after) break;
+  }
+  return { jobs, nextCursor: after };
+}
+
 /** Mounted only for owners, keyed to the workspace, while Trash is visible. */
 export function PendingDeletions() {
   const [jobs, setJobs] = useState<DeletionJobSummary[]>([]);
@@ -35,24 +60,13 @@ export function PendingDeletions() {
       loadingRequest.current = true;
       setLoading(true);
       try {
-        let after = cursor ?? null;
-        const incoming: DeletionJobSummary[] = [];
-        for (let page = 0; page < (cursor ? 1 : loadedPages.current); page++) {
-          const result = await api<DeletionJobsPage>(
-            `/api/deletion-jobs${after ? `?cursor=${encodeURIComponent(after)}` : ""}`,
-            { signal: request.signal },
-          );
-          if (request.signal.aborted) return;
-          incoming.push(...result.jobs);
-          after = result.nextCursor;
-          if (!after) break;
-        }
+        const result = await fetchDeletionPages(cursor, cursor ? 1 : loadedPages.current, request.signal);
         if (request.signal.aborted) return;
         if (cursor) loadedPages.current++;
         setJobs((current) => [
-          ...new Map([...(cursor ? current : []), ...incoming].map((job) => [job.id, job])).values(),
+          ...new Map([...(cursor ? current : []), ...result.jobs].map((job) => [job.id, job])).values(),
         ]);
-        setNextCursor(after);
+        setNextCursor(result.nextCursor);
         setError("");
       } catch (cause) {
         if (request.signal.aborted) return;
@@ -124,8 +138,7 @@ export function PendingDeletions() {
           <div key={job.id}>
             <strong>{job.title}</strong>
             <span>
-              {job.pageCount} {job.pageCount === 1 ? "page" : "pages"} ·{" "}
-              {job.status === "blocked" ? "Paused" : job.status === "retrying" ? "Retry scheduled" : "Deleting"}
+              {job.pageCount} {job.pageCount === 1 ? "page" : "pages"} · {STATUS_LABELS[job.status]}
             </span>
             <p>{job.reason ?? "Permanent deletion is in progress."}</p>
             {job.canRetry && (
