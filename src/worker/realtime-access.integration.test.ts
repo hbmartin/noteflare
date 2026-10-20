@@ -93,6 +93,29 @@ describe("realtime access barriers", () => {
     expect(response.status).toBe(201);
     expect(response.headers.has("X-Notes-Realtime-Status")).toBe(false);
   });
+  it("does not label a failed pre-mutation access read as a saved transition", async () => {
+    const bindings = runtime(async () => {
+      throw new Error("Nothing was committed");
+    });
+    bindings.DB = {
+      prepare: () => {
+        throw new Error("database unavailable before mutation");
+      },
+    } as unknown as D1Database;
+    let wrote = false;
+    const response = await withRealtimeAccessTracking(bindings, async () => {
+      try {
+        await trackRealtimeWorkspace(bindings, "uncommitted");
+        wrote = true;
+        return Response.json({ ok: true });
+      } catch {
+        return Response.json({ error: "database unavailable before mutation" }, { status: 503 });
+      }
+    });
+    expect(wrote).toBe(false);
+    expect(response.status).toBe(503);
+    expect(response.headers.has("X-Notes-Realtime-Status")).toBe(false);
+  });
   it("uses one D1 status read and one coordinator registration on a clean handshake", async () => {
     const id = await workspace();
     await env.DB.prepare("UPDATE realtime_revocations SET completed_revision=revision WHERE workspace_id=?")

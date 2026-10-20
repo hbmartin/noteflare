@@ -31,7 +31,15 @@ export async function trackRealtimeWorkspace(env: Env, workspaceId: string) {
       workspaceId,
       realtimeAccessStatus(env, workspaceId).then((status) => status.revision),
     );
-  await scope.get(workspaceId);
+  const snapshot = scope.get(workspaceId)!;
+  try {
+    await snapshot;
+  } catch (error) {
+    // No caller may start its write until this baseline succeeds. A failed
+    // baseline is a rejected operation, not a committed pending transition.
+    if (scope.get(workspaceId) === snapshot) scope.delete(workspaceId);
+    throw error;
+  }
 }
 export async function trackRealtimeUser(env: Env, userId: string) {
   if (!impacts.getStore()) return;
