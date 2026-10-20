@@ -1,5 +1,10 @@
-import { deletionCheckpointFailure, DeletionLeaseLostError } from "./deletion-jobs";
-import { safeHttpError } from "./http";
+import {
+  deletionCheckpointFailure,
+  deletionCheckpointStatement,
+  deletionWireError,
+  DeletionLeaseLostError,
+  type DeletionCheckpointSnapshot,
+} from "./deletion-jobs";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import type { ColumnType } from "../shared/types";
@@ -614,7 +619,7 @@ export class TableAuthority extends DurableObject<Env> {
     } catch (error) {
       if (error instanceof TableRequestError)
         return Response.json({ error: { code: error.code, message: error.message } }, { status: error.status });
-      const deliberate = safeHttpError(error);
+      const deliberate = deletionWireError(error);
       if (deliberate)
         return Response.json(
           { error: { code: deliberate.code, message: deliberate.message, details: deliberate.details } },
@@ -2043,15 +2048,16 @@ export class TableAuthority extends DurableObject<Env> {
           .bind(jobId, target)
           .first();
         if (!stopped) fail("Deletion stop is incomplete.", 409, "deletion_pending");
+      } else if (captured.generation !== generation) {
+        fail("Deletion evidence generation changed.", 409, "table_generation_conflict");
       } else if (
         captured.page_workspace !== captured.workspace_id ||
         captured.kind !== "table" ||
         captured.archived_at === null ||
         captured.archived_at !== captured.locked_at ||
-        captured.archive_operation_id !== captured.locked_operation ||
-        captured.generation !== generation
+        captured.archive_operation_id !== captured.locked_operation
       )
-        fail("Deletion evidence ownership changed.", 409, "deletion_ownership_conflict");
+        fail("Deletion evidence ownership changed.", 403, "table_forbidden");
       if (this.deletionIntent) {
         if (
           captured.phase === "staging" ||
@@ -2142,52 +2148,30 @@ export class TableAuthority extends DurableObject<Env> {
       tombstone.generation !== body.generation
     )
       fail("Deletion proof generation changed.", 409, "table_generation_conflict");
-    const owned = await this.env.DB.prepare(`SELECT locked.archived_at,locked.archive_operation_id
-      FROM deletion_jobs job JOIN deletion_targets target ON target.job_id=job.id
-      JOIN deletion_job_pages locked ON locked.job_id=job.id AND locked.page_id=?
-      JOIN pages detail ON detail.id=locked.page_id AND detail.workspace_id=job.workspace_id
-        AND detail.archived_at IS locked.archived_at AND detail.archive_operation_id IS locked.archive_operation_id
-      WHERE job.id=? AND job.workspace_id=? AND job.phase='rows' AND job.next_attempt_at=?
-        AND target.kind='table_row' AND target.target=? AND target.completed_at IS NULL AND json_valid(target.target)
-        AND json_extract(target.target,'$.tableId')=? AND json_extract(target.target,'$.rowId')=?
-        AND json_extract(target.target,'$.detailPageId')=? AND json_extract(target.target,'$.generation')=?
-        AND NOT EXISTS(SELECT 1 FROM pages WHERE id=?) AND NOT EXISTS(SELECT 1 FROM table_authority WHERE page_id=?)
-        AND NOT EXISTS(SELECT 1 FROM table_rows WHERE id=?)
-        AND NOT EXISTS(SELECT 1 FROM table_row_pages WHERE row_id=? OR page_id=?)
-        AND NOT EXISTS(SELECT 1 FROM table_id_claims WHERE kind='row' AND id=? AND page_id<>?)`)
-      .bind(
-        body.detailPageId,
-        body.jobId,
-        body.workspaceId,
-        body.leaseUntil,
-        body.target,
-        body.pageId,
-        body.rowId,
-        body.detailPageId,
-        body.generation,
-        body.pageId,
-        body.pageId,
-        body.rowId,
-        body.rowId,
-        body.detailPageId,
-        body.rowId,
-        body.pageId,
-      )
-      .first<{ archived_at: number; archive_operation_id: string | null }>();
-    if (!owned || owned.archived_at === null) {
-      const failure = await deletionCheckpointFailure(
-        this.env,
-        body.jobId,
-        body.leaseUntil,
-        "Deletion proof ownership changed.",
-        {
-          tableId: body.pageId,
-          workspaceId: body.workspaceId,
-          generation: body.generation,
-          rowId: body.rowId,
-          detailPageId: body.detailPageId,
-        },
-      );
+    const owned = await deletionCheckpointStatement(this.env, {
+      jobId: body.jobId,
+      leaseUntil: body.leaseUntil,
+      phase: "rows",
+      tableId: body.pageId,
+      workspaceId: body.workspaceId,
+      generation: body.generation,
+      rowId: body.rowId,
+      detailPageId: body.detailPageId,
+      target: body.target,
+    }).first<DeletionCheckpointSnapshot>();
+    if (
+      !owned ||
+      !owned.exact_pending ||
+      owned.archived_at === null ||
+      owned.table_present ||
+      owned.row_present ||
+      owned.link_present ||
+      owned.ownership_changed ||
+      owned.generation_changed ||
+      !owned.phase_matches ||
+      !owned.lease_matches
+    ) {
+      const failure = deletionCheckpointFailure(owned!, "Deletion proof ownership changed.", body.pageId);
       if (failure instanceof DeletionLeaseLostError)
         fail("Deletion proof checkpoint changed.", 409, "deletion_pending");
       throw failure;

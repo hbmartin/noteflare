@@ -1,4 +1,7 @@
 export const DELETION_FAILURE_MESSAGES = {
+  deletion_dependency_blocked:
+    "Deletion is paused until the containing table deletion recovers. It will resume automatically after the original purge is verified.",
+  deletion_state_conflict: "Deletion is paused because its cleanup state needs repair before an owner recheck.",
   deletion_evidence_unavailable: "Table deletion evidence is temporarily unavailable. Please retry shortly.",
   deletion_proof_unavailable: "Deletion is paused because the original table purge could not be verified.",
   deletion_proof_invalid: "Deletion is paused because the table returned an invalid deletion proof.",

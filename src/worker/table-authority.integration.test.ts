@@ -340,7 +340,8 @@ describe("per-table authority", () => {
     ).rejects.toMatchObject({ code: "deletion_pending" });
     await env.DB.prepare("UPDATE pages SET archive_operation_id='new-archive' WHERE id=?").bind(detailPageId).run();
     await expect(tableInternal(env, pageId, "/row-deletion-proof", body)).rejects.toMatchObject({
-      code: "deletion_ownership_conflict",
+      status: 403,
+      code: "table_forbidden",
     });
     await env.DB.prepare("UPDATE pages SET archive_operation_id='detail-archive' WHERE id=?").bind(detailPageId).run();
     await setTombstone(null);
