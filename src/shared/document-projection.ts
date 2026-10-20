@@ -598,6 +598,24 @@ export function projectDocument(root: ProseMirrorJson): DocumentProjection {
   };
 }
 
+/** Derived heading text includes nested native tables/tabs and never replaces canonical content. */
+export function projectDocumentHeadings(root: ProseMirrorJson) {
+  const headings: string[] = [];
+  let size = 0;
+  const visit = (node: ProseMirrorJson) => {
+    if (size >= 50_000) return;
+    if (node.type === "heading" || /^heading[1-6]$/.test(node.type ?? "")) {
+      const text = normalizeText(nodeText(node));
+      headings.push(text);
+      size += text.length + 1;
+      return;
+    }
+    for (const child of node.content ?? []) visit(child);
+  };
+  visit(root);
+  return headings.join(" ").slice(0, 50_000);
+}
+
 export function serializeDocument(
   root: ProseMirrorJson,
   options: DocumentSerializationOptions = {},

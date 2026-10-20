@@ -5,6 +5,14 @@ import {
   DeletionLeaseLostError,
   type DeletionCheckpointSnapshot,
 } from "./deletion-jobs";
+import { CanonicalRelations, relationProjectionIsPure } from "./table-relations";
+import {
+  relationDefinition,
+  relationRowIds,
+  rollupRelation,
+  filterRelatedRows,
+  type RelationInput,
+} from "../shared/table-relations";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import type { ColumnType } from "../shared/types";
@@ -93,6 +101,7 @@ export type TableActor = {
   userId: string;
   generation: number;
   expiresAt: number;
+  authGeneration?: number;
   creation?: { board: boolean; calendar: boolean };
   authorization?: { sql: string; binds: unknown[] };
   effects?: ProjectionStatement[];
@@ -199,13 +208,17 @@ export async function tableActorSignature(secret: string, actor: TableActor) {
 
 /** SQLite owns table ordering and receipts. D1 is rebuilt from durable projection events. */
 export class TableAuthority extends DurableObject<Env> {
+  private readonly relations: CanonicalRelations;
   private projecting: Promise<boolean> | null = null;
   private repairWork: Promise<unknown> | null = null;
   private deletionIntent: DeletionIntent | null = null;
   private purged = false;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.relations = new CanonicalRelations(ctx.storage.sql);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS meta(id INTEGER PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS access_fence(id INTEGER PRIMARY KEY,generation INTEGER NOT NULL);
+      INSERT OR IGNORE INTO access_fence VALUES(1,0);
       CREATE TABLE IF NOT EXISTS properties(id TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS rows(id TEXT PRIMARY KEY,position REAL NOT NULL,created_at INTEGER NOT NULL,created_by TEXT,edited_at INTEGER NOT NULL,edited_by TEXT,detail_page_id TEXT);
       CREATE TABLE IF NOT EXISTS row_revisions(id TEXT PRIMARY KEY,revision INTEGER NOT NULL);
@@ -379,6 +392,15 @@ export class TableAuthority extends DurableObject<Env> {
       return fail("Projection repair is running. Retry shortly.", 503, "table_projection_repairing");
     if (write && (page.role === "viewer" || (page.role !== "owner" && page.space_role === "viewer")))
       return fail("This table is read-only.", 403, "read_only");
+    if (actor.authGeneration !== undefined) {
+      const current =
+        (await this.env.DB.prepare("SELECT revision FROM realtime_revocations WHERE workspace_id=?")
+          .bind(actor.workspaceId)
+          .first<number>("revision")) ?? 0;
+      const fence = this.rows<{ generation: number }>("SELECT generation FROM access_fence WHERE id=1")[0]!.generation;
+      if (actor.authGeneration < Math.max(current, fence))
+        return fail("Access changed. Reconnect to continue.", 403, "table_forbidden");
+    }
     return { ...actor, taskList: Boolean(page.is_task_list) };
   }
   // fallow-ignore-next-line unused-class-member -- Called by Cloudflare Durable Object runtime.
@@ -386,6 +408,23 @@ export class TableAuthority extends DurableObject<Env> {
     try {
       const url = new URL(request.url),
         path = url.pathname;
+      if (path === "/revoke-access") {
+        if (request.headers.get("x-notes-internal") !== this.env.BETTER_AUTH_SECRET)
+          return new Response("Forbidden", { status: 403 });
+        const body = await request.json<{ generation?: unknown }>();
+        if (!Number.isSafeInteger(body.generation) || Number(body.generation) < 0)
+          return new Response("Invalid generation", { status: 422 });
+        this.ctx.storage.sql.exec(
+          "UPDATE access_fence SET generation=max(generation,?) WHERE id=1",
+          Number(body.generation),
+        );
+        const floor = this.rows<{ generation: number }>("SELECT generation FROM access_fence WHERE id=1")[0]!
+          .generation;
+        for (const socket of this.ctx.getWebSockets())
+          if (((socket.deserializeAttachment() as TableActor)?.authGeneration ?? 0) < floor)
+            socket.close(4403, "Access changed. Reconnect to continue.");
+        return new Response(null, { status: 204 });
+      }
       if (path === "/row-deletion-proof" || path === "/deletion-evidence") {
         if (request.headers.get("x-table-internal") !== this.env.BETTER_AUTH_SECRET)
           fail("Forbidden.", 403, "table_forbidden");
@@ -532,6 +571,7 @@ export class TableAuthority extends DurableObject<Env> {
             pageId: meta.pageId,
             workspaceId: meta.workspaceId,
             generation: meta.generation,
+            relations: this.relations.snapshot(rows.map((row) => row.id)),
             columns: this.columns(),
             views: this.rows<{ value: string }>("SELECT value FROM views ORDER BY id").map(
               (view) => JSON.parse(view.value) as TableView,
@@ -591,6 +631,113 @@ export class TableAuthority extends DurableObject<Env> {
           );
         return Response.json({ ...result, projectionPending: this.meta().projectedRevision < result.revision });
       }
+      if (path === "/relation-edges") {
+        const targetId = url.searchParams.get("targetPageId"),
+          targetRowId = url.searchParams.get("targetRowId"),
+          after = url.searchParams.get("after") ?? "";
+        if (!targetId || !targetRowId) return fail("Choose a target row.");
+        const allowed = await this.env.DB.prepare(
+          "SELECT 1 FROM pages source JOIN pages target ON source.space_id=target.space_id AND source.workspace_id=target.workspace_id WHERE source.id=? AND target.id=? AND target.archived_at IS NULL AND target.import_job_id IS NULL",
+        )
+          .bind(actor.pageId, targetId)
+          .first();
+        if (!allowed) return fail("Related table unavailable.", 403, "relation_target_unavailable");
+        const result = this.relationEdges(targetId, targetRowId, after);
+        await this.authorize(request, false);
+        return Response.json(result);
+      }
+      if (path === "/relation-backlinks") {
+        const targetRow = this.row(url.searchParams.get("rowId")),
+          after = url.searchParams.get("after") ?? "";
+        const candidates =
+          await this.env.DB.prepare(`SELECT DISTINCT p.id,a.generation,p.title FROM table_relation_sources relation
+          JOIN pages p ON p.id=relation.source_page_id JOIN pages target ON target.id=? AND target.space_id=p.space_id AND target.workspace_id=p.workspace_id
+          JOIN table_authority a ON a.page_id=p.id AND a.state='do'
+          WHERE relation.target_page_id=? AND relation.deleted=0 AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.id>? ORDER BY p.id LIMIT 20`)
+            .bind(actor.pageId, actor.pageId, after)
+            .all<{ id: string; generation: number; title: string }>();
+        const sources = await Promise.all(
+          candidates.results.map(async (source) => {
+            const grant: TableActor = {
+              pageId: source.id,
+              workspaceId: actor.workspaceId,
+              userId: actor.userId,
+              generation: source.generation,
+              expiresAt: Date.now() + 60_000,
+              ...(actor.authGeneration === undefined ? {} : { authGeneration: actor.authGeneration }),
+            };
+            try {
+              if (source.id === actor.pageId)
+                return { ...this.relationEdges(actor.pageId, targetRow.id, ""), title: source.title };
+              const params = new URLSearchParams({ targetPageId: actor.pageId, targetRowId: targetRow.id });
+              const response = await this.env.TABLE.getByName(source.id).fetch(
+                new Request(`https://table.internal/relation-edges?${params}`, {
+                  headers: {
+                    "x-table-actor": JSON.stringify(grant),
+                    "x-table-signature": await tableActorSignature(this.env.BETTER_AUTH_SECRET, grant),
+                  },
+                }),
+              );
+              if (!response.ok) return null;
+              return { ...(await response.json<Record<string, unknown>>()), title: source.title };
+            } catch {
+              return null;
+            }
+          }),
+        );
+        await this.authorize(request, false);
+        return Response.json({
+          sources: sources.filter(Boolean),
+          nextCursor: candidates.results.length === 20 ? candidates.results.at(-1)!.id : null,
+          consistency: "projected-discovery-canonical-values",
+        });
+      }
+      if (path === "/relation-inputs") {
+        const result = this.relationInputs(url);
+        await this.authorize(request, false);
+        return Response.json(result);
+      }
+      if (path === "/relations") {
+        if (url.searchParams.has("sourceRevision") && Number(url.searchParams.get("sourceRevision")) !== meta.revision)
+          return fail(
+            "The source table changed. Refresh before reading related values.",
+            409,
+            "table_revision_conflict",
+          );
+        const row = this.row(url.searchParams.get("rowId"));
+        const snapshot = this.relations.snapshot([row.id]);
+        const targets = await Promise.all(
+          snapshot.definitions.map(async (definition) => {
+            const ids = snapshot.cells.find((cell) => cell.relationId === definition.id)?.rowIds ?? [];
+            try {
+              const input = await this.relatedInput(actor, definition.targetPageId, ids);
+              const derived = (definition.derived ?? []).map((d) => ({
+                id: d.id,
+                ...(d.kind === "rollup"
+                  ? rollupRelation(ids, input, d.columnId, d.operation)
+                  : {
+                      rowIds: filterRelatedRows(ids, input, d.filter),
+                      state: ids.some((targetRowId) => !input.rows.some((candidate) => candidate.id === targetRowId))
+                        ? "unavailable"
+                        : "current",
+                      source: { generation: input.generation, revision: input.revision },
+                    }),
+              }));
+              return { relationId: definition.id, input, derived, state: "current" };
+            } catch {
+              return { relationId: definition.id, input: null, derived: [], state: "unavailable" };
+            }
+          }),
+        );
+        await this.authorize(request, false);
+        if (this.meta().revision !== meta.revision)
+          return fail(
+            "The source table changed. Refresh before reading related values.",
+            409,
+            "table_revision_conflict",
+          );
+        return Response.json({ ...snapshot, targets });
+      }
       if (path === "/query") {
         const result = { ...this.query(new URL(request.url), actor), people: await this.people(actor) };
         await this.authorize(request, false);
@@ -638,7 +785,117 @@ export class TableAuthority extends DurableObject<Env> {
       );
     }
   }
+  private relationEdges(targetId: string, targetRowId: string, after: string) {
+    const meta = this.meta();
+    const matches = this.ctx.storage.sql
+      .exec<{ relation_id: string; row_id: string; value: string; revision: number }>(
+        `SELECT c.* FROM relation_cells c JOIN relation_definitions d ON d.id=c.relation_id
+          WHERE d.deleted=0 AND json_extract(d.value,'$.targetPageId')=? AND c.row_id>? AND EXISTS(SELECT 1 FROM json_each(c.value) WHERE value=?) ORDER BY c.row_id,c.relation_id LIMIT 2020`,
+        targetId,
+        after,
+        targetRowId,
+      )
+      .toArray();
+    const uniqueRows = [...new Set(matches.map((cell) => cell.row_id))].slice(0, 100);
+    const cells = matches.filter((cell) => uniqueRows.includes(cell.row_id));
+    const rows = uniqueRows.flatMap((rowId) => {
+      const row = this.rows<StoredRow>("SELECT * FROM rows WHERE id=?", rowId)[0];
+      return row ? [this.rowValue(row)] : [];
+    });
+    return {
+      pageId: meta.pageId,
+      generation: meta.generation,
+      revision: meta.revision,
+      definitions: this.relations.definitions().filter((definition) => definition.targetPageId === targetId),
+      cells,
+      rows,
+      nextCursor: uniqueRows.length === 100 ? uniqueRows.at(-1) : null,
+    };
+  }
+  private relationInputs(url: URL): RelationInput {
+    const selected = url.searchParams.get("rowIds"),
+      after = url.searchParams.get("after") ?? "";
+    let ids: string[] | null = null;
+    if (selected !== null) {
+      try {
+        ids = relationRowIds(JSON.parse(selected));
+      } catch {
+        return fail("Invalid row selection.", 422, "relation_validation");
+      }
+    }
+    const rows = ids
+      ? this.rows<StoredRow>(
+          "SELECT * FROM rows WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id",
+          JSON.stringify(ids),
+        )
+      : this.rows<StoredRow>("SELECT * FROM rows WHERE id>? ORDER BY id LIMIT 100", after);
+    const meta = this.meta();
+    return {
+      pageId: meta.pageId,
+      generation: meta.generation,
+      revision: meta.revision,
+      columns: this.columns(),
+      rows: rows.map((row) => this.rowValue(row)),
+      nextCursor: ids || rows.length < 100 ? null : rows.at(-1)!.id,
+    };
+  }
+  private async relatedInput(actor: TableActor, targetPageId: string, rowIds: string[]): Promise<RelationInput> {
+    const sameSpace = async () =>
+      await this.env.DB.prepare(`SELECT a.generation FROM pages source JOIN pages target ON source.space_id=target.space_id AND source.workspace_id=target.workspace_id JOIN table_authority a ON a.page_id=target.id
+      WHERE source.id=? AND target.id=? AND target.archived_at IS NULL AND target.import_job_id IS NULL AND a.state='do'`)
+        .bind(actor.pageId, targetPageId)
+        .first<{ generation: number }>();
+    const target = await sameSpace();
+    if (!target)
+      return fail("Choose an available canonical table in the same space.", 422, "relation_target_unavailable");
+    const params = new URLSearchParams({ rowIds: JSON.stringify(rowIds) });
+    if (targetPageId === actor.pageId)
+      return this.relationInputs(new URL(`https://table.internal/relation-inputs?${params}`));
+    const grant: TableActor = {
+      pageId: targetPageId,
+      workspaceId: actor.workspaceId,
+      userId: actor.userId,
+      generation: target.generation,
+      expiresAt: Date.now() + 60_000,
+      ...(actor.authGeneration === undefined ? {} : { authGeneration: actor.authGeneration }),
+      ...(actor.authorization ? { authorization: actor.authorization } : {}),
+    };
+    const response = await this.env.TABLE.getByName(targetPageId).fetch(
+      new Request(`https://table.internal/relation-inputs?${params}`, {
+        headers: {
+          "x-table-actor": JSON.stringify(grant),
+          "x-table-signature": await tableActorSignature(this.env.BETTER_AUTH_SECRET, grant),
+        },
+      }),
+    );
+    if (!response.ok || !(await sameSpace()))
+      return fail("The related table is unavailable.", 403, "relation_target_unavailable");
+    return response.json<RelationInput>();
+  }
   private async validateReferences(actor: TableActor, command: TableCommand): Promise<void> {
+    if (["define_relation", "set_relation", "delete_relation"].includes(command.kind)) {
+      if (this.env.TABLE_RELATIONS_ENABLED !== "true")
+        return fail("Relation creation is not enabled.", 403, "feature_disabled");
+      if (command.expectedRevision === undefined)
+        return fail("Reload this table before changing relations.", 409, "table_revision_required");
+      if (command.kind === "delete_relation") return;
+      const definition =
+        command.kind === "define_relation"
+          ? relationDefinition(command.payload.definition, 1)
+          : this.relations.definition(String(command.payload.relationId));
+      const ids = command.kind === "set_relation" ? relationRowIds(command.payload.rowIds, definition.multiple) : [];
+      if (command.kind === "set_relation") this.row(command.payload.rowId);
+      const input = await this.relatedInput(actor, definition.targetPageId, ids);
+      if (ids.some((targetRowId) => !input.rows.some((candidate) => candidate.id === targetRowId)))
+        return fail("A selected target row is unavailable.", 422, "relation_validation");
+      for (const derived of definition.derived ?? []) {
+        if (derived.kind === "rollup") {
+          if (rollupRelation([], input, derived.columnId, derived.operation).state === "invalid")
+            return fail("Choose a compatible rollup property.", 422, "relation_validation");
+        } else filterRelatedRows([], input, derived.filter);
+      }
+      return;
+    }
     const items =
       command.kind === "bulk" && Array.isArray(command.payload.commands)
         ? (command.payload.commands as Array<{ kind: string; payload: Record<string, unknown> }>)
@@ -943,7 +1200,9 @@ export class TableAuthority extends DurableObject<Env> {
       this.ctx.storage.sql.exec("INSERT OR REPLACE INTO row_revisions VALUES(?,?)", rowId, revision);
       projection.push(...this.rowProjection({ ...row, edited_at: time, edited_by: actor.userId }));
     };
-    if (command.kind === "create_column") {
+    if (["define_relation", "set_relation", "delete_relation"].includes(command.kind)) {
+      result = this.relations.apply(command, revision, meta.pageId, projection);
+    } else if (command.kind === "create_column") {
       const name = title(p.name),
         columnType = type(p.type);
       if (this.columns().length >= 50) return fail("This table has reached its property limit.");
@@ -1106,6 +1365,7 @@ export class TableAuthority extends DurableObject<Env> {
       rememberRow(row);
       if (row.detail_page_id && !actor.allowDeleteDetail)
         return fail("Archive the row detail page before deleting its row.", 409, "row_detail_archive_required");
+      this.relations.removeRow(meta.pageId, row.id, revision, projection);
       this.ctx.storage.sql.exec("DELETE FROM computed WHERE row_id=?", row.id);
       this.ctx.storage.sql.exec("DELETE FROM cells WHERE row_id=?", row.id);
       this.ctx.storage.sql.exec("DELETE FROM rows WHERE id=?", row.id);
@@ -1825,6 +2085,7 @@ export class TableAuthority extends DurableObject<Env> {
       calculations[columnId] = calculateColumn(kind, inputs);
     }
     return {
+      relations: this.relations.snapshot(rows.map((row) => row.id)),
       calculations,
       protocolVersion: TABLE_PROTOCOL_VERSION,
       pageId: meta.pageId,
@@ -2242,6 +2503,9 @@ export class TableAuthority extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       this.deletionIntent!.purged = true;
       for (const table of [
+        "relation_stats",
+        "relation_cells",
+        "relation_definitions",
         "properties",
         "rows",
         "row_revisions",
@@ -3025,6 +3289,7 @@ export class TableAuthority extends DurableObject<Env> {
   private repairHeaders(seedBaseline: boolean): ProjectionStatement[] {
     const meta = this.meta();
     return [
+      ...this.relations.headerProjection(meta.pageId),
       ...(!seedBaseline
         ? [
             { sql: "DELETE FROM table_columns WHERE page_id=?", binds: [meta.pageId] },
@@ -3051,12 +3316,14 @@ export class TableAuthority extends DurableObject<Env> {
       statements.push(
         this.cellProjection(row.id, cell.column_id, JSON.parse(cell.value), cell.revision, row.edited_at),
       );
+    statements.push(...this.relations.rowProjection(this.meta().pageId, row.id));
     statements.push(...this.computedProjection(row.id, this.meta().revision));
     return statements;
   }
   private snapshot(): TableSnapshot {
     return {
       revision: this.meta().revision,
+      relations: this.relations.snapshot(),
       columns: this.columns(),
       views: this.rows<{ value: string }>("SELECT value FROM views ORDER BY id").map(
         (view) => JSON.parse(view.value) as TableView,
@@ -3224,7 +3491,10 @@ export class TableAuthority extends DurableObject<Env> {
           ),
         );
     cells.push({ sql: COMPUTED_DELETE_SQL, binds: [JSON.stringify(ids), meta.pageId] });
-    for (const row of rows) cells.push(...this.computedProjection(row.id, meta.revision).slice(1));
+    for (const row of rows) {
+      cells.push(...this.computedProjection(row.id, meta.revision).slice(1));
+      cells.push(...this.relations.rowProjection(meta.pageId, row.id));
+    }
     batches.push(...projectionBatches(compactProjection(cells)));
     return batches;
   }
@@ -3829,6 +4099,7 @@ function chunkPrerequisites(records: Prerequisite[]): string[] {
   return chunks;
 }
 function pureProjection(statement: ProjectionStatement, pageId: string) {
+  if (relationProjectionIsPure(statement, pageId)) return true;
   if (insertRecords(statement).length) return true;
   const patterns: Record<string, { count: number; page?: number; json?: number }> = {
     "DELETE FROM table_columns WHERE id=? AND page_id=?": { count: 2, page: 1 },

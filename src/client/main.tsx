@@ -5,8 +5,10 @@ import { Startup } from "./startup";
 import { RenderBoundary } from "./RenderBoundary";
 import "./startup.css";
 import { installClientTelemetry } from "./telemetry";
+import { installChunkRecovery } from "./chunk-recovery";
 
 installClientTelemetry();
+installChunkRecovery();
 
 if (import.meta.env.PROD && "serviceWorker" in navigator) {
   window.addEventListener("load", () => {

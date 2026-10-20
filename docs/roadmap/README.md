@@ -1,5 +1,7 @@
 # NoteFlare phased roadmap
 
+The [small team wiki improvement program](12-small-team-wiki-improvements.md), proposed on 20 October 2026 against `a80e215`, covers current release closeout, reliability, editor and search improvements, Slack, and relational tables. Its confirmed online-only editing and minimal public-sharing scope supersedes the older offline activation and sharing expansion recommendations below. Its [upstream assessment](../research/upstream-change-assessment-2026-10-20.md) maps the selected Outline, Docmost, and AFFiNE changes. The dated release statuses below retain their original audit baseline.
+
 Status audited on **12 October 2026** against `main` at `b61dfbd` (migrations through `0082`). Phases 1–6, 9, and 11 are merged; a successful deployment record covers that SHA. Phases 7–8 and 10 remain planned. Production flags, owner enablement, and live acceptance are separate facts; see [audit evidence](../evidence/documentation-audit-2026-10-12.md).
 
 This directory records implementation contracts, state ownership, recovery and rollout rules, and exit matrices. Complete a phase's exit matrix against the deployed installation before calling it shipped. A merged patch, visible control, or successful CI run alone is insufficient.

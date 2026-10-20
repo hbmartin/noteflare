@@ -1,3 +1,5 @@
+import { useOnlineStatus } from "./online-status";
+import { CommentDraftContext, DraftFloatingComposer, DraftThread, DraftThreadsSidebar } from "./CommentDrafts";
 import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
 
@@ -9,7 +11,8 @@ import { BlockNoteView } from "@blocknote/mantine";
 import {
   getDefaultReactSlashMenuItems,
   SuggestionMenuController,
-  ThreadsSidebar,
+  FloatingComposerController,
+  FloatingThreadController,
   useCreateBlockNote,
   FormattingToolbarController,
   FormattingToolbar,
@@ -28,6 +31,7 @@ import {
   type WritingLaunchRequest,
 } from "./writing-target";
 import { collaborationUndoLifecycleExtension } from "./collaboration-undo";
+import { EditorUploads, editorUploadsExtension } from "./editor-uploads";
 import { deferredSyntaxExtension } from "./deferred-syntax";
 import { FindReplace, findReplaceExtension } from "./find-replace";
 import { tabsExtension, footnotesExtension, insertFootnote, selectionInsideTabs } from "./editor-feature-blocks";
@@ -204,6 +208,8 @@ export function EditorPage({
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
+  const online = useOnlineStatus();
+  const [connectionSynced, setConnectionSynced] = useState(false);
   const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [storageWriteFailed, setStorageWriteFailed] = useState(false);
@@ -401,6 +407,9 @@ export function EditorPage({
     (entry) => entry.key === currentStorageKey && (entry.storageFailed || entry.reason === "storage"),
   );
   const editable =
+    online &&
+    status === "connected" &&
+    connectionSynced &&
     member.role !== "viewer" &&
     !sizeWarning?.readOnly &&
     !schemaUpgrade &&
@@ -812,6 +821,7 @@ export function EditorPage({
     };
     const connectionSync = (synced: boolean) => {
       if (!active) return;
+      setConnectionSynced(synced);
       closeReconciler.handleSync(synced);
       if (synced && active) setHasConfirmedSync(true);
     };
@@ -821,6 +831,7 @@ export function EditorPage({
       try {
         await next.ready;
         if (active) {
+          setConnectionSynced(next.provider.synced);
           setStorageLoadingSlow(false);
           setStorageError(null);
           setBundle(next);
@@ -834,6 +845,7 @@ export function EditorPage({
           try {
             await next.lateReady;
             if (!active) return;
+            setConnectionSynced(next.provider.synced);
             setStorageLoadingSlow(false);
             setStorageError(null);
             setBundle(next);
@@ -934,8 +946,10 @@ export function EditorPage({
     <main className={`page-canvas ${page.fullWidth ? "full-width" : ""}`}>
       <PageTools>
         <PageInfoPopover pageId={page.id} />
-        {status !== "connected" && (
-          <output className={`sync-state sync-${status}`}>{status === "connecting" ? "Connecting…" : "Offline"}</output>
+        {(!online || status !== "connected" || !connectionSynced) && (
+          <output className={`sync-state sync-${status}`}>
+            {!online || status === "offline" ? "Reading cached copy · connect to edit" : "Syncing · editing paused"}
+          </output>
         )}
         <ActionMenu label="Page details" icon="comment">
           {editable && (
@@ -1450,19 +1464,14 @@ function AttachmentsPanel({ page, editable }: { page: Page; editable: boolean })
 function editorOptions(
   bundle: CollaborationBundle,
   member: ClientMemberContext,
-  editable: boolean,
-  pageId: string,
   threadStore: ServerThreadStore,
+  uploads: EditorUploads,
 ) {
   return withCollaboration({
     schema: notesSchema,
     // Media dropped or pasted into the body becomes a real attachment on this page, so
     // the subtree delete that already collects attachments covers inline media too.
-    uploadFile: async (file: File) => {
-      if (!editable) throw new Error("This document is read-only.");
-      const attachment = await uploadAttachment(pageId, file);
-      return `/api/attachments/${attachment.id}`;
-    },
+    uploadFile: (file: File, blockId?: string) => uploads.upload(file, blockId),
     resolveFileUrl: async (url: string) => resolveAttachmentUrl(url),
     collaboration: {
       fragment: bundle.doc.getXmlFragment("document-store"),
@@ -1471,6 +1480,7 @@ function editorOptions(
       showCursorLabels: "activity" as const,
     },
     extensions: [
+      editorUploadsExtension({ manager: uploads }),
       findReplaceExtension,
       tabsExtension,
       footnotesExtension,
@@ -1587,7 +1597,7 @@ function MountedCollaborativeEditor({
     title: string;
     sourceKey: string;
   } | null>(null);
-  const presentationSourceKey = `${pageId}:${contentEpoch}:${editable}`;
+  const presentationSourceKey = `${pageId}:${contentEpoch}:${member.role}`;
   // Permission/epoch changes discard the private snapshot before committing a
   // new view. Complete access loss removes this editor through App's page tree.
   if (presentation && presentation.sourceKey !== presentationSourceKey) setPresentation(null);
@@ -1602,10 +1612,19 @@ function MountedCollaborativeEditor({
     () => ({ pageId, userId: member.user.id, editable, remindersAllowed: !isTemplate }),
     [pageId, member.user.id, editable, isTemplate],
   );
+  const commentAccount = offlineAccountKey(member);
+  const online = useOnlineStatus();
   const commentsPanel = useRef<HTMLDivElement>(null);
   const threadStore = useMemo(
-    () => new ServerThreadStore(pageId, member.user.id, setCommentError),
-    [member.user.id, pageId],
+    () =>
+      new ServerThreadStore(
+        pageId,
+        member.user.id,
+        setCommentError,
+        () => navigator.onLine && bundle.provider.wsconnected && bundle.provider.synced,
+        { account: commentAccount, pageId, epoch: contentEpoch },
+      ),
+    [member.user.id, commentAccount, pageId, bundle, contentEpoch],
   );
   useEffect(() => {
     void threadStore.refresh(commentsRevision);
@@ -1626,11 +1645,15 @@ function MountedCollaborativeEditor({
     observer.observe(panel, { childList: true, subtree: true });
     return () => observer.disconnect();
   }, [commentsOpen, panelTarget]);
+  const uploads = useMemo(() => new EditorUploads(pageId), [pageId]);
+  useEffect(() => {
+    uploads.setReady(editable);
+  }, [editable, uploads]);
   const options = useMemo(
-    () => editorOptions(bundle, member, editable, pageId, threadStore),
-    [bundle, editable, member, pageId, threadStore],
+    () => editorOptions(bundle, member, threadStore, uploads),
+    [bundle, member, threadStore, uploads],
   );
-  const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
+  const editor = useCreateBlockNote(options, [bundle, pageId]);
   const [panelLaunch, setPanelLaunch] = useState<WritingLaunchRequest | undefined>();
   const writingBusy = useRef(false);
   const writingBusyChanged = useCallback((busy: boolean) => {
@@ -2076,28 +2099,46 @@ function MountedCollaborativeEditor({
                 slashMenu={false}
                 formattingToolbar={false}
                 sideMenu={member.features?.blockLinks ? false : undefined}
+                comments={false}
               >
-                {member.features?.blockLinks && <SideMenuController sideMenu={BlockLinkSideMenu} />}
-                <WritingLaunchContext.Provider value={launchWriting}>
-                  <FormattingToolbarController formattingToolbar={WritingFormattingToolbar} />
-                </WritingLaunchContext.Provider>
-                {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
-                {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
-                {commentsOpen &&
-                  panelTarget &&
-                  createPortal(
-                    <div ref={commentsPanel} className="comments-panel">
-                      <h2>Comments</h2>
-                      <p className="muted">
-                        {editable
-                          ? "Select text and use the formatting toolbar to start a thread."
-                          : "You can comment and reply even while the document is read-only."}
-                      </p>
-                      {commentError && <p className="form-error">{commentError}</p>}
-                      <ThreadsSidebar filter="all" sort="position" />
-                    </div>,
-                    panelTarget,
-                  )}
+                <CommentDraftContext.Provider
+                  value={{
+                    account: offlineAccountKey(member),
+                    pageId,
+                    epoch: contentEpoch,
+                    ready: online && bundle.provider.wsconnected && bundle.provider.synced,
+                  }}
+                >
+                  <FloatingComposerController floatingComposer={DraftFloatingComposer} />
+                  <FloatingThreadController floatingThread={DraftThread} />
+                  {member.features?.blockLinks && <SideMenuController sideMenu={BlockLinkSideMenu} />}
+                  <WritingLaunchContext.Provider value={launchWriting}>
+                    <FormattingToolbarController formattingToolbar={WritingFormattingToolbar} />
+                  </WritingLaunchContext.Provider>
+                  {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
+                  {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
+                  {commentsOpen &&
+                    panelTarget &&
+                    createPortal(
+                      <div
+                        ref={commentsPanel}
+                        className="comments-panel"
+                        inert={!online || !bundle.provider.wsconnected || !bundle.provider.synced}
+                      >
+                        <h2>Comments</h2>
+                        <p className="muted">
+                          {editable
+                            ? "Select text and use the formatting toolbar to start a thread."
+                            : bundle.provider.wsconnected && bundle.provider.synced
+                              ? "You can comment and reply even while the document is read-only."
+                              : "Connect to compose comments and reactions. Existing discussion remains readable."}
+                        </p>
+                        {commentError && <p className="form-error">{commentError}</p>}
+                        <DraftThreadsSidebar />
+                      </div>,
+                      panelTarget,
+                    )}
+                </CommentDraftContext.Provider>
               </BlockNoteView>
               {writingTarget &&
                 panelTarget &&

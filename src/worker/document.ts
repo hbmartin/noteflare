@@ -5,7 +5,13 @@ import { tracing } from "cloudflare:workers";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
-import { collectTransclusions, dateTokens, projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import {
+  collectTransclusions,
+  dateTokens,
+  projectDocument,
+  projectDocumentHeadings,
+  type ProseMirrorJson,
+} from "../shared/document-projection";
 import { dateMentionFromProps } from "../shared/date-mentions";
 import {
   diagramFromYDoc,
@@ -60,6 +66,7 @@ export interface ConnectionAuth {
   userId: string;
   role: "owner" | "editor" | "viewer";
   expiresAt: number;
+  authGeneration?: number;
   editorCapabilities?: string[];
   schemaWarning?: string;
   __ypsAwarenessIds?: number[];
@@ -686,6 +693,9 @@ export class Document extends YServer {
   }
 
   async onStart() {
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS realtime_access_fence(id INTEGER PRIMARY KEY,generation INTEGER NOT NULL); INSERT OR IGNORE INTO realtime_access_fence VALUES(1,0)",
+    );
     this.observedMentionRoot?.unobserveDeep(this.mentionObserver);
     this.observedMentionDocument?.off("update", this.updateObserver);
     this.observedMentionRoot = null;
@@ -888,6 +898,14 @@ export class Document extends YServer {
     const userId = context.request.headers.get("x-notes-user-id");
     const role = context.request.headers.get("x-notes-role") as ConnectionAuth["role"] | null;
     const expiresAt = Number(context.request.headers.get("x-notes-expires-at"));
+    const authGeneration = Number(context.request.headers.get("x-notes-auth-generation") ?? 0);
+    const minimumGeneration = this.state.storage.sql
+      .exec<{ generation: number }>("SELECT generation FROM realtime_access_fence WHERE id=1")
+      .one().generation;
+    if (authGeneration < minimumGeneration) {
+      connection.close(4403, "Access changed. Reconnect to continue.");
+      return;
+    }
     if (!userId || !role || !expiresAt) {
       connection.close(4401, "Authorization missing.");
       return;
@@ -897,7 +915,7 @@ export class Document extends YServer {
       .split(",")
       .filter((value) => /^[a-z0-9-]{1,80}$/.test(value))
       .slice(0, 50);
-    connection.setState({ userId, role, expiresAt, editorCapabilities });
+    connection.setState({ userId, role, expiresAt, editorCapabilities, authGeneration });
     await this.scheduleAlarm(expiresAt);
     await super.onConnect(connection, context);
     this.warnMissingCapabilities(connection);
@@ -969,6 +987,13 @@ export class Document extends YServer {
     const state = connection.state;
     if (!state || state.expiresAt <= Date.now()) {
       connection.close(4401, "Authorization expired. Reconnect to continue.");
+      return;
+    }
+    const fence = this.state.storage.sql
+      .exec<{ generation: number }>("SELECT generation FROM realtime_access_fence WHERE id=1")
+      .one().generation;
+    if ((state.authGeneration ?? 0) < fence) {
+      connection.close(4403, "Access changed. Reconnect to continue.");
       return;
     }
     if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition === "restore") {
@@ -1081,6 +1106,23 @@ export class Document extends YServer {
     const url = new URL(request.url);
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
+    }
+    if (request.method === "POST" && url.pathname === "/revoke-access") {
+      const body = await request.json<{ generation?: unknown }>();
+      if (!Number.isSafeInteger(body.generation) || Number(body.generation) < 0)
+        return new Response("Invalid generation", { status: 400 });
+      this.state.storage.sql.exec(
+        "UPDATE realtime_access_fence SET generation=max(generation,?) WHERE id=1",
+        Number(body.generation),
+      );
+      const floor = this.state.storage.sql
+        .exec<{ generation: number }>("SELECT generation FROM realtime_access_fence WHERE id=1")
+        .one().generation;
+      for (const connection of this.getConnections<ConnectionAuth>()) {
+        if ((connection.state?.authGeneration ?? 0) < floor)
+          connection.close(4403, "Access changed. Reconnect to continue.");
+      }
+      return new Response(null, { status: 204 });
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
       // Most callers use this endpoint as a current-content barrier. Public
@@ -2075,17 +2117,25 @@ export class Document extends YServer {
         );
         const statements = [
           this.bindings.DB.prepare(
-            `UPDATE pages SET plain_text = ?, indexed_seq = ?, oversized = ?, updated_at = ?
+            `UPDATE pages SET plain_text = ?, headings_text = ?, indexed_seq = ?, oversized = ?, updated_at = ?
                  , updated_by = COALESCE(?, updated_by)
               WHERE id = ? AND content_epoch = ?`,
           ).bind(
             projection.plainText,
+            projectDocumentHeadings(json),
             maximum,
             readOnly ? 1 : 0,
             timestamp,
             metadataAtStart.last_editor_id,
             pageId,
             epoch,
+          ),
+          this.bindings.DB.prepare(`DELETE FROM search_heading_backfill WHERE page_id=? AND EXISTS (
+            SELECT 1 FROM pages WHERE id=? AND content_epoch=? AND indexed_seq=?)`).bind(
+            pageId,
+            pageId,
+            epoch,
+            maximum,
           ),
           this.bindings.DB.prepare(
             `INSERT INTO document_projections

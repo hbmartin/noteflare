@@ -1,3 +1,4 @@
+import { createAuth } from "./auth";
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { betterAuth } from "better-auth";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -76,7 +77,13 @@ describe("first login after mandatory protection rollout", () => {
       env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0029"),
     );
     expect(await (await request("", "/api/security/status")).json()).toMatchObject({ state: "signed_out" });
-    const signedIn = await signIn();
+    // Isolate the historical security schema failure from later worker-level revocation migrations.
+    const signedIn = await createAuth(env).api.signInEmail({
+      body: { email: "legacy-diagnostic@example.test", password: "password123" },
+      headers: new Headers({ origin: "http://example.test" }),
+      asResponse: true,
+    });
+    expect(signedIn.status).toBe(200);
     const status = await request(responseCookies(signedIn), "/api/security/status");
     expect(status.status).toBe(500);
     expect(await status.text()).toBe("");

@@ -34,6 +34,7 @@ Choose the guide for your role. Feature availability depends on environment flag
 - [Contributors, validation and integrity release](implementation/contributors-integrity-release.md).
 - [Editor implementation and rendering evidence](implementation/editor-release.md).
 - [Table authority, views and computed data acceptance](implementation/table-authority-release.md).
+- [Small-team wiki implementation ledger](implementation/small-team-wiki-release.md).
 
 ## Planning
 

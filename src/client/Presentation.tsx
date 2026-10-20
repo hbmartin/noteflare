@@ -23,6 +23,8 @@ export function Presentation({
   const [slides, setSlides] = useState<SlideLayout[]>([]);
   const [index, setIndex] = useState(0);
   const [fullscreen, setFullscreen] = useState(false);
+  const [laser, setLaser] = useState(false);
+  const pointer = useRef<HTMLSpanElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const stage = useRef<HTMLDivElement>(null);
   const close = useRef<HTMLButtonElement>(null);
@@ -115,6 +117,7 @@ export function Presentation({
   useLayoutEffect(() => {
     applyVisibility(slides, index);
     if (stage.current) stage.current.scrollTop = 0;
+    if (pointer.current) pointer.current.hidden = true;
   }, [applyVisibility, slides, index]);
   useEffect(() => {
     const changed = () => setFullscreen(Boolean(document.fullscreenElement));
@@ -189,9 +192,24 @@ export function Presentation({
         <output aria-live="polite">
           Slide {index + 1} of {slides.length + 1}
         </output>
+        <button type="button" aria-pressed={laser} onClick={() => setLaser((value) => !value)}>
+          Laser pointer
+        </button>
       </header>
-      <div className="notes-presentation-stage" ref={stage}>
-        {index === 0 && <h1>{title}</h1>}
+      <div
+        className={`notes-presentation-stage${laser ? " has-laser" : ""}`}
+        ref={stage}
+        onPointerMove={(event) => {
+          if (!laser || !pointer.current) return;
+          pointer.current.style.transform = `translate(${event.clientX}px, ${event.clientY}px)`;
+          pointer.current.hidden = false;
+        }}
+        onPointerLeave={() => {
+          if (pointer.current) pointer.current.hidden = true;
+        }}
+      >
+        {laser && <span className="notes-presentation-laser" ref={pointer} aria-hidden="true" hidden />}
+        {index === 0 && <h1 dir="auto">{title}</h1>}
         <RenderBoundary label="The presentation could not be displayed">
           <BlockNoteView
             editor={editor}
@@ -203,6 +221,7 @@ export function Presentation({
         </RenderBoundary>
       </div>
       <footer>
+        <small>Snapshot captured when opened · reopen to include later changes</small>
         <button type="button" disabled={index === 0} onClick={() => setIndex((value) => value - 1)}>
           Previous slide
         </button>

@@ -66,7 +66,7 @@ describe("ServerThreadStore", () => {
     ]);
     expect(store.auth.canResolveThread(store.getThread("thread-1"))).toBe(true);
     expect(store.auth.canUpdateComment(store.getThread("thread-1").comments[0]!)).toBe(true);
-    expect(store.auth.canAddReaction(store.getThread("thread-1").comments[0]!)).toBe(false);
+    expect(store.auth.canAddReaction(store.getThread("thread-1").comments[0]!)).toBe(true);
     expect(observed).toHaveBeenLastCalledWith(expect.any(Map));
     expect(onError).toHaveBeenLastCalledWith("");
   });

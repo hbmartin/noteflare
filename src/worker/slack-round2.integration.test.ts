@@ -1,3 +1,4 @@
+import { previewSlackLink } from "./slack-link-preview";
 import { verifyHistoryPage } from "./slack-history";
 import { slackAccessAuthorization } from "./slack-identity";
 import { countedD1 } from "../../tests/helpers/count-d1";
@@ -240,6 +241,48 @@ beforeEach(async () => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+describe("viewer-private Slack link previews", () => {
+  async function prepare() {
+    await page();
+    await reference();
+    await env.DB.prepare("UPDATE slack_installations SET scopes=scopes||',users:read' WHERE id='installation'").run();
+    responses["users.info"] = { ok: true, user: { id: "U123", team_id: "T123" } };
+    responses["conversations.members"] = { ok: true, members: ["U123"] };
+    responses["conversations.history"] = {
+      ok: true,
+      messages: [{ ts: "1234567890.123456", text: "Private channel context" }],
+    };
+  }
+  it("returns a transient preview only to a verified current channel member", async () => {
+    await prepare();
+    expect(await previewSlackLink(runtime(), owner, "https://team.slack.com/archives/C123/p1234567890123456")).toEqual({
+      channel: "canonical-notes",
+      text: "Private channel context",
+      timestamp: "1234567890.123456",
+    });
+    expect(calls.some((call) => call.method === "chat.postMessage")).toBe(false);
+    calls = [];
+    responses["conversations.members"] = { ok: true, members: [] };
+    await expect(
+      previewSlackLink(runtime(), owner, "https://team.slack.com/archives/C123/p1234567890123456"),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(calls.some((call) => call.method === "conversations.history")).toBe(false);
+  });
+  it("discards a fetched preview if its identity grant was revoked during the read", async () => {
+    await prepare();
+    const original = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await original(input, init);
+      if (String(input).includes("conversations.history"))
+        await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'").run();
+      return response;
+    });
+    await expect(
+      previewSlackLink(runtime(), owner, "https://team.slack.com/archives/C123/p1234567890123456"),
+    ).rejects.toMatchObject({ status: 403 });
+  });
 });
 
 function settlePosts() {

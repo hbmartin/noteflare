@@ -1,3 +1,4 @@
+import { purgeCommentDrafts } from "./comment-drafts";
 import type { ClientMemberContext, Page, PageKind } from "../shared/types";
 import { fetchUpdates, type IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
@@ -682,6 +683,7 @@ export async function purgingOfflineAccounts() {
 }
 
 export async function forgetOfflineAccount(accountKey: string) {
+  purgeCommentDrafts(accountKey);
   const account = await markOfflineAccountPurging(accountKey);
   const prefix = accountDocumentPrefix(accountKey);
   const entryPrefix = documentRegistryEntryPrefix(accountKey);
@@ -750,6 +752,7 @@ export async function forgetOfflineAccount(accountKey: string) {
     }
     if (registryEntries().length)
       throw new Error("New local document storage appeared during sign-out. Retry removal.");
+    purgeCommentDrafts(accountKey);
     localStorage.removeItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`);
   } catch (error) {
     console.error("Offline document registry could not be cleared", error);

@@ -1,3 +1,4 @@
+import { evictDurableObject } from "cloudflare:test";
 import { enrollAccount } from "../../tests/helpers/security";
 import { docxDocument, docxPng } from "../../tests/helpers/docx";
 import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionContext } from "cloudflare:test";
@@ -2094,6 +2095,7 @@ describe("job execution", () => {
     linked.setAttribute("title", diagram.title);
     source.getXmlFragment("document-store").insert(0, [linked]);
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    await evictDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`));
 
     const context = createExecutionContext();
     const queued = await worker.fetch(
@@ -2154,6 +2156,7 @@ describe("job execution", () => {
     linked.setAttribute("title", diagram.title);
     source.getXmlFragment("document-store").insert(0, [linked]);
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    await evictDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`));
     const quickAction = vi.fn(async (_action: string, options: { html?: string }) => {
       expect(options.html).toContain("Oversized map");
       expect(options.html).not.toContain(`linked-diagrams/${diagram.id}.svg`);
@@ -2251,6 +2254,7 @@ describe("job execution", () => {
     linked.setAttribute("title", diagram.title);
     source.getXmlFragment("document-store").push([linked]);
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    await evictDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`));
 
     const markdownContext = createExecutionContext();
     const markdown = await worker.fetch(
@@ -2330,6 +2334,7 @@ describe("job execution", () => {
       fragment.push([linked]);
     }
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    await evictDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`));
     const context = createExecutionContext();
 
     const queued = await worker.fetch(
@@ -2490,6 +2495,7 @@ describe("job execution", () => {
       source.getXmlFragment("document-store").push([image]);
     }
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    await evictDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`));
 
     const quickAction = vi.fn(async (_action: string, options: { html?: string }) => {
       expect(options.html).toContain("<h1>Welcome</h1>");
@@ -2720,6 +2726,7 @@ describe("job execution", () => {
     imageGroup.insert(0, [imageBlock]);
     source.getXmlFragment("document-store").insert(0, [imageGroup]);
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    await evictDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`));
 
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
     const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });

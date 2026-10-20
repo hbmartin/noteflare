@@ -36,12 +36,30 @@ const grid: TableView = {
 };
 const board: TableView = { ...grid, id: "board", name: "Board", kind: "board", columnId: "State" };
 const calendar: TableView = { ...grid, id: "calendar", name: "Calendar", kind: "calendar", columnId: "Due" };
+class AuthorizedTableSocket extends EventTarget {
+  static OPEN = 1;
+  readyState = 1;
+  constructor() {
+    super();
+    queueMicrotask(() => {
+      if (this.readyState === 1)
+        this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-ready", revision: 1 }) }));
+    });
+  }
+  send() {
+    this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-ready", revision: 1 }) }));
+  }
+  close() {
+    this.readyState = 3;
+  }
+}
 let data: TableQueryResult;
 let failure: Error | null;
 let deniedRead: boolean;
 let writes: TableCommand[];
 let commandDelay: Promise<void> | null;
 beforeEach(() => {
+  vi.stubGlobal("WebSocket", AuthorizedTableSocket);
   writes = [];
   failure = null;
   deniedRead = false;
@@ -185,7 +203,10 @@ beforeEach(() => {
       return { ...data, view: data.views.find((view) => view.id === selected) ?? null };
     });
 });
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 function delayNextCommand() {
   let release!: () => void;
   commandDelay = new Promise<void>((resolve) => {

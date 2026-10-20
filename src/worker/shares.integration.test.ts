@@ -1,3 +1,4 @@
+import { evictDurableObject } from "cloudflare:test";
 import { enrollAccount } from "../../tests/helpers/security";
 import { abortAllDurableObjects, applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -88,6 +89,7 @@ describe("public page shares", () => {
     expect(updated.status).toBe(200);
     const indexedRoot = await SELF.fetch(`http://example.test/share/${key}`);
     expect(indexedRoot.status).toBe(200);
+    expect(indexedRoot.headers.get("x-robots-tag") ?? "").not.toContain("noindex");
     const indexedHtml = await indexedRoot.text();
     expect(indexedHtml).toContain('<meta name="robots" content="index,follow">');
     expect(indexedHtml).not.toContain("Internal diagram");
@@ -179,6 +181,7 @@ describe("public page shares", () => {
     reference.setAttribute("blockId", "system-map-source");
     source.getXmlFragment("document-store").insert(0, [linked, outsideLink, reference]);
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
+    await evictDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`));
 
     const transclusionSource = new Y.Doc();
     const sourceGroup = new Y.XmlElement("blockGroup");
@@ -260,6 +263,7 @@ describe("public page shares", () => {
     ).toBe(404);
 
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(new Y.Doc()));
+    await evictDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`));
     await abortAllDurableObjects();
     const unlinkedThumbnail = await SELF.fetch(`http://example.test${linkedThumbnailUrl}`);
     expect(unlinkedThumbnail.status).toBe(404);
