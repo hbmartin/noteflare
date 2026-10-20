@@ -84,6 +84,32 @@ test("unsupported historical previews and restores leave the live editor writabl
   expect(errors).toEqual([]);
 });
 
+test("remote updates preserve a queued historical restore and finalize it once", async ({ page }) => {
+  await signInOwner(page);
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const results = await page.evaluate(async () => {
+    const fixturePath = "/tests/e2e/fixtures/editor-code-reconciliation.mjs";
+    const fixture = await import(fixturePath);
+    return fixture.restoreSnapshotDuringRemoteUpdate();
+  });
+  expect(results).toEqual(
+    [false, true].flatMap((encoded) =>
+      [1, 3].map((updates) => ({
+        encoded,
+        updates,
+        renders: 1,
+        content: "old",
+        preview: "old",
+        editable: true,
+        cleared: true,
+        undo: 1,
+      })),
+    ),
+  );
+  expect(errors).toEqual([]);
+});
+
 test("ordinary edits inspect changed code scopes and new empty structure needs no code rescan", async ({ page }) => {
   await signInOwner(page);
   const result = await page.evaluate(async () => {
