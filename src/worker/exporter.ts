@@ -262,6 +262,12 @@ async function documentExport(
 
 async function tableExport(env: Env, page: ExportPage): Promise<SerializedExport> {
   const snapshot = await tableTemplateSnapshot(env, page.id);
+  if (snapshot.relations?.definitions.length)
+    throw new HttpError(
+      409,
+      "relation_format_required",
+      "This table contains relations. A compatible format is required before copying or exporting it.",
+    );
   const columns = snapshot.columns;
   const members = await env.DB.prepare(
     "SELECT u.id,u.name FROM user u JOIN workspace_members wm ON wm.user_id=u.id WHERE wm.workspace_id=?",

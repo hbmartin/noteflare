@@ -22,7 +22,7 @@ const mocks = vi.hoisted(() => {
       handlers.set(event, handler as (value: unknown) => void);
     }),
     awareness: { setLocalState: vi.fn() },
-    synced: false,
+    synced: true,
     sendMessage: vi.fn(),
   };
   return {
@@ -40,6 +40,7 @@ const mocks = vi.hoisted(() => {
     editorCreated: vi.fn(),
     documents: [] as Array<import("yjs").Doc>,
     realDocument: false,
+    connectionStatus: null as null | ((status: "offline" | "connecting" | "connected") => void),
   };
 });
 
@@ -55,29 +56,40 @@ vi.mock("./collaboration", async () => ({
       super("Offline document storage did not finish loading.");
     }
   },
-  createCollaboration: vi.fn(() => ({
-    doc: (() => {
-      const doc = new Y.Doc();
-      mocks.documents.push(doc);
-      return mocks.realDocument
-        ? doc
-        : {
-            getMap: vi.fn(() => new Map()),
-            getXmlFragment: vi.fn((name: string) => doc.getXmlFragment(name)),
-            on: vi.fn(),
-            off: vi.fn(),
-          };
-    })(),
-    provider: mocks.provider,
-    indexeddb: { _storeUpdate: mocks.storeUpdate, db: null, _dbsize: 0 },
-    ready: mocks.ready,
-    lateReady: mocks.lateReady,
-    get hasUnsyncedChanges() {
-      return mocks.unsynced;
+  createCollaboration: vi.fn(
+    (
+      _workspace: string,
+      _page: string,
+      _epoch: number,
+      onStatus: (status: "offline" | "connecting" | "connected") => void,
+    ) => {
+      mocks.connectionStatus = onStatus;
+      queueMicrotask(() => onStatus("connected"));
+      return {
+        doc: (() => {
+          const doc = new Y.Doc();
+          mocks.documents.push(doc);
+          return mocks.realDocument
+            ? doc
+            : {
+                getMap: vi.fn(() => new Map()),
+                getXmlFragment: vi.fn((name: string) => doc.getXmlFragment(name)),
+                on: vi.fn(),
+                off: vi.fn(),
+              };
+        })(),
+        provider: mocks.provider,
+        indexeddb: { _storeUpdate: mocks.storeUpdate, db: null, _dbsize: 0 },
+        ready: mocks.ready,
+        lateReady: mocks.lateReady,
+        get hasUnsyncedChanges() {
+          return mocks.unsynced;
+        },
+        destroy: mocks.destroy,
+        stop: mocks.stop,
+      };
     },
-    destroy: mocks.destroy,
-    stop: mocks.stop,
-  })),
+  ),
   loadOfflineCopy: vi.fn(),
   userColor: vi.fn(() => "#2563eb"),
 }));
@@ -103,6 +115,15 @@ vi.mock("@blocknote/mantine", () => ({
   BlockNoteView: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }));
 
+vi.mock("./CommentDrafts", async () => {
+  const { createContext } = await import("react");
+  return {
+    CommentDraftContext: createContext(null),
+    DraftFloatingComposer: () => null,
+    DraftThread: () => null,
+    DraftThreadsSidebar: () => <div data-testid="thread-sidebar" />,
+  };
+});
 vi.mock("@blocknote/react", () => ({
   getDefaultReactSlashMenuItems: () => [],
   SuggestionMenuController: ({
@@ -116,6 +137,8 @@ vi.mock("@blocknote/react", () => ({
     return null;
   },
   ThreadsSidebar: () => <div data-testid="thread-sidebar" />,
+  FloatingComposerController: () => null,
+  FloatingThreadController: () => null,
   FormattingToolbarController: () => null,
   FormattingToolbar: () => null,
   getFormattingToolbarItems: () => [],
@@ -203,6 +226,8 @@ describe("EditorPage close reconciliation", () => {
     mocks.provider.connect.mockReset();
     mocks.provider.disconnect.mockReset();
     mocks.provider.on.mockClear();
+    mocks.provider.synced = true;
+    mocks.connectionStatus = null;
     mocks.ready = Promise.resolve();
     mocks.lateReady = Promise.resolve();
     mocks.slashItems = null;
@@ -213,6 +238,33 @@ describe("EditorPage close reconciliation", () => {
     Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
     localStorage.clear();
   });
+  it("pauses document and title editing until authoritative synchronization completes", async () => {
+    mocks.provider.synced = false;
+    mocks.api.mockResolvedValue({ page });
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("textbox", { name: "Page title" })).toHaveAttribute("readonly");
+    await act(async () => {
+      mocks.handlers.get("sync")?.(true);
+    });
+    expect(screen.getByRole("textbox", { name: "Page title" })).not.toHaveAttribute("readonly");
+    await act(async () => {
+      mocks.connectionStatus?.("offline");
+    });
+    expect(screen.getByRole("textbox", { name: "Page title" })).toHaveAttribute("readonly");
+    expect(screen.getByText("Reading cached copy · connect to edit")).toBeInTheDocument();
+  });
+
   it("discards a presentation snapshot when source permissions change", async () => {
     mocks.api.mockResolvedValue({ page });
     const props = {
@@ -491,7 +543,7 @@ describe("EditorPage close reconciliation", () => {
     );
     await act(async () => Promise.resolve());
     expect(screen.getByLabelText("Page title")).toBeInTheDocument();
-    expect(screen.getByText("Offline")).toBeInTheDocument();
+    expect(screen.getByText("Reading cached copy · connect to edit")).toBeInTheDocument();
     expect(
       screen.getAllByText("Offline storage is unavailable, so editing and collaboration are disabled for this page."),
     ).not.toHaveLength(0);
@@ -767,7 +819,7 @@ describe("EditorPage close reconciliation", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Page details" }));
-    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Add icon" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(message);
   });
@@ -803,12 +855,12 @@ describe("EditorPage close reconciliation", () => {
     expect(await screen.findByText("The sub-page could not be created now.")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Page details" }));
-    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Add icon" }));
     expect(await screen.findByText("The page icon could not be saved.")).toBeInTheDocument();
     expect(screen.getByText("The sub-page could not be created now.")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Page details" }));
-    fireEvent.click(screen.getByRole("button", { name: "Add icon" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Add icon" }));
     await waitFor(() => expect(screen.queryByText("The page icon could not be saved.")).not.toBeInTheDocument());
     expect(screen.getByText("The sub-page could not be created now.")).toBeInTheDocument();
   });

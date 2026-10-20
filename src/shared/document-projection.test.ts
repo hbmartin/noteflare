@@ -4,6 +4,7 @@ import {
   collectLinkedDiagramIds,
   containsLinkedDiagramId,
   projectDocument,
+  projectDocumentHeadings,
   serializeDocument,
   type ProseMirrorJson,
 } from "./document-projection";
@@ -13,6 +14,21 @@ function document(...content: ProseMirrorJson[]): ProseMirrorJson {
 }
 
 describe("structured document projection", () => {
+  it("indexes headings inside nested blocks without promoting body text", () => {
+    const doc = document({
+      type: "blockGroup",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "Body only" }] },
+        { type: "blockGroup", content: [{ type: "heading", content: [{ type: "text", text: "API v2.0" }] }] },
+        { type: "heading2", content: [{ type: "text", text: "Nested heading" }] },
+      ],
+    });
+    expect(projectDocumentHeadings(doc)).toBe("API v2.0 Nested heading");
+    expect(
+      projectDocumentHeadings(document({ type: "heading", content: [{ type: "text", text: "a".repeat(60_000) }] })),
+    ).toHaveLength(50_000);
+  });
+
   it("flattens tabs, exports status and uses request-local stable footnote anchors", () => {
     const doc = document({
       type: "blockGroup",

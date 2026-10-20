@@ -77,6 +77,7 @@ export type ClientMemberContext = Omit<MemberContext, "session"> & {
     tableAuthority?: boolean;
     tableBoard?: boolean;
     tableCalendar?: boolean;
+    tableRelations?: boolean;
     diffDigests?: boolean;
   };
 };
@@ -192,6 +193,12 @@ export type Comment = {
   deletedAt: number | null;
   createdAt: number;
   updatedAt: number;
+  reactions?: Array<{
+    emoji: string;
+    createdAt: number;
+    userIds: string[];
+    users: Array<{ id: string; name: string }>;
+  }>;
 };
 
 export type CommentThread = {

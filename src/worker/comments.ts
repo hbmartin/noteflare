@@ -1,3 +1,4 @@
+import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import { slackThreadFanoutStatements } from "./slack-thread-fanout";
 import type { Comment, CommentAnchor, CommentBody, CommentThread, ProseMirrorJson, Role } from "../shared/types";
 import { flattenDocumentBlocks } from "../shared/notion-blocks";
@@ -240,9 +241,36 @@ async function commentsForThreads(env: Env, threadIds: string[]) {
     .bind(JSON.stringify(threadIds))
     .all<CommentRow>();
   const grouped = new Map<string, Comment[]>();
+  const reactions = await env.DB.prepare(
+    `SELECT reaction.comment_id,reaction.user_id,reaction.emoji,reaction.created_at,u.name
+       FROM comment_reactions reaction JOIN comments c ON c.id=reaction.comment_id
+       JOIN user u ON u.id=reaction.user_id
+      WHERE c.thread_id IN (SELECT value FROM json_each(?)) AND c.deleted_at IS NULL
+      ORDER BY reaction.comment_id,reaction.emoji,reaction.created_at,reaction.user_id`,
+  )
+    .bind(JSON.stringify(threadIds))
+    .all<{
+      comment_id: string;
+      user_id: string;
+      emoji: string;
+      created_at: number;
+      name: string;
+    }>();
+  const byComment = new Map<string, NonNullable<Comment["reactions"]>>();
+  for (const row of reactions.results) {
+    const values = byComment.get(row.comment_id) ?? [];
+    let reaction = values.find((value) => value.emoji === row.emoji);
+    if (!reaction) {
+      reaction = { emoji: row.emoji, createdAt: row.created_at, userIds: [], users: [] };
+      values.push(reaction);
+      byComment.set(row.comment_id, values);
+    }
+    reaction.userIds.push(row.user_id);
+    reaction.users.push({ id: row.user_id, name: row.name });
+  }
   for (const row of rows.results) {
     const comments = grouped.get(row.thread_id) ?? [];
-    comments.push(commentJson(row));
+    comments.push({ ...commentJson(row), reactions: byComment.get(row.id) ?? [] });
     grouped.set(row.thread_id, comments);
   }
   return grouped;
@@ -289,6 +317,54 @@ export async function commentThread(env: Env, member: CommentActor, page: Commen
   const row = await threadRow(env, page, threadId);
   const comments = await commentsForThreads(env, [threadId]);
   return threadJson(row, comments.get(threadId) ?? [], member, page);
+}
+
+export async function setCommentReaction(
+  env: Env,
+  member: CommentActor,
+  page: CommentPage,
+  threadId: string,
+  commentId: string,
+  emoji: unknown,
+  present: boolean,
+) {
+  if (
+    typeof emoji !== "string" ||
+    emoji.length > 64 ||
+    [...new Intl.Segmenter("en", { granularity: "grapheme" }).segment(emoji)].length !== 1 ||
+    !/[\p{Extended_Pictographic}\p{Regional_Indicator}\u20e3]/u.test(emoji)
+  ) {
+    throw new HttpError(422, "invalid_reaction", "Choose a single emoji reaction.");
+  }
+  const exists = await env.DB.prepare(
+    `SELECT c.id FROM comments c JOIN comment_threads t ON t.id=c.thread_id
+      WHERE c.id=? AND c.thread_id=? AND t.page_id=? AND c.deleted_at IS NULL`,
+  )
+    .bind(commentId, threadId, page.id)
+    .first();
+  if (!exists) throw new HttpError(404, "comment_not_found", "Comment not found.");
+  const permission = `EXISTS (SELECT 1 FROM pages p JOIN spaces s ON s.id=p.space_id
+    JOIN workspace_members wm ON wm.workspace_id=p.workspace_id AND wm.user_id=?
+    LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=wm.user_id
+    WHERE p.id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL
+      AND (wm.role='owner' OR s.visibility='workspace' OR sm.user_id IS NOT NULL))`;
+  if (present) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO comment_reactions(comment_id,user_id,emoji,created_at)
+       SELECT c.id,?,?,? FROM comments c WHERE c.id=? AND c.thread_id=? AND c.deleted_at IS NULL
+         AND ${permission}`,
+    )
+      .bind(member.user.id, emoji, Date.now(), commentId, threadId, member.user.id, page.id)
+      .run();
+  } else {
+    await env.DB.prepare(`DELETE FROM comment_reactions WHERE comment_id=? AND user_id=? AND emoji=? AND ${permission}`)
+      .bind(commentId, member.user.id, emoji, member.user.id, page.id)
+      .run();
+  }
+  if (!(await env.DB.prepare(`SELECT 1 WHERE ${permission}`).bind(member.user.id, page.id).first())) {
+    throw new HttpError(403, "comment_forbidden", "You no longer have access to this page.");
+  }
+  return commentThread(env, member, page, threadId);
 }
 
 function watchPageStatement(database: D1Database, page: CommentPage, userId: string, timestamp: number) {
@@ -397,6 +473,7 @@ export async function addCommentReply(
   bodyValue: unknown,
   requestedParentId?: unknown,
   source?: { receiptId: string; commentId: string; guard: D1PreparedStatement; slackOrderUs?: number },
+  browser?: { commentId: string; receipt: D1PreparedStatement },
 ) {
   const thread = await threadRow(env, page, threadId);
   const body = validatedCommentBody(bodyValue);
@@ -417,7 +494,7 @@ export async function addCommentReply(
           .first<{ id: string }>()
       )?.id ?? null;
   }
-  const commentId = source?.commentId ?? crypto.randomUUID();
+  const commentId = source?.commentId ?? browser?.commentId ?? crypto.randomUUID();
   const timestamp = Date.now();
   const mentionedUserIds = commentMentionUserIds(body.body);
   const participantIds = (await threadParticipantIds(env, threadId)).filter((id) => !mentionedUserIds.includes(id));
@@ -494,6 +571,7 @@ export async function addCommentReply(
         ]
       : []),
     ...refreshPageSearchV2Statements(env.DB, page.id),
+    ...(browser ? [browser.receipt] : []),
   ]);
   return commentThread(env, member, page, threadId);
 }
@@ -762,4 +840,59 @@ export async function migrateLegacyComments(env: Env, page: CommentPage) {
         error,
       ),
     );
+}
+
+/** A lost response can be retried explicitly without creating another comment or external fanout. */
+export async function commentOperation(
+  env: Env,
+  member: CommentActor,
+  page: CommentPage,
+  operationId: string | null,
+  expectedEpoch: string | null,
+  input: unknown,
+  threadId: string | null,
+  create: (identity: { threadId: string; commentId: string; receipt: D1PreparedStatement }) => Promise<CommentThread>,
+) {
+  if (expectedEpoch !== null && Number(expectedEpoch) !== page.content_epoch)
+    throw new HttpError(
+      409,
+      "comment_epoch_changed",
+      "This page was restored. Review your draft before posting it again.",
+    );
+  if (!operationId)
+    return create({
+      threadId: crypto.randomUUID(),
+      commentId: crypto.randomUUID(),
+      receipt: env.DB.prepare("SELECT 1"),
+    });
+  if (!ID_PATTERN.test(operationId))
+    throw new HttpError(422, "invalid_comment_operation", "Invalid comment operation.");
+  const hash = await sha256Hex(canonicalJson({ pageId: page.id, epoch: page.content_epoch, threadId, input }));
+  const read = async () => {
+    const previous = await env.DB.prepare("SELECT * FROM comment_operations WHERE user_id=? AND operation_id=?")
+      .bind(member.user.id, operationId)
+      .first<{ page_id: string; content_epoch: number; thread_id: string; request_hash: string }>();
+    if (!previous) return null;
+    if (previous.request_hash !== hash || previous.page_id !== page.id || previous.content_epoch !== page.content_epoch)
+      throw new HttpError(
+        409,
+        "idempotency_key_reused",
+        "This operation describes another comment. Review your draft.",
+      );
+    return commentThread(env, member, page, previous.thread_id);
+  };
+  const previous = await read();
+  if (previous) return previous;
+  const identity = await sha256Hex(`${member.user.id}:${operationId}`),
+    targetThread = threadId ?? `thread-${identity}`;
+  const receipt = env.DB.prepare(
+    "INSERT INTO comment_operations(user_id,operation_id,page_id,content_epoch,thread_id,request_hash) VALUES(?,?,?,?,?,?)",
+  ).bind(member.user.id, operationId, page.id, page.content_epoch, targetThread, hash);
+  try {
+    return await create({ threadId: targetThread, commentId: `comment-${identity}`, receipt });
+  } catch (error) {
+    const committed = await read();
+    if (committed) return committed;
+    throw error;
+  }
 }

@@ -54,6 +54,7 @@ export function WorkspaceTree({
   revealRequest,
   onRevealHandled,
   treeReady = true,
+  onVisiblePagesChanged,
 }: {
   nodes: PageNode[];
   selectedId: string | null;
@@ -67,6 +68,7 @@ export function WorkspaceTree({
   revealRequest?: { id: string; sequence: number } | undefined;
   onRevealHandled?: (sequence: number) => void;
   treeReady?: boolean;
+  onVisiblePagesChanged?: (ids: string[]) => void;
 }) {
   const [sorting, setSorting] = useState<Record<string, BranchSort>>(() =>
     readPreference(`${preferenceKey}:sorting`, {}),
@@ -136,13 +138,23 @@ export function WorkspaceTree({
   }, [revealRequest, collapsed, nodes, onRevealHandled, treeReady]);
   const toggle = (id: string) =>
     setCollapsed((current) => (current.includes(id) ? current.filter((x) => x !== id) : [...current, id]));
-  const visible: PageNode[] = [];
-  const flatten = (items: PageNode[]) =>
-    items.forEach((node) => {
-      visible.push(node);
-      if (!collapsed.includes(node.id)) flatten(node.children);
-    });
-  flatten(nodes);
+  const visible = useMemo(() => {
+    const result: PageNode[] = [];
+    const hidden = new Set(collapsed);
+    const flatten = (items: PageNode[]) => {
+      for (const node of items) {
+        result.push(node);
+        if (!hidden.has(node.id)) flatten(node.children);
+      }
+    };
+    flatten(nodes);
+    return result;
+  }, [nodes, collapsed]);
+  useEffect(() => {
+    onVisiblePagesChanged?.(visible.map((page) => page.id));
+  }, [visible, onVisiblePagesChanged]);
+  const positions = useMemo(() => new Map(visible.map((node, index) => [node.id, index])), [visible]);
+  const focusedId = focused && positions.has(focused) ? focused : visible[0]?.id;
   const focus = (id: string | undefined) => {
     if (id) {
       setFocused(id);
@@ -160,7 +172,7 @@ export function WorkspaceTree({
         aria-selected={selectedId === node.id}
         aria-expanded={node.children.length ? !collapsed.includes(node.id) : undefined}
         data-tree-page={node.id}
-        tabIndex={node.id === (visible.some((p) => p.id === focused) ? focused : visible[0]?.id) ? 0 : -1}
+        tabIndex={node.id === focusedId ? 0 : -1}
         onFocus={(event) => {
           if (event.target === event.currentTarget) setFocused(node.id);
         }}
@@ -176,7 +188,7 @@ export function WorkspaceTree({
         }}
         onKeyDown={(event) => {
           if (event.target !== event.currentTarget) return;
-          const position = visible.findIndex((p) => p.id === node.id);
+          const position = positions.get(node.id) ?? -1;
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             return;

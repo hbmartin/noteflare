@@ -125,3 +125,57 @@ test("Trash polls long backoff at sixty seconds, active work at five, and pauses
   await page.clock.runFor(120_000);
   expect(reads).toBe(3);
 });
+
+test("Trash explains dependency and state pauses and removes recovered jobs on refresh", async ({ page }) => {
+  await signInOwner(page);
+  let completed = false;
+  await page.route("**/api/deletion-jobs**", (route) =>
+    route.fulfill({
+      json: {
+        jobs: completed
+          ? []
+          : [
+              {
+                id: "dependent",
+                rootPageId: "detail",
+                title: "Dependent row",
+                pageCount: 1,
+                phase: "rows",
+                status: "blocked",
+                reasonCode: "deletion_dependency_blocked",
+                reason:
+                  "Deletion is paused until the containing table deletion recovers. It will resume automatically after the original purge is verified.",
+                nextAttemptAt: null,
+                createdAt: 1,
+                updatedAt: 1,
+                canRetry: true,
+              },
+              {
+                id: "state",
+                rootPageId: "state-root",
+                title: "State conflict",
+                pageCount: 1,
+                phase: "cleanup",
+                status: "blocked",
+                reasonCode: "deletion_state_conflict",
+                reason: "Deletion is paused because its cleanup state needs repair before an owner recheck.",
+                nextAttemptAt: null,
+                createdAt: 1,
+                updatedAt: 1,
+                canRetry: true,
+              },
+            ],
+        nextCursor: null,
+      },
+    }),
+  );
+  await openNavigation(page);
+  await page.getByRole("button", { name: "Trash", exact: true }).click();
+  const section = page.getByRole("region", { name: "Pending permanent deletions" });
+  await expect(section.getByText(/resume automatically after the original purge/)).toBeVisible();
+  await expect(section.getByText(/cleanup state needs repair/)).toBeVisible();
+  await expect(section.getByRole("button", { name: "Restore" })).toHaveCount(0);
+  completed = true;
+  await section.getByRole("button", { name: "Refresh pending deletions" }).click();
+  await expect(section.getByText("No pending permanent deletions.")).toBeVisible();
+});

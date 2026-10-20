@@ -89,6 +89,25 @@ beforeEach(async () => {
 });
 
 describe("search v2", () => {
+  it("ranks heading matches ahead of ordinary body matches and preserves permission filtering", async () => {
+    const installed = await bootstrap();
+    const body = await createPage(installed.cookie, "Reference", installed.generalId);
+    const heading = await createPage(installed.cookie, "Guide", installed.generalId);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE pages SET plain_text='Zebra protocol reference',headings_text='' WHERE id=?").bind(
+        body.id,
+      ),
+      env.DB.prepare(
+        "UPDATE pages SET plain_text='Zebra protocol reference',headings_text='Zebra protocol' WHERE id=?",
+      ).bind(heading.id),
+      ...refreshPageSearchV2Statements(env.DB, body.id),
+      ...refreshPageSearchV2Statements(env.DB, heading.id),
+    ]);
+    const result = await (await SELF.fetch(request(installed.cookie, "/api/search?q=Zebra"))).json<SearchResponse>();
+    expect(result.results.map((item) => item.page.id)).toEqual([heading.id, body.id]);
+    expect(result.results[0]!.snippet).toEqual({ source: "body", text: "Zebra protocol" });
+  });
+
   it.each(["rows", "cleanup"] as const)(
     "hides accepted %s deletions from archived listings while retaining staging and unrelated pages",
     async (phase) => {
@@ -176,8 +195,20 @@ describe("search v2", () => {
       env.DB,
       env.TEST_MIGRATIONS!.filter((item) => item.name < migration.name),
     );
-    const installed = await bootstrap();
-    const target = await createPage(installed.cookie, "Ａｒｃｈｉｔｅｃｔｕｒｅ", installed.generalId);
+    // Seed the historical schema without running a newer worker against it.
+    const target = { id: "old-page" };
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('old-user','Owner','old@example.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('old-workspace','Old workspace',1)"),
+      env.DB.prepare(
+        "INSERT INTO spaces(id,workspace_id,name,slug,position,created_at,updated_at) VALUES('old-space','old-workspace','Old space','old-space','a0',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at) VALUES(?,'old-workspace','old-space','document','a0','Ａｒｃｈｉｔｅｃｔｕｒｅ','old-user',1,1)",
+      ).bind(target.id),
+    ]);
     await env.DB.prepare("UPDATE page_title_trigrams SET normalized_title='architecture' WHERE page_id=?")
       .bind(target.id)
       .run();
@@ -214,10 +245,9 @@ describe("search v2", () => {
       env.DB,
       env.TEST_MIGRATIONS!.filter((item) => item.name > migration.name),
     );
-    const found = await (
-      await SELF.fetch(request(installed.cookie, "/api/search?q=architecure"))
-    ).json<SearchResponse>();
-    expect(found.results.map((result) => result.page.id)).toEqual([target.id]);
+    expect(await env.DB.prepare("SELECT headings_text FROM pages WHERE id=?").bind(target.id).first()).toEqual({
+      headings_text: "",
+    });
   });
 
   it("keeps trigram content synchronized through staging, publication, template changes and deletion", async () => {

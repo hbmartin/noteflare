@@ -413,3 +413,74 @@ export async function rejectHistoricalCode() {
   }
   return results;
 }
+
+/** A real peer update arrives synchronously before the scheduled history callback. */
+export async function restoreSnapshotDuringRemoteUpdate() {
+  const schema = new Schema({
+    nodes: {
+      doc: { content: "codeBlock+" },
+      codeBlock: { content: "text*", code: true, toDOM: () => ["pre", ["code", 0]] },
+      text: {},
+    },
+  });
+  const results = [];
+  for (const encoded of [false, true])
+    for (const updates of [1, 3]) {
+      const doc = new Y.Doc({ gc: false }),
+        root = doc.getXmlFragment("document-store"),
+        code = new Y.XmlElement("codeBlock"),
+        text = new Y.XmlText();
+      text.insert(0, "old");
+      code.insert(0, [text]);
+      root.insert(0, [code]);
+      const old = encoded ? Y.encodeStateAsUpdateV2(doc) : Y.snapshot(doc);
+      text.delete(0, 3);
+      text.insert(0, "live");
+      const initial = initProseMirrorDoc(root, schema),
+        host = document.createElement("section");
+      document.body.appendChild(host);
+      const view = new EditorView(host, {
+        state: EditorState.create({
+          schema,
+          doc: initial.doc,
+          plugins: [ySyncPlugin(root, { mapping: initial.meta.mapping })],
+        }),
+      });
+      const binding = ySyncPluginKey.getState(view.state).binding,
+        render = Reflect.get(binding, "_renderSnapshot").bind(binding);
+      let renders = 0;
+      Reflect.set(binding, "_renderSnapshot", (...args) => {
+        renders++;
+        return render(...args);
+      });
+      const undo = new Y.UndoManager(root, { trackedOrigins: new Set([ySyncPluginKey]), captureTimeout: 0 }),
+        peer = new Y.Doc({ gc: false });
+      try {
+        Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+        view.dispatch(view.state.tr.setMeta(ySyncPluginKey, { snapshot: old, prevSnapshot: old, restore: true }));
+        for (let index = 0; index < updates; index++) {
+          peer.getXmlFragment("document-store").get(0).get(0).insert(0, "remote-");
+          Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer), "peer");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const state = ySyncPluginKey.getState(view.state);
+        results.push({
+          encoded,
+          updates,
+          renders,
+          content: text.toString(),
+          preview: view.state.doc.textContent,
+          editable: view.editable,
+          cleared: state.snapshot === null && state.prevSnapshot === null && state.restore === null,
+          undo: undo.undoStack.length,
+        });
+      } finally {
+        undo.destroy();
+        peer.destroy();
+        view.destroy();
+        host.remove();
+        doc.destroy();
+      }
+    }
+  return results;
+}

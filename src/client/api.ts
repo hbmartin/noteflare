@@ -3,6 +3,7 @@ import { createAuthClient } from "better-auth/react";
 import { twoFactorClient } from "better-auth/client/plugins";
 import { passkeyClient } from "@better-auth/passkey/client";
 import { observeWorkerResponse, reportClientError } from "./telemetry";
+import { retainPendingWork } from "./pending-work";
 
 export const authClient = createAuthClient({
   baseURL: window.location.origin,
@@ -234,6 +235,23 @@ export function notifyApiUnauthorized(error: ApiClientError, requestEpoch: numbe
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && !navigator.onLine) {
+    throw new ApiClientError(
+      503,
+      "offline_read_only",
+      "Connect to make changes. Your cached copy is available for reading.",
+    );
+  }
+  const release = ["GET", "HEAD", "OPTIONS"].includes(method) ? () => undefined : retainPendingWork();
+  try {
+    return await apiRequest<T>(path, init);
+  } finally {
+    release();
+  }
+}
+
+async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const requestEpoch = unauthorizedRequestEpoch;
   const headers = new Headers(init?.headers);
   if (init?.body && !(init.body instanceof FormData)) headers.set("content-type", "application/json");

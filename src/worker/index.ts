@@ -1,3 +1,4 @@
+import { previewSlackLink } from "./slack-link-preview";
 import { TableAuthority } from "./table-authority";
 import {
   collaborativeTable,
@@ -84,16 +85,20 @@ import {
 } from "./integrations";
 import {
   addCommentReply,
+  commentOperation,
   commentThread,
   createCommentThread,
   listCommentThreads,
   migrateLegacyComments,
   setThreadResolved,
+  setCommentReaction,
   softDeleteComment,
   updateComment,
   type CommentPage,
 } from "./comments";
 import { Document } from "./document";
+import { flushRealtimeRevocations, registerRealtimeRoom } from "./realtime-access";
+import { backfillSearchHeadings } from "./search-heading-backfill";
 import type { Env, MemberContext } from "./env";
 import {
   HttpError,
@@ -1552,13 +1557,14 @@ app.get("/api/me", async (c) => {
     role: member.role,
     features: {
       expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true",
-      offlineEditing: c.env.OFFLINE_EDITING_ENABLED === "true",
+      offlineEditing: false,
       blockLinks: c.env.BLOCK_LINKS_ENABLED === "true",
       liveDiagramEmbeds: c.env.LIVE_DIAGRAM_EMBEDS_ENABLED === "true",
       editorBlocksV2: c.env.EDITOR_BLOCKS_V2_ENABLED === "true",
       tableAuthority: c.env.TABLE_AUTHORITY_ENABLED === "true",
       tableBoard: c.env.TABLE_BOARD_ENABLED === "true",
       tableCalendar: c.env.TABLE_CALENDAR_ENABLED === "true",
+      tableRelations: c.env.TABLE_RELATIONS_ENABLED === "true",
       diffDigests: c.env.DIFF_DIGESTS_ENABLED === "true",
       workspaceActivity: c.env.WORKSPACE_ACTIVITY_ENABLED === "true",
     },
@@ -3672,6 +3678,24 @@ app.delete("/api/pages/:pageId/share", async (c) => {
   return c.body(null, 204);
 });
 
+app.post("/api/security/realtime/reconcile", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const complete = await flushRealtimeRevocations(c.env, member.workspace.id);
+  if (!complete)
+    throw new HttpError(503, "realtime_revocation_pending", "Live access is still being refreshed. Retry shortly.");
+  return c.json({ complete });
+});
+
+app.post("/api/slack/link-preview", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const body = await jsonBody(c.req.raw);
+  const preview = await previewSlackLink(c.env, member, body.url);
+  await requireMember(c.req.raw, c.env);
+  c.header("Cache-Control", "private, no-store");
+  return c.json({ preview });
+});
+
 app.get("/api/pages/:id/comments", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
@@ -3703,7 +3727,16 @@ app.post("/api/pages/:id/comments", async (c) => {
     }
     anchor = { kind: "diagram", target: value.target, targetId: value.targetId };
   }
-  const thread = await createCommentThread(c.env, member, scopedPage, initialComment.body, anchor);
+  const thread = await commentOperation(
+    c.env,
+    member,
+    scopedPage,
+    c.req.header("x-notes-operation-id") ?? null,
+    c.req.header("x-notes-content-epoch") ?? null,
+    { body: initialComment.body, anchor },
+    null,
+    (source) => createCommentThread(c.env, member, scopedPage, initialComment.body, anchor, null, source),
+  );
   sendCommentMutationEvents(c, member.workspace.id, page.id);
   return c.json({ thread }, 201);
 });
@@ -3766,7 +3799,17 @@ async function createReplyResponse(c: Context<{ Bindings: Env }>, threadId: stri
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForCommentThread(c.env, member, threadId);
   const comment = object(body.comment);
-  const thread = await addCommentReply(c.env, member, commentPage(page), threadId, comment.body, body.parentId);
+  const scopedPage = commentPage(page);
+  const thread = await commentOperation(
+    c.env,
+    member,
+    scopedPage,
+    c.req.header("x-notes-operation-id") ?? null,
+    c.req.header("x-notes-content-epoch") ?? null,
+    { body: comment.body, parentId: body.parentId ?? null },
+    threadId,
+    (source) => addCommentReply(c.env, member, scopedPage, threadId, comment.body, body.parentId, undefined, source),
+  );
   sendCommentMutationEvents(c, member.workspace.id, page.id);
   return c.json({ thread }, 201);
 }
@@ -3843,6 +3886,21 @@ async function resolutionResponse(c: Context<{ Bindings: Env }>, threadId: strin
 app.post("/api/comment-threads/:id/resolve", async (c) => resolutionResponse(c, c.req.param("id"), true));
 app.post("/api/comment-threads/:id/reopen", async (c) => resolutionResponse(c, c.req.param("id"), false));
 app.post("/api/comment-threads/:id/unresolve", async (c) => resolutionResponse(c, c.req.param("id"), false));
+
+async function reactionResponse(c: Context<{ Bindings: Env }>, threadId: string, commentId: string, present: boolean) {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForCommentThread(c.env, member, threadId);
+  const body = await jsonBody(c.req.raw);
+  const thread = await setCommentReaction(c.env, member, commentPage(page), threadId, commentId, body.emoji, present);
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
+  return c.json({ thread });
+}
+app.put("/api/comment-threads/:id/comments/:commentId/reactions", (c) =>
+  reactionResponse(c, c.req.param("id"), c.req.param("commentId"), true),
+);
+app.delete("/api/comment-threads/:id/comments/:commentId/reactions", (c) =>
+  reactionResponse(c, c.req.param("id"), c.req.param("commentId"), false),
+);
 
 app.get("/api/notifications", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
@@ -4769,19 +4827,29 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   const rootId = c.req.param("id");
   const existing = await acceptedDeletionJob(c.env, member.workspace.id, rootId);
   if (existing) {
-    await queueDeletionRetry(c.env, member.workspace.id, existing.jobId);
-    c.executionCtx.waitUntil(
-      processDeletionJob(c.env, existing.jobId).catch((error) => {
-        logger.error(
-          "deletion.cleanup.failed",
-          "deletion",
-          "Immediate deletion cleanup failed.",
-          { jobId: existing.jobId },
-          error,
-        );
-      }),
+    const retry = await queueDeletionRetry(c.env, member.workspace.id, existing.jobId);
+    if (retry !== "missing")
+      c.executionCtx.waitUntil(
+        processDeletionJob(c.env, existing.jobId).catch((error) => {
+          logger.error(
+            "deletion.cleanup.failed",
+            "deletion",
+            "Immediate deletion cleanup failed.",
+            { jobId: existing.jobId },
+            error,
+          );
+        }),
+      );
+    return c.json(
+      {
+        ok: true,
+        jobId: existing.jobId,
+        replayed: true,
+        pageIds: existing.pageIds,
+        cleanupPending: retry !== "missing",
+      },
+      202,
     );
-    return c.json({ ok: true, pageIds: existing.pageIds, cleanupPending: true }, 202);
   }
   const page = await pageForMember(c.env, member, rootId, true);
   if (page.archived_at === null)
@@ -4794,7 +4862,7 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
       logger.error("deletion.cleanup.failed", "deletion", "Immediate deletion cleanup failed.", { jobId }, error);
     }),
   );
-  return c.json({ ok: true, pageIds, cleanupPending: true }, 202);
+  return c.json({ ok: true, jobId, pageIds, cleanupPending: true }, 202);
 });
 
 app.get("/api/search", async (c) => {
@@ -5978,6 +6046,19 @@ app.post("/api/tables/:pageId/commands", async (c) => {
     await tableCommand(c.env, member, c.req.param("pageId"), (await jsonBody(c.req.raw)) as unknown as TableCommand),
   );
 });
+app.get("/api/tables/:pageId/relation-backlinks", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return tableFetch(c.env, member, c.req.param("pageId"), `/relation-backlinks${new URL(c.req.url).search}`);
+});
+app.get("/api/tables/:pageId/relations", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return tableFetch(c.env, member, c.req.param("pageId"), `/relations${new URL(c.req.url).search}`);
+});
+app.get("/api/tables/:pageId/relation-inputs", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return tableFetch(c.env, member, c.req.param("pageId"), `/relation-inputs${new URL(c.req.url).search}`);
+});
+
 app.get("/api/tables/:pageId/query", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const result = await queryTable(c.env, member, c.req.param("pageId"), new URL(c.req.url).searchParams.toString());
@@ -7037,6 +7118,23 @@ async function handlePartyRequest(request: Request, env: Env) {
       connectionRole = member.role;
     }
     const expiresAt = Math.min(member.session.expiresAt.getTime(), now() + 5 * 60_000);
+    const authGeneration = await registerRealtimeRoom(env, member.workspace.id, isDocument ? room : null, expiresAt);
+    // Registration precedes this reread. A concurrent change either denies here
+    // or fences this registered generation before reporting completion.
+    const currentMember = await requireMember(request, env);
+    if (currentMember.session.id !== member.session.id || currentMember.workspace.id !== member.workspace.id) {
+      throw new HttpError(401, "unauthorized", "Sign in again to reconnect.");
+    }
+    if (isDocument) {
+      const ids = documentRoom(room)!;
+      const currentPage = await pageForMember(env, currentMember, ids.pageId);
+      if (currentPage.content_epoch !== ids.epoch)
+        throw new HttpError(409, "stale_epoch", "Reload this document version.");
+      connectionRole =
+        currentPage.kind === "diagram" && url.searchParams.get("mode") === "read"
+          ? "viewer"
+          : (currentPage.effective_role ?? currentMember.role);
+    } else connectionRole = currentMember.role;
     const placement = locationHint(member.workspace.locationHint ?? undefined);
     // Awaited so a rejection from the room fetch is enveloped and logged
     // below instead of escaping this handler as an unlogged runtime 500.
@@ -7044,11 +7142,18 @@ async function handlePartyRequest(request: Request, env: Env) {
       ...(placement ? { locationHint: placement } : {}),
       onBeforeConnect(incoming) {
         const headers = new Headers(incoming.headers);
-        for (const name of ["x-notes-user-id", "x-notes-role", "x-notes-expires-at", "x-notes-internal"])
+        for (const name of [
+          "x-notes-user-id",
+          "x-notes-role",
+          "x-notes-expires-at",
+          "x-notes-internal",
+          "x-notes-auth-generation",
+        ])
           headers.delete(name);
         headers.set("x-notes-user-id", member.user.id);
         headers.set("x-notes-role", connectionRole ?? member.role);
         headers.set("x-notes-expires-at", String(expiresAt));
+        headers.set("x-notes-auth-generation", String(authGeneration));
         for (const [name, value] of Object.entries(correlationHeaders())) headers.set(name, value);
         return new Request(incoming, { headers });
       },
@@ -7286,7 +7391,27 @@ export default {
         try {
           const handle = async () => {
             const party = await handlePartyRequest(request, env);
-            return party ?? app.fetch(request, env, context);
+            if (party) return party;
+            const result = await app.fetch(request, env, context);
+            if (
+              !["GET", "HEAD", "OPTIONS"].includes(request.method) &&
+              /^\/api\/(members|spaces|pages|auth|security)(?:\/|$)/.test(new URL(request.url).pathname) &&
+              !(await flushRealtimeRevocations(env))
+            ) {
+              const headers = new Headers(result.headers);
+              headers.delete("content-length");
+              headers.set("retry-after", "2");
+              return Response.json(
+                {
+                  error: {
+                    code: "realtime_revocation_pending",
+                    message: "The access change was saved. Live access is still being refreshed; retry shortly.",
+                  },
+                },
+                { status: 503, headers },
+              );
+            }
+            return result;
           };
           response = context.tracing
             ? await context.tracing.enterSpan("notes.route_request", async (span) => {
@@ -7317,6 +7442,7 @@ export default {
           throw error;
         }
         const headers = new Headers(response.headers);
+        if (!new URL(request.url).pathname.startsWith("/share/")) headers.set("X-Robots-Tag", "noindex, nofollow");
         headers.set("x-request-id", requestId);
         headers.set("x-worker-version", env.CF_VERSION_METADATA?.id ?? "local");
         const contentLengthHeader = headers.get("content-length");
@@ -7371,7 +7497,11 @@ export default {
           await pruneSlackSecurityRecords(env);
         },
         webhook_history: () => pruneWebhookHistory(env),
-        security_state: () => pruneSecurityState(env),
+        search_headings: () => backfillSearchHeadings(env),
+        security_state: async () => {
+          await pruneSecurityState(env);
+          if (!(await flushRealtimeRevocations(env))) throw new Error("Live access revocation is still pending.");
+        },
         oauth_security_records: () => pruneOAuthSecurityRecords(env),
         mcp_staged_pages: () => pruneStagedMcpPages(env),
         table_search_values: async () => {

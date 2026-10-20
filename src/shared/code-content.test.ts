@@ -166,6 +166,90 @@ describe("legacy code content normalization", () => {
     );
   });
 
+  it.each(["cjs", "esm"])("retains rejected validation across repeated %s reads", (format) => {
+    const imports =
+      format === "cjs"
+        ? `const fs=require('node:fs'),M=require('node:module'),path=require('node:path'),Y=require('yjs'),{Schema}=require('prosemirror-model'),filename=require.resolve('y-prosemirror'),pkg=new M(filename,module);pkg.filename=filename;pkg.paths=M._nodeModulePaths(path.dirname(filename));pkg._compile(fs.readFileSync(filename,'utf8')+';exports.readCode=createNodeFromYElement;',filename);const p=pkg.exports,readCode=p.readCode;`
+        : `import * as Y from 'yjs';import {Schema} from 'prosemirror-model';import * as p from 'y-prosemirror';import {createRequire} from 'node:module';import {pathToFileURL} from 'node:url';import path from 'node:path';const require=createRequire(import.meta.url),{createNodeFromYElement:readCode}=await import(pathToFileURL(path.resolve(path.dirname(require.resolve('y-prosemirror')),'../src/plugins/sync-plugin.js')));`;
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema=new Schema({nodes:{doc:{content:'codeBlock+'},codeBlock:{content:'text*'},text:{}}}),results=[];
+      for(const initialFull of [false,true]){
+        const doc=new Y.Doc(),root=doc.getXmlFragment('document-store'),code=new Y.XmlElement('codeBlock'),text=new Y.XmlText();text.insert(0,'safe');code.insert(0,[text]);root.insert(0,[code]);
+        const initial=p.initProseMirrorDoc(root,schema),binding=new p.ProsemirrorBinding(root,initial.meta.mapping);
+        // Isolate the retained reader cache from the separate live-error latch.
+        binding.beforeAllTransactions=()=>{};binding._observeFunction=()=>{};binding.initView({});if(!initialFull)binding._checkCodeContent(root);
+        text.insertEmbed(2,false);const before=Buffer.from(Y.encodeStateAsUpdate(doc)),errors=[];
+        for(let attempt=0;attempt<3;attempt++){try{readCode(code,schema,binding);errors.push(null);}catch(error){errors.push(error.code);}}
+        results.push({initialFull,errors,unchanged:before.equals(Buffer.from(Y.encodeStateAsUpdate(doc))),length:text.length});binding.destroy();doc.destroy();
+      }console.log(JSON.stringify(results));`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual(
+      [false, true].map((initialFull) => ({
+        initialFull,
+        errors: Array(3).fill("unsupported_code_content"),
+        unchanged: true,
+        length: 5,
+      })),
+    );
+  });
+
+  it.each(["cjs", "esm"])("preserves pending restore intent through remote updates in %s", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const {JSDOM}=require("jsdom"),Y=require("yjs"),{Schema}=require("prosemirror-model"),{EditorState}=require("prosemirror-state"),{EditorView}=require("prosemirror-view"),p=require("y-prosemirror");'
+        : 'import {JSDOM} from "jsdom";import * as Y from "yjs";import {Schema} from "prosemirror-model";import {EditorState} from "prosemirror-state";import {EditorView} from "prosemirror-view";import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const dom=new JSDOM('<!doctype html><div id="editor"></div>');for(const key of ['window','document','MutationObserver','HTMLElement','Node','Element'])globalThis[key]=key==='window'?dom.window:key==='document'?dom.window.document:dom.window[key];globalThis.getComputedStyle=dom.window.getComputedStyle.bind(dom.window);
+      const schema=new Schema({nodes:{doc:{content:'codeBlock+'},codeBlock:{content:'text*',code:true,toDOM:()=>['pre',['code',0]]},text:{}}}),results=[];
+      for(const encoded of [false,true])for(const updates of [1,3])for(const mode of ['restore','preview','exit','destroy']){
+        const doc=new Y.Doc({gc:false}),root=doc.getXmlFragment('document-store'),code=new Y.XmlElement('codeBlock'),text=new Y.XmlText();text.insert(0,'old');code.insert(0,[text]);root.insert(0,[code]);const old=encoded?Y.encodeStateAsUpdateV2(doc):Y.snapshot(doc);text.delete(0,3);text.insert(0,'live');
+        const initial=p.initProseMirrorDoc(root,schema),plugin=p.ySyncPlugin(root,{mapping:initial.meta.mapping}),view=new EditorView(document.querySelector('#editor'),{state:EditorState.create({schema,doc:initial.doc,plugins:[plugin]})}),binding=p.ySyncPluginKey.getState(view.state).binding;
+        const manager=new Y.UndoManager(root,{trackedOrigins:new Set([p.ySyncPluginKey]),captureTimeout:0}),peer=new Y.Doc({gc:false});Y.applyUpdate(peer,Y.encodeStateAsUpdate(doc));
+        const callbacks=[],original=setTimeout;let renders=0;const render=binding._renderSnapshot.bind(binding);binding._renderSnapshot=(...args)=>{renders++;return render(...args);};
+        globalThis.setTimeout=(fn,ms,...args)=>ms===0?(callbacks.push(()=>fn(...args)),0):original(fn,ms,...args);
+        try{
+          view.dispatch(view.state.tr.setMeta(p.ySyncPluginKey,{snapshot:old,prevSnapshot:old,restore:true}));
+          for(let update=0;update<updates;update++){peer.getXmlFragment('document-store').get(0).get(0).insert(0,'x');Y.applyUpdate(doc,Y.encodeStateAsUpdate(peer),'peer');}
+          if(mode==='preview')binding.renderSnapshot(old,old);if(mode==='exit')binding.unrenderSnapshot();if(mode==='destroy')view.destroy();
+          for(let index=0;index<callbacks.length;index++){if(index>20)throw new Error('Unbounded snapshot scheduling');callbacks[index]();}
+        }finally{globalThis.setTimeout=original;}
+        const state=p.ySyncPluginKey.getState(view.state);results.push({encoded,updates,mode,renders,text:text.toString(),preview:state.snapshot!=null,restore:state.restore!=null,undo:manager.undoStack.length,editable:mode==='destroy'?null:view.editable});
+        if(mode!=='destroy')view.destroy();manager.destroy();peer.destroy();doc.destroy();
+      }dom.window.close();console.log(JSON.stringify(results));`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual(
+      [false, true].flatMap((encoded) =>
+        [1, 3].flatMap((updates) =>
+          ["restore", "preview", "exit", "destroy"].map((mode) => ({
+            encoded,
+            updates,
+            mode,
+            renders: ["restore", "preview"].includes(mode) ? 1 : 0,
+            text: mode === "restore" ? "old" : "x".repeat(updates) + "live",
+            preview: ["preview", "destroy"].includes(mode),
+            restore: mode === "destroy",
+            undo: mode === "restore" ? 1 : 0,
+            editable: mode === "destroy" ? null : mode !== "preview",
+          })),
+        ),
+      ),
+    );
+  });
+
   it.each(["cjs", "esm"])("seeds %s cursors without scanning historical structs before full validation", (format) => {
     const imports =
       format === "cjs"

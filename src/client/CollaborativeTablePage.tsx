@@ -1,3 +1,5 @@
+import { useOnlineStatus } from "./online-status";
+import { RelationPanel } from "./RelationPanel";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type { ClientMemberContext, Page } from "../shared/types";
 import {
@@ -44,6 +46,8 @@ export function CollaborativeTablePage({
 }: CollaborativeTableProps) {
   const base = queryBase ?? `/api/tables/${page.id}/query`;
   const commandsPath = queryBase ? `${queryBase}/commands` : `/api/tables/${page.id}/commands`;
+  const online = useOnlineStatus();
+  const [connectionReady, setConnectionReady] = useState(false);
   const [data, setData] = useState<TableQueryResult | null>(null);
   const [viewId, setViewId] = useState(initialViewId ?? "");
   const [query, setQuery] = useState("");
@@ -60,7 +64,7 @@ export function CollaborativeTablePage({
   useEffect(() => {
     dataRef.current = data;
   }, [data]);
-  const editable = member.role !== "viewer" && data?.canEdit !== false;
+  const editable = online && connectionReady && member.role !== "viewer" && data?.canEdit !== false;
   const taskList = Boolean(page.taskList || data?.taskList);
   const tasksPath = queryBase ? `${queryBase}/tasks` : `/api/task-lists/${page.id}/tasks`;
   const discardDenied = useCallback((cause: unknown) => {
@@ -85,23 +89,27 @@ export function CollaborativeTablePage({
       if (cursor) params.set("cursor", cursor);
       try {
         const result = await api<TableQueryResult>(`${base}?${params}`, { signal: AbortSignal.timeout(15000) });
-        if (owner !== epoch.current || !active.current) return;
-        if (dirty.current) return; // Permission is rechecked while preserving the draft's original revision.
+        if (owner !== epoch.current || !active.current) return false;
+        if (dirty.current) return false; // Permission is rechecked while preserving the draft's original revision.
         setData((current) =>
           cursor && current?.revision === result.revision
             ? { ...result, rows: [...current.rows, ...result.rows] }
             : result,
         );
         setError("");
+        if (queryBase) setConnectionReady(true);
+        return true;
       } catch (cause) {
         if (owner === epoch.current && active.current) {
+          setConnectionReady(false);
           discardDenied(cause);
           setError(apiErrorMessage(cause, "The table could not be loaded."));
           if (cause instanceof ApiClientError && cause.code === "table_cursor_stale" && cursor) void fetchTable();
         }
       }
+      return false;
     },
-    [base, viewId, query, month, discardDenied],
+    [base, viewId, query, month, discardDenied, queryBase],
   );
   useEffect(() => {
     active.current = true;
@@ -113,7 +121,7 @@ export function CollaborativeTablePage({
     };
   }, [load]);
   useEffect(() => {
-    if (queryBase) return undefined;
+    if (queryBase || !online) return undefined;
     let socket: WebSocket | null = null,
       timer: ReturnType<typeof setTimeout> | undefined,
       stopped = false;
@@ -123,9 +131,12 @@ export function CollaborativeTablePage({
       url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
       socket = new WebSocket(url);
       socket.addEventListener("message", () => {
-        void load();
+        void load().then((loaded) => {
+          if (loaded && !stopped) setConnectionReady(true);
+        });
       });
       socket.addEventListener("close", () => {
+        if (!stopped) setConnectionReady(false);
         if (!stopped) timer = setTimeout(connect, 2000);
       });
     };
@@ -141,7 +152,7 @@ export function CollaborativeTablePage({
       clearInterval(heartbeat);
       socket?.close();
     };
-  }, [page.id, queryBase, load]);
+  }, [page.id, queryBase, load, online]);
   useEffect(() => {
     if (!queryBase) return undefined;
     const timer = setInterval(() => {
@@ -450,6 +461,14 @@ export function CollaborativeTablePage({
           columns={data.columns}
           fixedColumnIds={taskList ? Object.values(taskColumns(page.id)) : []}
           busy={busy}
+          command={command}
+        />
+      )}
+      {!embedded && !queryBase && (member.features?.tableRelations || Boolean(data.relations?.definitions.length)) && (
+        <RelationPanel
+          data={data}
+          enabled={member.features?.tableRelations ?? false}
+          editable={editable && !busy}
           command={command}
         />
       )}

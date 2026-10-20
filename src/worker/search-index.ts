@@ -1,10 +1,10 @@
-const SEARCH_COLUMNS = `(page_id, workspace_id, space_id, title, tags, body, comments, attachments)`;
+const SEARCH_COLUMNS = `(page_id, workspace_id, space_id, title, tags, body, comments, attachments, headings)`;
 
 const SEARCH_PROJECTION = `SELECT p.id, p.workspace_id, p.space_id, p.title,
     COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.page_id = p.id), ''),
     COALESCE(p.plain_text, ''),
     COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-    COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), '')
+    COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), ''), p.headings_text
   FROM pages p`;
 
 // Archived pages stay indexed: the archive-state search filter reads `pages.archived_at`

@@ -19,6 +19,7 @@ export const SCHEDULED_TASK_NAMES = [
   "oauth_security_records",
   "mcp_staged_pages",
   "table_search_values",
+  "search_headings",
   "ai_history",
 ] as const;
 

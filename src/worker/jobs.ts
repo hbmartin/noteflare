@@ -322,6 +322,12 @@ async function captureTemplateTable(env: Env, job: JobRow, options: TemplateClon
   const key = `jobs/${job.id}/table-template.json`;
   if (await env.BUCKET.head(key)) return;
   const snapshot = await tableTemplateSnapshot(env, options.sourcePageId);
+  if (snapshot.relations?.definitions.length)
+    throw new HttpError(
+      409,
+      "relation_format_required",
+      "This table contains relations. A compatible format is required before copying or exporting it.",
+    );
   requireCloneableTemplate(snapshot.taskList);
   snapshot.views = snapshot.views.filter((view) => !view.ownerId || view.ownerId === job.requested_by);
   await assertJobActive(env, job);

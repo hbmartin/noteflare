@@ -9,12 +9,17 @@ export function LoadingSplash() {
   );
 }
 
-export function AlertSplash({ title, message }: { title: string; message: string }) {
+export function AlertSplash({ title, message, onRetry }: { title: string; message: string; onRetry?: () => void }) {
   return (
     <main className="startup-splash">
       <div role="alert">
         <h1>{title}</h1>
         <p>{message}</p>
+        {onRetry && (
+          <button type="button" onClick={onRetry}>
+            Reload application
+          </button>
+        )}
       </div>
     </main>
   );

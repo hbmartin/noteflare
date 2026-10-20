@@ -1,3 +1,4 @@
+import { loadForegroundModule } from "./chunk-recovery";
 import { useEffect, useState, type ComponentType } from "react";
 import { AlertSplash, LoadingSplash } from "./Splash";
 import { reportClientError } from "./telemetry";
@@ -6,12 +7,13 @@ export type SupportedAppModule = { default: ComponentType };
 export type SupportedAppLoader = () => Promise<SupportedAppModule>;
 type StartupState = { kind: "loading" } | { kind: "ready"; SupportedApp: ComponentType } | { kind: "unavailable" };
 
-const loadDefaultSupportedApp: SupportedAppLoader = () => import("./SupportedApp");
+const loadDefaultSupportedApp: SupportedAppLoader = () => loadForegroundModule(() => import("./SupportedApp"));
 
 function StartupFallback({ kind }: { kind: "unsupported" | "unavailable" }) {
   const unavailable = kind === "unavailable";
   return (
     <AlertSplash
+      onRetry={unavailable ? () => window.location.reload() : undefined}
       title={unavailable ? "Workspace unavailable" : "Browser update required"}
       message={
         unavailable

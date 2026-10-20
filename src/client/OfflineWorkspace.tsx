@@ -294,7 +294,7 @@ export function OfflineWorkspace({
               <output className="notice">
                 {selectedReason
                   ? selectedReason
-                  : "Offline copy. Changes stay on this device until access is checked and server sync is confirmed."}
+                  : "Reading cached copy. Connect and finish syncing to edit this document."}
               </output>
               {selectedReason && (
                 <button
@@ -348,7 +348,7 @@ export function OfflineWorkspace({
                   page={selected}
                   accountKey={account.key}
                   quarantined={Boolean(selectedReason)}
-                  editingEnabled={account.offlineEditingEnabled && recovery !== "finalizing"}
+                  editingEnabled={false}
                   onRetry={() => setLocalLoadRetry((attempt) => attempt + 1)}
                 />
               </RenderBoundary>
