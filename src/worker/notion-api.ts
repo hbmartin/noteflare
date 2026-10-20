@@ -1,3 +1,4 @@
+import { trackRealtimeWorkspace } from "./realtime-access";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
 import {
@@ -1406,6 +1407,7 @@ notionApi.post("/pages", async (c) => {
 
 async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
   const principal = c.get("principal") as IntegrationPrincipal;
+  await trackRealtimeWorkspace(c.env, principal.workspaceId);
   capability(principal, "updateContent");
   const page = await accessiblePage(c.env, principal, c.req.param("pageId")!, true);
   const input = await body(c.req.raw, mode === "trash");

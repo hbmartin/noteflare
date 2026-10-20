@@ -1,3 +1,4 @@
+import { trackRealtimeUser } from "./realtime-access";
 import type { GenericEndpointContext } from "@better-auth/core";
 import { createOTP } from "@better-auth/utils/otp";
 import type { BetterAuthPlugin } from "better-auth";
@@ -46,6 +47,7 @@ function field(ctx: GenericEndpointContext, key: string): string {
 }
 
 async function securityAccount(env: Env, userId: string): Promise<SecurityAccount> {
+  await trackRealtimeUser(env, userId);
   const account = await env.DB.prepare(
     "SELECT generation,recovery_required,recovery_started_at,recovery_resume_key_hash,recovery_resume_claim_session_id,recovery_pending_key_hash,recovery_pending_session_id,recovery_pending_until,recovery_pending_repair_at,recovery_origin_session_id,codes_saved,locked_until FROM account_security WHERE user_id=?",
   )
@@ -347,6 +349,7 @@ async function issueSession(
       throw deny("Sign in again.");
     expireCookie(ctx, ctx.context.createAuthCookie("two_factor"));
   }
+  await trackRealtimeUser(env, id.userId);
   const user = await ctx.context.internalAdapter.findUserById(id.userId);
   if (!user) throw deny();
   const session = await ctx.context.internalAdapter.createSession(id.userId);
@@ -432,6 +435,7 @@ export function passkeyRegistrationRevokedResponse() {
 }
 
 async function clearExpiredRecoveryHandoff(env: Env, userId: string, time: number) {
+  await trackRealtimeUser(env, userId);
   const handoff = await env.DB.prepare(`SELECT generation,recovery_resume_key_hash,recovery_pending_key_hash,
     recovery_pending_session_id,recovery_origin_session_id FROM account_security
     WHERE user_id=? AND recovery_pending_key_hash IS NOT NULL AND
@@ -569,10 +573,13 @@ async function passwordRateLimitKey(email: string, headers: Headers | undefined)
   return `password-account-v2:${await sha256(JSON.stringify([email, passwordSource(headers)]))}`;
 }
 
-const post = (path: string, handler: (ctx: GenericEndpointContext) => Promise<unknown>) =>
-  createAuthEndpoint(path, { method: "POST" }, handler);
-
 export function mandatorySecurity(env: Env): BetterAuthPlugin {
+  const post = (path: string, handler: (ctx: GenericEndpointContext) => Promise<unknown>) =>
+    createAuthEndpoint(path, { method: "POST" }, async (ctx) => {
+      const id = await identity(ctx);
+      if (id) await trackRealtimeUser(env, id.userId);
+      return handler(ctx);
+    });
   return {
     id: "mandatory-security",
     endpoints: {
@@ -667,6 +674,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
           .bind(id.sessionId, id.userId, encrypted, Date.now() + RECOVERY_MS)
           .run();
         await resetAttempts(env, id.userId, id.security.account.generation);
+        await trackRealtimeUser(env, id.userId);
         const user = await ctx.context.internalAdapter.findUserById(id.userId);
         return ctx.json({ totpURI: createOTP(secret, { digits: 6, period: 30 }).url("NoteFlare", user!.email) });
       }),
@@ -1068,6 +1076,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
           if (!handoff[0]!.meta.changes || (replacementSession && !handoff[1]!.meta.changes))
             throw deny("Recovery key was replaced or expired. Resume recovery again.");
           if (replacementSession) {
+            await trackRealtimeUser(env, id.userId);
             const user = await ctx.context.internalAdapter.findUserById(id.userId);
             if (!user) throw deny("Sign in again.");
             await setSessionCookie(ctx, { user, session: replacementSession });

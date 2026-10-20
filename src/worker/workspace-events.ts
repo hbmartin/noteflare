@@ -159,7 +159,11 @@ export class WorkspaceEvents extends YServer {
   }
 
   onMessage(connection: Connection<EventConnectionAuth>, message: WSMessage) {
-    if (!connection.state || connection.state.expiresAt <= Date.now()) {
+    if (!connection.state || (connection.state.authGeneration ?? 0) < this.authGeneration()) {
+      connection.close(4403, "Access changed. Reconnect to continue.");
+      return;
+    }
+    if (connection.state.expiresAt <= Date.now()) {
       connection.close(4401, "Authorization expired. Reconnect to continue.");
       return;
     }
@@ -250,6 +254,11 @@ export class WorkspaceEvents extends YServer {
       }
       this.state.storage.sql.exec("UPDATE realtime_control SET generation=max(generation,?) WHERE id=1", generation);
       await this.scheduleAlarm(Date.now() + 2_000);
+      for (const connection of this.getConnections<EventConnectionAuth>()) {
+        if ((connection.state?.authGeneration ?? 0) < this.authGeneration())
+          connection.close(4403, "Access changed. Reconnect to continue.");
+      }
+      let discoveryComplete = true;
       // Cover grants issued by the previous deployment, before room registration existed.
       const legacy = this.state.storage.sql
         .exec<{ deadline: number; cursor: string; complete: number }>("SELECT * FROM realtime_legacy_scan WHERE id=1")
@@ -271,7 +280,7 @@ export class WorkspaceEvents extends YServer {
           pages.results.at(-1)?.id ?? legacy.cursor,
           pages.results.length < 64 ? 1 : 0,
         );
-        if (pages.results.length === 64) return Response.json({ complete: false }, { status: 503 });
+        discoveryComplete = pages.results.length < 64;
       } else if (!legacy.complete) this.state.storage.sql.exec("UPDATE realtime_legacy_scan SET complete=1 WHERE id=1");
       this.state.storage.sql.exec(
         `INSERT INTO realtime_fanout SELECT room,? FROM realtime_rooms WHERE expires_at>?
@@ -285,7 +294,8 @@ export class WorkspaceEvents extends YServer {
         if ((connection.state?.authGeneration ?? 0) < this.authGeneration())
           connection.close(4403, "Access changed. Reconnect to continue.");
       }
-      const complete = await this.drainRevocations();
+      const drained = await this.drainRevocations();
+      const complete = discoveryComplete && drained;
       return Response.json({ complete }, { status: complete ? 200 : 503 });
     }
     const workspaceId = this.state.id.name;

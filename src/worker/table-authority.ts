@@ -96,6 +96,7 @@ export type TableActor = {
   userId: string;
   generation: number;
   expiresAt: number;
+  socketExpiresAt?: number;
   authGeneration?: number;
   creation?: { board: boolean; calendar: boolean };
   authorization?: { sql: string; binds: unknown[] };
@@ -253,7 +254,15 @@ export class TableAuthority extends DurableObject<Env> {
       fail("Permanent deletion has been accepted for this table.", 409, "deletion_pending");
   }
   private async scheduleAlarm(delay: number) {
-    if (!this.deletionIntent && !this.purged) await this.ctx.storage.setAlarm(Date.now() + delay);
+    if (this.deletionIntent || this.purged) return;
+    const deadline = Date.now() + delay,
+      current = await this.ctx.storage.getAlarm();
+    if (current === null || current <= Date.now() || deadline < current) await this.ctx.storage.setAlarm(deadline);
+  }
+  private async clearWorkAlarm() {
+    await this.ctx.storage.deleteAlarm();
+    const socketDeadline = this.expireSockets();
+    if (Number.isFinite(socketDeadline)) await this.scheduleAlarm(Math.max(1, socketDeadline - Date.now()));
   }
   private async trackRepair<T>(work: () => Promise<T>): Promise<T> {
     this.requireActive();
@@ -401,6 +410,7 @@ export class TableAuthority extends DurableObject<Env> {
   // fallow-ignore-next-line unused-class-member -- Called by Cloudflare Durable Object runtime.
   async fetch(request: Request): Promise<Response> {
     try {
+      this.expireSockets();
       const url = new URL(request.url),
         path = url.pathname;
       if (path === "/revoke-access") {
@@ -706,18 +716,31 @@ export class TableAuthority extends DurableObject<Env> {
             const ids = snapshot.cells.find((cell) => cell.relationId === definition.id)?.rowIds ?? [];
             try {
               const input = await this.relatedInput(actor, definition.targetPageId, ids);
-              const derived = (definition.derived ?? []).map((d) => ({
-                id: d.id,
-                ...(d.kind === "rollup"
-                  ? rollupRelation(ids, input, d.columnId, d.operation)
-                  : {
-                      rowIds: filterRelatedRows(ids, input, d.filter),
-                      state: ids.some((targetRowId) => !input.rows.some((candidate) => candidate.id === targetRowId))
-                        ? "unavailable"
-                        : "current",
-                      source: { generation: input.generation, revision: input.revision },
-                    }),
-              }));
+              const derived = (definition.derived ?? []).map((d) => {
+                try {
+                  return {
+                    id: d.id,
+                    ...(d.kind === "rollup"
+                      ? rollupRelation(ids, input, d.columnId, d.operation)
+                      : {
+                          rowIds: filterRelatedRows(ids, input, d.filter),
+                          state: ids.some(
+                            (targetRowId) => !input.rows.some((candidate) => candidate.id === targetRowId),
+                          )
+                            ? "unavailable"
+                            : "current",
+                          source: { generation: input.generation, revision: input.revision },
+                        }),
+                  };
+                } catch {
+                  return {
+                    id: d.id,
+                    value: null,
+                    state: "invalid",
+                    source: { generation: input.generation, revision: input.revision },
+                  };
+                }
+              });
               return { relationId: definition.id, input, derived, state: "current" };
             } catch {
               return { relationId: definition.id, input: null, derived: [], state: "unavailable" };
@@ -753,7 +776,14 @@ export class TableAuthority extends DurableObject<Env> {
       if (path === "/socket") {
         const pair = new WebSocketPair();
         this.ctx.acceptWebSocket(pair[1], [actor.userId]);
+        if (
+          !actor.socketExpiresAt ||
+          actor.socketExpiresAt <= Date.now() ||
+          actor.socketExpiresAt > Date.now() + 5 * 60_000 + 1_000
+        )
+          return fail("Reconnect to refresh authorization.", 403, "table_forbidden");
         pair[1].serializeAttachment(actor);
+        await this.scheduleAlarm(actor.socketExpiresAt - Date.now());
         pair[1].send(JSON.stringify({ type: "table-ready", revision: meta.revision }));
         return new Response(null, { status: 101, webSocket: pair[0] });
       }
@@ -1749,7 +1779,10 @@ export class TableAuthority extends DurableObject<Env> {
         position,
         JSON.stringify(statements),
       );
+    this.expireSockets();
     for (const socket of this.ctx.getWebSockets()) {
+      const socketActor = socket.deserializeAttachment() as TableActor;
+      if (!socketActor.socketExpiresAt || socketActor.socketExpiresAt <= Date.now()) continue;
       try {
         socket.send(JSON.stringify({ type: "table-changed", revision, operationId: command.operationId }));
       } catch {
@@ -2481,14 +2514,14 @@ export class TableAuthority extends DurableObject<Env> {
       purged: false,
     };
     this.ctx.storage.sql.exec("INSERT OR REPLACE INTO meta VALUES(2,?)", JSON.stringify(this.deletionIntent));
-    await this.ctx.storage.deleteAlarm();
+    await this.clearWorkAlarm();
     await Promise.allSettled(
       [this.projecting, this.repairWork].filter((work): work is Promise<unknown> => work !== null),
     );
     await this.authorizeDeletion(body, "stop");
     this.deletionIntent.stopped = true;
     this.ctx.storage.sql.exec("INSERT OR REPLACE INTO meta VALUES(2,?)", JSON.stringify(this.deletionIntent));
-    await this.ctx.storage.deleteAlarm();
+    await this.clearWorkAlarm();
     return { ok: true, stopped: true, generation: body.generation };
   }
   private async purgeForDeletion(request: Request) {
@@ -2514,7 +2547,7 @@ export class TableAuthority extends DurableObject<Env> {
       [this.projecting, this.repairWork].filter((work): work is Promise<unknown> => work !== null),
     );
     await this.authorizeDeletion(body, "purge");
-    await this.ctx.storage.deleteAlarm();
+    await this.clearWorkAlarm();
     for (const socket of this.ctx.getWebSockets()) socket.close(1008, "Table permanently deleted.");
     this.ctx.storage.transactionSync(() => {
       this.deletionIntent!.purged = true;
@@ -3741,7 +3774,7 @@ export class TableAuthority extends DurableObject<Env> {
             await this.scheduleAlarm(1000);
             return { pending: true as const };
           }
-          await this.ctx.storage.deleteAlarm();
+          await this.clearWorkAlarm();
           fail("Projection verification failed. The write fence remains active.", 503, "table_projection_mismatch");
         }
         setIntent({
@@ -3802,7 +3835,7 @@ export class TableAuthority extends DurableObject<Env> {
               },
             },
           });
-          await this.ctx.storage.deleteAlarm();
+          await this.clearWorkAlarm();
         } else if (this.meta().repairIntent?.phase !== "blocked") await this.scheduleAlarm(10_000);
       }
       throw error;
@@ -3914,6 +3947,8 @@ export class TableAuthority extends DurableObject<Env> {
   }
   // fallow-ignore-next-line unused-class-member -- Called by Cloudflare Durable Object runtime.
   async alarm() {
+    const socketDeadline = this.expireSockets();
+    if (Number.isFinite(socketDeadline)) await this.scheduleAlarm(Math.max(1, socketDeadline - Date.now()));
     if (this.purged || this.deletionIntent) return;
     try {
       const meta = this.meta();
@@ -3939,9 +3974,25 @@ export class TableAuthority extends DurableObject<Env> {
       if (!this.purged && this.meta().repairIntent?.phase !== "blocked") await this.scheduleAlarm(10_000);
     }
   }
+  private expireSockets() {
+    let next = Infinity;
+    for (const socket of this.ctx.getWebSockets()) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      const actor = socket.deserializeAttachment() as TableActor;
+      if (!actor?.socketExpiresAt || actor.socketExpiresAt <= Date.now())
+        socket.close(4401, "Authorization expired. Reconnect to continue.");
+      else next = Math.min(next, actor.socketExpiresAt);
+    }
+    return next;
+  }
   // fallow-ignore-next-line unused-class-member -- Called by Cloudflare Durable Object runtime.
   async webSocketMessage(socket: WebSocket) {
-    const actor = { ...(socket.deserializeAttachment() as TableActor), expiresAt: Date.now() + 60_000 };
+    const grant = socket.deserializeAttachment() as TableActor;
+    if (!grant.socketExpiresAt || grant.socketExpiresAt <= Date.now()) {
+      socket.close(4401, "Authorization expired. Reconnect to continue.");
+      return;
+    }
+    const actor = { ...grant, expiresAt: Math.min(grant.socketExpiresAt, Date.now() + 60_000) };
     try {
       await this.authorize(
         new Request("https://table.internal/query", {

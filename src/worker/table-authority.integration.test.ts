@@ -140,6 +140,61 @@ async function addEffect(pageId: string, revision: number) {
 }
 
 describe("per-table authority", () => {
+  it("covers table sockets beyond the short actor expiry and fences them before completion", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    const response = await tableFetch(env, member, pageId, "/socket"),
+      socket = response.webSocket!;
+    socket.accept();
+    await runInDurableObject(env.WORKSPACE_EVENTS.getByName(member.workspace.id), async (_instance, state) => {
+      const room = state.storage.sql
+        .exec<{ expires_at: number }>("SELECT expires_at FROM realtime_rooms WHERE room=?", `table:${pageId}`)
+        .one();
+      expect(room.expires_at).toBeGreaterThan(Date.now() + 4 * 60_000);
+    });
+    await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+      const server = state.getWebSockets()[0]!,
+        actor = server.deserializeAttachment() as TableActor;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+      try {
+        await instance.webSocketMessage(server);
+        expect(server.readyState).toBe(WebSocket.OPEN);
+        expect(actor.socketExpiresAt).toBeGreaterThan(Date.now());
+      } finally {
+        clock.mockRestore();
+      }
+    });
+    const closed = new Promise<number>((resolve) =>
+      socket.addEventListener("close", (event) => resolve(event.code), { once: true }),
+    );
+    await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE workspace_id=? AND created_by=?")
+      .bind(member.workspace.id, member.user.id)
+      .run();
+    const { flushRealtimeRevocations } = await import("./realtime-access");
+    expect(await flushRealtimeRevocations(env, member.workspace.id)).toBe(true);
+    expect(await closed).toBe(4403);
+  });
+  it("expires legacy and fixed-deadline table sockets without extending them on heartbeat", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    for (const legacy of [false, true]) {
+      const response = await tableFetch(env, member, pageId, "/socket"),
+        socket = response.webSocket!;
+      socket.accept();
+      const closed = new Promise<number>((resolve) =>
+        socket.addEventListener("close", (event) => resolve(event.code), { once: true }),
+      );
+      await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+        const server = state.getWebSockets().find((candidate) => candidate.readyState === WebSocket.OPEN)!,
+          actor = server.deserializeAttachment() as TableActor;
+        if (legacy) delete actor.socketExpiresAt;
+        else actor.socketExpiresAt = Date.now() - 1;
+        server.serializeAttachment(actor);
+        await instance.webSocketMessage(server);
+      });
+      expect(await closed).toBe(4401);
+    }
+  });
   it("commits canonical forward relations, replays receipts, calculates one hop, and repairs reverse inputs", async () => {
     const { pageId, member } = await fixture();
     await enableTableAuthority(env, member, pageId);
@@ -212,6 +267,18 @@ describe("per-table authority", () => {
       await tableFetch(env, member, pageId, "/relations?rowId=source")
     ).json<{ targets: Array<{ derived: Array<{ state: string }> }> }>();
     expect(missing.targets[0]!.derived[0]!.state).toBe("unavailable");
+    await write(pageId, member, "delete_column", { columnId: "done" });
+    const invalid = await (
+      await tableFetch(env, member, pageId, "/relations?rowId=source")
+    ).json<{ targets: Array<{ input: unknown; state: string; derived: Array<{ id: string; state: string }> }> }>();
+    expect(invalid.targets[0]!.input).not.toBeNull();
+    expect(invalid.targets[0]!.state).toBe("current");
+    expect(invalid.targets[0]!.derived).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "completed", state: "invalid" }),
+        expect.objectContaining({ id: "count", state: "unavailable" }),
+      ]),
+    );
   });
 
   it("captures 20,000 linked identities in 20 indexed manifest pages without table-content reads", async () => {

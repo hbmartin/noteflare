@@ -168,6 +168,55 @@ describe("server-authoritative comments", () => {
     expect(await closed).toBe(4403);
   });
 
+  it("fences known sockets during the first of multiple legacy discovery batches", async () => {
+    const owner = await bootstrap();
+    const document = await SELF.fetch(
+      request(owner.cookie, `/parties/document/${owner.pageId}~1`, { headers: { Upgrade: "websocket" } }),
+    );
+    const events = await SELF.fetch(
+      request(owner.cookie, `/parties/workspace-events/${owner.workspaceId}`, { headers: { Upgrade: "websocket" } }),
+    );
+    const sockets = [document.webSocket!, events.webSocket!];
+    for (const socket of sockets) socket.accept();
+    const closed = sockets.map(
+      (socket) =>
+        new Promise<number>((resolve) =>
+          socket.addEventListener("close", (event) => resolve(event.code), { once: true }),
+        ),
+    );
+    await env.DB.batch(
+      Array.from({ length: 129 }, (_, index) =>
+        env.DB.prepare(
+          "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,updated_by,created_at,updated_at) SELECT ?,workspace_id,space_id,'document',?,'Legacy',created_by,updated_by,1,1 FROM pages WHERE id=?",
+        ).bind(`z-legacy-${String(index).padStart(3, "0")}`, `a${index}`, owner.pageId),
+      ),
+    );
+    await runInDurableObject(env.WORKSPACE_EVENTS.getByName(owner.workspaceId), async (_instance, state) => {
+      state.storage.sql.exec("UPDATE realtime_legacy_scan SET complete=0,cursor='' WHERE id=1");
+    });
+    await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?")
+      .bind(owner.userId)
+      .run();
+    const { flushRealtimeRevocations } = await import("./realtime-access");
+    expect(await flushRealtimeRevocations(env, owner.workspaceId)).toBe(false);
+    expect(await Promise.all(closed)).toEqual([4403, 4403]);
+    expect(await flushRealtimeRevocations(env, owner.workspaceId)).toBe(false);
+    expect(await flushRealtimeRevocations(env, owner.workspaceId)).toBe(true);
+  });
+  it("routes realtime security controls before the auth catch-all and restricts them to owners", async () => {
+    const owner = await bootstrap(),
+      viewer = await invite(owner.cookie, "status-controls");
+    const response = await SELF.fetch(request(owner.cookie, "/api/security/realtime/status"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ complete: true });
+    const reconciled = await SELF.fetch(request(owner.cookie, "/api/security/realtime/reconcile", { method: "POST" }));
+    expect(reconciled.status).toBe(200);
+    expect(await reconciled.json()).toMatchObject({ complete: true });
+    expect((await SELF.fetch(request(viewer.cookie, "/api/security/realtime/status"))).status).toBe(403);
+    expect(
+      (await SELF.fetch(request(viewer.cookie, "/api/security/realtime/reconcile", { method: "POST" }))).status,
+    ).toBe(403);
+  });
   it("replays comment and reply submissions without duplicate comments or fanout", async () => {
     const owner = await bootstrap();
     const body = { initialComment: { body: commentBody("Durable draft") } };
