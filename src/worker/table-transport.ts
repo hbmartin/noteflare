@@ -5,9 +5,26 @@ const TABLE_UNAVAILABLE = {
   message: "Table data is temporarily unavailable. Please retry shortly.",
 };
 
+/** The body was received completely, but cannot describe a table response. */
+export class MalformedTableResponseError extends HttpError {
+  constructor(unavailable = TABLE_UNAVAILABLE) {
+    super(503, unavailable.code, unavailable.message);
+  }
+}
+
 /** Internal responses may be interrupted or replaced by a non-JSON infrastructure error. */
 export async function decodeTableResponse<T>(response: Response, unavailable = TABLE_UNAVAILABLE): Promise<T> {
-  const body: unknown = await response.json().catch(() => undefined);
+  // A rejected body read is a transport failure even after successful headers.
+  const text = await response.text().catch(() => {
+    throw new HttpError(503, unavailable.code, unavailable.message);
+  });
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    if (response.ok) throw new MalformedTableResponseError(unavailable);
+    throw new HttpError(503, unavailable.code, unavailable.message);
+  }
   if (!response.ok && typeof body === "object" && body !== null && "error" in body) {
     const value = body.error;
     if (
@@ -49,7 +66,7 @@ export async function* tableReadPages<T extends { revision: number; nextCursor: 
       (chunk.nextCursor !== null &&
         (typeof chunk.nextCursor !== "string" || !chunk.nextCursor || cursors.has(chunk.nextCursor)))
     )
-      throw new HttpError(503, TABLE_UNAVAILABLE.code, TABLE_UNAVAILABLE.message);
+      throw new MalformedTableResponseError();
     if (revision !== undefined && chunk.revision !== revision)
       throw new HttpError(409, "table_snapshot_changed", "The table changed while its snapshot was captured. Retry.");
     revision = chunk.revision;

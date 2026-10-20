@@ -4,8 +4,8 @@ import { correlationHeaders, logger, safeTelemetryErrorMessage } from "./observa
 import { HttpError, safeHttpError } from "./http";
 import type { PageRow } from "./page-access";
 import { acceptedPageDeletionSql } from "./deletion-policy";
-import { decodeTableResponse, tableReadPages } from "./table-transport";
-import { CLEANUP_LEASE_MS, deletionFailure, queueDeletionRetry } from "./deletion-jobs";
+import { decodeTableResponse, MalformedTableResponseError, tableReadPages } from "./table-transport";
+import { CLEANUP_LEASE_MS, deletionFailure, deletionCheckpointFailure, DeletionLeaseLostError } from "./deletion-jobs";
 import { DELETION_FAILURE_MESSAGES } from "../shared/deletion-jobs";
 
 type DeletionTargetKind = "document_do" | "table_do" | "table_row" | "r2_object" | "r2_prefix";
@@ -69,7 +69,7 @@ const EVIDENCE_MAX_BYTES = 1_000_000;
 const EVIDENCE_MAX_RECORDS = 1_000;
 const EVIDENCE_FAILURE = {
   code: "deletion_evidence_unavailable",
-  message: "Table deletion evidence is temporarily unavailable. Please retry shortly.",
+  message: DELETION_FAILURE_MESSAGES.deletion_evidence_unavailable,
 };
 
 /** A successful response must contain proof we can retain; outages remain retryable. */
@@ -77,7 +77,7 @@ async function decodeDeletionProof<T>(response: Response, unavailable?: { code: 
   try {
     return await decodeTableResponse<T>(response, unavailable);
   } catch (error) {
-    if (response.ok)
+    if (error instanceof MalformedTableResponseError)
       throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
     throw error;
   }
@@ -121,7 +121,6 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
       if (!evidence.has(row.detailPageId)) evidence.set(row.detailPageId, { ...row, kind: "provenance" });
     if (table.generation !== null) {
       const canonicalLinks = new Map<string, string>();
-      const cursors = new Set<string>();
       try {
         for await (const snapshot of tableReadPages(async (params) => {
           params.set("deletionJob", job.id);
@@ -149,10 +148,6 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
             !manifest.workspaceId ||
             !Number.isSafeInteger(manifest.generation) ||
             manifest.generation < 1 ||
-            !Number.isSafeInteger(manifest.revision) ||
-            manifest.revision < 0 ||
-            (manifest.nextCursor !== null &&
-              (typeof manifest.nextCursor !== "string" || !manifest.nextCursor || cursors.has(manifest.nextCursor))) ||
             !Array.isArray(manifest.rows) ||
             manifest.rows.length > EVIDENCE_MAX_RECORDS ||
             manifest.rows.some(
@@ -161,15 +156,18 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
             )
           )
             throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
-          if (manifest.nextCursor !== null) cursors.add(manifest.nextCursor);
-          if (
-            manifest.pageId !== table.pageId ||
-            manifest.workspaceId !== table.workspaceId ||
-            manifest.generation !== table.generation
-          )
-            throw new HttpError(409, "deletion_pending", "The page subtree changed. Reload before retrying.");
           return manifest;
         })) {
+          if (
+            snapshot.pageId !== table.pageId ||
+            snapshot.workspaceId !== table.workspaceId ||
+            snapshot.generation !== table.generation
+          )
+            throw new HttpError(
+              409,
+              "deletion_ownership_conflict",
+              "The page subtree changed. Reload before retrying.",
+            );
           for (const row of snapshot.rows) {
             if (ownedPages.has(row.detailPageId)) continue;
             const priorRow = canonicalLinks.get(row.detailPageId);
@@ -184,6 +182,8 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
           }
         }
       } catch (error) {
+        if (error instanceof MalformedTableResponseError)
+          throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
         const failure = safeHttpError(error);
         if (
           failure?.code === "table_response_unavailable" ||
@@ -279,7 +279,10 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
     for (let offset = 0; offset < statements.length; offset += 50) {
       const inserted = await env.DB.batch(statements.slice(offset, offset + 50));
       if (inserted.some((result) => !result.meta.changes))
-        throw new HttpError(409, "deletion_pending", "The page subtree changed. Reload before retrying.");
+        throw await deletionCheckpointFailure(env, job.id, leaseUntil, "Deletion evidence checkpoint changed", {
+          tableId: table.pageId,
+          generation: table.generation,
+        });
     }
   }
 }
@@ -400,7 +403,14 @@ async function captureRowHandoffs(
       `EXISTS(SELECT 1 ${ROW_HANDOFF_FROM_SQL} ${filter} AND dependent.id=? AND whole.id=? AND target.target=?)`,
       [...bindings, candidate.jobId, candidate.wholeJobId, candidate.target],
     );
-    if (!captured.meta.changes) return "Deletion row handoff ownership changed";
+    if (!captured.meta.changes)
+      return deletionCheckpointFailure(
+        env,
+        wholeJobId ?? dependentJobId!,
+        leaseUntil,
+        "Deletion row handoff ownership changed",
+        { ...row, dependentJobId: candidate.jobId },
+      );
   }
   return undefined;
 }
@@ -459,7 +469,11 @@ async function captureLegacyCleanupHandoffs(env: Env, job: DeletionJobRow, lease
       `EXISTS(SELECT 1 ${LEGACY_CLEANUP_HANDOFF_SQL} ${filter} AND dependent.id=? AND target.target=? AND purge.target=?)`,
       [job.id, leaseUntil, candidate.jobId, candidate.target, candidate.purgeTarget],
     );
-    if (!captured.meta.changes) return "Deletion row handoff ownership changed";
+    if (!captured.meta.changes)
+      return deletionCheckpointFailure(env, job.id, leaseUntil, "Deletion row handoff ownership changed", {
+        ...row,
+        dependentJobId: candidate.jobId,
+      });
   }
   return undefined;
 }
@@ -746,6 +760,7 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
         failure &&
         [
           "deletion_pending",
+          "deletion_ownership_conflict",
           "table_forbidden",
           "table_purged",
           "table_generation_conflict",
@@ -757,7 +772,21 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
           "deletion_pending",
           "The deletion ownership or table snapshot changed. Reload before retrying.",
         );
-      throw new HttpError(503, EVIDENCE_FAILURE.code, EVIDENCE_FAILURE.message);
+      const permanent =
+        failure &&
+        [
+          "deletion_evidence_conflict",
+          "deletion_proof_invalid",
+          "table_deletion_proof_unavailable",
+          "table_projection_blocked",
+        ].includes(failure.code);
+      throw new HttpError(
+        503,
+        EVIDENCE_FAILURE.code,
+        permanent
+          ? "Deletion evidence could not be verified and needs repair before deletion can be accepted."
+          : EVIDENCE_FAILURE.message,
+      );
     }
     if (await captureRowHandoffs(env, { dependentJobId: jobId }))
       throw new HttpError(409, "deletion_pending", "The containing table deletion changed. Retry after it completes.");
@@ -969,7 +998,7 @@ async function processTarget(
       )
         .bind(jobId, leaseUntil)
         .first<{ workspace_id: string }>();
-      if (!dependent) throw new HttpError(409, "deletion_pending", "Deletion ownership changed. Please retry.");
+      if (!dependent) throw new DeletionLeaseLostError();
       const proofResponse = await env.TABLE.getByName(tuple.tableId).fetch(
         new Request("https://table.internal/row-deletion-proof", {
           method: "POST",
@@ -1049,7 +1078,16 @@ async function processTarget(
         ],
       );
       if (!captured.meta.changes)
-        throw new HttpError(409, "deletion_pending", "Deletion proof ownership changed. Please retry.");
+        throw await deletionCheckpointFailure(
+          env,
+          jobId!,
+          leaseUntil,
+          "Deletion proof ownership changed. Please retry.",
+          {
+            ...tuple,
+            dependentJobId: jobId!,
+          },
+        );
       target.target = next;
       return;
     }
@@ -1174,7 +1212,11 @@ async function upgradeDeletionTableTargets(env: Env, job: DeletionJobRow, leaseU
         old.target,
       ),
     ]);
-    if (!result[2]?.meta.changes) return "Deletion table target ownership changed";
+    if (!result[2]?.meta.changes)
+      return deletionCheckpointFailure(env, job.id, leaseUntil, "Deletion table target ownership changed", {
+        tableId: old.target,
+        generation: old.generation,
+      });
   }
   return undefined;
 }
@@ -1195,7 +1237,6 @@ async function reconcileDeletionRowTargets(env: Env, job: DeletionJobRow, leaseU
         AND json_extract(target.target,'$.tableId')=source.id)`)
       .bind(job.id, leaseUntil)
       .all<{ detailPageId: string; rowId: string; tableId: string; generation: number }>();
-  let incomplete: string | undefined;
   for (const row of rows.results) {
     // Only this job's original target can establish the accepted generation.
     const evidence =
@@ -1237,19 +1278,13 @@ async function reconcileDeletionRowTargets(env: Env, job: DeletionJobRow, leaseU
         row.generation,
       )
       .run();
-    if (!inserted.meta.changes) incomplete = "Deletion row target ownership changed";
+    if (!inserted.meta.changes)
+      return deletionCheckpointFailure(env, job.id, leaseUntil, "Deletion row target ownership changed", row);
   }
-  return incomplete;
+  return undefined;
 }
 
-export async function processDeletionJob(env: Env, jobId: string, { retryFailedRows = false } = {}) {
-  if (retryFailedRows) {
-    const previous = await env.DB.prepare("SELECT workspace_id FROM deletion_jobs WHERE id=? AND phase='rows'")
-      .bind(jobId)
-      .first<{ workspace_id: string }>();
-    if (!previous) return;
-    await queueDeletionRetry(env, previous.workspace_id, jobId);
-  }
+export async function processDeletionJob(env: Env, jobId: string) {
   const claimedAt = Date.now();
   const leaseUntil = claimedAt + CLEANUP_LEASE_MS;
   const job = await env.DB.prepare(
@@ -1261,7 +1296,7 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
     .first<DeletionJobRow>();
   if (!job) return;
 
-  let phaseFailure: string | undefined;
+  let phaseFailure: Error | undefined;
   let failure = deletionFailure(undefined);
   const rememberFailure = (error: unknown, tableId?: string) => {
     const next = deletionFailure(error);
@@ -1283,14 +1318,17 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
   try {
     phaseFailure = job.phase === "rows" ? await upgradeDeletionTableTargets(env, job, leaseUntil) : undefined;
     if (job.phase === "cleanup") phaseFailure = await captureLegacyCleanupHandoffs(env, job, leaseUntil);
-    if (phaseFailure) rememberFailure(new HttpError(409, "deletion_pending", phaseFailure));
+    if (phaseFailure instanceof DeletionLeaseLostError) return;
+    if (phaseFailure) rememberFailure(phaseFailure);
     if (job.phase === "rows" && !phaseFailure) {
       try {
         await captureExternalRowEvidence(env, job, leaseUntil);
         phaseFailure = await captureRowHandoffs(env, { wholeJobId: job.id, leaseUntil });
-        if (phaseFailure) rememberFailure(new HttpError(409, "deletion_pending", phaseFailure));
+        if (phaseFailure instanceof DeletionLeaseLostError) return;
+        if (phaseFailure) rememberFailure(phaseFailure);
       } catch (error) {
-        phaseFailure = safeTelemetryErrorMessage(error, "Deletion handoff capture failed");
+        phaseFailure = error instanceof Error ? error : new Error("Deletion handoff capture failed");
+        if (phaseFailure instanceof DeletionLeaseLostError) return;
         rememberFailure(error);
       }
     }
@@ -1341,8 +1379,9 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
               /* Legacy plain table identity. */
             }
           }
+          if (error instanceof DeletionLeaseLostError) return;
           rememberFailure(error, tableId);
-          phaseFailure ??= message;
+          phaseFailure ??= error instanceof Error ? error : new Error(message);
           await env.DB.prepare(
             `UPDATE deletion_targets
             SET attempts = attempts + 1, last_error = ?
@@ -1366,8 +1405,9 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
       // Owned tables cannot restore links while external row targets are reconciled.
       if (targets.results.every((target) => target.kind !== "table_row")) {
         phaseFailure = await reconcileDeletionRowTargets(env, job, leaseUntil);
+        if (phaseFailure instanceof DeletionLeaseLostError) return;
         if (phaseFailure) {
-          rememberFailure(new HttpError(409, "deletion_pending", phaseFailure));
+          rememberFailure(phaseFailure);
           break;
         }
         targets = await env.DB.prepare(
@@ -1399,7 +1439,7 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
           hint = locationHint(workspace?.location_hint ?? undefined);
         }
       } catch (error) {
-        phaseFailure = safeTelemetryErrorMessage(error, "Deletion metadata cleanup failed");
+        phaseFailure = error instanceof Error ? error : new Error("Deletion metadata cleanup failed");
         rememberFailure(error);
         break;
       }
@@ -1423,7 +1463,8 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
       return;
     }
   } catch (error) {
-    phaseFailure = safeTelemetryErrorMessage(error, "Deletion processing failed");
+    phaseFailure = error instanceof Error ? error : new Error("Deletion processing failed");
+    if (phaseFailure instanceof DeletionLeaseLostError) return;
     rememberFailure(error);
   }
 
@@ -1434,7 +1475,7 @@ async function recordDeletionFailure(
   env: Env,
   context: DeletionJobRow,
   leaseUntil: number,
-  phaseFailure: string | undefined,
+  phaseFailure: Error | undefined,
   failure: ReturnType<typeof deletionFailure>,
 ) {
   const jobId = context.id;
@@ -1461,7 +1502,9 @@ async function recordDeletionFailure(
       .bind(
         attempts,
         failure.blocked ? Number.MAX_SAFE_INTEGER : Date.now() + delay,
-        phaseFailure ?? failed?.last_error ?? "Cleanup incomplete",
+        phaseFailure
+          ? safeTelemetryErrorMessage(phaseFailure, "Cleanup incomplete")
+          : (failed?.last_error ?? "Cleanup incomplete"),
         Date.now(),
         failure.code,
         failure.blocked ? Date.now() : null,

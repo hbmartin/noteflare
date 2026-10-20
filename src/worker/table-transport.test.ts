@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { decodeTableResponse, tableReadPages } from "./table-transport";
+import { decodeTableResponse, MalformedTableResponseError, tableReadPages } from "./table-transport";
 
 describe("internal table transport", () => {
   it("preserves valid typed errors and details without trusting malformed envelopes", async () => {
@@ -80,6 +80,23 @@ describe("internal table transport", () => {
     });
     await expect(decodeTableResponse(new Response("{"))).rejects.toMatchObject({ status: 503 });
   });
+
+  it.each(["AbortError", "TimeoutError", "TypeError"])(
+    "distinguishes a failed successful body read (%s) from malformed JSON",
+    async (name) => {
+      const response = new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(name === "TypeError" ? new TypeError("lost") : new DOMException("lost", name));
+          },
+        }),
+      );
+      const error = await decodeTableResponse(response).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ status: 503, code: "table_response_unavailable" });
+      expect(error).not.toBeInstanceOf(MalformedTableResponseError);
+      await expect(decodeTableResponse(new Response("{"))).rejects.toBeInstanceOf(MalformedTableResponseError);
+    },
+  );
 
   it("pins pagination to the first revision and stops at a completed cursor", async () => {
     const read = vi.fn(async (params: URLSearchParams) => ({

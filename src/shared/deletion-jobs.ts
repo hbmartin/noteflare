@@ -4,7 +4,7 @@ export const DELETION_FAILURE_MESSAGES = {
   deletion_proof_invalid: "Deletion is paused because the table returned an invalid deletion proof.",
   deletion_generation_conflict: "Deletion is paused because the table generation no longer matches its evidence.",
   deletion_evidence_conflict: "Deletion is paused because retained evidence disagrees with the current table.",
-  deletion_ownership_conflict: "Deletion is paused because ownership of its captured data changed.",
+  deletion_ownership_conflict: "Deletion is paused because ownership of its captured data could not be verified.",
   deletion_recheck_required: "Deletion is paused and needs an owner to check it again.",
   deletion_cleanup_unavailable: "Deletion is waiting for a temporary service failure to recover.",
 } as const;

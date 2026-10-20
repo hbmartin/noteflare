@@ -21,6 +21,7 @@ import {
 import { mutateTask, taskListStatements, listTasks } from "./tasks";
 import { acceptPageDeletion, processDeletionJob } from "./cleanup";
 import { logger } from "./observability";
+import { HttpError } from "./http";
 import type { ProjectionStatement, TableActor } from "./table-authority";
 
 beforeEach(async () => {
@@ -339,7 +340,7 @@ describe("per-table authority", () => {
     ).rejects.toMatchObject({ code: "deletion_pending" });
     await env.DB.prepare("UPDATE pages SET archive_operation_id='new-archive' WHERE id=?").bind(detailPageId).run();
     await expect(tableInternal(env, pageId, "/row-deletion-proof", body)).rejects.toMatchObject({
-      code: "deletion_pending",
+      code: "deletion_ownership_conflict",
     });
     await env.DB.prepare("UPDATE pages SET archive_operation_id='detail-archive' WHERE id=?").bind(detailPageId).run();
     await setTombstone(null);
@@ -355,7 +356,7 @@ describe("per-table authority", () => {
       .bind(pageId, member.workspace.id, source.space_id, member.user.id)
       .run();
     await expect(tableInternal(env, pageId, "/row-deletion-proof", body)).rejects.toMatchObject({
-      code: "deletion_pending",
+      code: "table_generation_conflict",
     });
   });
   it("preserves dependencies when a bulk updates old cells before adding new properties", async () => {
@@ -1791,6 +1792,32 @@ describe("per-table authority", () => {
       await env.DB.prepare("DROP TRIGGER IF EXISTS unrelated_publication_error").run();
     }
   });
+  it("preserves deliberate repair verification status, code, and safe details", async () => {
+    const { pageId } = await fixture();
+    await runInDurableObject(env.TABLE.getByName(pageId), async (instance) => {
+      const internal = instance as unknown as { verification(): Promise<unknown> },
+        original = internal.verification;
+      internal.verification = async () => {
+        throw new HttpError(422, "table_limit", "This table exceeds the verification row limit.", { limit: 20_000 });
+      };
+      try {
+        const response = await instance.fetch(
+          new Request("https://table.internal/verify", { headers: { "x-table-internal": env.BETTER_AUTH_SECRET } }),
+        );
+        expect(response.status).toBe(422);
+        expect(await response.json()).toEqual({
+          error: {
+            code: "table_limit",
+            message: "This table exceeds the verification row limit.",
+            details: { limit: 20_000 },
+          },
+        });
+      } finally {
+        internal.verification = original;
+      }
+    });
+  });
+
   it("sanitizes and logs unexpected authority exceptions", async () => {
     const { pageId } = await fixture();
     const error = new Error("D1_ERROR: private connection diagnostics");

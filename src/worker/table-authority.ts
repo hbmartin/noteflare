@@ -1,3 +1,5 @@
+import { deletionCheckpointFailure, DeletionLeaseLostError } from "./deletion-jobs";
+import { safeHttpError } from "./http";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import type { ColumnType } from "../shared/types";
@@ -612,6 +614,12 @@ export class TableAuthority extends DurableObject<Env> {
     } catch (error) {
       if (error instanceof TableRequestError)
         return Response.json({ error: { code: error.code, message: error.message } }, { status: error.status });
+      const deliberate = safeHttpError(error);
+      if (deliberate)
+        return Response.json(
+          { error: { code: deliberate.code, message: deliberate.message, details: deliberate.details } },
+          { status: deliberate.status },
+        );
       logger.error(
         "table.request.unhandled_error",
         "table",
@@ -2043,7 +2051,7 @@ export class TableAuthority extends DurableObject<Env> {
         captured.archive_operation_id !== captured.locked_operation ||
         captured.generation !== generation
       )
-        fail("Deletion evidence ownership changed.", 409, "deletion_pending");
+        fail("Deletion evidence ownership changed.", 409, "deletion_ownership_conflict");
       if (this.deletionIntent) {
         if (
           captured.phase === "staging" ||
@@ -2166,7 +2174,24 @@ export class TableAuthority extends DurableObject<Env> {
         body.pageId,
       )
       .first<{ archived_at: number; archive_operation_id: string | null }>();
-    if (!owned || owned.archived_at === null) fail("Deletion proof ownership changed.", 409, "deletion_pending");
+    if (!owned || owned.archived_at === null) {
+      const failure = await deletionCheckpointFailure(
+        this.env,
+        body.jobId,
+        body.leaseUntil,
+        "Deletion proof ownership changed.",
+        {
+          tableId: body.pageId,
+          workspaceId: body.workspaceId,
+          generation: body.generation,
+          rowId: body.rowId,
+          detailPageId: body.detailPageId,
+        },
+      );
+      if (failure instanceof DeletionLeaseLostError)
+        fail("Deletion proof checkpoint changed.", 409, "deletion_pending");
+      throw failure;
+    }
     return {
       purged: true,
       pageId: body.pageId,
