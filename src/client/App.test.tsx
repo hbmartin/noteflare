@@ -6424,6 +6424,46 @@ describe("App error handling", () => {
     await waitFor(() => expect(trashLoads).toBe(2));
   });
 
+  it("refreshes a completed deletion replay without removing or invalidating a replacement page", async () => {
+    const archivedPage = { ...page, archivedAt: 2 },
+      replacement = { ...archivedPage, title: "Recreated page" };
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    let reads = 0,
+      releaseRefresh: () => void = () => {};
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
+      if (path === "/api/me") return { ...member, role: "owner" };
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") return { pages: [] };
+      if (path.startsWith("/api/deletion-jobs")) return { jobs: [], nextCursor: null };
+      if (path === "/api/pages/tree?archived=true") {
+        if (++reads === 1) return { pages: [archivedPage] };
+        await new Promise<void>((resolve) => {
+          releaseRefresh = resolve;
+        });
+        return { pages: [replacement] };
+      }
+      if (path === `/api/pages/${page.id}/permanent-delete` && init?.method === "POST")
+        return { ok: true, jobId: "original-job", replayed: true, pageIds: [page.id], cleanupPending: false };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /Trash/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete forever" }));
+    await waitFor(() => expect(reads).toBe(2));
+    expect(screen.getByText(archivedPage.title)).toBeInTheDocument();
+    expect(mocks.invalidatePagePreview).not.toHaveBeenCalledWith(page.id);
+    releaseRefresh();
+    expect(await screen.findByText("Recreated page")).toBeInTheDocument();
+    expect(screen.queryByText(/invalid permanent-delete response/i)).not.toBeInTheDocument();
+  });
+
   it("reports a permanent-delete rejection without an unhandled rejection", async () => {
     const owner = { ...member, role: "owner" as const };
     const archivedPage = { ...page, archivedAt: 2 };

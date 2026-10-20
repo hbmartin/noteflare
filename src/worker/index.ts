@@ -4769,19 +4769,29 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   const rootId = c.req.param("id");
   const existing = await acceptedDeletionJob(c.env, member.workspace.id, rootId);
   if (existing) {
-    await queueDeletionRetry(c.env, member.workspace.id, existing.jobId);
-    c.executionCtx.waitUntil(
-      processDeletionJob(c.env, existing.jobId).catch((error) => {
-        logger.error(
-          "deletion.cleanup.failed",
-          "deletion",
-          "Immediate deletion cleanup failed.",
-          { jobId: existing.jobId },
-          error,
-        );
-      }),
+    const retry = await queueDeletionRetry(c.env, member.workspace.id, existing.jobId);
+    if (retry !== "missing")
+      c.executionCtx.waitUntil(
+        processDeletionJob(c.env, existing.jobId).catch((error) => {
+          logger.error(
+            "deletion.cleanup.failed",
+            "deletion",
+            "Immediate deletion cleanup failed.",
+            { jobId: existing.jobId },
+            error,
+          );
+        }),
+      );
+    return c.json(
+      {
+        ok: true,
+        jobId: existing.jobId,
+        replayed: true,
+        pageIds: existing.pageIds,
+        cleanupPending: retry !== "missing",
+      },
+      202,
     );
-    return c.json({ ok: true, pageIds: existing.pageIds, cleanupPending: true }, 202);
   }
   const page = await pageForMember(c.env, member, rootId, true);
   if (page.archived_at === null)
@@ -4794,7 +4804,7 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
       logger.error("deletion.cleanup.failed", "deletion", "Immediate deletion cleanup failed.", { jobId }, error);
     }),
   );
-  return c.json({ ok: true, pageIds, cleanupPending: true }, 202);
+  return c.json({ ok: true, jobId, pageIds, cleanupPending: true }, 202);
 });
 
 app.get("/api/search", async (c) => {

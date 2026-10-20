@@ -8166,6 +8166,7 @@ describe("Worker integration", () => {
     expect(deleted.status).toBe(202);
     expect(await deleted.json()).toEqual({
       ok: true,
+      jobId: expect.any(String),
       pageIds: expect.arrayContaining([installed.pageId, child.id]),
       cleanupPending: true,
     });

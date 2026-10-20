@@ -256,6 +256,13 @@ describe("deletion job recovery", () => {
       );
       await waitOnExecutionContext(context);
       expect(response.status).toBe(202);
+      expect(await response.json()).toEqual({
+        ok: true,
+        jobId: "completed",
+        replayed: true,
+        pageIds: [],
+        cleanupPending: false,
+      });
       expect((await env.DB.prepare("SELECT id FROM deletion_jobs").all()).results).toEqual([]);
       expect(Boolean(await env.DB.prepare("SELECT id FROM pages WHERE id='root-completed'").first())).toBe(recreated);
     },
