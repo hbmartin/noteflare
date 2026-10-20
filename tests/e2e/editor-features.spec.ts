@@ -63,6 +63,27 @@ test("unsupported initial and received code embeds preserve shared bytes and blo
   ]);
 });
 
+test("unsupported historical previews and restores leave the live editor writable", async ({ page }) => {
+  await signInOwner(page);
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const results = await page.evaluate(async () => {
+    const path = "/tests/e2e/fixtures/editor-code-reconciliation.mjs";
+    const { rejectHistoricalCode } = await import(path);
+    return rejectHistoricalCode();
+  });
+  expect(results).toEqual(
+    [false, true].map((restore) => ({
+      restore,
+      unchanged: true,
+      editable: true,
+      cleared: true,
+      content: "after-safe",
+    })),
+  );
+  expect(errors).toEqual([]);
+});
+
 test("ordinary edits inspect changed code scopes and new empty structure needs no code rescan", async ({ page }) => {
   await signInOwner(page);
   const result = await page.evaluate(async () => {

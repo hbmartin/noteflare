@@ -39,6 +39,7 @@ import "./editor-features.css";
 import {
   assertSupportedCodeContent,
   observeUnsupportedCodeContent,
+  observeUnsupportedSnapshotContent,
   type UnsupportedCodeContentError,
   yUndoPluginKey,
   yXmlFragmentToProsemirrorJSON,
@@ -1512,12 +1513,20 @@ function editorOptions(
 }
 
 function CollaborativeEditor(props: React.ComponentProps<typeof MountedCollaborativeEditor>) {
+  const { onError } = props;
   const doc = useMemo(() => {
     const nextDoc = props.bundle.doc;
     assertSupportedCodeContent(nextDoc.getXmlFragment("document-store"));
     return nextDoc;
   }, [props.bundle.doc]);
   const [contentError, setContentError] = useState<{ doc: Y.Doc; error: UnsupportedCodeContentError } | null>(null);
+  useEffect(
+    () =>
+      observeUnsupportedSnapshotContent(doc, () =>
+        onError("This saved version contains unsupported code content. The current document is still available."),
+      ),
+    [doc, onError],
+  );
   useEffect(() => {
     const unsubscribe = observeUnsupportedCodeContent(doc, (error) => setContentError({ doc, error }));
     // Check again after subscribing: a received update can arrive before the

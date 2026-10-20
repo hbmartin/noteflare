@@ -1,8 +1,18 @@
+import { Schema } from "prosemirror-model";
+import { EditorState } from "prosemirror-state";
+import { EditorView } from "prosemirror-view";
 import { BlockNoteEditor } from "@blocknote/core";
 import { CommentsExtension } from "@blocknote/core/comments";
 import { withCollaboration } from "@blocknote/core/yjs";
 import * as Y from "yjs";
-import { observeUnsupportedCodeContent, UnsupportedCodeContentError, ySyncPluginKey } from "y-prosemirror";
+import {
+  initProseMirrorDoc,
+  observeUnsupportedSnapshotContent,
+  ySyncPlugin,
+  observeUnsupportedCodeContent,
+  UnsupportedCodeContentError,
+  ySyncPluginKey,
+} from "y-prosemirror";
 import { notesCommentSchema, notesSchema } from "../../../src/client/mentions";
 import { ServerThreadStore } from "../../../src/client/server-thread-store";
 import { normalizeYCodeBlocks } from "../../../src/shared/code-content";
@@ -328,6 +338,77 @@ export async function reconcileCodeReplicas() {
       for (const host of hosts) host.remove();
       for (const doc of docs) doc.destroy();
       seed.destroy();
+    }
+  }
+  return results;
+}
+
+/** Exercise the actual asynchronous binding callback in the browser. */
+export async function rejectHistoricalCode() {
+  const schema = new Schema({
+      nodes: {
+        doc: { content: "codeBlock+" },
+        codeBlock: { content: "text*", code: true, toDOM: () => ["pre", ["code", 0]] },
+        text: {},
+      },
+    }),
+    results = [];
+  for (const restore of [false, true]) {
+    const doc = new Y.Doc({ gc: false }),
+      root = doc.getXmlFragment("document-store"),
+      code = new Y.XmlElement("codeBlock"),
+      text = new Y.XmlText(),
+      host = document.createElement("div");
+    let view, unobserve;
+    document.body.appendChild(host);
+    try {
+      text.insert(0, "safe");
+      code.insert(0, [text]);
+      root.insert(0, [code]);
+      text.insertEmbed(2, false);
+      const bad = Y.snapshot(doc);
+      text.delete(2, 1);
+      const clean = Y.snapshot(doc);
+      const initial = initProseMirrorDoc(root, schema);
+      view = new EditorView(host, {
+        state: EditorState.create({
+          schema,
+          doc: initial.doc,
+          plugins: [ySyncPlugin(root, { mapping: initial.meta.mapping })],
+        }),
+      });
+      const before = Y.encodeStateAsUpdate(doc);
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Snapshot error notification did not arrive")), 2_000);
+        unobserve = observeUnsupportedSnapshotContent(doc, () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        view.dispatch(
+          view.state.tr.setMeta(ySyncPluginKey, {
+            snapshot: restore ? bad : clean,
+            prevSnapshot: bad,
+            ...(restore ? { restore: true } : {}),
+          }),
+        );
+      });
+      const state = ySyncPluginKey.getState(view.state),
+        after = Y.encodeStateAsUpdate(doc);
+      const unchanged = before.length === after.length && before.every((value, index) => value === after[index]);
+      const editable = view.editable;
+      view.dispatch(view.state.tr.insertText("after-", 1));
+      results.push({
+        restore,
+        unchanged,
+        editable,
+        cleared: state.snapshot === null && state.prevSnapshot === null && state.restore === null,
+        content: text.toString(),
+      });
+    } finally {
+      unobserve?.();
+      view?.destroy();
+      host.remove();
+      doc.destroy();
     }
   }
   return results;
