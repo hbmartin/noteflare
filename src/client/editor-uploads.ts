@@ -17,6 +17,7 @@ type Entry = {
   resolve: (url: string) => void;
   release: () => void;
   attempt: number;
+  completed?: string;
 };
 const key = new PluginKey("notesLocalUploads");
 
@@ -30,7 +31,7 @@ export class EditorUploads {
     this.ready = ready;
     for (const entry of this.entries.values()) {
       entry.retry.disabled = !ready;
-      if (!ready && !entry.controller.signal.aborted) entry.controller.abort();
+      if (ready && entry.completed) this.applyCompleted(entry);
     }
   }
   upload(file: File, blockId?: string): Promise<string> {
@@ -115,15 +116,28 @@ export class EditorUploads {
         },
       );
       if (this.entries.get(blockId) !== entry || attempt !== entry.attempt) return;
-      this.forget(blockId);
-      entry.resolve(`/api/attachments/${result.id}`);
-      this.changed?.();
+      entry.completed = `/api/attachments/${result.id}`;
+      entry.status.textContent = this.ready ? "Uploaded" : "Uploaded. Waiting for the document to reconnect…";
+      if (this.ready) this.applyCompleted(entry);
     } catch {
       if (this.entries.get(blockId) !== entry || attempt !== entry.attempt) return;
       entry.status.textContent = this.ready ? "Upload failed. Retry or cancel." : "Connect to retry this upload.";
       entry.retry.hidden = false;
       entry.retry.disabled = !this.ready;
     }
+  }
+  private applyCompleted(entry: Entry) {
+    for (const [id, current] of this.entries) {
+      if (current !== entry || !entry.completed) continue;
+      const url = entry.completed;
+      this.forget(id);
+      entry.resolve(url);
+      this.changed?.();
+      break;
+    }
+  }
+  dispose() {
+    for (const id of this.entries.keys()) this.forget(id);
   }
   private forget(blockId: string) {
     const entry = this.entries.get(blockId);
@@ -140,7 +154,7 @@ export class EditorUploads {
     };
     return () => {
       this.changed = null;
-      for (const id of this.entries.keys()) this.forget(id);
+      this.dispose();
     };
   }
   decorations(doc: PMNode) {

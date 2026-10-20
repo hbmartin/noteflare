@@ -2265,6 +2265,31 @@ describe("App error handling", () => {
     await waitFor(() => expect(document.activeElement).toBe(navigation));
   });
 
+  it("does not reconcile page creation when an offline rejection was never sent", async () => {
+    let treeLoads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status")
+        return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
+      if (path === "/api/me") return member;
+      if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
+      if (path === "/api/pages/tree") {
+        treeLoads++;
+        return { pages: [page] };
+      }
+      if (path === "/api/pages" && init?.method === "POST")
+        throw new ApiClientError(503, "offline_read_only", "Connect to make changes.", false, { notSent: true });
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+    const create = await findRootCreation();
+    await waitFor(() => expect(create).toBeEnabled());
+    fireEvent.click(create);
+    await screen.findByText("Connect to make changes.");
+    expect(treeLoads).toBe(1);
+    expect(screen.queryByText(/result could not be verified/i)).toBeNull();
+  });
   it("reconciles an uncertain page creation and clears its diagnostics after observing the requested page", async () => {
     const createdPageId = "00000000-0000-4000-8000-000000000002";
     const createdPage = {

@@ -38,11 +38,14 @@ const board: TableView = { ...grid, id: "board", name: "Board", kind: "board", c
 const calendar: TableView = { ...grid, id: "calendar", name: "Calendar", kind: "calendar", columnId: "Due" };
 class AuthorizedTableSocket extends EventTarget {
   static OPEN = 1;
+  static instances: AuthorizedTableSocket[] = [];
+  static autoReady = true;
   readyState = 1;
   constructor() {
     super();
+    AuthorizedTableSocket.instances.push(this);
     queueMicrotask(() => {
-      if (this.readyState === 1)
+      if (this.readyState === 1 && AuthorizedTableSocket.autoReady)
         this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-ready", revision: 1 }) }));
     });
   }
@@ -59,6 +62,8 @@ let deniedRead: boolean;
 let writes: TableCommand[];
 let commandDelay: Promise<void> | null;
 beforeEach(() => {
+  AuthorizedTableSocket.instances = [];
+  AuthorizedTableSocket.autoReady = true;
   vi.stubGlobal("WebSocket", AuthorizedTableSocket);
   writes = [];
   failure = null;
@@ -227,6 +232,108 @@ function show(initialViewId = "", context = member, onSelectPage = vi.fn(), task
   );
 }
 describe("collaborative table UI", () => {
+  it("restores canonical socket readiness without dropping a focused draft or saving on disconnect blur", async () => {
+    vi.useFakeTimers();
+    await act(async () => {
+      render(
+        <CollaborativeTablePage page={{ id: "table", title: "Roadmap" }} member={member} onSelectPage={vi.fn()} />,
+      );
+    });
+    const title = screen.getByLabelText("Title");
+    expect(title).not.toBeDisabled();
+    fireEvent.focus(title);
+    fireEvent.change(title, { target: { value: "Preserved draft" } });
+    await act(async () => {
+      const socket = AuthorizedTableSocket.instances.at(-1)!;
+      socket.readyState = 3;
+      socket.dispatchEvent(new CloseEvent("close", { code: 4403 }));
+    });
+    expect(title).toBeDisabled();
+    fireEvent.blur(title);
+    expect(writes).toHaveLength(0);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    expect(title).not.toBeDisabled();
+    expect(title).toHaveValue("Preserved draft");
+    fireEvent.focus(title);
+    fireEvent.blur(title);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.payload).toMatchObject({
+      values: { Title: "Preserved draft" },
+      expectedCellRevisions: { Title: 1 },
+    });
+  });
+  it("does not turn mere focus into an edit when a remote value changes", async () => {
+    show();
+    const title = await screen.findByLabelText("Title");
+    fireEvent.focus(title);
+    data = {
+      ...data,
+      revision: 2,
+      rows: [
+        {
+          ...data.rows[0]!,
+          cells: { ...data.rows[0]!.cells, Title: "Remote value" },
+          cellRevisions: { ...data.rows[0]!.cellRevisions, Title: 2 },
+        },
+      ],
+    };
+    await act(async () => {
+      window.dispatchEvent(new Event("notes:workspace-event"));
+    });
+    fireEvent.blur(title);
+    expect(writes).toHaveLength(0);
+    expect(title).toHaveValue("Remote value");
+  });
+  it("requires review before replacing a remotely changed cell with its preserved draft", async () => {
+    show();
+    const title = await screen.findByLabelText("Title");
+    fireEvent.focus(title);
+    fireEvent.change(title, { target: { value: "My draft" } });
+    data = {
+      ...data,
+      revision: 2,
+      rows: [
+        {
+          ...data.rows[0]!,
+          cells: { ...data.rows[0]!.cells, Title: "Remote value" },
+          cellRevisions: { ...data.rows[0]!.cellRevisions, Title: 2 },
+        },
+      ],
+    };
+    await act(async () => {
+      window.dispatchEvent(new Event("notes:workspace-event"));
+    });
+    fireEvent.blur(title);
+    expect(writes).toHaveLength(0);
+    expect(title).toHaveValue("My draft");
+    fireEvent.click(screen.getByRole("button", { name: "Keep my edit" }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]!.payload).toMatchObject({ values: { Title: "My draft" }, expectedCellRevisions: { Title: 2 } });
+  });
+  it("waits for fresh socket authorization after an offline transition without a close event", async () => {
+    render(<CollaborativeTablePage page={{ id: "table", title: "Roadmap" }} member={member} onSelectPage={vi.fn()} />);
+    const title = await screen.findByLabelText("Title");
+    await waitFor(() => expect(title).not.toBeDisabled());
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    fireEvent(window, new Event("offline"));
+    expect(title).toBeDisabled();
+    AuthorizedTableSocket.autoReady = false;
+    online.mockReturnValue(true);
+    fireEvent(window, new Event("online"));
+    expect(title).toBeDisabled();
+    await act(async () => {
+      AuthorizedTableSocket.instances
+        .at(-1)!
+        .dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-ready", revision: 1 }) }));
+    });
+    expect(title).not.toBeDisabled();
+    online.mockRestore();
+  });
   it("rechecks linked source access while a draft is dirty and removes cached rows on denial", async () => {
     vi.useFakeTimers();
     await act(async () => {
@@ -279,6 +386,7 @@ describe("collaborative table UI", () => {
         '"assigneeId":null',
       ),
     );
+    await waitFor(() => expect(screen.getByRole("button", { name: "Properties" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Properties" }));
     expect(screen.getByText("Assignee · Fixed task property")).toBeInTheDocument();
     expect(screen.queryByLabelText("Type for Status")).toBeNull();

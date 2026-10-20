@@ -38,6 +38,19 @@ function silenceApiResponseReport() {
   return reported;
 }
 
+describe("offline mutation classification", () => {
+  it("rejects an unsent mutation explicitly without fetching", async () => {
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    const fetcher = vi.spyOn(globalThis, "fetch");
+    await expect(api("/api/pages", { method: "POST", body: "{}" })).rejects.toMatchObject({
+      code: "offline_read_only",
+      notSent: true,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+});
+
 describe("api", () => {
   it("accepts only supported page-not-found statuses", () => {
     expect(isPageNotFoundError(new ApiClientError(410, "page_not_found", "Page not found."))).toBe(true);

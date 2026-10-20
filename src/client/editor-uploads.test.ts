@@ -56,6 +56,28 @@ describe("block-local uploads", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:local");
     expect(hasPendingWork()).toBe(false);
   });
+  it("keeps transport alive during sync loss and holds completion until ready", async () => {
+    let finish!: (value: Awaited<ReturnType<typeof uploadAttachment>>) => void;
+    vi.mocked(uploadAttachment).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const manager = fixture(),
+      result = manager.upload(file(), "media"),
+      settled = vi.fn();
+    void result.then(settled);
+    manager.setReady(false);
+    expect(vi.mocked(uploadAttachment).mock.calls[0]![3]!.signal!.aborted).toBe(false);
+    finish({ id: "held", pageId: "page", name: "photo.png", mime: "image/png", size: 5 });
+    await vi.waitFor(() => expect(document.body.textContent).toContain("Waiting for the document"));
+    expect(settled).not.toHaveBeenCalled();
+    expect(hasPendingWork()).toBe(true);
+    manager.setReady(true);
+    expect(await result).toBe("/api/attachments/held");
+    expect(hasPendingWork()).toBe(false);
+  });
   it("cancels in-flight work without accepting a late result", async () => {
     let finish!: (value: Awaited<ReturnType<typeof uploadAttachment>>) => void;
     vi.mocked(uploadAttachment).mockImplementation(
