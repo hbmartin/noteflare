@@ -4753,7 +4753,8 @@ app.post("/api/deletion-jobs/:id/retry", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   const jobId = c.req.param("id");
-  await queueDeletionRetry(c.env, member.workspace.id, jobId);
+  if ((await queueDeletionRetry(c.env, member.workspace.id, jobId)) === "missing")
+    throw new HttpError(404, "deletion_job_not_found", "This pending deletion is no longer available.");
   c.executionCtx.waitUntil(
     processDeletionJob(c.env, jobId).catch((error) => {
       logger.error("deletion.cleanup.failed", "deletion", "Deletion recheck failed.", { jobId }, error);

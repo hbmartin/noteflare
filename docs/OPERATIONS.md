@@ -84,8 +84,8 @@ Rotate during low traffic. Do not rotate while a version restore is in progress.
 
 ## Inspecting the work queues
 
-Three D1 tables are the system's asynchronous work queues. None has a UI, and they are the first place
-to look when cleanup appears stuck. See [Configuration](CONFIGURATION.md#cron-drain-rates-and-backoff)
+Three D1 tables are the system's asynchronous work queues. Owners can inspect accepted permanent
+deletions in Trash; the underlying queues are the first place to look when cleanup appears stuck. See [Configuration](CONFIGURATION.md#cron-drain-rates-and-backoff)
 for the drain rates that tell "stuck" from "backed off".
 
 ### Deletion jobs
@@ -93,7 +93,9 @@ for the drain rates that tell "stuck" from "backed off".
 Permanent deletion returns `202` and commits a job. The job purges each document epoch's Durable Object,
 then deletes exact attachment keys and complete `documents/{pageId}/` prefixes.
 If table evidence cannot be captured, acceptance returns `503 / deletion_evidence_unavailable`;
-retry shortly. Ownership changes return `409 / deletion_pending`. Neither response accepts the deletion.
+retry shortly for temporary outages. Malformed or conflicting evidence and blocked projection instead
+explain that the original evidence needs repair before acceptance. Ownership or snapshot changes return
+`409 / deletion_pending`. Neither response accepts the deletion; raw service errors are never returned.
 
 ```sh
 pnpm wrangler d1 execute DB --env production --remote --command \
@@ -117,8 +119,22 @@ tombstone after the whole-table job is gone. If that proof is unavailable, the a
 locks and parks with a diagnostic. Owners can inspect **Pending permanent deletions** in Trash and
 choose **Check again**. The action rechecks the same job; it never creates a replacement deletion,
 changes captured evidence, or overrides an active cleanup lease. Accepted pages remain unavailable
-for restore. Pending and retrying jobs refresh every five seconds while Trash is open; paused jobs
-wait for an explicit refresh or recheck.
+for restore. Pending jobs, including active cleanup leases, refresh every five seconds while Trash is
+open. Waiting retries refresh at their next-attempt time, bounded to 5–60 seconds so completion by another
+worker becomes visible. Paused jobs wait for an explicit refresh or recheck.
+
+Network failures and interrupted response-body reads retry automatically, even after successful response
+headers. Complete malformed proof responses, missing purge proof, generation conflicts, and conflicting
+retained evidence pause immediately. A failed compare-and-swap or a stopped containing table alone is
+coordination contention and retries with normal backoff; it is not proof of changed ownership. Every
+checkpoint still verifies the original identities and cleanup lease.
+
+During a rolling deployment, old workers may park jobs at `MAX_SAFE_INTEGER` without `blocked_at`, even
+after migration 0094 ran. The list recognizes these as paused and requiring owner recheck without guessing
+the original failure. Existing ownership blocks remain paused; they are never automatically unblocked
+based on a guess that old code misclassified contention. Inspect the captured identities and evidence,
+repair the original proof if necessary, then choose **Check again**. A recheck does not repair evidence,
+accept a newer generation, or release locks. These fixes require no migration beyond existing 0094.
 
 `GET /api/deletion-jobs` lists accepted jobs for the current workspace (owners only, 50 per page,
 with an opaque `nextCursor`). `POST /api/deletion-jobs/:id/retry` requests a recheck and returns `202`.

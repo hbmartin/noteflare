@@ -100,6 +100,104 @@ describe("legacy code content normalization", () => {
     );
   });
 
+  it.each(["cjs", "esm"])("recovers scheduled unsupported snapshot requests in the %s runtime", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const {JSDOM}=require("jsdom"),Y=require("yjs"),{Schema}=require("prosemirror-model"),{EditorState}=require("prosemirror-state"),{EditorView}=require("prosemirror-view"),p=require("y-prosemirror");'
+        : 'import {JSDOM} from "jsdom";import * as Y from "yjs";import {Schema} from "prosemirror-model";import {EditorState} from "prosemirror-state";import {EditorView} from "prosemirror-view";import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const dom=new JSDOM('<!doctype html><div id="editor"></div>');
+      for(const key of ['window','document','MutationObserver','HTMLElement','Node','Element'])globalThis[key]=key==='window'?dom.window:key==='document'?dom.window.document:dom.window[key];
+      globalThis.getComputedStyle=dom.window.getComputedStyle.bind(dom.window);
+      const schema=new Schema({nodes:{doc:{content:'codeBlock+'},codeBlock:{content:'text*',code:true,toDOM:()=>['pre',['code',0]]},text:{}}}),results=[];
+      for(const encoded of [false,true])for(const mode of ['preview','restore','valid-preview','valid-restore','superseded','exit','destroy']){
+        const doc=new Y.Doc({gc:false}),root=doc.getXmlFragment('document-store'),code=new Y.XmlElement('codeBlock'),text=new Y.XmlText();
+        text.insert(0,'old');code.insert(0,[text]);root.insert(0,[code]);const valid=encoded?Y.encodeStateAsUpdateV2(doc):Y.snapshot(doc);text.delete(0,3);text.insert(0,'safe');text.insertEmbed(2,false);
+        const bad=encoded?Y.encodeStateAsUpdateV2(doc):Y.snapshot(doc);text.delete(2,1);
+        const clean=encoded?Y.encodeStateAsUpdateV2(doc):Y.snapshot(doc),initial=p.initProseMirrorDoc(root,schema),plugin=p.ySyncPlugin(root,{mapping:initial.meta.mapping});
+        const view=new EditorView(document.querySelector('#editor'),{state:EditorState.create({schema,doc:initial.doc,plugins:[plugin]})});
+        let liveErrors=0,historyErrors=0,unexpected=0;
+        const unlive=p.observeUnsupportedCodeContent(doc,()=>liveErrors++),unhistory=p.observeUnsupportedSnapshotContent(doc,()=>historyErrors++);
+        const manager=new Y.UndoManager(root,{trackedOrigins:new Set([p.ySyncPluginKey]),captureTimeout:0});
+        const before=Buffer.from(Y.encodeStateAsUpdate(doc)),callbacks=[],original=setTimeout;
+        try{
+          globalThis.setTimeout=(fn,ms,...args)=>ms===0?(callbacks.push(()=>fn(...args)),0):original(fn,ms,...args);
+          const restore=mode==='restore'||mode==='valid-restore',validHistory=mode.startsWith('valid-');
+          view.dispatch(view.state.tr.setMeta(p.ySyncPluginKey,{snapshot:validHistory?valid:restore?bad:clean,prevSnapshot:validHistory?valid:bad,...(restore?{restore:true}:{})}));
+          if(mode==='superseded')view.dispatch(view.state.tr.setMeta(p.ySyncPluginKey,{snapshot:clean,prevSnapshot:clean}));
+          if(mode==='exit')p.ySyncPluginKey.getState(view.state).binding.unrenderSnapshot();
+          if(mode==='destroy')view.destroy();
+          for(const callback of callbacks){try{callback();}catch(error){unexpected++;}}
+        }finally{globalThis.setTimeout=original;}
+        const state=p.ySyncPluginKey.getState(view.state),retained=mode==='superseded'||mode==='valid-preview';
+        results.push({encoded,mode,liveErrors,historyErrors,unexpected,unchanged:before.equals(Buffer.from(Y.encodeStateAsUpdate(doc))),snapshotRetained:state.snapshot!=null,restoreRetained:state.restore===true,undoEntries:manager.undoStack.length});
+        if(mode!=='destroy'){
+          if(retained)state.binding.unrenderSnapshot();
+          if(!view.editable)throw new Error('Live editor stayed read-only');
+          view.dispatch(view.state.tr.insertText('after-',1));
+          if(text.toString()!==(mode==='valid-restore'?'after-old':'after-safe'))throw new Error('Live document no longer editable');
+          view.destroy();
+        }
+        unlive();unhistory();manager.destroy();doc.destroy();
+      }
+      dom.window.close();console.log(JSON.stringify(results));`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual(
+      [false, true].flatMap((encoded) =>
+        ["preview", "restore", "valid-preview", "valid-restore", "superseded", "exit", "destroy"].map((mode) => ({
+          encoded,
+          mode,
+          liveErrors: 0,
+          historyErrors: ["preview", "restore"].includes(mode) ? 1 : 0,
+          unexpected: 0,
+          unchanged: mode !== "valid-restore",
+          snapshotRetained: ["superseded", "valid-preview", "destroy"].includes(mode),
+          restoreRetained: false,
+          undoEntries: mode === "valid-restore" ? 1 : 0,
+        })),
+      ),
+    );
+  });
+
+  it.each(["cjs", "esm"])("seeds %s cursors without scanning historical structs before full validation", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y=require("yjs"),{Schema}=require("prosemirror-model"),p=require("y-prosemirror");'
+        : 'import * as Y from "yjs";import {Schema} from "prosemirror-model";import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema=new Schema({nodes:{doc:{content:'codeBlock+'},codeBlock:{content:'text*'},text:{}}}),results=[];
+      for(const count of [100,1000,10000]){
+        const doc=new Y.Doc({gc:false}),root=doc.getXmlFragment('document-store'),code=new Y.XmlElement('codeBlock'),text=new Y.XmlText();
+        text.insert(0,'safe');code.insert(0,[text]);root.insert(0,[code]);
+        for(let index=0;index<count;index++){const item=new Y.XmlElement('paragraph');root.insert(0,[item]);root.delete(0,1);}
+        let reads=0;
+        for(const [client,structs] of doc.store.clients)doc.store.clients.set(client,new Proxy(structs,{get(target,key){if(typeof key==='string'&&/^\\d+$/.test(key))reads++;return Reflect.get(target,key);}}));
+        const start=performance.now(),pm=p.initProseMirrorDoc(root,schema).doc,ms=performance.now()-start;
+        results.push({count,reads,content:pm.textContent,ms});doc.destroy();
+      }
+      console.log(JSON.stringify(results));`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    const results = JSON.parse(output) as Array<{ count: number; reads: number; content: string; ms: number }>;
+    expect(results.map(({ count, reads, content }) => ({ count, reads, content }))).toEqual(
+      [100, 1000, 10000].map((count) => ({ count, reads: 1, content: "safe" })),
+    );
+    expect(results.every((result) => Number.isFinite(result.ms))).toBe(true);
+  });
+
   it.each(["cjs", "esm"])("validates linearly while the %s reader merges adjacent paragraph texts", (format) => {
     const imports =
       format === "cjs"
@@ -130,6 +228,68 @@ describe("legacy code content normalization", () => {
     expect(JSON.parse(output)).toEqual(
       [50, 100, 200].map((count) => ({ count, reads: 2 * count, paragraph: "leftright", blocks: 2 * count })),
     );
+  });
+
+  it.each(["cjs", "esm"])("avoids repeated historical client scans in the %s reader", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y=require("yjs"),{Schema}=require("prosemirror-model"),p=require("y-prosemirror");'
+        : 'import * as Y from "yjs";import {Schema} from "prosemirror-model";import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema=new Schema({nodes:{doc:{content:"paragraph+"},paragraph:{content:"text*"},text:{}}}), results=[];
+      for (const count of [50,200,800]) {
+        const doc=new Y.Doc(),root=doc.getXmlFragment("document-store");doc.clientID=1;
+        doc.transact(()=>{for(let index=0;index<count;index++) {
+          const paragraph=new Y.XmlElement("paragraph"),text=new Y.XmlText();text.insert(0,"safe");paragraph.insert(0,[text]);root.insert(root.length,[paragraph]);
+        }});
+        for(let index=1;index<1000;index++) {
+          const peer=new Y.Doc();peer.clientID=200000+index;peer.getMap("presence").set(String(index),index);
+          Y.applyUpdate(doc,Y.encodeStateAsUpdate(peer));peer.destroy();
+        }
+        let scans=0,visits=0;const entries=doc.store.clients[Symbol.iterator].bind(doc.store.clients);
+        doc.store.clients[Symbol.iterator]=function*(){scans++;for(const entry of entries()){visits++;yield entry;}};
+        const pm=p.initProseMirrorDoc(root,schema).doc;
+        results.push({count,scans,visits,blocks:pm.childCount});doc.destroy();
+      }
+      console.log(JSON.stringify(results));`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual(
+      [50, 200, 800].map((count) => ({ count, scans: 1, visits: 1000, blocks: count })),
+    );
+  });
+
+  it.each(["cjs", "esm"])("detects mutations inside an open transaction during the %s reader", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y=require("yjs"),{Schema}=require("prosemirror-model"),p=require("y-prosemirror");'
+        : 'import * as Y from "yjs";import {Schema} from "prosemirror-model";import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema=new Schema({nodes:{doc:{content:"paragraph codeBlock"},paragraph:{content:"text*"},codeBlock:{content:"text*"},text:{}}});
+      const doc=new Y.Doc(),root=doc.getXmlFragment("document-store"),paragraph=new Y.XmlElement("paragraph"),plain=new Y.XmlText(),code=new Y.XmlElement("codeBlock"),text=new Y.XmlText();
+      plain.insert(0,"plain");paragraph.insert(0,[plain]);text.insert(0,"safe");code.insert(0,[text]);root.insert(0,[paragraph,code]);
+      const attributes=paragraph.getAttributes.bind(paragraph);let injected=false,rejected=false;
+      // A descendant read mutates a later code block after root preflight, while
+      // the existing transaction suppresses a second beforeTransaction event.
+      paragraph.getAttributes=(...args)=>{if(!injected){injected=true;text.insertEmbed(0,false);}return attributes(...args);};
+      try {doc.transact(()=>p.initProseMirrorDoc(root,schema));}
+      catch(error) {if(!(error instanceof p.UnsupportedCodeContentError))throw error;rejected=true;}
+      console.log(JSON.stringify({injected,rejected,retained:text.toDelta().some(delta=>delta.insert===false)}));doc.destroy();`,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    expect(JSON.parse(output)).toEqual({ injected: true, rejected: true, retained: true });
   });
 
   it.each(["cjs", "esm"])("invalidates an active unbound %s preflight after observer mutations", (format) => {

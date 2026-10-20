@@ -1,7 +1,9 @@
-import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
+import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { enrollAccount } from "../../tests/helpers/security";
 import { CLEANUP_LEASE_MS, listDeletionJobs, queueDeletionRetry } from "./deletion-jobs";
+import worker from "./index";
+import { afterD1 } from "../../tests/helpers/d1-races";
 import type { DeletionJobsPage } from "../shared/deletion-jobs";
 
 beforeEach(async () => {
@@ -52,6 +54,40 @@ describe("deletion job recovery", () => {
       status: "blocked",
       reasonCode: "deletion_recheck_required",
       canRetry: true,
+    });
+  });
+
+  it.each([null, "old proof failure"])(
+    "recognizes legacy parking written after migration (error=%s)",
+    async (error) => {
+      await job("legacy-after");
+      await env.DB.prepare("UPDATE deletion_jobs SET next_attempt_at=?,last_error=? WHERE id='legacy-after'")
+        .bind(Number.MAX_SAFE_INTEGER, error)
+        .run();
+      expect((await listDeletionJobs(env, "workspace", null)).jobs[0]).toMatchObject({
+        status: "blocked",
+        reasonCode: "deletion_recheck_required",
+        nextAttemptAt: null,
+        canRetry: true,
+      });
+      expect(await queueDeletionRetry(env, "workspace", "legacy-after")).toBe("queued");
+      expect((await listDeletionJobs(env, "workspace", null)).jobs[0]).toMatchObject({
+        status: "pending",
+        canRetry: false,
+      });
+    },
+  );
+
+  it("keeps previously ambiguous ownership blocks for an owner recheck", async () => {
+    await job("ambiguous");
+    await env.DB.prepare(
+      "UPDATE deletion_jobs SET next_attempt_at=?,blocked_at=2,failure_code='deletion_ownership_conflict' WHERE id='ambiguous'",
+    )
+      .bind(Number.MAX_SAFE_INTEGER)
+      .run();
+    expect((await listDeletionJobs(env, "workspace", null)).jobs[0]).toMatchObject({
+      status: "blocked",
+      reasonCode: "deletion_ownership_conflict",
     });
   });
 
@@ -128,9 +164,50 @@ describe("deletion job recovery", () => {
     expect(
       await env.DB.prepare("SELECT next_attempt_at,last_error FROM deletion_jobs WHERE id='leased'").first(),
     ).toEqual({ next_attempt_at: now + CLEANUP_LEASE_MS, last_error: "old failure" });
-    expect((await listDeletionJobs(env, "workspace", null)).jobs[0]?.canRetry).toBe(false);
-    await expect(queueDeletionRetry(env, "foreign", "leased")).rejects.toMatchObject({ status: 404 });
+    expect((await listDeletionJobs(env, "workspace", null)).jobs[0]).toMatchObject({
+      status: "pending",
+      canRetry: false,
+    });
+    await expect(queueDeletionRetry(env, "foreign", "leased")).resolves.toBe("missing");
   });
+
+  it.each([false, true])(
+    "returns 202 when a selected accepted job completes before recheck (recreated=%s)",
+    async (recreated) => {
+      const installed = await owner();
+      await job("completed", "cleanup", installed.workspace.id);
+      const db = afterD1(
+        env.DB,
+        (sql) => sql === "SELECT page_id FROM deletion_job_pages WHERE job_id=? ORDER BY page_id",
+        async () => {
+          await env.DB.prepare("DELETE FROM deletion_jobs WHERE id='completed'").run();
+          if (recreated) {
+            const space = await env.DB.prepare("SELECT id FROM spaces WHERE workspace_id=? LIMIT 1")
+              .bind(installed.workspace.id)
+              .first<{ id: string }>();
+            await env.DB.prepare(
+              "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,archived_at) VALUES('root-completed',?,?,'document','a0','Recreated',?,1,1,1)",
+            )
+              .bind(installed.workspace.id, space!.id, installed.user.id)
+              .run();
+          }
+        },
+      );
+      const context = createExecutionContext();
+      const response = await worker.fetch(
+        new Request("http://example.test/api/pages/root-completed/permanent-delete", {
+          method: "POST",
+          headers: { cookie: installed.cookie, origin: "http://example.test" },
+        }),
+        { ...env, DB: db },
+        context,
+      );
+      await waitOnExecutionContext(context);
+      expect(response.status).toBe(202);
+      expect((await env.DB.prepare("SELECT id FROM deletion_jobs").all()).results).toEqual([]);
+      expect(Boolean(await env.DB.prepare("SELECT id FROM pages WHERE id='root-completed'").first())).toBe(recreated);
+    },
+  );
 
   it("authorizes listing and retries by workspace and owner role", async () => {
     const installed = await owner();

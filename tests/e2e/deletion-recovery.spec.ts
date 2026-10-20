@@ -3,6 +3,10 @@ import { openNavigation, signInOwner } from "./security-helpers";
 
 test.use({ serviceWorkers: "block" });
 
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: "wait" });
+});
+
 test("owners can inspect and recheck paused deletions separately from Trash pages", async ({ page }) => {
   await signInOwner(page);
   let completed = false;
@@ -56,20 +60,68 @@ test("owners can inspect and recheck paused deletions separately from Trash page
 
 test("non-owners never load owner deletion status", async ({ page }) => {
   await signInOwner(page);
-  await page.route("**/api/me", async (route) => {
-    const response = await route.fetch();
-    const body = await response.json();
-    await route.fulfill({ response, json: { ...body, role: "editor" } });
-  });
+  const response = await page.request.get("/api/me");
+  expect(response.ok()).toBe(true);
+  const member = await response.json();
+  await page.route("**/api/me", (route) => route.fulfill({ json: { ...member, role: "editor" } }));
   let ownerRequests = 0;
   await page.route("**/api/deletion-jobs**", async (route) => {
     ownerRequests++;
     await route.fulfill({ status: 403, json: { error: { code: "owner_required", message: "Owner required" } } });
   });
   await page.reload();
+  await expect(page.getByLabel("Workspace navigation")).toBeAttached();
   await openNavigation(page);
   await page.getByRole("button", { name: "Trash", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Trash", exact: true })).toBeVisible();
   await expect(page.getByRole("region", { name: "Pending permanent deletions" })).toHaveCount(0);
   expect(ownerRequests).toBe(0);
+});
+
+test("Trash polls long backoff at sixty seconds, active work at five, and pauses blocked jobs", async ({ page }) => {
+  await signInOwner(page);
+  const start = new Date();
+  await page.clock.install({ time: start });
+  await page.clock.pauseAt(new Date(start.getTime() + 10_000));
+  let reads = 0;
+  await page.route("**/api/deletion-jobs**", async (route) => {
+    reads++;
+    const status = reads === 1 ? "retrying" : reads === 2 ? "pending" : "blocked";
+    await route.fulfill({
+      json: {
+        jobs: [
+          {
+            id: "waiting",
+            rootPageId: "root",
+            title: "Waiting deletion",
+            pageCount: 1,
+            phase: "cleanup",
+            status,
+            reasonCode: null,
+            reason: null,
+            nextAttemptAt: Date.now() + 16 * 60 * 60_000,
+            createdAt: 1,
+            updatedAt: 1,
+            canRetry: status === "blocked",
+          },
+        ],
+        nextCursor: null,
+      },
+    });
+  });
+  await openNavigation(page);
+  await page.getByRole("button", { name: "Trash", exact: true }).click();
+  const section = page.getByRole("region", { name: "Pending permanent deletions" });
+  await expect(section.getByText("Waiting deletion")).toBeVisible();
+  expect(reads).toBe(1);
+  await page.clock.runFor(59_999);
+  expect(reads).toBe(1);
+  await page.clock.runFor(1);
+  await expect.poll(() => reads).toBe(2);
+  await expect(section.getByText("1 page · Deleting")).toBeVisible();
+  await page.clock.runFor(5_000);
+  await expect.poll(() => reads).toBe(3);
+  await expect(section.getByText("1 page · Paused")).toBeVisible();
+  await page.clock.runFor(120_000);
+  expect(reads).toBe(3);
 });

@@ -289,6 +289,42 @@ describe("EditorPage close reconciliation", () => {
     expect(mocks.editorCreated.mock.calls.length).toBeGreaterThan(creations);
   });
 
+  it("reports unsupported historical content without closing the live editor", async () => {
+    mocks.realDocument = true;
+    mocks.api.mockResolvedValue({ page });
+    const view = render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => Promise.resolve());
+    const doc = mocks.documents.at(-1)!;
+    const before = Y.encodeStateAsUpdate(doc),
+      creations = vi.mocked(createCollaboration).mock.calls.length;
+    expect(doc["_observers"].get("unsupported-snapshot-content")?.size).toBe(1);
+    await act(async () => {
+      (doc as unknown as { emit(event: string, args: unknown[]): void }).emit("unsupported-snapshot-content", [
+        new UnsupportedCodeContentError(),
+      ]);
+    });
+    expect(
+      screen.getByText(
+        "This saved version contains unsupported code content. The current document is still available.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("This content could not be displayed")).toBeNull();
+    expect(vi.mocked(createCollaboration).mock.calls.length).toBe(creations);
+    expect(Y.encodeStateAsUpdate(doc)).toEqual(before);
+    view.unmount();
+    expect(doc["_observers"].get("unsupported-snapshot-content")?.size ?? 0).toBe(0);
+  });
+
   it("ignores a queued error from a replaced document without remounting the guard", async () => {
     mocks.realDocument = true;
     vi.spyOn(console, "error").mockImplementation(() => undefined);

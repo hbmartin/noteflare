@@ -21,7 +21,9 @@ const blocked: DeletionJobSummary = {
   updatedAt: 1,
   canRetry: true,
 };
-beforeEach(() => request.mockReset());
+beforeEach(() => {
+  request.mockReset();
+});
 afterEach(() => vi.useRealTimers());
 
 describe("pending deletion controls", () => {
@@ -38,6 +40,35 @@ describe("pending deletion controls", () => {
     await screen.findByText("No pending permanent deletions.");
     expect(request).toHaveBeenCalledWith("/api/deletion-jobs/job/retry", expect.objectContaining({ method: "POST" }));
   });
+  it("shows loading instead of empty state before the first response", () => {
+    request.mockImplementation(() => new Promise(() => {}));
+    render(<PendingDeletions />);
+    expect(screen.queryByText("No pending permanent deletions.")).toBeNull();
+    expect(screen.getByText("Refreshing pending deletions…")).toBeVisible();
+  });
+
+  it.each([
+    [2_000, 5_000],
+    [20_000, 20_000],
+    [16 * 60 * 60_000, 60_000],
+  ])("polls a waiting retry due in %ims after %ims", async (backoff, delay) => {
+    vi.useFakeTimers();
+    request
+      .mockResolvedValueOnce({
+        jobs: [{ ...blocked, status: "retrying", nextAttemptAt: Date.now() + backoff }],
+        nextCursor: null,
+      })
+      .mockResolvedValue({ jobs: [blocked], nextCursor: null });
+    render(<PendingDeletions />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(delay - 1));
+    expect(request).toHaveBeenCalledTimes(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(request).toHaveBeenCalledTimes(2);
+    await act(() => vi.advanceTimersByTimeAsync(120_000));
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
   it("loads older pages and refreshes all loaded pages", async () => {
     request
       .mockResolvedValueOnce({ jobs: [blocked], nextCursor: "older" })
