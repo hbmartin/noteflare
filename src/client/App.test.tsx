@@ -4846,7 +4846,7 @@ describe("App error handling", () => {
     fireEvent.click(screen.getByRole("button", { name: /Search/ }));
     fireEvent.click(screen.getByRole("button", { name: /Trash/ }));
 
-    expect(screen.getByRole("status")).toHaveTextContent("Refreshing trash…");
+    expect(screen.getByText("Refreshing trash…")).toBeVisible();
     expect(screen.getByRole("button", { name: "Restore" })).toBeDisabled();
     await act(async () => {
       refresh.resolve({ pages: [] });

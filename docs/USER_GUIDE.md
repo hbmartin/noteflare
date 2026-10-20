@@ -24,7 +24,7 @@ Insert a date mention and choose its reminder settings. Delivery follows the ins
 
 ## Offline work and app installation
 
-A production build offers an installable app shell and a catalog of opened documents. Offline document mutation requires `OFFLINE_EDITING_ENABLED`; when off, cached documents remain read-only offline. Reconnect and complete sync before AI writing or server-authoritative actions. Diagrams retain a disconnected view but resume editing only after live sync.
+A production build offers an installable app shell and a catalog of opened documents. Cached documents remain read-only offline. Editing, uploads, comments, reactions, and applying AI writing require a current connection and completed authoritative synchronization. Drafts already in progress are preserved; they never submit automatically after reconnect. Diagrams retain a disconnected view but resume editing only after live sync.
 
 ## Links embeds and sharing
 

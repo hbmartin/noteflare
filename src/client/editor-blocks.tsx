@@ -1,3 +1,7 @@
+import { loadForegroundModule } from "./chunk-recovery";
+import { EditorFeatureContext } from "./editor-feature-context";
+import { SlackLinkCard } from "./SlackLinkCard";
+import { slackMessageLink } from "../shared/slack-links";
 import { renderToString } from "katex";
 import { createReactBlockSpec, createReactInlineContentSpec } from "@blocknote/react";
 import {
@@ -21,8 +25,9 @@ import { useNearViewport } from "./near-viewport";
 import { updateHeadingIndex, type IndexedHeading, type HeadingBlock } from "./heading-index";
 
 import { DiagramEmbedContext } from "./diagram-embed-context";
+import { subscribeBookmarkPreview, type BookmarkPreview } from "./bookmark-preview-pool";
 const LiveDiagramEmbed = lazy(() =>
-  import("./LiveDiagramEmbed").then((module) => ({ default: module.LiveDiagramEmbed })),
+  loadForegroundModule(() => import("./LiveDiagramEmbed").then((module) => ({ default: module.LiveDiagramEmbed }))),
 );
 
 const CALLOUT_TONES = ["info", "success", "warning", "danger"] as const;
@@ -333,49 +338,38 @@ const embed = createReactBlockSpec(
   },
 )();
 
-type LinkPreview = {
-  id: string;
-  url: string;
-  title: string;
-  description: string;
-  siteName: string;
-  imageUrl: string | null;
-  expiresAt: number;
-};
-
 export function BookmarkBlock({ url, title, update }: { url: string; title: string; update?: (url: string) => void }) {
   const { ref: viewportRef, ready } = useNearViewport();
   const expanded = useContext(EmbedFeatureContext);
-  const [loaded, setLoaded] = useState<{ url: string; preview: LinkPreview } | null>(null);
+  const host = useContext(EditorFeatureContext);
+  const account = host ? `${host.member.user.id}:${host.member.workspace.id}` : null;
+  const [loaded, setLoaded] = useState<{ url: string; preview: BookmarkPreview } | null>(null);
   const [failedImage, setFailedImage] = useState<string | null>(null);
   const preview = loaded?.url === url ? loaded.preview : null;
   useEffect(() => {
-    if (!ready || !expanded || !url.startsWith("https://")) return undefined;
-    const controller = new AbortController();
+    if (!ready || !expanded || !account || slackMessageLink(url) || !url.startsWith("https://")) return undefined;
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
     let retries = 0;
     let retryTimer: number | undefined;
     const load = () => {
-      void api<{ preview: LinkPreview }>("/api/link-previews", {
-        method: "POST",
-        body: json({ url }),
-        signal: controller.signal,
-      })
-        .then((result) => setLoaded({ url, preview: result.preview }))
-        .catch((cause: unknown) => {
-          if (controller.signal.aborted) return;
-          setLoaded(null);
-          if (cause instanceof ApiClientError && cause.code === "preview_pending" && retries++ < 2) {
-            retryTimer = window.setTimeout(load, 30_000);
-          }
-        });
+      unsubscribe?.();
+      unsubscribe = subscribeBookmarkPreview(account, url, ({ preview: loadedPreview, error }) => {
+        if (!active) return;
+        setLoaded(loadedPreview ? { url, preview: loadedPreview } : null);
+        if (error instanceof ApiClientError && error.code === "preview_pending" && retries++ < 2) {
+          retryTimer = window.setTimeout(load, 30_000);
+        }
+      });
     };
     const timer = window.setTimeout(load, 500);
     return () => {
       window.clearTimeout(timer);
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
-      controller.abort();
+      active = false;
+      unsubscribe?.();
     };
-  }, [ready, expanded, url]);
+  }, [ready, expanded, account, url]);
   const displayTitle = title && title !== "Bookmark" && title !== url ? title : preview?.title || title || "Bookmark";
   return (
     <div className="editor-bookmark" ref={viewportRef}>
@@ -387,6 +381,7 @@ export function BookmarkBlock({ url, title, update }: { url: string; title: stri
         {preview?.description && <span>{preview.description}</span>}
         <span>{preview?.siteName || url || "Add an HTTP, HTTPS, or mail link"}</span>
       </a>
+      {account && expanded && slackMessageLink(url) && <SlackLinkCard key={url} url={url} />}
       {update && (
         <input
           contentEditable={false}

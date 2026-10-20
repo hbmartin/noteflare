@@ -4,6 +4,10 @@ User-visible and operator-relevant changes. The dated summaries below are retros
 
 ## Unreleased
 
+- Small-team wiki implementation increments: connected authoring with cached reading, safe module recovery, durable live-access fencing, block-local upload retry/cancel, heading-weighted search, and shared bookmark preview requests.
+- Private comment drafts and submission receipts, emoji reactions, grouped settings, trash filters, navigation commands, and presentation laser/snapshot controls.
+- Viewer-authorized Slack message previews and a gated canonical relation/rollup pilot. New migrations and remaining acceptance gates are recorded in the [implementation ledger](docs/implementation/small-team-wiki-release.md). No production activation is implied.
+
 - Documentation organized by reader, current setup and upgrade references, and automated link/discovery/configuration coverage checks.
 
 ## October 2026 through 12 October

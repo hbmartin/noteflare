@@ -18,8 +18,8 @@ export type DocumentCloseReconcilerOptions = {
   onUnauthorized?: () => void;
 };
 
-const TRANSITION_CLOSE_CODES = new Set([4410, 4412]);
-const RECONCILED_CLOSE_CODES = new Set([4410, 4412, 1006]);
+const TRANSITION_CLOSE_CODES = new Set([4403, 4410, 4412]);
+const RECONCILED_CLOSE_CODES = new Set([4403, 4410, 4412, 1006]);
 
 export function createDocumentCloseReconciler({
   page,

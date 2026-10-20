@@ -9,6 +9,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 export interface EventConnectionAuth {
   userId: string;
   expiresAt: number;
+  authGeneration?: number;
   __ypsAwarenessIds?: number[];
 }
 
@@ -80,16 +81,75 @@ export class WorkspaceEvents extends YServer {
     super(state, env as Cloudflare.Env);
     this.state = state;
     this.bindings = env;
+    this.state.storage.sql
+      .exec(`CREATE TABLE IF NOT EXISTS realtime_control(id INTEGER PRIMARY KEY,generation INTEGER NOT NULL);
+      INSERT OR IGNORE INTO realtime_control VALUES(1,0);
+      CREATE TABLE IF NOT EXISTS realtime_rooms(room TEXT PRIMARY KEY,expires_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS realtime_fanout(room TEXT PRIMARY KEY,generation INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS realtime_room_fences(room TEXT PRIMARY KEY,generation INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS realtime_legacy_scan(id INTEGER PRIMARY KEY,deadline INTEGER NOT NULL,cursor TEXT NOT NULL,complete INTEGER NOT NULL);`);
+    this.state.storage.sql.exec("INSERT OR IGNORE INTO realtime_legacy_scan VALUES(1,?,'',0)", Date.now() + 5 * 60_000);
+  }
+
+  private authGeneration() {
+    return this.state.storage.sql
+      .exec<{ generation: number }>("SELECT generation FROM realtime_control WHERE id=1")
+      .one().generation;
+  }
+
+  private async drainRevocations() {
+    this.state.storage.sql.exec(
+      "DELETE FROM realtime_fanout WHERE NOT EXISTS (SELECT 1 FROM realtime_rooms WHERE realtime_rooms.room=realtime_fanout.room AND expires_at>?)",
+      Date.now(),
+    );
+    const pending = this.state.storage.sql
+      .exec<{ room: string; generation: number }>("SELECT * FROM realtime_fanout LIMIT 64")
+      .toArray();
+    await Promise.allSettled(
+      pending.map(async (item) => {
+        const response = await (
+          item.room.startsWith("table:")
+            ? this.bindings.TABLE.getByName(item.room.slice(6))
+            : this.bindings.DOCUMENT.getByName(item.room)
+        ).fetch(
+          new Request("https://document.internal/revoke-access", {
+            method: "POST",
+            headers: { "x-notes-internal": this.bindings.BETTER_AUTH_SECRET },
+            body: JSON.stringify({ generation: item.generation }),
+          }),
+        );
+        if (response.ok || response.status === 404 || response.status === 410) {
+          this.state.storage.sql.exec(
+            "INSERT INTO realtime_room_fences VALUES(?,?) ON CONFLICT(room) DO UPDATE SET generation=max(generation,excluded.generation)",
+            item.room,
+            item.generation,
+          );
+          this.state.storage.sql.exec(
+            "DELETE FROM realtime_fanout WHERE room=? AND generation<=?",
+            item.room,
+            item.generation,
+          );
+        }
+      }),
+    );
+    const count = this.state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) n FROM realtime_fanout").one().n;
+    if (count) await this.scheduleAlarm(Date.now() + 2_000);
+    return count === 0;
   }
 
   async onConnect(connection: Connection<EventConnectionAuth>, context: ConnectionContext) {
     const userId = context.request.headers.get("x-notes-user-id");
     const expiresAt = Number(context.request.headers.get("x-notes-expires-at"));
+    const authGeneration = Number(context.request.headers.get("x-notes-auth-generation") ?? 0);
+    if (authGeneration < this.authGeneration()) {
+      connection.close(4403, "Access changed. Reconnect to continue.");
+      return;
+    }
     if (!userId || !expiresAt) {
       connection.close(4401, "Authorization missing.");
       return;
     }
-    connection.setState({ userId, expiresAt });
+    connection.setState({ userId, expiresAt, authGeneration });
     await this.scheduleAlarm(expiresAt);
     await super.onConnect(connection, context);
   }
@@ -107,6 +167,26 @@ export class WorkspaceEvents extends YServer {
   }
 
   async onAlarm() {
+    const generation = this.authGeneration();
+    const legacy = this.state.storage.sql
+      .exec<{ complete: number }>("SELECT complete FROM realtime_legacy_scan WHERE id=1")
+      .one();
+    const pending = this.state.storage.sql.exec<{ n: number }>("SELECT count(*) n FROM realtime_fanout").one().n;
+    if (generation > 0 && (!legacy.complete || pending)) {
+      const response = await this.onRequestObserved(
+        new Request("https://workspace-events.internal/revoke-rooms", {
+          method: "POST",
+          headers: { "x-notes-internal": this.bindings.BETTER_AUTH_SECRET },
+          body: JSON.stringify({ generation }),
+        }),
+      );
+      if (response.ok)
+        await this.bindings.DB.prepare(
+          "UPDATE realtime_revocations SET completed_revision=max(completed_revision,?) WHERE workspace_id=?",
+        )
+          .bind(generation, this.state.id.name)
+          .run();
+    } else await this.drainRevocations();
     const time = Date.now();
     for (const connection of this.getConnections<EventConnectionAuth>()) {
       if (!connection.state || connection.state.expiresAt <= time) {
@@ -133,6 +213,81 @@ export class WorkspaceEvents extends YServer {
       return new Response(null, { status: 204 });
     }
     if (request.method !== "POST") return new Response("Not found", { status: 404 });
+    const path = new URL(request.url).pathname;
+    if (path === "/register-room" || path === "/revoke-rooms") {
+      const body = await request.json<{ room?: unknown; generation?: unknown; expiresAt?: unknown }>();
+      if (!Number.isSafeInteger(body.generation) || Number(body.generation) < 0)
+        return new Response("Invalid generation", { status: 400 });
+      const generation = Number(body.generation);
+      if (path === "/register-room") {
+        if (generation !== this.authGeneration()) return new Response("Refresh required", { status: 409 });
+        const pending = this.state.storage.sql.exec<{ n: number }>("SELECT count(*) n FROM realtime_fanout").one().n;
+        const legacy = this.state.storage.sql
+          .exec<{ complete: number }>("SELECT complete FROM realtime_legacy_scan WHERE id=1")
+          .one();
+        if (pending || (generation > 0 && !legacy.complete)) return new Response("Refresh required", { status: 409 });
+        if (body.room !== null) {
+          if (
+            typeof body.room !== "string" ||
+            !/^(?:[a-zA-Z0-9-]{1,100}~[1-9][0-9]*|table:[a-zA-Z0-9-]{1,100})$/.test(body.room) ||
+            !Number.isFinite(body.expiresAt) ||
+            Number(body.expiresAt) <= Date.now() ||
+            Number(body.expiresAt) > Date.now() + 5 * 60_000 + 5_000
+          ) {
+            return new Response("Invalid room", { status: 400 });
+          }
+          this.state.storage.sql.exec("DELETE FROM realtime_rooms WHERE expires_at<=?", Date.now());
+          this.state.storage.sql.exec(
+            "DELETE FROM realtime_room_fences WHERE NOT EXISTS(SELECT 1 FROM realtime_rooms WHERE realtime_rooms.room=realtime_room_fences.room)",
+          );
+          this.state.storage.sql.exec(
+            "INSERT INTO realtime_rooms VALUES(?,?) ON CONFLICT(room) DO UPDATE SET expires_at=max(expires_at,excluded.expires_at)",
+            body.room,
+            Number(body.expiresAt),
+          );
+        }
+        return Response.json({ generation });
+      }
+      this.state.storage.sql.exec("UPDATE realtime_control SET generation=max(generation,?) WHERE id=1", generation);
+      await this.scheduleAlarm(Date.now() + 2_000);
+      // Cover grants issued by the previous deployment, before room registration existed.
+      const legacy = this.state.storage.sql
+        .exec<{ deadline: number; cursor: string; complete: number }>("SELECT * FROM realtime_legacy_scan WHERE id=1")
+        .one();
+      if (!legacy.complete && legacy.deadline > Date.now()) {
+        const pages = await this.bindings.DB.prepare(
+          "SELECT id,content_epoch,kind FROM pages WHERE workspace_id=? AND id>? ORDER BY id LIMIT 64",
+        )
+          .bind(this.state.id.name, legacy.cursor)
+          .all<{ id: string; content_epoch: number; kind: string }>();
+        for (const page of pages.results)
+          this.state.storage.sql.exec(
+            "INSERT INTO realtime_rooms VALUES(?,?) ON CONFLICT(room) DO UPDATE SET expires_at=max(expires_at,excluded.expires_at)",
+            page.kind === "table" ? `table:${page.id}` : `${page.id}~${page.content_epoch}`,
+            legacy.deadline,
+          );
+        this.state.storage.sql.exec(
+          "UPDATE realtime_legacy_scan SET cursor=?,complete=? WHERE id=1",
+          pages.results.at(-1)?.id ?? legacy.cursor,
+          pages.results.length < 64 ? 1 : 0,
+        );
+        if (pages.results.length === 64) return Response.json({ complete: false }, { status: 503 });
+      } else if (!legacy.complete) this.state.storage.sql.exec("UPDATE realtime_legacy_scan SET complete=1 WHERE id=1");
+      this.state.storage.sql.exec(
+        `INSERT INTO realtime_fanout SELECT room,? FROM realtime_rooms WHERE expires_at>?
+        AND COALESCE((SELECT generation FROM realtime_room_fences WHERE realtime_room_fences.room=realtime_rooms.room),-1)<?
+        ON CONFLICT(room) DO UPDATE SET generation=max(generation,excluded.generation)`,
+        this.authGeneration(),
+        Date.now(),
+        this.authGeneration(),
+      );
+      for (const connection of this.getConnections<EventConnectionAuth>()) {
+        if ((connection.state?.authGeneration ?? 0) < this.authGeneration())
+          connection.close(4403, "Access changed. Reconnect to continue.");
+      }
+      const complete = await this.drainRevocations();
+      return Response.json({ complete }, { status: complete ? 200 : 503 });
+    }
     const workspaceId = this.state.id.name;
     if (!workspaceId || !ID_PATTERN.test(workspaceId)) {
       return Response.json({ error: "Invalid workspace object identity." }, { status: 500 });
@@ -319,6 +474,7 @@ export class WorkspaceEvents extends YServer {
 }
 
 export async function broadcastWorkspaceEvent(env: Env, workspaceId: string, event: WorkspaceEvent) {
+  // Rooms publish while restoring. Revocation drains belong to request/maintenance boundaries, avoiding room-to-coordinator recursion.
   const stub = env.WORKSPACE_EVENTS.getByName(workspaceId);
   const response = await stub.fetch(
     new Request("https://workspace-events.internal/broadcast", {

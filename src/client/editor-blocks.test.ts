@@ -1,9 +1,10 @@
+import { EditorFeatureContext } from "./editor-feature-context";
 // @vitest-environment jsdom
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { createElement } from "react";
+import { createElement, type ComponentProps } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Page } from "../shared/types";
+import type { Page, ClientMemberContext } from "../shared/types";
 import { ApiClientError } from "./api";
 import {
   allowedEmbedUrl,
@@ -29,6 +30,19 @@ vi.mock("./api", async (importOriginal) => ({
   json: (value: unknown) => JSON.stringify(value),
 }));
 
+function authenticatedBookmark(props: ComponentProps<typeof BookmarkBlock>) {
+  return createElement(
+    EditorFeatureContext.Provider,
+    {
+      value: {
+        hostId: "host",
+        member: { user: { id: "user" }, workspace: { id: "workspace" } } as ClientMemberContext,
+        onSelectPage: () => undefined,
+      },
+    },
+    createElement(BookmarkBlock, props),
+  );
+}
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((complete) => {
@@ -82,7 +96,7 @@ describe("core editor blocks", () => {
       createElement(
         EmbedFeatureContext.Provider,
         { value: true },
-        createElement(BookmarkBlock, { url: value, title: "Saved title", update }),
+        createElement(authenticatedBookmark, { url: value, title: "Saved title", update }),
       );
     const view = render(block("https://example.com/arti"));
     view.rerender(block(url));
@@ -116,7 +130,11 @@ describe("core editor blocks", () => {
           },
         });
       render(
-        createElement(EmbedFeatureContext.Provider, { value: true }, createElement(BookmarkBlock, { url, title: url })),
+        createElement(
+          EmbedFeatureContext.Provider,
+          { value: true },
+          createElement(authenticatedBookmark, { url, title: url }),
+        ),
       );
       await act(async () => vi.advanceTimersByTimeAsync(500));
       expect(mocks.api).toHaveBeenCalledOnce();

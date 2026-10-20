@@ -1,5 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { reportClientError } from "./telemetry";
+import { isChunkLoadFailure } from "./chunk-recovery";
 
 export class RenderBoundary extends Component<
   {
@@ -10,14 +11,14 @@ export class RenderBoundary extends Component<
     onExport?: () => void;
     onRetry?: () => void;
   },
-  { failed: boolean; resetKey: string | number | undefined }
+  { failed: boolean; chunkFailed: boolean; resetKey: string | number | undefined }
 > {
-  state = { failed: false, resetKey: this.props.resetKey };
+  state = { failed: false, chunkFailed: false, resetKey: this.props.resetKey };
   static getDerivedStateFromProps(props: RenderBoundary["props"], state: RenderBoundary["state"]) {
-    return props.resetKey !== state.resetKey ? { failed: false, resetKey: props.resetKey } : null;
+    return props.resetKey !== state.resetKey ? { failed: false, chunkFailed: false, resetKey: props.resetKey } : null;
   }
-  static getDerivedStateFromError() {
-    return { failed: true };
+  static getDerivedStateFromError(error: unknown) {
+    return { failed: true, chunkFailed: isChunkLoadFailure(error) };
   }
   componentDidCatch(error: Error, _info: ErrorInfo) {
     void reportClientError("client.render_failed", error);
@@ -45,11 +46,15 @@ export class RenderBoundary extends Component<
         <button
           type="button"
           onClick={() => {
+            if (this.state.chunkFailed) {
+              window.location.reload();
+              return;
+            }
             this.props.onRetry?.();
             this.setState({ failed: false });
           }}
         >
-          Try again
+          {this.state.chunkFailed ? "Reload application" : "Try again"}
         </button>
       </section>
     );

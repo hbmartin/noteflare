@@ -1,3 +1,4 @@
+import { useOnlineStatus } from "./online-status";
 import { nodeTypes, flowEdge, type FlowNode, type FlowEdge } from "./diagram-rendering";
 import type { ReactNode } from "react";
 import { ActionMenu, PageTools } from "./WorkspaceUI";
@@ -1136,7 +1137,8 @@ export function DiagramPage({
   }, [commentsRevision, page.id]);
 
   const connected = status === "connected" && Boolean(bundle?.synced) && ready;
-  const editable = member.role !== "viewer" && connected && !sizeWarning?.readOnly && !schemaUpgrade;
+  const online = useOnlineStatus();
+  const editable = online && member.role !== "viewer" && connected && !sizeWarning?.readOnly && !schemaUpgrade;
 
   async function saveTitle() {
     const normalized = title.trim() || "Untitled";

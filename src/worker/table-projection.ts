@@ -1,3 +1,4 @@
+import type { RelationDefinition, RelationCell, RelationSnapshot } from "../shared/table-relations";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
@@ -42,6 +43,7 @@ export async function projectionColumns(env: Env, pageId: string): Promise<Colla
 }
 
 export type TableSnapshot = {
+  relations?: RelationSnapshot;
   revision: number;
   columns: CollaborativeColumn[];
   views: TableView[];
@@ -136,6 +138,26 @@ export async function compareTableProjectionContent(env: Env, pageId: string, ca
         .all<{ id: string; name: string }>()
     ).results,
   };
+  projected.relations = {
+    definitions: (
+      await env.DB.prepare(
+        "SELECT value_json FROM table_relation_sources WHERE source_page_id=? AND deleted=0 ORDER BY relation_id",
+      )
+        .bind(pageId)
+        .all<{ value_json: string }>()
+    ).results.map((row) => JSON.parse(row.value_json) as RelationDefinition),
+    cells: (
+      await env.DB.prepare(`SELECT c.relation_id,c.row_id,c.row_ids_json,c.revision FROM table_relation_cells c JOIN table_relation_sources d ON d.source_page_id=c.source_page_id AND d.relation_id=c.relation_id AND d.deleted=0
+      JOIN table_rows r ON r.id=c.row_id AND r.page_id=c.source_page_id WHERE c.source_page_id=? ORDER BY c.relation_id,c.row_id`)
+        .bind(pageId)
+        .all<{ relation_id: string; row_id: string; row_ids_json: string; revision: number }>()
+    ).results.map((row) => ({
+      relationId: row.relation_id,
+      rowId: row.row_id,
+      rowIds: JSON.parse(row.row_ids_json) as string[],
+      revision: row.revision,
+    })),
+  };
   let after: string | null = null;
   do {
     const rows = await projectionRows(env, pageId, after);
@@ -168,12 +190,21 @@ export async function compareTableProjectionContent(env: Env, pageId: string, ca
         columns: snapshot.columns.map(({ conversion: _conversion, ...column }) => column),
         views: snapshot.views,
         people: snapshot.people ?? [],
+        ...(snapshot.relations?.definitions.length ? { relations: snapshot.relations.definitions } : {}),
       }),
     );
+    const relationCells = new Map<string, RelationCell[]>();
+    for (const cell of snapshot.relations?.cells ?? []) {
+      const cells = relationCells.get(cell.rowId) ?? [];
+      cells.push(cell);
+      relationCells.set(cell.rowId, cells);
+    }
     for (const row of snapshot.rows) {
       const value = { ...row, cells: { ...row.cells }, computedCells: row.computedCells ?? {} };
       for (const property of snapshot.columns) if (metadataColumns.has(property.type)) delete value.cells[property.id];
-      hash = await sha256Hex(`${hash}:${canonicalJson(value)}`);
+      hash = await sha256Hex(
+        `${hash}:${canonicalJson({ ...value, ...(relationCells.has(row.id) ? { relations: relationCells.get(row.id) } : {}) })}`,
+      );
     }
     return hash;
   };

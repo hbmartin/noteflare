@@ -9,6 +9,7 @@ async function documentPage(page: Page, title: string) {
   const { page: created } = await result.json();
   await page.goto(`/?page=${created.id}`);
   await expect(page.locator(".bn-editor")).toBeVisible();
+  await expect(page.locator(".bn-editor")).toHaveAttribute("contenteditable", "true");
   return created;
 }
 async function features(page: Page) {
@@ -18,6 +19,65 @@ async function features(page: Page) {
     await route.fulfill({ response, json: { ...data, features: { ...data.features, editorBlocksV2: true } } });
   });
 }
+
+test("disconnect pauses authoring while keeping the cached document readable", async ({ page, context }) => {
+  await signInOwner(page);
+  await documentPage(page, "Connected authoring");
+  const editor = page.locator(".bn-editor");
+  await expect(editor).toHaveAttribute("contenteditable", "true");
+  await editor.click();
+  await page.keyboard.insertText("Read this while disconnected");
+  await expect(editor).toContainText("Read this while disconnected");
+  await context.setOffline(true);
+  await expect(editor).toHaveAttribute("contenteditable", "false");
+  await expect(editor).toContainText("Read this while disconnected");
+  await expect(page.getByText("Reading cached copy · connect to edit")).toBeVisible();
+  await context.setOffline(false);
+  await expect(editor).toHaveAttribute("contenteditable", "true");
+});
+
+test("a failed pasted file retries in its original block with one attachment identity", async ({ page }) => {
+  await signInOwner(page);
+  const created = await documentPage(page, "Upload lifecycle");
+  const attempts: string[] = [];
+  await page.route(`**/api/pages/${created.id}/attachments`, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    attempts.push(/name="attachmentId"\r\n\r\n([^\r\n]+)/.exec(route.request().postData() ?? "")?.[1] ?? "");
+    if (attempts.length === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "temporary_upload_failure", message: "Retry this upload." } }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+  const editor = page.locator(".bn-editor");
+  await editor.click();
+  await editor.evaluate((element) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.items.add(
+      new File(["Media lifecycle fixture"], "wiki-upload.txt", { type: "application/octet-stream" }),
+    );
+    element.dispatchEvent(new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }));
+  });
+  const upload = page.getByRole("region", { name: "Uploading wiki-upload.txt" });
+  await expect(upload).toBeVisible();
+  await expect(upload).toContainText("Upload failed");
+  await upload.getByRole("button", { name: "Retry upload" }).click();
+  await expect(upload).toHaveCount(0);
+  await expect(editor).toContainText("wiki-upload.txt");
+  expect(attempts).toHaveLength(2);
+  expect(attempts[0]).not.toBe("");
+  expect(attempts[1]).toBe(attempts[0]);
+  const stored = await page.request.get(`/api/pages/${created.id}/attachments`);
+  expect(stored.ok()).toBeTruthy();
+  expect((await stored.json()).attachments).toHaveLength(1);
+});
 
 test("migrated code text converges through real disconnected editor bindings without duplicating tails", async ({
   page,
@@ -295,6 +355,13 @@ test("find replacement reveals hidden tabs, supports undo and converges remotely
   const presentation = page.getByRole("dialog", { name: "Presentation mode" });
   await expect(presentation).toBeVisible();
   await expect(presentation).toContainText("Slide 1 of");
+  await presentation.getByRole("button", { name: "Laser pointer" }).click();
+  await expect(presentation.getByRole("button", { name: "Laser pointer" })).toHaveAttribute("aria-pressed", "true");
+  const stage = presentation.locator(".notes-presentation-stage");
+  await stage.hover({ position: { x: 80, y: 100 } });
+  await expect(presentation.locator(".notes-presentation-laser")).toBeVisible();
+  await presentation.getByRole("button", { name: "Laser pointer" }).click();
+  await expect(presentation.locator(".notes-presentation-laser")).toHaveCount(0);
   await presentation.getByRole("button", { name: "Next slide" }).click();
   await expect(presentation).toContainText("Alpha needle");
   await page.setViewportSize({ width: 950, height: 700 });

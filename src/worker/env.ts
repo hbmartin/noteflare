@@ -46,6 +46,7 @@ export interface AppBindings {
   EDITOR_BLOCKS_V2_ENABLED?: "true" | "false";
   TABLE_AUTHORITY_ENABLED?: "true" | "false";
   TABLE_BOARD_ENABLED?: "true" | "false";
+  TABLE_RELATIONS_ENABLED?: "true" | "false";
   TABLE_CALENDAR_ENABLED?: "true" | "false";
   NOTION_MARKDOWN_WRITES_ENABLED?: "true" | "false";
   OFFLINE_EDITING_ENABLED?: "true" | "false";
@@ -72,6 +73,7 @@ declare global {
       | "EDITOR_BLOCKS_V2_ENABLED"
       | "TABLE_AUTHORITY_ENABLED"
       | "TABLE_BOARD_ENABLED"
+      | "TABLE_RELATIONS_ENABLED"
       | "TABLE_CALENDAR_ENABLED"
       | "NOTION_MARKDOWN_WRITES_ENABLED"
       | "OFFLINE_EDITING_ENABLED"

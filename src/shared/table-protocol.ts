@@ -1,3 +1,4 @@
+import type { RelationSnapshot } from "./table-relations";
 import type { ComputedValue } from "./formula";
 import { CALCULATION_KINDS, type CalculationKind, type CalculationResult } from "./table-computed";
 import type { ColumnType } from "./types";
@@ -123,6 +124,9 @@ export type TableCommand = {
   operationId: string;
   expectedRevision?: number;
   kind:
+    | "define_relation"
+    | "set_relation"
+    | "delete_relation"
     | "create_column"
     | "update_column"
     | "delete_column"
@@ -148,6 +152,7 @@ export type TableCommandResult = {
   projectionPending: boolean;
 };
 export type TableQueryResult = {
+  relations?: RelationSnapshot;
   protocolVersion: number;
   taskList?: boolean;
   canEdit?: boolean;

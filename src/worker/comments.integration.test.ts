@@ -100,6 +100,195 @@ afterEach(async () => {
 });
 
 describe("server-authoritative comments", () => {
+  it("fences registered live rooms before a member removal reports completion", async () => {
+    const owner = await bootstrap();
+    const viewer = await invite(owner.cookie, "live-revoke");
+    const opened = await SELF.fetch(
+      request(viewer.cookie, `/parties/document/${owner.pageId}~1`, { headers: { Upgrade: "websocket" } }),
+    );
+    expect(opened.status).toBe(101);
+    const socket = opened.webSocket!;
+    socket.accept();
+    const closed = new Promise<number>((resolve) =>
+      socket.addEventListener("close", (event) => resolve(event.code), { once: true }),
+    );
+    const removed = await SELF.fetch(request(owner.cookie, `/api/members/${viewer.userId}`, { method: "DELETE" }));
+    expect(removed.status).toBe(200);
+    expect(await closed).toBe(4403);
+    const intent = await env.DB.prepare(
+      "SELECT revision,completed_revision FROM realtime_revocations WHERE workspace_id=?",
+    )
+      .bind(owner.workspaceId)
+      .first<{ revision: number; completed_revision: number }>();
+    expect(intent!.revision).toBeGreaterThan(0);
+    expect(intent!.completed_revision).toBe(intent!.revision);
+    const stale = await env.WORKSPACE_EVENTS.getByName(owner.workspaceId).fetch(
+      new Request("https://workspace-events.internal/register-room", {
+        method: "POST",
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        body: JSON.stringify({ room: `${owner.pageId}~1`, generation: 0, expiresAt: Date.now() + 60_000 }),
+      }),
+    );
+    expect(stale.status).toBe(409);
+    expect(
+      (
+        await SELF.fetch(
+          request(viewer.cookie, `/parties/document/${owner.pageId}~1`, { headers: { Upgrade: "websocket" } }),
+        )
+      ).status,
+    ).not.toBe(101);
+    const ownerReconnect = await SELF.fetch(
+      request(owner.cookie, `/parties/document/${owner.pageId}~1`, { headers: { Upgrade: "websocket" } }),
+    );
+    expect(ownerReconnect.status).toBe(101);
+    ownerReconnect.webSocket!.accept();
+    ownerReconnect.webSocket!.close();
+  });
+
+  it("covers live grants from before room registration during an upgrade", async () => {
+    const owner = await bootstrap();
+    const opened = await SELF.fetch(
+      request(owner.cookie, `/parties/document/${owner.pageId}~1`, { headers: { Upgrade: "websocket" } }),
+    );
+    const socket = opened.webSocket!;
+    socket.accept();
+    // Reproduce a legacy room: a grant exists but the coordinator has no registration.
+    await runInDurableObject(env.WORKSPACE_EVENTS.getByName(owner.workspaceId), async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM realtime_rooms");
+      state.storage.sql.exec("UPDATE realtime_legacy_scan SET complete=0,cursor='' WHERE id=1");
+    });
+    const closed = new Promise<number>((resolve) =>
+      socket.addEventListener("close", (event) => resolve(event.code), { once: true }),
+    );
+    await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?")
+      .bind(owner.userId)
+      .run();
+    const { flushRealtimeRevocations } = await import("./realtime-access");
+    expect(await flushRealtimeRevocations(env, owner.workspaceId)).toBe(true);
+    expect(await closed).toBe(4403);
+  });
+
+  it("replays comment and reply submissions without duplicate comments or fanout", async () => {
+    const owner = await bootstrap();
+    const body = { initialComment: { body: commentBody("Durable draft") } };
+    const headers = {
+      "content-type": "application/json",
+      "x-notes-operation-id": crypto.randomUUID(),
+      "x-notes-content-epoch": "1",
+    };
+    const post = () =>
+      SELF.fetch(
+        request(owner.cookie, `/api/pages/${owner.pageId}/comments`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        }),
+      );
+    const first = await post();
+    expect(first.status).toBe(201);
+    const created = (await first.json<{ thread: CommentThread }>()).thread;
+    const second = await post();
+    expect(second.status).toBe(201);
+    expect((await second.json<{ thread: CommentThread }>()).thread.id).toBe(created.id);
+    const replyBody = { comment: { body: commentBody("Reply") } },
+      replyHeaders = { ...headers, "x-notes-operation-id": crypto.randomUUID() };
+    const reply = () =>
+      SELF.fetch(
+        request(owner.cookie, `/api/comment-threads/${created.id}/replies`, {
+          method: "POST",
+          headers: replyHeaders,
+          body: JSON.stringify(replyBody),
+        }),
+      );
+    expect((await reply()).status).toBe(201);
+    expect((await reply()).status).toBe(201);
+    expect(
+      await env.DB.prepare("SELECT COUNT(*) n FROM comments WHERE thread_id=?").bind(created.id).first<number>("n"),
+    ).toBe(2);
+    const changed = await SELF.fetch(
+      request(owner.cookie, `/api/pages/${owner.pageId}/comments`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ initialComment: { body: commentBody("Different") } }),
+      }),
+    );
+    expect(changed.status).toBe(409);
+    const stale = await SELF.fetch(
+      request(owner.cookie, `/api/pages/${owner.pageId}/comments`, {
+        method: "POST",
+        headers: { ...headers, "x-notes-content-epoch": "2" },
+        body: JSON.stringify(body),
+      }),
+    );
+    expect(stale.status).toBe(409);
+  });
+
+  it("continues a fanout larger than one batch without requeueing acknowledged rooms", async () => {
+    const owner = await bootstrap();
+    await runInDurableObject(env.WORKSPACE_EVENTS.getByName(owner.workspaceId), async (_instance, state) => {
+      for (let index = 0; index < 70; index++)
+        state.storage.sql.exec(
+          "INSERT INTO realtime_rooms VALUES(?,?)",
+          `table:${crypto.randomUUID()}`,
+          Date.now() + 60_000,
+        );
+    });
+    await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?")
+      .bind(owner.userId)
+      .run();
+    const { flushRealtimeRevocations } = await import("./realtime-access");
+    expect(await flushRealtimeRevocations(env, owner.workspaceId)).toBe(false);
+    expect(await flushRealtimeRevocations(env, owner.workspaceId)).toBe(true);
+    await runInDurableObject(env.WORKSPACE_EVENTS.getByName(owner.workspaceId), async (_instance, state) => {
+      expect(state.storage.sql.exec<{ n: number }>("SELECT count(*) n FROM realtime_fanout").one().n).toBe(0);
+      expect(
+        state.storage.sql.exec<{ n: number }>("SELECT count(*) n FROM realtime_room_fences").one().n,
+      ).toBeGreaterThanOrEqual(70);
+    });
+  });
+
+  it("keeps reactions idempotent and removes only the acting member's reaction", async () => {
+    const owner = await bootstrap();
+    const viewer = await invite(owner.cookie, "reactor");
+    const thread = await createThread(owner.cookie, owner.pageId, "React to this");
+    const path = `/api/comment-threads/${thread.id}/comments/${thread.comments[0]!.id}/reactions`;
+    const react = async (cookie: string, method = "PUT", emoji = "👍") => {
+      const response = await SELF.fetch(
+        request(cookie, path, {
+          method,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ emoji }),
+        }),
+      );
+      expect(response.status).toBe(200);
+      return (await response.json<{ thread: CommentThread }>()).thread.comments[0]!.reactions!;
+    };
+    expect((await react(owner.cookie))[0]!.userIds).toEqual([owner.userId]);
+    expect((await react(owner.cookie))[0]!.userIds).toEqual([owner.userId]);
+    expect((await react(viewer.cookie))[0]!.userIds).toHaveLength(2);
+    expect((await react(owner.cookie, "DELETE"))[0]!.userIds).toEqual([viewer.userId]);
+    expect((await react(owner.cookie, "DELETE"))[0]!.userIds).toEqual([viewer.userId]);
+    expect(await react(viewer.cookie, "DELETE")).toEqual([]);
+    const invalid = await SELF.fetch(
+      request(owner.cookie, path, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ emoji: "hello" }),
+      }),
+    );
+    expect(invalid.status).toBe(422);
+    await env.DB.prepare("DELETE FROM workspace_members WHERE user_id=?").bind(viewer.userId).run();
+    const denied = await SELF.fetch(
+      request(viewer.cookie, path, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ emoji: "👍" }),
+      }),
+    );
+    expect([401, 403, 404]).toContain(denied.status);
+    expect(await env.DB.prepare("SELECT COUNT(*) n FROM comment_reactions").first<number>("n")).toBe(0);
+  });
+
   it("stores diagram node and edge anchors without mutating the Yjs document", async () => {
     const installed = await bootstrap();
     const created = await SELF.fetch(

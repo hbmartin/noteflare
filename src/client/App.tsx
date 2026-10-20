@@ -1,3 +1,4 @@
+import { loadForegroundModule } from "./chunk-recovery";
 import { slackAuthErrorMessage } from "./slack-auth-errors";
 import { ActivityView } from "./ActivityView";
 import { PendingDeletions } from "./PendingDeletions";
@@ -28,7 +29,6 @@ import type {
   MentionInboxItem,
   Page,
   PageKind,
-  Role,
   Space,
   Tag,
   TagColor,
@@ -68,12 +68,8 @@ import { WatchControl } from "./WatchControl";
 import { SearchView } from "./SearchView";
 import { ExportDialog } from "./ExportDialog";
 import { ImportDialog } from "./ImportDialog";
-import { SlackSettings } from "./SlackSettings";
 import { ThemeCommand, ThemeControl } from "./ThemeControl";
 import { ShareControl } from "./ShareControl";
-import { IntegrationsSettings } from "./IntegrationsSettings";
-import { OAuthConnectionsSettings } from "./OAuthConnectionsSettings";
-import { WritingSettings } from "./WritingSettings";
 import { WritingHistory } from "./WritingHistory";
 import type { WritingLaunchRequest } from "./writing-target";
 import {
@@ -93,7 +89,12 @@ import { OfflineWorkspace } from "./OfflineWorkspace";
 import { exportPendingOfflinePages, formatOfflineExportResult } from "./offline-export";
 import { sha256Hex } from "../shared/import-integrity";
 
-const DiagramPage = lazy(() => import("./DiagramPage").then((module) => ({ default: module.DiagramPage })));
+const WorkspaceSettings = lazy(() =>
+  loadForegroundModule(() => import("./WorkspaceSettings").then((module) => ({ default: module.WorkspaceSettings }))),
+);
+const DiagramPage = lazy(() =>
+  loadForegroundModule(() => import("./DiagramPage").then((module) => ({ default: module.DiagramPage }))),
+);
 
 import type { SecurityStatus } from "../shared/security";
 import { SecurityScreen, finishPasswordSignIn } from "./SecurityScreen";
@@ -3826,7 +3827,35 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const initialPageLoadFailed = !pagesLoaded && workspaceErrors.some((error) => error.source === "page-tree");
   const pendingPageError = workspaceErrors.find((error) => error.source === "page-access")?.message;
 
+  const visiblePageIds = useRef<string[]>([]);
+  const visiblePagesChanged = useCallback((ids: string[]) => {
+    visiblePageIds.current = ids;
+  }, []);
+  const adjacentPage = (direction: -1 | 1) => {
+    const current = visiblePageIds.current.indexOf(selectedId ?? "");
+    return current < 0 ? undefined : visiblePageIds.current[current + direction];
+  };
   const commands: AppCommand[] = [
+    {
+      id: "previous-page",
+      label: "Open previous visible page",
+      shortcut: "",
+      isAvailable: () => view === "pages" && Boolean(adjacentPage(-1)),
+      run: () => {
+        const id = adjacentPage(-1);
+        if (id) navigateToPage(id);
+      },
+    },
+    {
+      id: "next-page",
+      label: "Open next visible page",
+      shortcut: "",
+      isAvailable: () => view === "pages" && Boolean(adjacentPage(1)),
+      run: () => {
+        const id = adjacentPage(1);
+        if (id) navigateToPage(id);
+      },
+    },
     {
       id: "create-document",
       label: "Create document",
@@ -4052,6 +4081,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               editable={canEditActiveSpace}
               canCreate={canCreatePage}
               onSelect={navigateToPage}
+              onVisiblePagesChanged={visiblePagesChanged}
               onCreate={(parentId, kind) => void createPage(kind, parentId)}
               onArchive={(page) => void archive(page)}
               onMove={(id, parentId, beforeId, afterId) => void move(id, parentId, beforeId, afterId)}
@@ -4469,7 +4499,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             />
           </main>
         ) : view === "settings" ? (
-          <MembersView member={member} spaces={spaces} pages={pages} />
+          <Suspense fallback={<div className="editor-loading">Loading settings…</div>}>
+            <WorkspaceSettings member={member} spaces={spaces} pages={pages} />
+          </Suspense>
         ) : !pagesLoaded ? (
           <PendingPage
             title={initialPageLoadFailed ? "Workspace unavailable" : "Loading workspace…"}
@@ -4890,14 +4922,39 @@ function TrashView({
   onRestore: (page: Page) => Promise<void>;
   onDelete: (page: Page) => Promise<void>;
 }) {
+  const [query, setQuery] = useState("");
+  const [kind, setKind] = useState("all");
+  const visible = pages.filter(
+    (page) =>
+      (kind === "all" || page.kind === kind) &&
+      page.title.toLocaleLowerCase().includes(query.toLocaleLowerCase().trim()),
+  );
   return (
     <main className="utility-view">
       <p className="eyebrow">Archive</p>
       <h1>Trash</h1>
       <p className="muted">Restoring a parent restores its entire archived subtree.</p>
       {loading && <output className="muted">{pages.length ? "Refreshing trash…" : "Loading trash…"}</output>}
+      <div className="trash-filters">
+        <label>
+          Search trash
+          <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} />
+        </label>
+        <label>
+          Page type
+          <select value={kind} onChange={(event) => setKind(event.target.value)}>
+            <option value="all">All types</option>
+            <option value="document">Documents</option>
+            <option value="table">Tables</option>
+            <option value="diagram">Diagrams</option>
+          </select>
+        </label>
+        <output aria-live="polite">
+          {visible.length} of {pages.length} archived pages
+        </output>
+      </div>
       <div className="trash-list">
-        {pages.map((page) => {
+        {visible.map((page) => {
           const mutationPending = pendingPageIds.has(page.id);
           const actionsDisabled = loading || mutationPending;
           return (
@@ -4905,6 +4962,14 @@ function TrashView({
               <span>{page.kind === "table" ? "▦" : page.kind === "diagram" ? "◇" : "□"}</span>
               <strong>{page.title}</strong>
               {page.isTemplate && <small>Template</small>}
+              <small>
+                {page.archivedAt ? `Archived ${new Date(page.archivedAt).toLocaleDateString()}` : "Archived"}
+              </small>
+              <small>
+                {page.parentId
+                  ? `Parent: ${pages.find((parent) => parent.id === page.parentId)?.title ?? "Active or unavailable parent"}`
+                  : "Top-level page"}
+              </small>
               <button disabled={actionsDisabled} onClick={() => void onRestore(page)}>
                 Restore
               </button>
@@ -4917,92 +4982,11 @@ function TrashView({
           );
         })}
       </div>
+      {!!pages.length && !visible.length && !loading && (
+        <p className="empty-copy">No archived pages match these filters.</p>
+      )}
       {!pages.length && !loading && !loadFailed && <p className="empty-copy">Trash is empty.</p>}
       {owner && <PendingDeletions key={workspaceId} />}
-    </main>
-  );
-}
-
-type MemberRow = { id: string; name: string; email: string; role: Role; createdAt: number };
-function MembersView({ member, spaces, pages }: { member: ClientMemberContext; spaces: Space[]; pages: Page[] }) {
-  const [members, setMembers] = useState<MemberRow[]>([]);
-  const [inviteUrl, setInviteUrl] = useState("");
-  const load = useCallback(
-    () => api<{ members: MemberRow[] }>("/api/members").then((data) => setMembers(data.members)),
-    [],
-  );
-  useEffect(() => {
-    void load();
-  }, [load]);
-  async function invite(role: "editor" | "viewer") {
-    const result = await api<{ invite: { token: string } }>("/api/invites", { method: "POST", body: json({ role }) });
-    setInviteUrl(`${location.origin}/?invite=${result.invite.token}`);
-  }
-  return (
-    <main className="utility-view">
-      <p className="eyebrow">Workspace access</p>
-      <h1>Members</h1>
-      <ThemeControl />
-      {member.role === "owner" && (
-        <div className="invite-card">
-          <div>
-            <strong>Invite a teammate</strong>
-            <p>Links can be used once and expire after seven days.</p>
-          </div>
-          <button onClick={() => void invite("editor")}>Invite editor</button>
-          <button onClick={() => void invite("viewer")}>Invite viewer</button>
-        </div>
-      )}
-      {inviteUrl && (
-        <div className="invite-link">
-          <input readOnly value={inviteUrl} />
-          <button onClick={() => void navigator.clipboard.writeText(inviteUrl)}>Copy</button>
-        </div>
-      )}
-      <div className="member-list">
-        {members.map((row) => (
-          <div key={row.id}>
-            <span className="member-avatar">{row.name[0]?.toUpperCase()}</span>
-            <div>
-              <strong>{row.name}</strong>
-              <small>{row.email}</small>
-            </div>
-            {member.role === "owner" ? (
-              <select
-                value={row.role}
-                onChange={async (event) => {
-                  await api(`/api/members/${row.id}`, { method: "PATCH", body: json({ role: event.target.value }) });
-                  await load();
-                }}
-              >
-                <option value="owner">Owner</option>
-                <option value="editor">Editor</option>
-                <option value="viewer">Viewer</option>
-              </select>
-            ) : (
-              <span>{row.role}</span>
-            )}
-            {member.role === "owner" && row.id !== member.user.id && (
-              <button
-                className="text-danger"
-                onClick={async () => {
-                  if (confirm(`Remove ${row.name}?`)) {
-                    await api(`/api/members/${row.id}`, { method: "DELETE" });
-                    await load();
-                  }
-                }}
-              >
-                Remove
-              </button>
-            )}
-          </div>
-        ))}
-      </div>
-      <SecurityScreen settings />
-      <SlackSettings owner={member.role === "owner"} spaces={spaces} pages={pages} />
-      <OAuthConnectionsSettings owner={member.role === "owner"} />
-      <WritingSettings owner={member.role === "owner"} />
-      <IntegrationsSettings owner={member.role === "owner"} pages={pages} />
     </main>
   );
 }

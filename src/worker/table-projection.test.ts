@@ -98,9 +98,14 @@ function fixture() {
               };
             if (sql.startsWith("SELECT c.* FROM table_computed_cells")) return { results: caches };
             if (
-              ["table_select_options", "table_cells", "table_views", "table_people"].some((table) =>
-                sql.includes(table),
-              )
+              [
+                "table_select_options",
+                "table_cells",
+                "table_views",
+                "table_people",
+                "table_relation_sources",
+                "table_relation_cells",
+              ].some((table) => sql.includes(table))
             )
               return { results: [] };
             throw new Error(`Unexpected projection query: ${sql}`);

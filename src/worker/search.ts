@@ -61,6 +61,7 @@ type SearchRow = PageJsonRow & {
   title_excerpt: string;
   tag_excerpt: string;
   body_excerpt: string;
+  heading_excerpt: string;
   comment_excerpt: string;
   attachment_excerpt: string;
 };
@@ -148,11 +149,12 @@ function resultSnippet(row: SearchRow): { source: SearchSnippetSource; text: str
   const candidates: Array<[SearchSnippetSource, string]> = [
     ["title", row.title_excerpt],
     ["tag", row.tag_excerpt],
+    ["body", row.heading_excerpt],
     ["body", row.body_excerpt],
     ["comment", row.comment_excerpt],
     ["attachment", row.attachment_excerpt],
   ];
-  const marked = candidates.find(([, value]) => value.includes(SNIPPET_OPEN));
+  const marked = candidates.find(([, value]) => (value ?? "").includes(SNIPPET_OPEN));
   if (marked) return { source: marked[0], text: cleanExcerpt(marked[1]) };
   return { source: "title", text: row.title };
 }
@@ -221,7 +223,8 @@ export async function searchPages(
       `SELECT p.*, s.name space_name, s.icon space_icon,
               CASE WHEN lower(trim(p.title)) = ? THEN 0
                    WHEN lower(p.title) LIKE ? ESCAPE '\\' THEN 1 ELSE 2 END rank_tier,
-              bm25(page_search_v2, 0, 0, 0, 12.0, 8.0, 4.0, 2.0, 1.0) score,
+              bm25(page_search_v2, 0, 0, 0, 12.0, 8.0, 4.0, 2.0, 1.0, 10.0) score,
+              snippet(page_search_v2, 8, '${SNIPPET_OPEN}', '${SNIPPET_CLOSE}', '…', 20) heading_excerpt,
               snippet(page_search_v2, 3, '${SNIPPET_OPEN}', '${SNIPPET_CLOSE}', '…', 20) title_excerpt,
               snippet(page_search_v2, 4, '${SNIPPET_OPEN}', '${SNIPPET_CLOSE}', '…', 20) tag_excerpt,
               snippet(page_search_v2, 5, '${SNIPPET_OPEN}', '${SNIPPET_CLOSE}', '…', 20) body_excerpt,
