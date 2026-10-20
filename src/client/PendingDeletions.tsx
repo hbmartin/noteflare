@@ -31,20 +31,18 @@ async function fetchDeletionPages(
 export function PendingDeletions() {
   const [jobs, setJobs] = useState<DeletionJobSummary[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [accessLost, setAccessLost] = useState(false);
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
   const requests = useRef<AbortController | null>(null);
   const lifetime = useRef(new AbortController());
   const loadedPages = useRef(1);
-  const loadingRequest = useRef(false);
   const retrying = useRef(new Set<string>());
 
   const revokeAccess = useCallback(() => {
     lifetime.current.abort();
     requests.current?.abort();
-    loadingRequest.current = false;
     setLoading(false);
     setJobs([]);
     setNextCursor(null);
@@ -57,7 +55,6 @@ export function PendingDeletions() {
       requests.current?.abort();
       const request = new AbortController();
       requests.current = request;
-      loadingRequest.current = true;
       setLoading(true);
       try {
         const result = await fetchDeletionPages(cursor, cursor ? 1 : loadedPages.current, request.signal);
@@ -74,7 +71,6 @@ export function PendingDeletions() {
         else setError(apiErrorMessage(cause, "Pending deletions could not be loaded."));
       } finally {
         if (!request.signal.aborted) {
-          loadingRequest.current = false;
           setLoading(false);
         }
       }
@@ -94,14 +90,16 @@ export function PendingDeletions() {
     };
   }, [load]);
 
-  const active = jobs.some((job) => job.status !== "blocked");
   useEffect(() => {
-    if (!active) return undefined;
-    const timer = setInterval(() => {
-      if (!loadingRequest.current) void load();
-    }, 5_000);
-    return () => clearInterval(timer);
-  }, [active, load]);
+    if (loading || accessLost) return undefined;
+    const active = jobs.filter((job) => job.status !== "blocked");
+    if (!active.length) return undefined;
+    const delay = active.some((job) => job.status === "pending")
+      ? 5_000
+      : Math.max(5_000, Math.min(60_000, ...active.map((job) => (job.nextAttemptAt ?? Date.now()) - Date.now())));
+    const timer = setTimeout(() => void load(), delay);
+    return () => clearTimeout(timer);
+  }, [jobs, loading, accessLost, load]);
 
   async function retry(jobId: string) {
     if (retrying.current.has(jobId)) return;
