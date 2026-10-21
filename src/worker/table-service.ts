@@ -67,9 +67,10 @@ export async function tableFetch(
     throw new HttpError(409, "table_authority_required", "Enable collaboration for this table first.");
   if (method !== "GET" && registry.state === "repairing")
     throw new HttpError(503, "table_projection_repairing", "Table projection repair is running. Retry shortly.");
-  const expiresAt = Date.now() + 60_000;
+  const socketExpiresAt = Math.min(member.session.expiresAt.getTime(), Date.now() + 5 * 60_000);
+  const expiresAt = path.startsWith("/socket") ? Math.min(socketExpiresAt, Date.now() + 60_000) : Date.now() + 60_000;
   const authGeneration = path.startsWith("/socket")
-    ? await registerRealtimeRoom(env, member.workspace.id, `table:${pageId}`, expiresAt)
+    ? await registerRealtimeRoom(env, member.workspace.id, `table:${pageId}`, socketExpiresAt + 5_000)
     : ((await env.DB.prepare("SELECT revision FROM realtime_revocations WHERE workspace_id=?")
         .bind(member.workspace.id)
         .first<number>("revision")) ?? 0);
@@ -79,6 +80,7 @@ export async function tableFetch(
     userId: member.user.id,
     generation: registry.generation,
     expiresAt,
+    ...(path.startsWith("/socket") ? { socketExpiresAt } : {}),
     authGeneration,
     creation: { board: env.TABLE_BOARD_ENABLED === "true", calendar: env.TABLE_CALENDAR_ENABLED === "true" },
     ...extras,

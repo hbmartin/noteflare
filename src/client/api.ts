@@ -1,3 +1,4 @@
+import { observeRealtimeAccessResponse, realtimeAccessAccount } from "./realtime-access-status";
 import { createAuthClient } from "better-auth/react";
 
 import { twoFactorClient } from "better-auth/client/plugins";
@@ -13,6 +14,7 @@ export const authClient = createAuthClient({
 export type ApiResponseBodyFailure = "empty" | "read" | "parse";
 
 export interface ApiClientErrorDiagnostics {
+  notSent?: boolean;
   requestPath?: string;
   responseUrl?: string | null;
   contentType?: string | null;
@@ -41,6 +43,7 @@ type ApiErrorPayload = {
 };
 
 export class ApiClientError extends Error {
+  readonly notSent: boolean;
   readonly requestPath: string | null;
   readonly responseUrl: string | null;
   readonly contentType: string | null;
@@ -57,6 +60,7 @@ export class ApiClientError extends Error {
   ) {
     super(message, diagnostics.cause === undefined ? undefined : { cause: diagnostics.cause });
     this.name = "ApiClientError";
+    this.notSent = diagnostics.notSent === true;
     this.requestPath = diagnostics.requestPath ?? null;
     this.responseUrl = diagnostics.responseUrl ?? null;
     this.contentType = diagnostics.contentType ?? null;
@@ -234,18 +238,23 @@ export function notifyApiUnauthorized(error: ApiClientError, requestEpoch: numbe
   }
 }
 
-export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const method = (init?.method ?? "GET").toUpperCase();
-  if (!["GET", "HEAD", "OPTIONS"].includes(method) && !navigator.onLine) {
+export type ApiInit = RequestInit & { readOnly?: boolean };
+export async function api<T>(path: string, init?: ApiInit): Promise<T> {
+  const { readOnly, ...requestInit } = init ?? {};
+  const method = (requestInit.method ?? "GET").toUpperCase();
+  const mutation = !readOnly && !["GET", "HEAD", "OPTIONS"].includes(method);
+  if (mutation && !navigator.onLine) {
     throw new ApiClientError(
       503,
       "offline_read_only",
       "Connect to make changes. Your cached copy is available for reading.",
+      false,
+      { notSent: true },
     );
   }
-  const release = ["GET", "HEAD", "OPTIONS"].includes(method) ? () => undefined : retainPendingWork();
+  const release = mutation ? retainPendingWork() : () => undefined;
   try {
-    return await apiRequest<T>(path, init);
+    return await apiRequest<T>(path, requestInit);
   } finally {
     release();
   }
@@ -253,10 +262,12 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const requestEpoch = unauthorizedRequestEpoch;
+  const requestAccount = realtimeAccessAccount();
   const headers = new Headers(init?.headers);
   if (init?.body && !(init.body instanceof FormData)) headers.set("content-type", "application/json");
   const response = await fetch(path, { ...init, headers });
   observeWorkerResponse(response.headers);
+  observeRealtimeAccessResponse(response.headers, requestAccount);
   const responseUrl = response.url || null;
   const contentType = response.headers.get("content-type");
   const requestId = response.headers.get("x-request-id");

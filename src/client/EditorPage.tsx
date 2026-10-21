@@ -1,5 +1,5 @@
 import { useOnlineStatus } from "./online-status";
-import { CommentDraftContext, DraftFloatingComposer, DraftThread, DraftThreadsSidebar } from "./CommentDrafts";
+import { CommentDraftContext, DraftCommentsControllers, DraftThreadsSidebar } from "./CommentDrafts";
 import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
 
@@ -11,8 +11,6 @@ import { BlockNoteView } from "@blocknote/mantine";
 import {
   getDefaultReactSlashMenuItems,
   SuggestionMenuController,
-  FloatingComposerController,
-  FloatingThreadController,
   useCreateBlockNote,
   FormattingToolbarController,
   FormattingToolbar,
@@ -1645,10 +1643,15 @@ function MountedCollaborativeEditor({
     observer.observe(panel, { childList: true, subtree: true });
     return () => observer.disconnect();
   }, [commentsOpen, panelTarget]);
-  const uploads = useMemo(() => new EditorUploads(pageId), [pageId]);
+  const uploads = useMemo(
+    () => ({ epoch: contentEpoch, manager: new EditorUploads(pageId) }),
+    [pageId, contentEpoch],
+  ).manager;
+  useEffect(() => () => uploads.dispose(), [uploads]);
   useEffect(() => {
     uploads.setReady(editable);
-  }, [editable, uploads]);
+    if (member.role === "viewer") uploads.dispose();
+  }, [editable, uploads, member.role]);
   const options = useMemo(
     () => editorOptions(bundle, member, threadStore, uploads),
     [bundle, member, threadStore, uploads],
@@ -2109,8 +2112,7 @@ function MountedCollaborativeEditor({
                     ready: online && bundle.provider.wsconnected && bundle.provider.synced,
                   }}
                 >
-                  <FloatingComposerController floatingComposer={DraftFloatingComposer} />
-                  <FloatingThreadController floatingThread={DraftThread} />
+                  <DraftCommentsControllers />
                   {member.features?.blockLinks && <SideMenuController sideMenu={BlockLinkSideMenu} />}
                   <WritingLaunchContext.Provider value={launchWriting}>
                     <FormattingToolbarController formattingToolbar={WritingFormattingToolbar} />

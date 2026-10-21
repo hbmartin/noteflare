@@ -119,8 +119,7 @@ vi.mock("./CommentDrafts", async () => {
   const { createContext } = await import("react");
   return {
     CommentDraftContext: createContext(null),
-    DraftFloatingComposer: () => null,
-    DraftThread: () => null,
+    DraftCommentsControllers: () => null,
     DraftThreadsSidebar: () => <div data-testid="thread-sidebar" />,
   };
 });

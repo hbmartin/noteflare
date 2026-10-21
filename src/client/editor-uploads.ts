@@ -17,6 +17,7 @@ type Entry = {
   resolve: (url: string) => void;
   release: () => void;
   attempt: number;
+  completed?: string;
 };
 const key = new PluginKey("notesLocalUploads");
 
@@ -30,7 +31,7 @@ export class EditorUploads {
     this.ready = ready;
     for (const entry of this.entries.values()) {
       entry.retry.disabled = !ready;
-      if (!ready && !entry.controller.signal.aborted) entry.controller.abort();
+      if (ready && entry.completed) this.applyCompleted(entry);
     }
   }
   upload(file: File, blockId?: string): Promise<string> {
@@ -84,7 +85,6 @@ export class EditorUploads {
       });
       cancel.addEventListener("click", () => {
         this.forget(blockId);
-        resolve("");
         this.changed?.();
       });
       for (const child of [name, status, progress, retry, cancel]) element.appendChild(child);
@@ -115,9 +115,9 @@ export class EditorUploads {
         },
       );
       if (this.entries.get(blockId) !== entry || attempt !== entry.attempt) return;
-      this.forget(blockId);
-      entry.resolve(`/api/attachments/${result.id}`);
-      this.changed?.();
+      entry.completed = `/api/attachments/${result.id}`;
+      entry.status.textContent = this.ready ? "Uploaded" : "Uploaded. Waiting for the document to reconnect…";
+      if (this.ready) this.applyCompleted(entry);
     } catch {
       if (this.entries.get(blockId) !== entry || attempt !== entry.attempt) return;
       entry.status.textContent = this.ready ? "Upload failed. Retry or cancel." : "Connect to retry this upload.";
@@ -125,7 +125,20 @@ export class EditorUploads {
       entry.retry.disabled = !this.ready;
     }
   }
-  private forget(blockId: string) {
+  private applyCompleted(entry: Entry) {
+    for (const [id, current] of this.entries) {
+      if (current !== entry || !entry.completed) continue;
+      const url = entry.completed;
+      this.forget(id, url);
+      this.changed?.();
+      break;
+    }
+  }
+  dispose() {
+    for (const id of this.entries.keys()) this.forget(id);
+    this.changed?.();
+  }
+  private forget(blockId: string, result = "") {
     const entry = this.entries.get(blockId);
     if (!entry) return;
     this.entries.delete(blockId);
@@ -133,6 +146,7 @@ export class EditorUploads {
     entry.controller.abort();
     entry.release();
     if (entry.preview) URL.revokeObjectURL(entry.preview);
+    entry.resolve(result);
   }
   bind(view: EditorView) {
     this.changed = () => {
@@ -140,7 +154,7 @@ export class EditorUploads {
     };
     return () => {
       this.changed = null;
-      for (const id of this.entries.keys()) this.forget(id);
+      this.dispose();
     };
   }
   decorations(doc: PMNode) {

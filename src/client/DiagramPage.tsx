@@ -1,3 +1,4 @@
+import { createDocumentCloseReconciler } from "./document-connection";
 import { useOnlineStatus } from "./online-status";
 import { nodeTypes, flowEdge, type FlowNode, type FlowEdge } from "./diagram-rendering";
 import type { ReactNode } from "react";
@@ -1105,10 +1106,17 @@ export function DiagramPage({
         // Ignore messages from future servers.
       }
     };
+    const reconciler = createDocumentCloseReconciler({
+      page: { id: page.id, contentEpoch: page.contentEpoch },
+      provider: next.provider,
+      hasUnsyncedChanges: () => next.hasUnsyncedChanges,
+      quarantine: () => setSchemaUpgrade(true),
+      onPageChanged,
+      onPageUnavailable,
+      onAccessDenied,
+    });
     const close = (event: CloseEvent) => {
-      if (!active) return;
-      if (event.code === 4410 || event.code === 4412) onPageUnavailable(page.id);
-      if (event.code === 4403) onAccessDenied(page.id, new ApiClientError(403, "page_access_denied", "Access denied."));
+      if (active) reconciler.handleClose(event);
     };
     next.provider.on("custom-message", custom);
     next.provider.on("connection-close", close);
@@ -1127,9 +1135,10 @@ export function DiagramPage({
       window.removeEventListener("beforeunload", unload);
       next.provider.off("custom-message", custom);
       next.provider.off("connection-close", close);
+      reconciler.destroy();
       next.destroy();
     };
-  }, [onAccessDenied, onPageUnavailable, page.contentEpoch, page.id]);
+  }, [onAccessDenied, onPageUnavailable, onPageChanged, page.contentEpoch, page.id]);
   useEffect(() => {
     void api<{ threads: CommentThread[] }>(`/api/pages/${page.id}/comments?revision=${commentsRevision}`)
       .then((data) => setThreads(data.threads))

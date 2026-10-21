@@ -1,3 +1,4 @@
+import { setRealtimeAccessAccount } from "./realtime-access-status";
 import { loadForegroundModule } from "./chunk-recovery";
 import { slackAuthErrorMessage } from "./slack-auth-errors";
 import { ActivityView } from "./ActivityView";
@@ -447,7 +448,7 @@ async function requestMutation<T>(
     value = await api<unknown>(path, init);
   } catch (error) {
     if (isSuccessfulJsonResponseBodyError(error)) return { kind: "committed", value: null, responseError: error };
-    return error instanceof ApiClientError && error.status >= 400 && error.status < 500
+    return error instanceof ApiClientError && (error.notSent || (error.status >= 400 && error.status < 500))
       ? { kind: "rejected", error }
       : { kind: "uncertain", error };
   }
@@ -1517,6 +1518,10 @@ export function useCommittedRef<T>(value: T) {
 }
 
 function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
+  useEffect(() => {
+    setRealtimeAccessAccount(`${member.user.id}\0${member.workspace.id}`);
+    return () => setRealtimeAccessAccount("");
+  }, [member.user.id, member.workspace.id]);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [installTip, setInstallTip] = useState(false);
   useEffect(() => {

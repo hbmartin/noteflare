@@ -1,3 +1,4 @@
+import { writeCommentDraft, readCommentDraft } from "./comment-drafts";
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,6 +44,26 @@ function thread(overrides: Partial<CommentThread> = {}): CommentThread {
     ...overrides,
   };
 }
+
+it("preserves a reply edited while its older submission is pending", async () => {
+  const scope = { account: "pending-reply-test", pageId: "page-1", epoch: 1 };
+  const initial = thread().comments[0]!.body as never,
+    newer = [{ type: "paragraph", content: [{ type: "text", text: "Newer reply" }] }] as never;
+  writeCommentDraft(scope, "reply:thread-1", initial);
+  let finish!: (value: unknown) => void;
+  mockedApi.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true, scope);
+  const pending = store.addComment({ threadId: "thread-1", comment: { body: initial } });
+  writeCommentDraft(scope, "reply:thread-1", newer);
+  finish({ thread: thread() });
+  await pending;
+  expect(readCommentDraft(scope, "reply:thread-1")!.body).toEqual(newer);
+});
 
 describe("ServerThreadStore", () => {
   beforeEach(() => mockedApi.mockReset());

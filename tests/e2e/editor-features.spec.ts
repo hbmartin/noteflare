@@ -63,7 +63,11 @@ test("a failed pasted file retries in its original block with one attachment ide
     clipboardData.items.add(
       new File(["Media lifecycle fixture"], "wiki-upload.txt", { type: "application/octet-stream" }),
     );
-    element.dispatchEvent(new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }));
+    const event = new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true });
+    // Firefox sanitizes files supplied to the ClipboardEvent constructor. Supply
+    // the same clipboard interface explicitly so the fixture represents a file paste.
+    if (!event.clipboardData?.files.length) Object.defineProperty(event, "clipboardData", { value: clipboardData });
+    element.dispatchEvent(event);
   });
   const upload = page.getByRole("region", { name: "Uploading wiki-upload.txt" });
   await expect(upload).toBeVisible();

@@ -3,7 +3,7 @@ import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Page, SearchResponse, SearchTitleSuggestion, Space, Tag } from "../shared/types";
 import { refreshPageSearchV2Statements } from "./search-index";
-import { normalizeQueuedTitles } from "./search";
+import { normalizeQueuedTitles, parseSearchRequest, searchPages } from "./search";
 import { acceptPageDeletion, processDeletionJob } from "./cleanup";
 import type { Env } from "./env";
 
@@ -248,6 +248,17 @@ describe("search v2", () => {
     expect(await env.DB.prepare("SELECT headings_text FROM pages WHERE id=?").bind(target.id).first()).toEqual({
       headings_text: "",
     });
+    const found = await searchPages(
+      env.DB,
+      {
+        user: { id: "old-user", name: "Owner", email: "old@example.test" },
+        workspace: { id: "old-workspace", name: "Old workspace", locationHint: null },
+        role: "owner",
+        session: { id: "historical-search", expiresAt: new Date(Date.now() + 60_000) },
+      },
+      parseSearchRequest("https://example.test/api/search?q=architecure"),
+    );
+    expect(found.results.map((result) => result.page.id)).toEqual([target.id]);
   });
 
   it("keeps trigram content synchronized through staging, publication, template changes and deletion", async () => {

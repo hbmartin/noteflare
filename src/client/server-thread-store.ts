@@ -138,11 +138,13 @@ export class ServerThreadStore extends ThreadStore {
       ...(this.draftScope ? { "x-notes-content-epoch": String(this.draftScope.epoch) } : {}),
     };
   }
-  private posted(key: string) {
-    this.pendingOperations.delete(key);
+  private readonly threadOperations = new Map<string, string>();
+  private posted(key: string, operationId?: string) {
+    const submitted = operationId ?? this.pendingOperations.get(key)?.id;
+    if (this.pendingOperations.get(key)?.id === submitted) this.pendingOperations.delete(key);
     if (this.draftScope)
       try {
-        clearCommentDraft(this.draftScope, key);
+        if (submitted) clearCommentDraft(this.draftScope, key, submitted);
       } catch {
         this.onError("Comment posted. The saved draft could not be removed from this device.");
       }
@@ -195,15 +197,17 @@ export class ServerThreadStore extends ThreadStore {
     metadata?: unknown;
   }) {
     if (!this.ready()) throw new Error("Connect to the document before changing comments.");
+    const submission = this.operationHeaders("new", options.initialComment.body);
     const data = await this.mutate<{ thread: CommentThread }>(
       `/api/pages/${encodeURIComponent(this.pageId)}/comments`,
       {
         method: "POST",
-        headers: this.operationHeaders("new", options.initialComment.body),
+        headers: submission,
         body: json(options),
       },
     );
-    if (!this.draftScope) this.posted("new");
+    this.threadOperations.set(data.thread.id, submission["x-notes-operation-id"]);
+    if (!this.draftScope) this.posted("new", submission["x-notes-operation-id"]);
     return this.upsert(data.thread);
   }
 
@@ -232,21 +236,23 @@ export class ServerThreadStore extends ThreadStore {
         body: json({ selection: { prosemirror: options.selection, yjs: yjsSelection } }),
       },
     );
-    this.posted("new");
+    this.posted("new", this.threadOperations.get(options.threadId));
+    this.threadOperations.delete(options.threadId);
     this.upsert(data.thread);
   }
 
   async addComment(options: { comment: { body: BlockNoteCommentBody; metadata?: unknown }; threadId: string }) {
     if (!this.ready()) throw new Error("Connect to the document before changing comments.");
+    const submission = this.operationHeaders(`reply:${options.threadId}`, options.comment.body);
     const data = await this.mutate<{ thread: CommentThread }>(
       `/api/comment-threads/${encodeURIComponent(options.threadId)}/replies`,
       {
         method: "POST",
-        headers: this.operationHeaders(`reply:${options.threadId}`, options.comment.body),
+        headers: submission,
         body: json({ comment: options.comment }),
       },
     );
-    this.posted(`reply:${options.threadId}`);
+    this.posted(`reply:${options.threadId}`, submission["x-notes-operation-id"]);
     const thread = this.upsert(data.thread);
     return thread.comments.at(-1)!;
   }

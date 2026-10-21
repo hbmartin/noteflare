@@ -97,7 +97,14 @@ import {
   type CommentPage,
 } from "./comments";
 import { Document } from "./document";
-import { flushRealtimeRevocations, registerRealtimeRoom } from "./realtime-access";
+import {
+  flushRealtimeRevocations,
+  registerRealtimeRoom,
+  trackRealtimeWorkspace,
+  withRealtimeAccessTracking,
+  realtimeAccessStatus,
+  drainRealtimeRevocationsBatch,
+} from "./realtime-access";
 import { backfillSearchHeadings } from "./search-heading-backfill";
 import type { Env, MemberContext } from "./env";
 import {
@@ -1534,6 +1541,20 @@ app.post("/api/invites/complete", async (c) => {
   return c.json({ success: true });
 });
 
+app.get("/api/security/realtime/status", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  c.header("Cache-Control", "private, no-store");
+  return c.json(await realtimeAccessStatus(c.env, member.workspace.id));
+});
+app.post("/api/security/realtime/reconcile", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  await flushRealtimeRevocations(c.env, member.workspace.id);
+  c.header("Cache-Control", "private, no-store");
+  return c.json(await realtimeAccessStatus(c.env, member.workspace.id));
+});
+
 // nosemgrep: worker-hono-direct-middleware-registration -- Terminal wildcard endpoint, not middleware.
 app.all("/api/security/*", async (c) => {
   const url = new URL(c.req.url);
@@ -1636,6 +1657,7 @@ app.post("/api/invites", async (c) => {
 
 app.patch("/api/members/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  await trackRealtimeWorkspace(c.env, member.workspace.id);
   requireOwner(member);
   const body = await jsonBody(c.req.raw);
   const nextRole = role(body.role);
@@ -1656,6 +1678,7 @@ app.patch("/api/members/:id", async (c) => {
 
 app.delete("/api/members/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  await trackRealtimeWorkspace(c.env, member.workspace.id);
   requireOwner(member);
   const targetId = c.req.param("id");
   const target = await c.env.DB.prepare(`SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?`)
@@ -1733,6 +1756,7 @@ app.post("/api/spaces", async (c) => {
 
 app.patch("/api/spaces/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  await trackRealtimeWorkspace(c.env, member.workspace.id);
   requireOwner(member);
   const space = await spaceForMember(c.env, member, c.req.param("id"));
   const body = await jsonBody(c.req.raw);
@@ -1762,6 +1786,7 @@ app.patch("/api/spaces/:id", async (c) => {
 
 app.put("/api/spaces/:id/members/:userId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  await trackRealtimeWorkspace(c.env, member.workspace.id);
   requireOwner(member);
   const space = await spaceForMember(c.env, member, c.req.param("id"));
   const userId = text(c.req.param("userId"), "userId", 100);
@@ -1787,6 +1812,7 @@ app.put("/api/spaces/:id/members/:userId", async (c) => {
 
 app.delete("/api/spaces/:id/members/:userId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  await trackRealtimeWorkspace(c.env, member.workspace.id);
   requireOwner(member);
   const space = await spaceForMember(c.env, member, c.req.param("id"));
   await c.env.DB.prepare(`DELETE FROM space_members WHERE space_id = ? AND user_id = ?`)
@@ -3678,15 +3704,6 @@ app.delete("/api/pages/:pageId/share", async (c) => {
   return c.body(null, 204);
 });
 
-app.post("/api/security/realtime/reconcile", async (c) => {
-  const member = await requireMember(c.req.raw, c.env);
-  requireOwner(member);
-  const complete = await flushRealtimeRevocations(c.env, member.workspace.id);
-  if (!complete)
-    throw new HttpError(503, "realtime_revocation_pending", "Live access is still being refreshed. Retry shortly.");
-  return c.json({ complete });
-});
-
 app.post("/api/slack/link-preview", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const body = await jsonBody(c.req.raw);
@@ -4369,6 +4386,7 @@ app.get("/api/pages/:id/moves/:operationId", async (c) => {
 
 app.post("/api/pages/:id/move-space", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  await trackRealtimeWorkspace(c.env, member.workspace.id);
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"));
   requirePageEditor(page);
@@ -7392,26 +7410,7 @@ export default {
           const handle = async () => {
             const party = await handlePartyRequest(request, env);
             if (party) return party;
-            const result = await app.fetch(request, env, context);
-            if (
-              !["GET", "HEAD", "OPTIONS"].includes(request.method) &&
-              /^\/api\/(members|spaces|pages|auth|security)(?:\/|$)/.test(new URL(request.url).pathname) &&
-              !(await flushRealtimeRevocations(env))
-            ) {
-              const headers = new Headers(result.headers);
-              headers.delete("content-length");
-              headers.set("retry-after", "2");
-              return Response.json(
-                {
-                  error: {
-                    code: "realtime_revocation_pending",
-                    message: "The access change was saved. Live access is still being refreshed; retry shortly.",
-                  },
-                },
-                { status: 503, headers },
-              );
-            }
-            return result;
+            return withRealtimeAccessTracking(env, () => app.fetch(request, env, context));
           };
           response = context.tracing
             ? await context.tracing.enterSpan("notes.route_request", async (span) => {
@@ -7500,7 +7499,7 @@ export default {
         search_headings: () => backfillSearchHeadings(env),
         security_state: async () => {
           await pruneSecurityState(env);
-          if (!(await flushRealtimeRevocations(env))) throw new Error("Live access revocation is still pending.");
+          if (!(await drainRealtimeRevocationsBatch(env))) throw new Error("Live access revocation is still pending.");
         },
         oauth_security_records: () => pruneOAuthSecurityRecords(env),
         mcp_staged_pages: () => pruneStagedMcpPages(env),

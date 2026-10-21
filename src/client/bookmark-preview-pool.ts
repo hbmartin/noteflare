@@ -45,6 +45,7 @@ export function subscribeBookmarkPreview(
     entries.set(key, current);
     void api<{ preview: BookmarkPreview }>("/api/link-previews", {
       method: "POST",
+      readOnly: true,
       body: json({ url }),
       signal: current.controller.signal,
     })

@@ -1,6 +1,6 @@
 import { useOnlineStatus } from "./online-status";
 import { RelationPanel } from "./RelationPanel";
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { ClientMemberContext, Page } from "../shared/types";
 import {
   TABLE_COLUMN_TYPES,
@@ -22,6 +22,15 @@ import { taskColumns } from "../shared/tasks";
 import { calendarDay } from "../shared/table-calendar";
 import "./collaborative-table.css";
 
+type CellDraft = {
+  changed: boolean;
+  rowId: string;
+  columnId: string;
+  type: string;
+  text: string;
+  baseRevision: number;
+};
+const draftKey = (rowId: string, columnId: string) => `${rowId}:${columnId}`;
 export type CollaborativeTableProps = {
   page: Pick<Page, "id" | "title" | "taskList">;
   member: ClientMemberContext;
@@ -47,6 +56,10 @@ export function CollaborativeTablePage({
   const base = queryBase ?? `/api/tables/${page.id}/query`;
   const commandsPath = queryBase ? `${queryBase}/commands` : `/api/tables/${page.id}/commands`;
   const online = useOnlineStatus();
+  const [drafts] = useState(() => new Map<string, CellDraft>());
+  const writeReady = useRef(false);
+  const connectionGeneration = useRef(0);
+  const [, refreshDrafts] = useState(0);
   const [connectionReady, setConnectionReady] = useState(false);
   const [data, setData] = useState<TableQueryResult | null>(null);
   const [viewId, setViewId] = useState(initialViewId ?? "");
@@ -59,12 +72,15 @@ export function CollaborativeTablePage({
   const [newTitle, setNewTitle] = useState("");
   const epoch = useRef(0),
     dataRef = useRef(data),
-    dirty = useRef(false),
     active = useRef(true);
   useEffect(() => {
     dataRef.current = data;
   }, [data]);
   const editable = online && connectionReady && member.role !== "viewer" && data?.canEdit !== false;
+  useLayoutEffect(() => {
+    writeReady.current = Boolean(editable);
+  }, [editable]);
+  const canCommit = useCallback(() => writeReady.current && navigator.onLine, []);
   const taskList = Boolean(page.taskList || data?.taskList);
   const tasksPath = queryBase ? `${queryBase}/tasks` : `/api/task-lists/${page.id}/tasks`;
   const discardDenied = useCallback((cause: unknown) => {
@@ -73,7 +89,6 @@ export function CollaborativeTablePage({
     dataRef.current = null;
     setRetry(null);
     setPanel(null);
-    dirty.current = false;
     return true;
   }, []);
   const load = useCallback(
@@ -90,14 +105,13 @@ export function CollaborativeTablePage({
       try {
         const result = await api<TableQueryResult>(`${base}?${params}`, { signal: AbortSignal.timeout(15000) });
         if (owner !== epoch.current || !active.current) return false;
-        if (dirty.current) return false; // Permission is rechecked while preserving the draft's original revision.
         setData((current) =>
           cursor && current?.revision === result.revision
             ? { ...result, rows: [...current.rows, ...result.rows] }
             : result,
         );
         setError("");
-        if (queryBase) setConnectionReady(true);
+        if (queryBase && navigator.onLine) setConnectionReady(true);
         return true;
       } catch (cause) {
         if (owner === epoch.current && active.current) {
@@ -112,6 +126,21 @@ export function CollaborativeTablePage({
     [base, viewId, query, month, discardDenied, queryBase],
   );
   useEffect(() => {
+    const offline = () => {
+      writeReady.current = false;
+      setConnectionReady(false);
+    };
+    const reconnect = () => {
+      if (queryBase) void load();
+    };
+    window.addEventListener("offline", offline);
+    window.addEventListener("online", reconnect);
+    return () => {
+      window.removeEventListener("offline", offline);
+      window.removeEventListener("online", reconnect);
+    };
+  }, [queryBase, load]);
+  useEffect(() => {
     active.current = true;
     void Promise.resolve().then(() => load());
     const requestEpoch = epoch;
@@ -122,21 +151,34 @@ export function CollaborativeTablePage({
   }, [load]);
   useEffect(() => {
     if (queryBase || !online) return undefined;
+    const generationRef = connectionGeneration,
+      readinessRef = writeReady;
     let socket: WebSocket | null = null,
       timer: ReturnType<typeof setTimeout> | undefined,
       stopped = false;
     const connect = () => {
       if (stopped) return;
+      const generation = ++generationRef.current;
       const url = new URL(`/api/tables/${page.id}/socket`, location.href);
       url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
       socket = new WebSocket(url);
-      socket.addEventListener("message", () => {
+      socket.addEventListener("message", (event) => {
+        try {
+          if (!["table-ready", "table-changed"].includes(JSON.parse(event.data).type)) return;
+        } catch {
+          return;
+        }
         void load().then((loaded) => {
-          if (loaded && !stopped) setConnectionReady(true);
+          if (loaded && !stopped && generation === generationRef.current && socket?.readyState === WebSocket.OPEN)
+            setConnectionReady(true);
         });
       });
       socket.addEventListener("close", () => {
-        if (!stopped) setConnectionReady(false);
+        if (!stopped) {
+          readinessRef.current = false;
+          generationRef.current++;
+          setConnectionReady(false);
+        }
         if (!stopped) timer = setTimeout(connect, 2000);
       });
     };
@@ -148,6 +190,9 @@ export function CollaborativeTablePage({
     }, 15000);
     return () => {
       stopped = true;
+      readinessRef.current = false;
+      generationRef.current++;
+      setConnectionReady(false);
       clearTimeout(timer);
       clearInterval(heartbeat);
       socket?.close();
@@ -166,6 +211,7 @@ export function CollaborativeTablePage({
     return () => window.removeEventListener("notes:workspace-event", invalidate);
   }, [load]);
   const send = async (command: TableCommand) => {
+    if (!canCommit()) return false;
     setBusy(true);
     setError("");
     setRetry(null);
@@ -175,7 +221,6 @@ export function CollaborativeTablePage({
         body: json(command),
         signal: AbortSignal.timeout(30000),
       });
-      dirty.current = false;
       await load();
       if (result.projectionPending) setError("Saved. Search and task lists are catching up.");
       if (result.result.visibleInView === false)
@@ -186,7 +231,6 @@ export function CollaborativeTablePage({
       if (discardDenied(cause)) return false;
       if (!(cause instanceof ApiClientError) || cause.status >= 500) setRetry(() => () => send(command));
       else if (cause.status === 409) {
-        dirty.current = false;
         await load();
         setError("The table changed. Review the latest value before saving again.");
       }
@@ -203,6 +247,7 @@ export function CollaborativeTablePage({
       payload,
     });
   const saveTask = async (body: Record<string, unknown>, rowId?: string): Promise<boolean> => {
+    if (!canCommit()) return false;
     setBusy(true);
     setError("");
     setRetry(null);
@@ -212,7 +257,6 @@ export function CollaborativeTablePage({
         body: json(body),
         signal: AbortSignal.timeout(30000),
       });
-      dirty.current = false;
       if (!rowId) setNewTitle("");
       await load();
       if (result?.visibleInView === false)
@@ -223,7 +267,6 @@ export function CollaborativeTablePage({
       if (discardDenied(cause)) return false;
       if (!(cause instanceof ApiClientError) || cause.status >= 500) setRetry(() => () => saveTask(body, rowId));
       else if (cause.status === 409) {
-        dirty.current = false;
         await load();
         setError("The task list changed. Review the latest value before saving again.");
       }
@@ -232,7 +275,13 @@ export function CollaborativeTablePage({
       setBusy(false);
     }
   };
-  const changeCell = (row: CollaborativeRow, column: CollaborativeColumn, value: TableValue) => {
+  const changeCell = async (
+    row: CollaborativeRow,
+    column: CollaborativeColumn,
+    value: TableValue,
+    baseRevision?: number,
+  ) => {
+    if (!canCommit()) return false;
     if (taskList) {
       const columns = taskColumns(page.id),
         field = Object.entries(columns).find(([, id]) => id === column.id)?.[0];
@@ -244,7 +293,7 @@ export function CollaborativeTablePage({
       };
       if (field) {
         const op = crypto.randomUUID();
-        void saveTask(
+        return saveTask(
           {
             operationId: op,
             expectedRevision: data?.revision,
@@ -257,13 +306,12 @@ export function CollaborativeTablePage({
           },
           row.id,
         );
-        return;
       }
     }
-    void command("update_cells", {
+    return command("update_cells", {
       rowId: row.id,
       values: { [column.id]: value },
-      expectedCellRevisions: { [column.id]: row.cellRevisions[column.id] ?? 0 },
+      expectedCellRevisions: { [column.id]: baseRevision ?? row.cellRevisions[column.id] ?? 0 },
     });
   };
   const add = async (groupId?: string, date?: string) => {
@@ -331,10 +379,9 @@ export function CollaborativeTablePage({
               people={data.people ?? []}
               taskAssignee={Boolean(taskList && column.id === taskColumns(page.id).assignee)}
               disabled={!editable || busy}
-              dirty={(value) => {
-                dirty.current = value;
-              }}
-              onChange={(value) => changeCell(row, column, value)}
+              drafts={drafts}
+              canCommit={canCommit}
+              onChange={(value, revision) => changeCell(row, column, value, revision)}
             />
           </label>
         ))}
@@ -346,7 +393,7 @@ export function CollaborativeTablePage({
     if (!row || !view?.columnId || busy) return;
     if (taskList) {
       const column = data.columns.find((candidate) => candidate.id === view.columnId);
-      if (column) changeCell(row, column, target);
+      if (column) void changeCell(row, column, target);
       return;
     }
     void command("move_row", {
@@ -413,6 +460,28 @@ export function CollaborativeTablePage({
           Refresh
         </button>
       </div>
+      {[...drafts.entries()]
+        .filter(
+          ([, draft]) =>
+            draft.changed &&
+            (!data.rows.some((row) => row.id === draft.rowId) ||
+              !data.columns.some((column) => column.id === draft.columnId && column.type === draft.type)),
+        )
+        .map(([key, draft]) => (
+          <section key={key} aria-live="polite">
+            <p>This cell is unavailable. Your unfinished text is preserved.</p>
+            <textarea aria-label="Recovered cell draft" readOnly value={draft.text} />
+            <button onClick={() => void navigator.clipboard.writeText(draft.text)}>Copy draft</button>
+            <button
+              onClick={() => {
+                drafts.delete(key);
+                refreshDrafts((value) => value + 1);
+              }}
+            >
+              Discard draft
+            </button>
+          </section>
+        ))}
       {error && (
         <div role="alert">
           {error}
@@ -566,10 +635,9 @@ export function CollaborativeTablePage({
                         people={data.people ?? []}
                         taskAssignee={Boolean(taskList && column.id === taskColumns(page.id).assignee)}
                         disabled={!editable || busy}
-                        dirty={(value) => {
-                          dirty.current = value;
-                        }}
-                        onChange={(value) => changeCell(row, column, value)}
+                        drafts={drafts}
+                        canCommit={canCommit}
+                        onChange={(value, revision) => changeCell(row, column, value, revision)}
                       />
                     </td>
                   ))}
@@ -638,7 +706,8 @@ function Cell({
   people,
   taskAssignee = false,
   disabled,
-  dirty,
+  drafts,
+  canCommit,
   onChange,
 }: {
   column: CollaborativeColumn;
@@ -646,15 +715,18 @@ function Cell({
   people: NonNullable<TableQueryResult["people"]>;
   taskAssignee?: boolean;
   disabled: boolean;
-  dirty: (value: boolean) => void;
-  onChange: (value: TableValue) => void;
+  drafts: Map<string, CellDraft>;
+  canCommit: () => boolean;
+  onChange: (value: TableValue, revision?: number) => Promise<boolean>;
 }) {
+  const key = draftKey(row.id, column.id);
   const value = row.cells[column.id] ?? null;
-  const [draft, setDraft] = useState(String(value ?? ""));
+  const [draft, setDraft] = useState(drafts.get(key)?.text ?? String(value ?? ""));
+  const [, invalidateDraft] = useState(0);
   const focused = useRef(false);
   useEffect(() => {
-    if (!focused.current) setDraft(String(value ?? ""));
-  }, [value]);
+    if (!focused.current && !drafts.has(key)) setDraft(String(value ?? ""));
+  }, [value, drafts, key]);
   if (column.type === "formula") {
     const computedValue = row.computedCells?.[column.id]?.value;
     return (
@@ -776,19 +848,81 @@ function Cell({
         disabled={disabled || Boolean(column.conversion)}
         onFocus={() => {
           focused.current = true;
-          dirty(true);
+          if (!drafts.has(key))
+            drafts.set(key, {
+              rowId: row.id,
+              columnId: column.id,
+              type: column.type,
+              text: draft,
+              baseRevision: row.cellRevisions[column.id] ?? 0,
+              changed: false,
+            });
         }}
-        onChange={(event) => setDraft(event.target.value)}
+        onChange={(event) => {
+          const text = event.target.value;
+          setDraft(text);
+          const previous = drafts.get(key);
+          drafts.set(key, {
+            rowId: row.id,
+            columnId: column.id,
+            type: column.type,
+            changed: true,
+            text,
+            baseRevision: previous?.baseRevision ?? row.cellRevisions[column.id] ?? 0,
+          });
+        }}
         onBlur={() => {
           focused.current = false;
-          dirty(false);
           const next = column.type === "number" ? (draft === "" ? null : Number(draft)) : draft || null;
-          if (JSON.stringify(next) !== JSON.stringify(value)) onChange(next);
+          const pending = drafts.get(key);
+          if (!pending?.changed) {
+            drafts.delete(key);
+            setDraft(String(value ?? ""));
+            return;
+          }
+          if (!canCommit() || disabled || pending.baseRevision !== (row.cellRevisions[column.id] ?? 0)) return;
+          if (JSON.stringify(next) !== JSON.stringify(value)) {
+            void onChange(next, pending?.baseRevision).then((saved) => {
+              if (saved && drafts.get(key) === pending) {
+                drafts.delete(key);
+                invalidateDraft((version) => version + 1);
+              }
+            });
+          } else drafts.delete(key);
         }}
         onKeyDown={(event) => {
           if (event.key === "Enter") event.currentTarget.blur();
         }}
       />
+      {drafts.get(key) && drafts.get(key)!.baseRevision !== (row.cellRevisions[column.id] ?? 0) && (
+        <div aria-live="polite">
+          <p>The server value changed: {String(value ?? "Empty")}. Your edit is preserved.</p>
+          <button
+            disabled={disabled}
+            onClick={() => {
+              const pending = drafts.get(key);
+              if (!pending || !canCommit()) return;
+              pending.baseRevision = row.cellRevisions[column.id] ?? 0;
+              const next =
+                column.type === "number" ? (pending.text === "" ? null : Number(pending.text)) : pending.text || null;
+              void onChange(next, pending.baseRevision).then((saved) => {
+                if (saved && drafts.get(key) === pending) drafts.delete(key);
+                invalidateDraft((version) => version + 1);
+              });
+            }}
+          >
+            Keep my edit
+          </button>
+          <button
+            onClick={() => {
+              drafts.delete(key);
+              setDraft(String(value ?? ""));
+            }}
+          >
+            Use server value
+          </button>
+        </div>
+      )}
       {column.type === "url" && typeof value === "string" && /^https?:\/\//i.test(value) && (
         <a href={value} target="_blank" rel="noopener noreferrer">
           Open link

@@ -14,6 +14,8 @@ import {
   UnreadableApiResponseError,
 } from "./api";
 import { installClientTelemetry, observeWorkerResponse, resetClientTelemetryForTests } from "./telemetry";
+import { hasPendingWork } from "./pending-work";
+import { claimChunkRecovery } from "./chunk-recovery";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -37,6 +39,67 @@ function silenceApiResponseReport() {
   onTestFinished(() => reported.mockRestore());
   return reported;
 }
+
+describe("offline mutation classification", () => {
+  it.each(["/api/link-previews", "/api/slack/link-preview"])(
+    "does not retain pending writes for a preview at %s",
+    async (path) => {
+      let finish!: (response: Response) => void;
+      const fetcher = vi.fn<typeof fetch>(
+        () =>
+          new Promise<Response>((resolve) => {
+            finish = resolve;
+          }),
+      );
+      vi.stubGlobal("fetch", fetcher);
+      const result = api(path, { method: "POST", readOnly: true, body: "{}" });
+      expect(hasPendingWork()).toBe(false);
+      expect(fetcher.mock.calls[0]?.[1]).not.toHaveProperty("readOnly");
+      sessionStorage.clear();
+      expect(claimChunkRecovery(new Error("Failed to fetch dynamically imported module"))).toBe(true);
+      finish(Response.json({ preview: null }));
+      await result;
+      sessionStorage.clear();
+    },
+  );
+  it("keeps real writes protected while previews are also in flight", async () => {
+    const finishes: Array<(response: Response) => void> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => finishes.push(resolve))),
+    );
+    const preview = api("/api/link-previews", { method: "POST", readOnly: true });
+    const mutation = api("/api/pages", { method: "POST", readOnly: false });
+    expect(hasPendingWork()).toBe(true);
+    finishes[0]!(Response.json({ preview: null }));
+    await preview;
+    expect(hasPendingWork()).toBe(true);
+    expect(claimChunkRecovery(new Error("Failed to fetch dynamically imported module"))).toBe(false);
+    finishes[1]!(Response.json({ page: {} }));
+    await mutation;
+    expect(hasPendingWork()).toBe(false);
+  });
+  it("attempts offline previews as reads while rejecting unsent changes", async () => {
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    const fetcher = vi.fn().mockRejectedValue(new TypeError("offline"));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(api("/api/slack/link-preview", { method: "POST", readOnly: true })).rejects.toThrow("offline");
+    await expect(api("/api/pages", { method: "POST" })).rejects.toMatchObject({ notSent: true });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(hasPendingWork()).toBe(false);
+    online.mockRestore();
+  });
+  it("rejects an unsent mutation explicitly without fetching", async () => {
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    const fetcher = vi.spyOn(globalThis, "fetch");
+    await expect(api("/api/pages", { method: "POST", body: "{}" })).rejects.toMatchObject({
+      code: "offline_read_only",
+      notSent: true,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+});
 
 describe("api", () => {
   it("accepts only supported page-not-found statuses", () => {

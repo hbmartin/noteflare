@@ -1,3 +1,4 @@
+import { trackRealtimeUser } from "./realtime-access";
 import { betterAuth } from "better-auth";
 import type { GenericEndpointContext } from "@better-auth/core";
 import { passkey } from "@better-auth/passkey";
@@ -342,12 +343,18 @@ export function createAuth(env: Env, allowRegistration = false) {
         },
       },
       session: {
+        delete: {
+          before: async (session) => {
+            await trackRealtimeUser(env, session.userId);
+          },
+        },
         create: {
           after: async (session, ctx) => {
             if (!ctx) return;
             try {
               await finishSlackAuthentication(env, ctx, session.userId, session.id);
             } catch (error) {
+              await trackRealtimeUser(env, session.userId);
               await env.DB.prepare("DELETE FROM session WHERE id=? AND userId=?")
                 .bind(session.id, session.userId)
                 .run();

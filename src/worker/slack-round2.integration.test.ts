@@ -270,6 +270,23 @@ describe("viewer-private Slack link previews", () => {
     ).rejects.toMatchObject({ status: 403 });
     expect(calls.some((call) => call.method === "conversations.history")).toBe(false);
   });
+  it("bounds a reply permalink read to its exact inclusive timestamp", async () => {
+    await prepare();
+    responses["conversations.replies"] = { ok: true, messages: [{ ts: "1234567890.123456", text: "Exact reply" }] };
+    const preview = await previewSlackLink(
+      runtime(),
+      owner,
+      "https://team.slack.com/archives/C123/p1234567890123456?thread_ts=1234567800.000001",
+    );
+    expect(preview.text).toBe("Exact reply");
+    expect(calls.find((call) => call.method === "conversations.replies")?.body).toMatchObject({
+      oldest: "1234567890.123456",
+      latest: "1234567890.123456",
+      inclusive: "true",
+      limit: "1",
+      ts: "1234567800.000001",
+    });
+  });
   it("discards a fetched preview if its identity grant was revoked during the read", async () => {
     await prepare();
     const original = globalThis.fetch;

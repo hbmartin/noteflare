@@ -40,27 +40,57 @@ export function RelationPanel({
     [target, setTarget] = useState(""),
     [name, setName] = useState("Related rows");
   useEffect(() => {
-    if (!rowId) return undefined;
+    if (!rowId || !Number.isFinite(data.generation)) return undefined;
+    let disposed = false,
+      running = false,
+      trailing = false;
     const controller = new AbortController();
-    void api<Details>(
-      `/api/tables/${data.pageId}/relations?rowId=${encodeURIComponent(rowId)}&sourceRevision=${data.revision}`,
-      {
-        signal: controller.signal,
-      },
-    )
-      .then((value) => {
-        if (controller.signal.aborted) return;
-        setDetails(value);
-        setError("");
-      })
-      .catch((cause) => {
-        if (!controller.signal.aborted) {
+    const refresh = async () => {
+      if (disposed || document.hidden || !navigator.onLine) return;
+      if (running) {
+        trailing = true;
+        return;
+      }
+      running = true;
+      try {
+        const value = await api<Details>(
+          `/api/tables/${data.pageId}/relations?rowId=${encodeURIComponent(rowId)}&sourceRevision=${data.revision}`,
+          { signal: controller.signal },
+        );
+        if (!disposed) {
+          setDetails(value);
+          setError("");
+        }
+      } catch (cause) {
+        if (!disposed) {
           setDetails(null);
           setError(apiErrorMessage(cause, "Related rows could not be loaded."));
         }
-      });
-    return () => controller.abort();
-  }, [data, rowId]);
+      } finally {
+        running = false;
+        if (trailing && !disposed) {
+          trailing = false;
+          void refresh();
+        }
+      }
+    };
+    const invalidate = () => {
+      void refresh();
+    };
+    void refresh();
+    const timer = setInterval(invalidate, 15_000);
+    window.addEventListener("notes:workspace-event", invalidate);
+    window.addEventListener("online", invalidate);
+    document.addEventListener("visibilitychange", invalidate);
+    return () => {
+      disposed = true;
+      controller.abort();
+      clearInterval(timer);
+      window.removeEventListener("notes:workspace-event", invalidate);
+      window.removeEventListener("online", invalidate);
+      document.removeEventListener("visibilitychange", invalidate);
+    };
+  }, [data.pageId, data.generation, data.revision, rowId]);
   useEffect(() => {
     if (!search.trim()) return undefined;
     const controller = new AbortController();
