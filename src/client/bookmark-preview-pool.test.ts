@@ -17,6 +17,7 @@ describe("public bookmark preview pool", () => {
     const third = subscribeBookmarkPreview("same-account", "https://example.com/missing", receive);
     expect(receive).toHaveBeenCalledTimes(3);
     expect(api).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(api).mock.calls[0]![1]).toMatchObject({ readOnly: true });
     third();
   });
 

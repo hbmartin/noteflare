@@ -22,6 +22,30 @@ afterEach(() => {
   vi.restoreAllMocks();
   setRealtimeAccessAccount("");
 });
+it("names the generated invitation link for assistive technology", async () => {
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (path === "/api/members") return { members: [] };
+    if (path.endsWith("/status")) return { complete: true };
+    if (path === "/api/invites") return { invite: { token: "generated-token" } };
+    throw new Error(path);
+  });
+  await act(async () => {
+    render(
+      <WorkspaceSettings
+        member={{ role: "owner", user: { id: "owner", name: "Owner" } } as ClientMemberContext}
+        spaces={[]}
+        pages={[]}
+      />,
+    );
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Invite editor" }));
+  });
+  expect(screen.getByRole("textbox", { name: "Invite link" })).toHaveValue(
+    `${location.origin}/?invite=generated-token`,
+  );
+  expect(screen.getByRole("textbox", { name: "Invite link" })).toHaveAttribute("readonly");
+});
 it("shows committed membership while fencing retries never resubmit the mutation", async () => {
   let role = "editor",
     pending = false,

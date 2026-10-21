@@ -152,7 +152,7 @@ export function WorkspaceSettings({
       )}
       {inviteUrl && (
         <div className="invite-link">
-          <input readOnly value={inviteUrl} />
+          <input aria-label="Invite link" readOnly value={inviteUrl} />
           <button onClick={() => void navigator.clipboard.writeText(inviteUrl)}>Copy</button>
         </div>
       )}

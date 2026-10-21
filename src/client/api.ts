@@ -238,9 +238,12 @@ export function notifyApiUnauthorized(error: ApiClientError, requestEpoch: numbe
   }
 }
 
-export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const method = (init?.method ?? "GET").toUpperCase();
-  if (!["GET", "HEAD", "OPTIONS"].includes(method) && !navigator.onLine) {
+type ApiInit = RequestInit & { readOnly?: boolean };
+export async function api<T>(path: string, init?: ApiInit): Promise<T> {
+  const { readOnly, ...requestInit } = init ?? {};
+  const method = (requestInit.method ?? "GET").toUpperCase();
+  const mutation = !readOnly && !["GET", "HEAD", "OPTIONS"].includes(method);
+  if (mutation && !navigator.onLine) {
     throw new ApiClientError(
       503,
       "offline_read_only",
@@ -249,9 +252,9 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       { notSent: true },
     );
   }
-  const release = ["GET", "HEAD", "OPTIONS"].includes(method) ? () => undefined : retainPendingWork();
+  const release = mutation ? retainPendingWork() : () => undefined;
   try {
-    return await apiRequest<T>(path, init);
+    return await apiRequest<T>(path, requestInit);
   } finally {
     release();
   }

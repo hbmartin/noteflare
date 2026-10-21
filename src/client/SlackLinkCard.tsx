@@ -40,6 +40,7 @@ export function SlackLinkCard({ url }: { url: string }) {
     try {
       const result = await api<{ preview: SlackLinkPreview }>("/api/slack/link-preview", {
         method: "POST",
+        readOnly: true,
         body: json({ url }),
         signal: controller.signal,
       });
