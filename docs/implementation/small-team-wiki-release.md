@@ -1,6 +1,6 @@
 # Small-team wiki implementation ledger
 
-Status: implementation in progress on `codex/small-team-wiki-improvements`, based on `a80e215662f68951870970156d8990e472c8a8bc`. Local evidence only; no deployment or team pilot is recorded here. Updated 20 October 2026.
+Status: implementation in progress on `codex/small-team-wiki-improvements`, based on `a80e215662f68951870970156d8990e472c8a8bc` and incorporating PR #261. Local evidence only; no deployment or team pilot is recorded here. Updated 21 October 2026.
 
 The [program](../roadmap/12-small-team-wiki-improvements.md) and [upstream assessment](../research/upstream-change-assessment-2026-10-20.md) establish the scope. Portability/import/export improvements, backups, ownership/verification/freshness, and audit history are excluded. Existing format compatibility and data integrity remain release requirements. Comments, reactions, settings, and trash usability are retained.
 
@@ -66,7 +66,7 @@ Targeted local checks already passed during implementation:
 - Canonical relation receipt replay, deduplication, one-hop calculations, reverse lookup, projection corruption detection/rebuild, and missing target row behavior.
 - Private Slack preview permitted for a verified channel member, denied before content fetch after membership loss, and discarded if the identity grant is revoked during the read. These use mocked Slack responses and send no external messages.
 
-Validation for this implementation pass:
+Initial implementation validation: 20 October 2026, commit `10bfc32`; this is the original wiki increment, before the PR #261 merge and subsequent corrections.
 
 - Unit coverage: **2,591 passed, one pre-existing skip**; 73.78% lines, 71.06% statements, 66.29% branches, 65.30% functions.
 - Browser acceptance: **eleven passing scenarios**: disconnect/reconnect, presentation/source removal and find/tab convergence in Chromium, Firefox and WebKit, plus real pasted-file retry in Chromium with one server attachment and one stable upload identity, and the comments/watch/notifications/Slack-settings accessibility scenario in Chromium. Browser fixtures wait for synchronized edit readiness.
@@ -91,7 +91,7 @@ The follow-up retains workspace-wide fencing and the original scope exclusions. 
 
 Local clean-handshake barrier measurement (10bfc32 algorithm versus this implementation, same Worker test runtime): one coordinator registration in both versions; D1 reads decrease from two to one. Ten cold coordinator names and fifty warm samples per version measured p50/p95 milliseconds: baseline cold **5/6**, current cold **4/6**; baseline warm **4/32**, current warm **3/8**. These isolate the registration barrier and local coordinator initialization; they are not production network or full browser-upgrade latency claims. No reproducible p95 regression was observed in this run.
 
-Follow-up validation:
+Correctness follow-up validation: 20 October 2026, commits `4de0642`, `e6b187a`, and `06fe066`; this branch had not yet incorporated the PR #261 deletion/editor changes.
 
 - Unit coverage: **2,604 passed, one pre-existing skip**; 73.75% lines, 71.01% statements, 66.20% branches, 65.46% functions. New cases cover focused/unchanged/conflicting cells, reconnect without a socket close event, unsent offline mutation reconciliation, held upload completion, shared/versioned drafts including blocked storage, pending-access settings, and coalesced target refresh.
 - Full Worker integration and coverage: **2,329 passed across 36 files**; 86.42% lines, 83.09% statements, 76.57% branches, 89.69% functions. The final pre-mutation-read failure guard was then validated with all **nine** barrier regressions, including its new case, plus Worker/source-test TypeScript checks and lint; the full suite was not repeated for that isolated error-path guard.
@@ -99,3 +99,34 @@ Follow-up validation:
 - All five TypeScript projects, formatting/docs checks, lint, dead-code analysis, generated bindings, application build and Worker dry-run pass. Middleware Semgrep hit its default five-second per-rule timeout under concurrent validation; the same strict rules passed with a thirty-second timeout and all ten rule tests. Deployment Semgrep and both rule tests pass. No rules were skipped or disabled.
 
 Primary implementation commits: `4de0642` contains server access/authority corrections and `e6b187a` contains client lifecycle corrections and browser regressions. The closeout adds a guard so a failed access-state read before a write cannot label a rejected operation as saved, together with this validation record. Apply migration 0100 before deploying the new worker. Production rollout, production latency measurement, relation format compatibility/lifecycle acceptance and feature activation remain separate release gates.
+
+## PR #261 review fixes and combined branch
+
+The PR #261 description records a separate 20 October 2026 run at `c66f86d`: 2,596 unit tests with one existing skip, 2,330 Worker cases across 35 files, and 27 focused Chromium scenarios. Those totals include its deletion/editor changes and are historical evidence from that PR. PR #261 merged into main as `40d9741`; integration commit `f00d5a1` combines its implementation with the three local correctness commits, preserving both sets of changes.
+
+The 21 October review fixes add these contracts:
+
+- Migration 0101 adds the missing space-grant INSERT trigger. A first viewer override on a workspace-visible space fences an existing workspace editor just like a role update. The upgrade advances each workspace with an existing affected override once, preserving completion revisions and other workspaces.
+- The same forward migration restricts heading-epoch work to documents, removes existing non-document queue entries, and indexes comment-operation page/thread cascades. Migrations 0095–0100 retain their original contents.
+- Upload success resolves its attachment URL; every cancellation path resolves the empty cancellation result once. Block deletion, replacement, editor disposal, epoch changes and confirmed access loss release transport and local resources. Both native paste/drop and file-panel callers skip cancellation results; paste/drop also checks that a successfully uploaded block still exists. Core and React patches include source and both shipped ESM/CJS builds.
+- The API's client-only `readOnly` option classifies preview POSTs as reads and is stripped before fetch. Previews cannot hold the pending-write unload/recovery guard. Ordinary mutations retain their guard and offline `notSent` rejection; Slack checks and private response handling remain unchanged. Generated invite links have an accessible name.
+- The historical migration test again searches for `architecure` after the entire forward upgrade, asserting that the full-width Architecture title is returned. Its direct normalization, trigram, queue and heading checks remain.
+
+An isolated in-memory SQLite cascade measurement used 20 fresh databases per version, 20,000 operation receipts, 200 threads and two pages; deleting one page removed 100 threads/10,000 receipts and preserved the other half. Seeding was excluded. Baseline p50/p95 was **74.421/74.944 ms**; indexed p50/p95 was **12.937/13.067 ms**. Both child lookup plans change from scans to the new indexes. These figures describe local SQLite work, not production D1 timing.
+
+### Sonar reliability disposition
+
+The two PR #261 reliability observations, `AaFaxRopAKmEkIRyfNR9` and `AaFaxRopAKmEkIRyfNR_` (`typescript:S2871`), concern sorting canonical row identifiers in relation references and filtered results. They are false positives for alphabetical display ordering: these are bounded ASCII identifiers and need deterministic code-unit ordering. A comparator probe gives `10,2,A,Z,a,a-1,a:1,a_1` using the existing sort, while English locale collation gives `10,2,a,A,a_1,a-1,a:1,Z`. Switching to locale ordering changes the contract. The implementation preserves the existing ordering. No Sonar dashboard disposition or scanner policy was changed; the other 51 maintainability observations remain outside this pass, and the remote quality gate is not claimed to pass.
+
+### Combined validation and rollout
+
+Combined validation on 21 October 2026, with the application code at `fcff523` and browser fixtures at `68274ef`:
+
+- Unit coverage: **2,622 passed, one pre-existing skip**, across 149 passing files; 73.87% lines, 71.15% statements, 66.15% branches, 65.70% functions. The complete final run uses two workers. An earlier heavily parallel run hit the existing observability timing-ratio assertion; no threshold or test was changed.
+- Full Worker integration and coverage: **2,348 passed across 37 files**; 86.50% lines, 83.21% statements, 76.76% branches, 89.84% functions. Targeted migration/access/search cases also passed before the full suite. Worker source remained unchanged while the frontend-only cancellation refinements were completed.
+- Browser matrix: **36 passed**, twelve cases in Chromium, Firefox and WebKit. It covers native multi-file and file-panel cancellation, invite accessibility, stable-ID Retry, diagram and cell reconnects, shared/anchored/legacy comment recovery, comments/settings accessibility, and merged editor/code-binding behavior.
+- Additional combined-branch browser regressions: **28 passed**, seven cases in Chromium, Firefox, WebKit and mobile Chromium. These cover owner-only deletion recovery, polling/backoff and dependency pauses, rejected historical previews, queued restore preservation, and changed-scope validation. The two disjoint browser batches total **64 passing scenarios**.
+- All five TypeScript projects, lint, formatting/docs checks, dead-code analysis, generated bindings, application production build and Worker dry-run pass. Strict middleware Semgrep passes with the same ten rules and ten rule tests at a thirty-second timeout after the default timeout under load; deployment Semgrep and both rule tests pass. No rules were disabled or skipped to obtain these results.
+- Native paste/drop and file-panel unit tests exercise the installed ESM package. Both core/React patches also update their CJS builds, whose changed files pass syntax checks. Cancellation restores the native placeholder without a document write, keeps overlapping replacements busy until their end callbacks settle, and stops pending multi-file insertion after read-only/unmount transitions.
+
+Apply pending migrations **0100 and 0101**, in order, before deploying this worker. Observe pending/completed realtime revisions until the migration's backfilled fences drain. Keep `TABLE_RELATIONS_ENABLED=false`. Remote migration, deployment, live Slack installation testing, production timing and relation pilot activation remain separate release gates.
