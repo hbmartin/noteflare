@@ -45,12 +45,12 @@ async function bootstrap() {
   return { cookie, userId: me.user.id, workspaceId: me.workspace.id, pageId: pages.pages[0]!.id };
 }
 
-async function invite(ownerCookie: string, suffix: string) {
+async function invite(ownerCookie: string, suffix: string, role = "viewer") {
   const invitation = await SELF.fetch(
     request(ownerCookie, "/api/invites", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ role: "viewer" }),
+      body: JSON.stringify({ role }),
     }),
   );
   const token = (await invitation.json<{ invite: { token: string } }>()).invite.token;
@@ -100,6 +100,77 @@ afterEach(async () => {
 });
 
 describe("server-authoritative comments", () => {
+  it("fences document and table editors when their first viewer override is inserted", async () => {
+    const owner = await bootstrap();
+    const editor = await invite(owner.cookie, "first-viewer-grant", "editor");
+    const page = await env.DB.prepare("SELECT space_id FROM pages WHERE id=?")
+      .bind(owner.pageId)
+      .first<{ space_id: string }>();
+    const tableResponse = await SELF.fetch(
+      request(owner.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "table", title: "Grant test", spaceId: page!.space_id }),
+      }),
+    );
+    const table = (await tableResponse.json<{ page: Page }>()).page;
+    expect((await SELF.fetch(request(owner.cookie, `/api/tables/${table.id}/authority`, { method: "POST" }))).ok).toBe(
+      true,
+    );
+    const paths = [`/parties/document/${owner.pageId}~1`, `/api/tables/${table.id}/socket`];
+    const sockets: WebSocket[] = [];
+    for (const path of paths) {
+      const response = await SELF.fetch(request(editor.cookie, path, { headers: { Upgrade: "websocket" } }));
+      expect(response.status).toBe(101);
+      response.webSocket!.accept();
+      sockets.push(response.webSocket!);
+    }
+    const closed = sockets.map(
+      (socket) =>
+        new Promise<number>((resolve) =>
+          socket.addEventListener("close", (event) => resolve(event.code), { once: true }),
+        ),
+    );
+    const before =
+      (await env.DB.prepare("SELECT revision FROM realtime_revocations WHERE workspace_id=?")
+        .bind(owner.workspaceId)
+        .first<number>("revision")) ?? 0;
+    const grant = (role: string) =>
+      SELF.fetch(
+        request(owner.cookie, `/api/spaces/${page!.space_id}/members/${editor.userId}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ role }),
+        }),
+      );
+    expect((await grant("viewer")).status).toBe(200);
+    expect(await Promise.all(closed)).toEqual([4403, 4403]);
+    const status = () =>
+      env.DB.prepare("SELECT revision,completed_revision FROM realtime_revocations WHERE workspace_id=?")
+        .bind(owner.workspaceId)
+        .first<{ revision: number; completed_revision: number }>();
+    expect(await status()).toEqual({ revision: before + 1, completed_revision: before + 1 });
+    const reconnected: WebSocket[] = [];
+    for (const path of paths) {
+      const response = await SELF.fetch(request(editor.cookie, path, { headers: { Upgrade: "websocket" } }));
+      expect(response.status).toBe(101);
+      response.webSocket!.accept();
+      reconnected.push(response.webSocket!);
+    }
+    const query = await SELF.fetch(request(editor.cookie, `/api/tables/${table.id}/query`));
+    expect(await query.json()).toMatchObject({ canEdit: false });
+    expect((await SELF.fetch(request(editor.cookie, `/api/pages/${owner.pageId}`))).status).toBe(200);
+    const grants = await runInDurableObject(env.DOCUMENT.getByName(`${owner.pageId}~1`), async (instance) =>
+      [...instance.getConnections()].map((connection) => connection.state),
+    );
+    expect(grants).toContainEqual(expect.objectContaining({ userId: editor.userId, role: "viewer" }));
+    for (const socket of reconnected) socket.close();
+    expect((await grant("viewer")).status).toBe(200);
+    expect(await status()).toEqual({ revision: before + 1, completed_revision: before + 1 });
+    expect((await grant("editor")).status).toBe(200);
+    expect(await status()).toEqual({ revision: before + 2, completed_revision: before + 2 });
+  });
+
   it("fences registered live rooms before a member removal reports completion", async () => {
     const owner = await bootstrap();
     const viewer = await invite(owner.cookie, "live-revoke");
