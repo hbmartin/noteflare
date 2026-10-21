@@ -238,7 +238,7 @@ export function notifyApiUnauthorized(error: ApiClientError, requestEpoch: numbe
   }
 }
 
-type ApiInit = RequestInit & { readOnly?: boolean };
+export type ApiInit = RequestInit & { readOnly?: boolean };
 export async function api<T>(path: string, init?: ApiInit): Promise<T> {
   const { readOnly, ...requestInit } = init ?? {};
   const method = (requestInit.method ?? "GET").toUpperCase();
