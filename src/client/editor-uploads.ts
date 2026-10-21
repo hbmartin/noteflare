@@ -85,7 +85,6 @@ export class EditorUploads {
       });
       cancel.addEventListener("click", () => {
         this.forget(blockId);
-        resolve("");
         this.changed?.();
       });
       for (const child of [name, status, progress, retry, cancel]) element.appendChild(child);
@@ -130,16 +129,16 @@ export class EditorUploads {
     for (const [id, current] of this.entries) {
       if (current !== entry || !entry.completed) continue;
       const url = entry.completed;
-      this.forget(id);
-      entry.resolve(url);
+      this.forget(id, url);
       this.changed?.();
       break;
     }
   }
   dispose() {
     for (const id of this.entries.keys()) this.forget(id);
+    this.changed?.();
   }
-  private forget(blockId: string) {
+  private forget(blockId: string, result = "") {
     const entry = this.entries.get(blockId);
     if (!entry) return;
     this.entries.delete(blockId);
@@ -147,6 +146,7 @@ export class EditorUploads {
     entry.controller.abort();
     entry.release();
     if (entry.preview) URL.revokeObjectURL(entry.preview);
+    entry.resolve(result);
   }
   bind(view: EditorView) {
     this.changed = () => {

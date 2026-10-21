@@ -98,13 +98,56 @@ describe("block-local uploads", () => {
     expect(document.querySelector(".local-upload")).toBeNull();
     expect(hasPendingWork()).toBe(false);
   });
-  it("aborts and releases the preview when undo removes the block", () => {
+  it("aborts and settles cancellation when undo removes the block", async () => {
     vi.mocked(uploadAttachment).mockImplementation(() => new Promise(() => {}));
     const manager = fixture();
-    void manager.upload(file(), "media");
+    const result = manager.upload(file(), "media");
     view.dispatch(view.state.tr.delete(0, view.state.doc.content.size));
+    expect(await result).toBe("");
     expect(vi.mocked(uploadAttachment).mock.calls[0]![3]!.signal!.aborted).toBe(true);
     expect(URL.revokeObjectURL).toHaveBeenCalled();
+    expect(hasPendingWork()).toBe(false);
+  });
+  it("settles replacement and disposal once while ignoring both late transfers", async () => {
+    const finishes: Array<(value: Awaited<ReturnType<typeof uploadAttachment>>) => void> = [];
+    vi.mocked(uploadAttachment).mockImplementation(() => new Promise((resolve) => finishes.push(resolve)));
+    const manager = fixture();
+    const first = manager.upload(file(), "media"),
+      firstSettled = vi.fn();
+    void first.then(firstSettled);
+    const second = manager.upload(file(), "media"),
+      secondSettled = vi.fn();
+    void second.then(secondSettled);
+    expect(await first).toBe("");
+    expect(firstSettled).toHaveBeenCalledTimes(1);
+    expect(secondSettled).not.toHaveBeenCalled();
+    manager.dispose();
+    manager.dispose();
+    expect(await second).toBe("");
+    for (const finish of finishes)
+      finish({ id: "late", pageId: "page", name: "photo.png", mime: "image/png", size: 5 });
+    await Promise.resolve();
+    expect(firstSettled).toHaveBeenCalledTimes(1);
+    expect(secondSettled).toHaveBeenCalledTimes(1);
+    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2);
+    expect(hasPendingWork()).toBe(false);
+    expect(document.querySelector(".local-upload")).toBeNull();
+  });
+  it("cancels a held completion when the editor epoch is disposed", async () => {
+    vi.mocked(uploadAttachment).mockResolvedValue({
+      id: "held",
+      pageId: "page",
+      name: "photo.png",
+      mime: "image/png",
+      size: 5,
+    });
+    const manager = fixture(),
+      result = manager.upload(file(), "media");
+    manager.setReady(false);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("Waiting for the document"));
+    unbind();
+    expect(await result).toBe("");
+    manager.setReady(true);
     expect(hasPendingWork()).toBe(false);
   });
 });
