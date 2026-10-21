@@ -126,8 +126,18 @@ worker becomes visible. Paused jobs wait for an explicit refresh or recheck.
 Network failures and interrupted response-body reads retry automatically, even after successful response
 headers. Complete malformed proof responses, missing purge proof, generation conflicts, and conflicting
 retained evidence pause immediately. A failed compare-and-swap or a stopped containing table alone is
-coordination contention and retries with normal backoff; it is not proof of changed ownership. Every
-checkpoint still verifies the original identities and cleanup lease.
+coordination contention and retries automatically; it is not proof of changed ownership. Row cleanup
+waits 1, 2, 4, 8, then 15 minutes between failures, capped at 15 minutes. Physical cleanup retains its
+existing hourly backoff. Active claims clear `failure_code`; a recorded 15-minute retry is therefore
+not an active cleanup lease, and an owner can still choose **Check again**.
+
+A row deletion whose matching containing-table job is paused instead shows `deletion_dependency_blocked`.
+It keeps its original identities and locks and stops calling the stopped table. When that original
+generation's purge proof is published, the dependent resumes automatically without a second owner
+recheck. Scheduled reconciliation also recognizes proof published by an older worker. Independent
+proof, ownership, and generation failures remain paused. An unexpected phase under a current lease
+shows `deletion_state_conflict`; operators must repair the original job state before rechecking.
+Every checkpoint still verifies the original identities and cleanup lease.
 
 During a rolling deployment, old workers may park jobs at `MAX_SAFE_INTEGER` without `blocked_at`, even
 after migration 0094 ran. The list recognizes these as paused and requiring owner recheck without guessing
@@ -138,17 +148,25 @@ accept a newer generation, or release locks. These fixes require no migration be
 
 `GET /api/deletion-jobs` lists accepted jobs for the current workspace (owners only, 50 per page,
 with an opaque `nextCursor`). `POST /api/deletion-jobs/:id/retry` requests a recheck and returns `202`.
-The existing repeat-permanent-delete endpoint uses the same retry guard. Summaries expose a safe
-reason instead of the raw stored `last_error`:
+The existing repeat-permanent-delete endpoint uses the same retry guard. Its responses include the
+accepted `jobId`. If that selected job completes before the recheck, the response remains `202` with
+`replayed: true` and `cleanupPending: false`; it acknowledges that original job and never initiates
+deletion of a recreated page. The client refreshes Trash without optimistically removing replacement
+pages. During mixed-version deployments, verified internal ownership failures retain `table_forbidden`;
+state conflicts use its allowlisted `deletionReason: state_conflict` detail. Generation conflicts retain
+`table_generation_conflict`, and ordinary contention retains `deletion_pending`.
+Summaries expose a safe reason instead of the raw stored `last_error`:
 
-| Reason code                    | Recovery                                                                            |
-| ------------------------------ | ----------------------------------------------------------------------------------- |
-| `deletion_proof_unavailable`   | Restore or investigate the original purge tombstone, then recheck.                  |
-| `deletion_proof_invalid`       | Investigate the malformed successful proof response, then recheck.                  |
-| `deletion_generation_conflict` | Reconcile the original captured generation; a newer tombstone is never substituted. |
-| `deletion_evidence_conflict`   | Investigate retained versus recaptured identities; evidence is not overwritten.     |
-| `deletion_ownership_conflict`  | Resolve the captured identity's ownership before rechecking.                        |
-| `deletion_recheck_required`    | Historical parking has no classified cause; recheck to obtain a current diagnosis.  |
+| Reason code                    | Recovery                                                                                             |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `deletion_dependency_blocked`  | Recheck the containing table deletion; its dependents resume when original purge proof is published. |
+| `deletion_state_conflict`      | Inspect and repair the original cleanup phase/target state, then recheck.                            |
+| `deletion_proof_unavailable`   | Restore or investigate the original purge tombstone, then recheck.                                   |
+| `deletion_proof_invalid`       | Investigate the malformed successful proof response, then recheck.                                   |
+| `deletion_generation_conflict` | Reconcile the original captured generation; a newer tombstone is never substituted.                  |
+| `deletion_evidence_conflict`   | Investigate retained versus recaptured identities; evidence is not overwritten.                      |
+| `deletion_ownership_conflict`  | Resolve the captured identity's ownership before rechecking.                                         |
+| `deletion_recheck_required`    | Historical parking has no classified cause; recheck to obtain a current diagnosis.                   |
 
 Malformed successful proofs and missing proofs pause immediately. Network failures, rate limits,
 and ordinary service outages retain automatic retry backoff. A table that has not been seeded is

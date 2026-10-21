@@ -5,7 +5,21 @@ import { HttpError, safeHttpError } from "./http";
 import type { PageRow } from "./page-access";
 import { acceptedPageDeletionSql } from "./deletion-policy";
 import { decodeTableResponse, MalformedTableResponseError, tableReadPages } from "./table-transport";
-import { CLEANUP_LEASE_MS, deletionFailure, deletionCheckpointFailure, DeletionLeaseLostError } from "./deletion-jobs";
+import {
+  CLEANUP_LEASE_MS,
+  PARKED_DELETION,
+  deletionFailure,
+  deletionCheckpointFailure,
+  deletionCheckpointStatement,
+  deletionSnapshotFailure,
+  DeletionLeaseLostError,
+  DeletionDependencyBlockedError,
+  deletionError,
+  resumeDeletionDependenciesStatement,
+  logResumedDeletions,
+  type DeletionCheckpoint,
+  type DeletionCheckpointSnapshot,
+} from "./deletion-jobs";
 import { DELETION_FAILURE_MESSAGES } from "../shared/deletion-jobs";
 
 type DeletionTargetKind = "document_do" | "table_do" | "table_row" | "r2_object" | "r2_prefix";
@@ -158,11 +172,9 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
             throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
           return manifest;
         })) {
-          if (
-            snapshot.pageId !== table.pageId ||
-            snapshot.workspaceId !== table.workspaceId ||
-            snapshot.generation !== table.generation
-          )
+          if (snapshot.generation !== table.generation)
+            throw new HttpError(409, "table_generation_conflict", "Deletion evidence generation changed.");
+          if (snapshot.pageId !== table.pageId || snapshot.workspaceId !== table.workspaceId)
             throw new HttpError(
               409,
               "deletion_ownership_conflict",
@@ -277,12 +289,23 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
       );
     }
     for (let offset = 0; offset < statements.length; offset += 50) {
-      const inserted = await env.DB.batch(statements.slice(offset, offset + 50));
-      if (inserted.some((result) => !result.meta.changes))
-        throw await deletionCheckpointFailure(env, job.id, leaseUntil, "Deletion evidence checkpoint changed", {
+      const inserted = await env.DB.batch([
+        ...statements.slice(offset, offset + 50),
+        deletionCheckpointStatement(env, {
+          jobId: job.id,
+          leaseUntil,
+          phase: job.phase,
           tableId: table.pageId,
           generation: table.generation,
-        });
+          target: stop.target,
+        }),
+      ]);
+      if (inserted.slice(0, -1).some((result) => !result.meta.changes))
+        throw deletionCheckpointFailure(
+          inserted.at(-1)!.results[0] as DeletionCheckpointSnapshot,
+          "Deletion evidence checkpoint changed",
+          table.pageId,
+        );
     }
   }
 }
@@ -349,11 +372,26 @@ async function compareAndSwapRowTarget(
   next: string,
   guard: string,
   bindings: Array<string | number | null>,
+  checkpoint: DeletionCheckpoint,
+  publishProof = false,
 ) {
-  return env.DB.prepare(`UPDATE deletion_targets SET target=?
-    WHERE job_id=? AND kind='table_row' AND target=? AND completed_at IS NULL AND ${guard}`)
-    .bind(next, jobId, previous, ...bindings)
-    .run();
+  const result = await env.DB.batch([
+    env.DB.prepare(`UPDATE deletion_targets SET target=?
+      WHERE job_id=? AND kind='table_row' AND target=? AND completed_at IS NULL AND ${guard}`).bind(
+      next,
+      jobId,
+      previous,
+      ...bindings,
+    ),
+    deletionCheckpointStatement(env, checkpoint),
+    ...(publishProof ? [resumeDeletionDependenciesStatement(env, Date.now(), jobId)] : []),
+  ]);
+  if (publishProof)
+    logResumedDeletions(
+      result[2]!.results as Array<{ id: string; root_page_id: string; phase: string }>,
+      checkpoint.jobId,
+    );
+  return { ...result[0]!, snapshot: result[1]!.results[0] as DeletionCheckpointSnapshot };
 }
 
 async function captureRowHandoffs(
@@ -402,15 +440,17 @@ async function captureRowHandoffs(
       next,
       `EXISTS(SELECT 1 ${ROW_HANDOFF_FROM_SQL} ${filter} AND dependent.id=? AND whole.id=? AND target.target=?)`,
       [...bindings, candidate.jobId, candidate.wholeJobId, candidate.target],
+      {
+        ...row,
+        jobId: wholeJobId ?? dependentJobId!,
+        leaseUntil,
+        phase: dependentJobId ? "staging" : "rows",
+        dependentJobId: candidate.jobId,
+        target: candidate.target,
+      },
     );
     if (!captured.meta.changes)
-      return deletionCheckpointFailure(
-        env,
-        wholeJobId ?? dependentJobId!,
-        leaseUntil,
-        "Deletion row handoff ownership changed",
-        { ...row, dependentJobId: candidate.jobId },
-      );
+      return deletionCheckpointFailure(captured.snapshot, "Deletion row handoff ownership changed", row.tableId);
   }
   return undefined;
 }
@@ -468,12 +508,17 @@ async function captureLegacyCleanupHandoffs(env: Env, job: DeletionJobRow, lease
       next,
       `EXISTS(SELECT 1 ${LEGACY_CLEANUP_HANDOFF_SQL} ${filter} AND dependent.id=? AND target.target=? AND purge.target=?)`,
       [job.id, leaseUntil, candidate.jobId, candidate.target, candidate.purgeTarget],
+      {
+        ...row,
+        jobId: job.id,
+        leaseUntil,
+        phase: "cleanup",
+        dependentJobId: candidate.jobId,
+        target: candidate.target,
+      },
     );
     if (!captured.meta.changes)
-      return deletionCheckpointFailure(env, job.id, leaseUntil, "Deletion row handoff ownership changed", {
-        ...row,
-        dependentJobId: candidate.jobId,
-      });
+      return deletionCheckpointFailure(captured.snapshot, "Deletion row handoff ownership changed", row.tableId);
   }
   return undefined;
 }
@@ -523,16 +568,11 @@ async function publishRowHandoffProofs(
         row.handoff!.archivedAt,
         row.handoff!.archiveOperationId,
       ],
+      { ...row, jobId, leaseUntil, phase: "cleanup", dependentJobId: candidate.job_id, target: candidate.target },
+      true,
     );
-    if (!persisted.meta.changes) {
-      const remaining =
-        await env.DB.prepare(`SELECT 1 FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL
-        AND json_extract(target,'$.tableId')=? AND json_extract(target,'$.generation')=? AND json_extract(target,'$.rowId')=?
-        AND json_extract(target,'$.detailPageId')=? AND json_extract(target,'$.handoff.jobId')=? AND json_extract(target,'$.handoff.status')='pending'`)
-          .bind(candidate.job_id, row.tableId, row.generation, row.rowId, row.detailPageId, jobId)
-          .first();
-      if (remaining) throw new Error("Deletion row handoff proof ownership changed");
-    }
+    if (!persisted.meta.changes && persisted.snapshot.target_pending)
+      throw deletionCheckpointFailure(persisted.snapshot, "Deletion row handoff proof ownership changed", row.tableId);
   }
 }
 
@@ -941,6 +981,18 @@ async function processTarget(
 ) {
   if (target.kind === "table_row") {
     const tuple = JSON.parse(target.target) as RowDeletionTarget;
+    if (
+      !tuple ||
+      typeof tuple !== "object" ||
+      ![tuple.tableId, tuple.rowId, tuple.detailPageId].every((id) => typeof id === "string" && id.length > 0) ||
+      !Number.isSafeInteger(tuple.generation) ||
+      tuple.generation < 1
+    )
+      throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
+    const checkpoint = { ...tuple, jobId: jobId!, leaseUntil, phase: "rows" as const, target: target.target };
+    const snapshot = await deletionCheckpointStatement(env, checkpoint).first<DeletionCheckpointSnapshot>();
+    const invalid = deletionSnapshotFailure(snapshot!, "Deletion row ownership changed", tuple.tableId);
+    if (invalid) throw invalid;
     if (tuple.handoff) {
       const handoff = tuple.handoff;
       if (
@@ -953,7 +1005,7 @@ async function processTarget(
         (handoff.archiveOperationId !== null && typeof handoff.archiveOperationId !== "string") ||
         !["pending", "purged"].includes(handoff.status)
       )
-        throw new Error("Invalid deletion row handoff");
+        throw new HttpError(503, "deletion_proof_invalid", DELETION_FAILURE_MESSAGES.deletion_proof_invalid);
       if (handoff.status !== "purged") throw new Error("Whole-table deletion is pending");
       const owned =
         await env.DB.prepare(`SELECT 1 FROM deletion_jobs dependent JOIN deletion_job_pages locked ON locked.job_id=dependent.id
@@ -970,7 +1022,7 @@ async function processTarget(
             handoff.archiveOperationId,
           )
           .first();
-      if (!owned) throw new Error("Deletion row handoff ownership changed");
+      if (!owned) throw new HttpError(409, "deletion_ownership_conflict", "Deletion row handoff ownership changed");
       return;
     }
     const response = await env.TABLE.getByName(tuple.tableId).fetch(
@@ -993,12 +1045,13 @@ async function processTarget(
           .first();
         if (!absent) throw error;
       } else if (failure?.status !== 410 || failure.code !== "table_purged") throw error;
-      const dependent = await env.DB.prepare(
-        "SELECT workspace_id FROM deletion_jobs WHERE id=? AND phase='rows' AND next_attempt_at=?",
-      )
-        .bind(jobId, leaseUntil)
-        .first<{ workspace_id: string }>();
-      if (!dependent) throw new DeletionLeaseLostError();
+      const dependent = await env.DB.prepare(`SELECT job.workspace_id,job.phase,job.next_attempt_at
+        FROM deletion_jobs job WHERE job.id=?`)
+        .bind(jobId)
+        .first<{ workspace_id: string; phase: string; next_attempt_at: number }>();
+      if (!dependent || dependent.next_attempt_at !== leaseUntil) throw new DeletionLeaseLostError();
+      if (dependent.phase !== "rows")
+        throw new HttpError(409, "deletion_state_conflict", DELETION_FAILURE_MESSAGES.deletion_state_conflict);
       const proofResponse = await env.TABLE.getByName(tuple.tableId).fetch(
         new Request("https://table.internal/row-deletion-proof", {
           method: "POST",
@@ -1076,17 +1129,13 @@ async function processTarget(
           tuple.rowId,
           tuple.tableId,
         ],
+        checkpoint,
       );
       if (!captured.meta.changes)
-        throw await deletionCheckpointFailure(
-          env,
-          jobId!,
-          leaseUntil,
+        throw deletionCheckpointFailure(
+          captured.snapshot,
           "Deletion proof ownership changed. Please retry.",
-          {
-            ...tuple,
-            dependentJobId: jobId!,
-          },
+          tuple.tableId,
         );
       target.target = next;
       return;
@@ -1211,12 +1260,21 @@ async function upgradeDeletionTableTargets(env: Env, job: DeletionJobRow, leaseU
         old.generation,
         old.target,
       ),
-    ]);
-    if (!result[2]?.meta.changes)
-      return deletionCheckpointFailure(env, job.id, leaseUntil, "Deletion table target ownership changed", {
+      deletionCheckpointStatement(env, {
+        jobId: job.id,
+        leaseUntil,
+        phase: "rows",
         tableId: old.target,
         generation: old.generation,
-      });
+        target: old.target,
+      }),
+    ]);
+    if (!result[2]?.meta.changes)
+      return deletionCheckpointFailure(
+        result[3]!.results[0] as DeletionCheckpointSnapshot,
+        "Deletion table target ownership changed",
+        old.target,
+      );
   }
   return undefined;
 }
@@ -1247,7 +1305,8 @@ async function reconcileDeletionRowTargets(env: Env, job: DeletionJobRow, leaseU
     if (evidence.results.length !== 1 || evidence.results[0]?.generation !== row.generation) {
       throw new HttpError(409, "table_generation_conflict", "Deletion row target generation is unavailable");
     }
-    const inserted = await env.DB.prepare(`INSERT OR IGNORE INTO deletion_targets(job_id,kind,target)
+    const inserted = await env.DB.batch([
+      env.DB.prepare(`INSERT OR IGNORE INTO deletion_targets(job_id,kind,target)
       SELECT ?,'table_row',? WHERE EXISTS(SELECT 1 FROM deletion_jobs WHERE id=? AND phase='rows' AND next_attempt_at=?)
       AND EXISTS(SELECT 1 FROM deletion_job_pages locked JOIN deletion_jobs job ON job.id=locked.job_id
         JOIN pages detail ON detail.id=locked.page_id AND detail.workspace_id=job.workspace_id
@@ -1259,8 +1318,7 @@ async function reconcileDeletionRowTargets(env: Env, job: DeletionJobRow, leaseU
       AND EXISTS(SELECT 1 FROM deletion_targets WHERE job_id=? AND kind='table_row'
         AND json_extract(target,'$.tableId')=? AND json_extract(target,'$.generation')=?)
       AND NOT EXISTS(SELECT 1 FROM deletion_targets WHERE job_id=? AND kind='table_row'
-        AND json_extract(target,'$.tableId')=? AND json_extract(target,'$.generation') IS NOT ?)`)
-      .bind(
+        AND json_extract(target,'$.tableId')=? AND json_extract(target,'$.generation') IS NOT ?)`).bind(
         job.id,
         JSON.stringify(row),
         job.id,
@@ -1276,10 +1334,21 @@ async function reconcileDeletionRowTargets(env: Env, job: DeletionJobRow, leaseU
         job.id,
         row.tableId,
         row.generation,
-      )
-      .run();
-    if (!inserted.meta.changes)
-      return deletionCheckpointFailure(env, job.id, leaseUntil, "Deletion row target ownership changed", row);
+      ),
+      deletionCheckpointStatement(env, {
+        ...row,
+        jobId: job.id,
+        leaseUntil,
+        phase: "rows",
+        target: JSON.stringify(row),
+      }),
+    ]);
+    if (!inserted[0]!.meta.changes)
+      return deletionCheckpointFailure(
+        inserted[1]!.results[0] as DeletionCheckpointSnapshot,
+        "Deletion row target ownership changed",
+        row.tableId,
+      );
   }
   return undefined;
 }
@@ -1300,7 +1369,13 @@ export async function processDeletionJob(env: Env, jobId: string) {
   let failure = deletionFailure(undefined);
   const rememberFailure = (error: unknown, tableId?: string) => {
     const next = deletionFailure(error);
-    if (!failure.blocked) failure = next;
+    if (
+      !failure.blocked ||
+      (failure.code === "deletion_dependency_blocked" && next.blocked && next.code !== "deletion_dependency_blocked")
+    ) {
+      failure = next;
+      if (next.blocked) phaseFailure = deletionError(error, "Deletion processing failed");
+    }
     logger.warn(
       "deletion.job.failure",
       "cleanup",
@@ -1311,6 +1386,9 @@ export async function processDeletionJob(env: Env, jobId: string) {
         phase: job.phase,
         failureCode: next.code,
         ...(tableId ? { tableId } : {}),
+        ...(error instanceof DeletionDependencyBlockedError
+          ? { parentJobId: error.parentJobId, tableId: error.tableId }
+          : {}),
       },
       error,
     );
@@ -1318,17 +1396,16 @@ export async function processDeletionJob(env: Env, jobId: string) {
   try {
     phaseFailure = job.phase === "rows" ? await upgradeDeletionTableTargets(env, job, leaseUntil) : undefined;
     if (job.phase === "cleanup") phaseFailure = await captureLegacyCleanupHandoffs(env, job, leaseUntil);
-    if (phaseFailure instanceof DeletionLeaseLostError) return;
+    if (phaseFailure) phaseFailure = deletionError(phaseFailure, "Deletion processing failed");
     if (phaseFailure) rememberFailure(phaseFailure);
     if (job.phase === "rows" && !phaseFailure) {
       try {
         await captureExternalRowEvidence(env, job, leaseUntil);
         phaseFailure = await captureRowHandoffs(env, { wholeJobId: job.id, leaseUntil });
-        if (phaseFailure instanceof DeletionLeaseLostError) return;
+        if (phaseFailure) phaseFailure = deletionError(phaseFailure, "Deletion processing failed");
         if (phaseFailure) rememberFailure(phaseFailure);
       } catch (error) {
-        phaseFailure = error instanceof Error ? error : new Error("Deletion handoff capture failed");
-        if (phaseFailure instanceof DeletionLeaseLostError) return;
+        phaseFailure = deletionError(error, "Deletion handoff capture failed");
         rememberFailure(error);
       }
     }
@@ -1379,9 +1456,9 @@ export async function processDeletionJob(env: Env, jobId: string) {
               /* Legacy plain table identity. */
             }
           }
-          if (error instanceof DeletionLeaseLostError) return;
+          deletionError(error, message);
           rememberFailure(error, tableId);
-          phaseFailure ??= error instanceof Error ? error : new Error(message);
+          phaseFailure ??= deletionError(error, message);
           await env.DB.prepare(
             `UPDATE deletion_targets
             SET attempts = attempts + 1, last_error = ?
@@ -1405,7 +1482,7 @@ export async function processDeletionJob(env: Env, jobId: string) {
       // Owned tables cannot restore links while external row targets are reconciled.
       if (targets.results.every((target) => target.kind !== "table_row")) {
         phaseFailure = await reconcileDeletionRowTargets(env, job, leaseUntil);
-        if (phaseFailure instanceof DeletionLeaseLostError) return;
+        if (phaseFailure) phaseFailure = deletionError(phaseFailure, "Deletion processing failed");
         if (phaseFailure) {
           rememberFailure(phaseFailure);
           break;
@@ -1439,7 +1516,7 @@ export async function processDeletionJob(env: Env, jobId: string) {
           hint = locationHint(workspace?.location_hint ?? undefined);
         }
       } catch (error) {
-        phaseFailure = error instanceof Error ? error : new Error("Deletion metadata cleanup failed");
+        phaseFailure = deletionError(error, "Deletion metadata cleanup failed");
         rememberFailure(error);
         break;
       }
@@ -1463,8 +1540,8 @@ export async function processDeletionJob(env: Env, jobId: string) {
       return;
     }
   } catch (error) {
-    phaseFailure = error instanceof Error ? error : new Error("Deletion processing failed");
-    if (phaseFailure instanceof DeletionLeaseLostError) return;
+    if (error instanceof DeletionLeaseLostError) return;
+    phaseFailure = deletionError(error, "Deletion processing failed");
     rememberFailure(error);
   }
 
@@ -1487,21 +1564,32 @@ async function recordDeletionFailure(
     if (!job) return;
     const attempts = job.attempts + 1;
     const delay =
-      job.phase === "rows" ? 60_000 : Math.min(24 * 60 * 60_000, 60 * 60_000 * 2 ** Math.min(attempts - 1, 4));
+      job.phase === "rows"
+        ? Math.min(CLEANUP_LEASE_MS, 60_000 * 2 ** Math.min(attempts - 1, 4))
+        : Math.min(24 * 60 * 60_000, 60 * 60_000 * 2 ** Math.min(attempts - 1, 4));
     const failed = await env.DB.prepare(
       `SELECT last_error FROM deletion_targets
       WHERE job_id = ? AND completed_at IS NULL AND last_error IS NOT NULL LIMIT 1`,
     )
       .bind(jobId)
       .first<{ last_error: string }>();
+    if (failure.code === "deletion_dependency_blocked" && phaseFailure instanceof DeletionDependencyBlockedError) {
+      const parents = await env.DB.prepare(`SELECT blocked_at,next_attempt_at FROM deletion_jobs WHERE id=?`)
+        .bind(phaseFailure.parentJobId)
+        .first<{ blocked_at: number | null; next_attempt_at: number }>();
+      if (!parents || (parents.blocked_at === null && parents.next_attempt_at !== PARKED_DELETION))
+        failure = deletionFailure(undefined);
+    }
     const recorded = await env.DB.prepare(
       `UPDATE deletion_jobs
         SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?, failure_code=?,blocked_at=?
-      WHERE id = ? AND next_attempt_at = ?`,
+      WHERE id = ? AND next_attempt_at = ?
+        AND (? IS NULL OR EXISTS(SELECT 1 FROM deletion_jobs parent WHERE parent.id=?
+          AND (parent.blocked_at IS NOT NULL OR parent.next_attempt_at=?)))`,
     )
       .bind(
         attempts,
-        failure.blocked ? Number.MAX_SAFE_INTEGER : Date.now() + delay,
+        failure.blocked ? PARKED_DELETION : Date.now() + delay,
         phaseFailure
           ? safeTelemetryErrorMessage(phaseFailure, "Cleanup incomplete")
           : (failed?.last_error ?? "Cleanup incomplete"),
@@ -1510,14 +1598,48 @@ async function recordDeletionFailure(
         failure.blocked ? Date.now() : null,
         jobId,
         leaseUntil,
+        failure.blocked && phaseFailure instanceof DeletionDependencyBlockedError ? phaseFailure.parentJobId : null,
+        phaseFailure instanceof DeletionDependencyBlockedError ? phaseFailure.parentJobId : null,
+        PARKED_DELETION,
       )
       .run();
-    if (!recorded.meta.changes) return;
+    if (!recorded.meta.changes) {
+      if (phaseFailure instanceof DeletionDependencyBlockedError) {
+        const scheduled =
+          await env.DB.prepare(`UPDATE deletion_jobs SET attempts=?,next_attempt_at=?,updated_at=?,last_error=?,failure_code='deletion_cleanup_unavailable'
+          WHERE id=? AND next_attempt_at=?`)
+            .bind(attempts, Date.now() + delay, Date.now(), "Table deletion recovery advanced", jobId, leaseUntil)
+            .run();
+        if (scheduled.meta.changes)
+          logger.info(
+            "deletion.job.retry_scheduled",
+            "cleanup",
+            "Containing table recovery advanced; deletion will retry.",
+            {
+              jobId,
+              rootPageId: context.root_page_id,
+              phase: job.phase,
+              failureCode: "deletion_cleanup_unavailable",
+              parentJobId: phaseFailure.parentJobId,
+              tableId: phaseFailure.tableId,
+            },
+          );
+      }
+      return;
+    }
     logger.info(
       failure.blocked ? "deletion.job.blocked" : "deletion.job.retry_scheduled",
       "cleanup",
       failure.blocked ? "Deletion requires an owner recheck." : "Deletion will retry automatically.",
-      { jobId, rootPageId: context.root_page_id, phase: job.phase, failureCode: failure.code },
+      {
+        jobId,
+        rootPageId: context.root_page_id,
+        phase: job.phase,
+        failureCode: failure.code,
+        ...(phaseFailure instanceof DeletionDependencyBlockedError
+          ? { parentJobId: phaseFailure.parentJobId, tableId: phaseFailure.tableId }
+          : {}),
+      },
     );
   } catch (error) {
     logger.warn("cleanup.failure_checkpoint", "cleanup", "Deletion failure checkpoint unavailable", {
@@ -1531,6 +1653,12 @@ async function recordDeletionFailure(
 }
 
 export async function processDueDeletionJobs(env: Env, limit = 10) {
+  const resumed = await resumeDeletionDependenciesStatement(env, Date.now(), null, limit).all<{
+    id: string;
+    root_page_id: string;
+    phase: string;
+  }>();
+  logResumedDeletions(resumed.results);
   await env.DB.prepare("DELETE FROM deletion_jobs WHERE phase='staging' AND created_at<?")
     .bind(Date.now() - 24 * 60 * 60_000)
     .run();

@@ -1,8 +1,17 @@
 import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { enrollAccount } from "../../tests/helpers/security";
-import { CLEANUP_LEASE_MS, listDeletionJobs, queueDeletionRetry } from "./deletion-jobs";
+import {
+  CLEANUP_LEASE_MS,
+  activeDeletionLease,
+  activeDeletionLeaseSql,
+  deletionWireError,
+  deletionFailure,
+  listDeletionJobs,
+  queueDeletionRetry,
+} from "./deletion-jobs";
 import worker from "./index";
+import { HttpError } from "./http";
 import { afterD1 } from "../../tests/helpers/d1-races";
 import type { DeletionJobsPage } from "../shared/deletion-jobs";
 
@@ -37,6 +46,49 @@ async function owner() {
 }
 
 describe("deletion job recovery", () => {
+  it("keeps SQL and JavaScript lease predicates equivalent at retry and lease boundaries", async () => {
+    await job("parity");
+    const now = Date.now();
+    for (const offset of [-1, 0, 1, CLEANUP_LEASE_MS - 1, CLEANUP_LEASE_MS, CLEANUP_LEASE_MS + 1])
+      for (const code of [null, "deletion_cleanup_unavailable"]) {
+        const row = { next_attempt_at: now + offset, updated_at: now, failure_code: code };
+        await env.DB.prepare("UPDATE deletion_jobs SET next_attempt_at=?,updated_at=?,failure_code=? WHERE id='parity'")
+          .bind(row.next_attempt_at, row.updated_at, code)
+          .run();
+        const result = await env.DB.prepare(
+          `SELECT (${activeDeletionLeaseSql()}) active FROM deletion_jobs WHERE id='parity'`,
+        )
+          .bind(now, CLEANUP_LEASE_MS)
+          .first<{ active: number }>();
+        expect(Boolean(result!.active)).toBe(activeDeletionLease(row, now));
+        expect(Boolean(result!.active)).toBe(code === null && offset === CLEANUP_LEASE_MS);
+      }
+  });
+
+  it("uses legacy-compatible ownership/state wire errors and preserves deliberate statuses", () => {
+    for (const code of ["deletion_ownership_conflict", "deletion_state_conflict"]) {
+      const wire = deletionWireError(new HttpError(409, code, "Captured identity needs repair"))!;
+      expect(wire).toMatchObject({ status: 403, code: "table_forbidden" });
+      const decoded = new HttpError(wire.status, wire.code, wire.message, wire.details);
+      expect(deletionFailure(decoded)).toEqual({ blocked: true, code });
+      // Both existing acceptance and job classifiers recognize this older wire code.
+      expect(["deletion_pending", "table_forbidden", "table_generation_conflict"]).toContain(wire.code);
+    }
+    expect(
+      deletionWireError(new HttpError(409, "deletion_dependency_blocked", "Local dependency state")),
+    ).toMatchObject({ status: 409, code: "deletion_pending" });
+    for (const [status, code] of [
+      [409, "table_generation_conflict"],
+      [409, "deletion_pending"],
+      [422, "table_limit"],
+    ] as const)
+      expect(deletionWireError(new HttpError(status, code, "Deliberate failure"))).toMatchObject({ status, code });
+    expect(deletionFailure(new HttpError(409, "deletion_ownership_conflict", "Already-running producer"))).toEqual({
+      blocked: true,
+      code: "deletion_ownership_conflict",
+    });
+  });
+
   it("backfills legacy parking without inferring a cause", async () => {
     await reset();
     await applyD1Migrations(
@@ -204,6 +256,13 @@ describe("deletion job recovery", () => {
       );
       await waitOnExecutionContext(context);
       expect(response.status).toBe(202);
+      expect(await response.json()).toEqual({
+        ok: true,
+        jobId: "completed",
+        replayed: true,
+        pageIds: [],
+        cleanupPending: false,
+      });
       expect((await env.DB.prepare("SELECT id FROM deletion_jobs").all()).results).toEqual([]);
       expect(Boolean(await env.DB.prepare("SELECT id FROM pages WHERE id='root-completed'").first())).toBe(recreated);
     },

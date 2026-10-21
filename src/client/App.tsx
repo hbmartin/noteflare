@@ -273,6 +273,18 @@ function responsePageIds(value: unknown, rootPageId: string, allowMissingRoot = 
   return allowMissingRoot || uniquePageIds.includes(rootPageId) ? uniquePageIds : null;
 }
 
+function permanentDeletionResponse(value: unknown, rootPageId: string) {
+  const response = value as { ok?: unknown; jobId?: unknown; replayed?: unknown; cleanupPending?: unknown } | null;
+  const completedReplay =
+    response?.ok === true &&
+    typeof response.jobId === "string" &&
+    response.jobId.length > 0 &&
+    response.replayed === true &&
+    response.cleanupPending === false;
+  const pageIds = responsePageIds(value, rootPageId, completedReplay);
+  return pageIds ? { pageIds, completedReplay } : null;
+}
+
 function archiveResponse(value: unknown, rootPageId: string): ArchiveResponse | null {
   const response = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : null;
   const uniquePageIds = responsePageIds(value, rootPageId, response?.replayed === true);
@@ -3792,15 +3804,19 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const attempt = startClearedWorkspaceErrorAttempt({ source: "trash-mutation", scope: errorScope });
     try {
       const result = await requestMutation(`/api/pages/${page.id}/permanent-delete`, { method: "POST" }, (value) =>
-        responsePageIds(value, page.id),
+        permanentDeletionResponse(value, page.id),
       );
-      const deletedIds = result.kind === "committed" ? new Set(result.value ?? knownPageIds) : null;
+      const completedReplay = result.kind === "committed" && result.value?.completedReplay === true;
+      const deletedIds =
+        result.kind === "committed" && !completedReplay ? new Set(result.value?.pageIds ?? knownPageIds) : null;
       const previewIds = deletedIds ?? (result.kind === "uncertain" ? knownPageIds : null);
       if (previewIds) {
         for (const pageId of previewIds) invalidatePagePreview(pageId);
       }
       if (signal.aborted) return;
-      if (result.kind === "committed" && deletedIds) {
+      if (completedReplay) {
+        clearWorkspaceErrors(attempt);
+      } else if (result.kind === "committed" && deletedIds) {
         setTrash((current) => current.filter((candidate) => !deletedIds.has(candidate.id)));
         if (page.isTemplate) void loadOrganization();
         if (!result.value) {
