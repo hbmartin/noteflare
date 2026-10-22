@@ -27,7 +27,7 @@ import {
   useBlockNoteEditor,
 } from "@blocknote/react";
 import { apiErrorMessage } from "./api";
-import { submitAnchoredComment } from "./comment-submission";
+import { submitAnchoredComment, CommentSubmissionOwner, CommentAnchorUnavailableError } from "./comment-submission";
 import { TextSelection } from "prosemirror-state";
 import { captureCommentDraftAnchor, resolveCommentDraftAnchor } from "./comment-draft-anchor";
 import { notesCommentSchema } from "./mentions";
@@ -190,12 +190,21 @@ function NewDraftComposer({
     main = useBlockNoteEditor();
   const context = useContext(CommentDraftContext)!;
   const [error, setError] = useState("");
-  const lifetime = useMemo(() => ({ active: true }), [main, anchor, context.account, context.pageId, context.epoch]);
-  const submitting = useRef(false);
+  const lifetime = useMemo(
+    () =>
+      new CommentSubmissionOwner({
+        editor: main,
+        anchor,
+        account: context.account,
+        pageId: context.pageId,
+        epoch: context.epoch,
+      }),
+    [main, anchor, context.account, context.pageId, context.epoch],
+  );
   useLayoutEffect(() => {
-    lifetime.active = true;
+    lifetime.activate();
     return () => {
-      lifetime.active = false;
+      lifetime.dispose();
     };
   }, [lifetime]);
   const editor = useCreateBlockNote(
@@ -206,8 +215,7 @@ function NewDraftComposer({
         commentEditorSubmitExtension({
           submitOnEnter: comments.submitOnEnter,
           onSubmit: async (commentEditor) => {
-            if (submitting.current || !lifetime.active) return;
-            submitting.current = true;
+            if (!lifetime.begin()) return;
             const submitted = JSON.stringify(commentEditor.document);
             setError("");
             try {
@@ -216,19 +224,19 @@ function NewDraftComposer({
                 anchor,
                 commentEditor.document,
                 comments.threadStore,
-                () => lifetime.active,
+                () => lifetime.isCurrent(),
               );
               if (applied && (commentEditor.isEmpty || JSON.stringify(commentEditor.document) === submitted))
                 comments.stopPendingComment();
             } catch (cause) {
-              if (lifetime.active)
+              if (lifetime.isCurrent())
                 setError(
-                  cause instanceof Error
+                  cause instanceof CommentAnchorUnavailableError
                     ? cause.message
                     : apiErrorMessage(cause, "The comment could not be posted. Your draft is preserved."),
                 );
             } finally {
-              submitting.current = false;
+              lifetime.finish();
             }
           },
         }),

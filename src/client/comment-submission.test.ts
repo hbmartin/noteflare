@@ -50,18 +50,27 @@ it.each(["insert", "delete-before", "delete-selection", "disposed"])(
       if (change === "delete-before") editor.transact((tr) => tr.delete(start, start + 4));
       if (change === "delete-selection") editor.transact((tr) => tr.delete(from, to));
       if (change === "disposed") current = false;
-      const assertion =
-        change === "delete-selection"
-          ? expect(pending).rejects.toThrow("original comment selection")
-          : expect(pending).resolves.toBe(change !== "disposed");
+      const outcome = pending.then(
+        (value) => ({ value, error: null }),
+        (error: Error) => ({ value: null, error }),
+      );
       finish({ id: "existing-thread" });
-      await assertion;
+      const result = await outcome;
+      expect(result.value).toBe(change === "delete-selection" ? null : change !== "disposed");
+      expect(result.error?.message).toBe(
+        change === "delete-selection"
+          ? "The original comment selection is unavailable. Your draft is preserved; it was not attached elsewhere."
+          : undefined,
+      );
       expect(createThread).toHaveBeenCalledOnce();
-      if (["insert", "delete-before"].includes(change)) {
-        expect(addThreadToDocument).toHaveBeenCalledOnce();
-        const selection = (addThreadToDocument.mock.calls[0] as unknown as [{ selection: TextSelection }])[0].selection;
-        expect(editor.prosemirrorState.doc.textBetween(selection.from, selection.to)).toBe("selected");
-      } else expect(addThreadToDocument).not.toHaveBeenCalled();
+      const attached = ["insert", "delete-before"].includes(change);
+      expect(addThreadToDocument).toHaveBeenCalledTimes(attached ? 1 : 0);
+      const selection = (
+        addThreadToDocument.mock.calls[0] as unknown as [{ selection: TextSelection }] | undefined
+      )?.[0].selection;
+      expect(selection ? editor.prosemirrorState.doc.textBetween(selection.from, selection.to) : undefined).toBe(
+        attached ? "selected" : undefined,
+      );
     } finally {
       editor.unmount();
       host.remove();
