@@ -247,6 +247,16 @@ or cron schedule.
 
 A verified fresh database alone may skip upgrade-only confirmations: `0001_initial.sql` must be pending, no application tables may exist, and no migration history may be recorded. Only known internal D1/SQLite tables are ignored. Unexpected tables or failed/malformed queries stop deployment. Existing databases still require every applicable pause/drain confirmation; the helper does not provide it automatically.
 
+## Migration 0103: anchored comment publication
+
+Apply `0103_anchored_comment_submissions.sql` after 0102 and before the updated Worker. It adds private, author/page/epoch-scoped comment preparations, indexed expiry, content-free terminal receipts, and transactional publication guards. Existing public and unanchored comments are unchanged. Older browser clients retain their existing comment API; refreshed first-party document composers use preparation and publication.
+
+An unpublished preparation becomes unusable after 24 hours. Expiry is checked on requests; the existing fifteen-minute maintenance schedule erases expired bodies in batches of 100. Cancellation erases the unpublished body immediately. Terminal receipts remain until their page or account is deleted so delayed requests cannot revive a canceled post. Published text remains in the ordinary comment tables.
+
+Document rooms lazily add a provisional-anchor journal. A short internal publication lease prevents cleanup from racing a late commit; it does not extend user authorization. Before rolling back to older Worker code, finish or expire outstanding preparations and reconcile provisional anchors while the updated maintenance and room code remain available. Do not drop receipts or inline Durable Object tables during rollback.
+
+Keep `TABLE_RELATIONS_ENABLED=false`. This change requires no feature activation, additional cron schedule, or external Slack setup.
+
 ## Automated deployment guards
 
 The production workflow stops when `0011_page_move_receipt_envelopes.sql` or a guarded Slack migration is pending. Complete the relevant quiescence procedure, then use manual workflow dispatch with `confirm_page_move_receipt_migration_safe` or `confirm_slack_review_migration_safe`. A confirmation records maintenance already completed; it does not pause live consumers. Later releases need no confirmation after these migrations are applied.
