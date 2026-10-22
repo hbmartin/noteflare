@@ -86,7 +86,8 @@ test("serves the built app with frame policy and editor shortcuts", async ({ pag
   for (const provider of embedProviders) expect(csp).toContain(provider.origin);
 
   await signInOwner(page);
-  const editor = page.locator(".bn-editor");
+  await createDocument(page);
+  const editor = await editableDocument(page, new URL(page.url()).searchParams.get("page")!);
   await editor.click();
   await page.keyboard.press("ControlOrMeta+k");
   const palette = page.getByRole("dialog", { name: "Find a page or command" });

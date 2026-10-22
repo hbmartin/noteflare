@@ -77,7 +77,7 @@ it("retries persistent receipt cleanup after a confirmed cancellation and purges
     expiresAt: 1,
   }));
   expect((await activeCommentCancellation(scope, recover)!()).state).toBe("canceled");
-  registerCommentPublication(scope, "purge-attempt", recover);
+  registerCommentPublication(scope, "purge-attempt", () => recover("purge-attempt"));
   purgeCommentPublications(scope.account);
   expect(activeCommentCancellation(scope, recover)).toBeUndefined();
 });
