@@ -11,13 +11,17 @@ import {
   isSuccessfulJsonResponseBodyError,
   json,
   onApiUnauthorized,
+  unauthorizedResolution,
   UnreadableApiResponseError,
 } from "./api";
 import { installClientTelemetry, observeWorkerResponse, resetClientTelemetryForTests } from "./telemetry";
 import { hasPendingWork } from "./pending-work";
 import { claimChunkRecovery } from "./chunk-recovery";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 function responseAt(url: string, body: BodyInit | null, init?: ResponseInit) {
   const response = new Response(body, init);
@@ -652,4 +656,27 @@ describe("api", () => {
     expect(payload).not.toHaveProperty("requestId");
     expect(payload).not.toHaveProperty("release");
   });
+});
+
+it("rejects immediately while retaining an asynchronous unauthorized result", async () => {
+  let finish!: (value: "ready") => void;
+  const stop = onApiUnauthorized(
+    () =>
+      new Promise<"ready">((resolve) => {
+        finish = resolve;
+      }),
+  );
+  onTestFinished(stop);
+  vi.stubGlobal(
+    "fetch",
+    vi
+      .fn()
+      .mockResolvedValue(Response.json({ error: { code: "challenge_required", message: "Verify" } }, { status: 401 })),
+  );
+  const error = await api("/private").catch((failure) => failure as ApiClientError);
+  expect(error).toBeInstanceOf(ApiClientError);
+  const resolution = unauthorizedResolution(error as ApiClientError);
+  expect(resolution).toBeDefined();
+  finish("ready");
+  await expect(resolution).resolves.toBe("ready");
 });

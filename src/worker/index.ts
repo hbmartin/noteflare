@@ -98,10 +98,10 @@ import {
 } from "./comments";
 import { Document } from "./document";
 import {
-  flushRealtimeRevocations,
   registerRealtimeRoom,
   trackRealtimeWorkspace,
   withRealtimeAccessTracking,
+  reconcileRealtimeAccessStatus,
   realtimeAccessStatus,
   drainRealtimeRevocationsBatch,
 } from "./realtime-access";
@@ -1550,9 +1550,8 @@ app.get("/api/security/realtime/status", async (c) => {
 app.post("/api/security/realtime/reconcile", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
-  await flushRealtimeRevocations(c.env, member.workspace.id);
   c.header("Cache-Control", "private, no-store");
-  return c.json(await realtimeAccessStatus(c.env, member.workspace.id));
+  return c.json(await reconcileRealtimeAccessStatus(c.env, member.workspace.id));
 });
 
 // nosemgrep: worker-hono-direct-middleware-registration -- Terminal wildcard endpoint, not middleware.

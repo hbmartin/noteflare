@@ -152,7 +152,14 @@ export function isSuccessfulJsonResponseBodyError(cause: unknown): cause is Succ
   return cause instanceof SuccessfulApiResponseError && cause.hasJsonContentType;
 }
 
-export type UnauthorizedHandler = (error: ApiClientError) => void;
+export type UnauthorizedResolution = "ready" | "transitioned" | "obsolete" | "failed";
+export type UnauthorizedHandler = (
+  error: ApiClientError,
+) => void | UnauthorizedResolution | Promise<void | UnauthorizedResolution>;
+const unauthorizedResolutions = new WeakMap<ApiClientError, Promise<UnauthorizedResolution>>();
+export function unauthorizedResolution(error: ApiClientError) {
+  return unauthorizedResolutions.get(error);
+}
 
 const unauthorizedHandlers = new Set<UnauthorizedHandler>();
 let unauthorizedRequestEpoch = 0;
@@ -223,19 +230,38 @@ export function invalidateUnauthorizedRequests() {
 export function apiRequestEpoch() {
   return unauthorizedRequestEpoch;
 }
-export function notifyApiUnauthorized(error: ApiClientError, requestEpoch: number) {
-  if (error.status !== 401 || requestEpoch !== unauthorizedRequestEpoch) return;
+export function notifyApiUnauthorized(failure: ApiClientError, requestEpoch: number) {
+  if (failure.status !== 401) return;
+  if (requestEpoch !== unauthorizedRequestEpoch) {
+    unauthorizedResolutions.set(failure, Promise.resolve("obsolete"));
+    return;
+  }
+  const outcomes: Array<Promise<void | UnauthorizedResolution>> = [];
+  const failed = (handlerError: unknown): UnauthorizedResolution => {
+    console.error("API unauthorized handler failed", handlerError);
+    void reportClientError("client.api_unauthorized_handler_failed", handlerError, {
+      requestId: failure.requestId,
+      release: failure.workerVersion,
+    });
+    return "failed";
+  };
   for (const handler of unauthorizedHandlers) {
     try {
-      handler(error);
+      outcomes.push(Promise.resolve(handler(failure)).catch(failed));
     } catch (handlerError) {
-      console.error("API unauthorized handler failed", handlerError);
-      void reportClientError("client.api_unauthorized_handler_failed", handlerError, {
-        requestId: error.requestId,
-        release: error.workerVersion,
-      });
+      outcomes.push(Promise.resolve(failed(handlerError)));
     }
   }
+  if (outcomes.length)
+    unauthorizedResolutions.set(
+      failure,
+      Promise.all(outcomes).then((values) => {
+        if (values.includes("transitioned")) return "transitioned";
+        if (values.includes("ready")) return "ready";
+        if (values.includes("obsolete")) return "obsolete";
+        return "failed";
+      }),
+    );
 }
 
 export type ApiInit = RequestInit & { readOnly?: boolean };

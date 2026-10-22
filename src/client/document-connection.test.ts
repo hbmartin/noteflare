@@ -2,7 +2,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
-import { ApiClientError } from "./api";
+import { ApiClientError, apiRequestEpoch, notifyApiUnauthorized, onApiUnauthorized } from "./api";
+import { setRealtimeAccessAccount } from "./realtime-access-status";
 import { createDocumentCloseReconciler } from "./document-connection";
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
@@ -175,4 +176,87 @@ describe("document close reconciliation", () => {
     expect(onPageUnavailable).not.toHaveBeenCalled();
     expect(onAccessDenied).toHaveBeenCalledWith(page.id, expect.objectContaining({ status: 403 }));
   });
+});
+
+it("resets transition backoff after successful synchronization", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(1);
+  mocks.api.mockResolvedValue({ page });
+  const { provider, reconciler } = setup();
+  try {
+    for (let index = 0; index < 7; index++) {
+      reconciler.handleClose(new CloseEvent("close", { code: 4403 }));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(provider.connect).toHaveBeenCalledTimes(index + 1);
+      reconciler.handleSync(true);
+    }
+  } finally {
+    reconciler.destroy();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+it.each(["ready", "transitioned", "failed"] as const)(
+  "waits for the shared auth result %s without removing an authorized page",
+  async (outcome) => {
+    vi.useFakeTimers();
+    let finish!: (value: typeof outcome) => void;
+    const stop = onApiUnauthorized(
+      () =>
+        new Promise<typeof outcome>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const error = new ApiClientError(401, "challenge_required", "Verify again.");
+    notifyApiUnauthorized(error, apiRequestEpoch());
+    mocks.api.mockRejectedValueOnce(error).mockResolvedValue({ page });
+    const { provider, reconciler, onPageUnavailable, onAccessDenied } = setup();
+    try {
+      reconciler.handleClose(new CloseEvent("close", { code: 4403 }));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(provider.connect).not.toHaveBeenCalled();
+      expect(mocks.api).toHaveBeenCalledTimes(1);
+      finish(outcome);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(provider.connect).toHaveBeenCalledTimes(outcome === "ready" ? 1 : 0);
+      expect(mocks.api).toHaveBeenCalledTimes(outcome === "ready" ? 2 : 1);
+      expect(onPageUnavailable).not.toHaveBeenCalled();
+      expect(onAccessDenied).not.toHaveBeenCalled();
+    } finally {
+      stop();
+      reconciler.destroy();
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  },
+);
+
+it("never resumes a retired account after authorization completes", async () => {
+  vi.useFakeTimers();
+  setRealtimeAccessAccount("first\0wiki");
+  let finish!: (value: "ready") => void;
+  const stop = onApiUnauthorized(
+    () =>
+      new Promise<"ready">((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const error = new ApiClientError(401, "challenge_required", "Verify");
+  notifyApiUnauthorized(error, apiRequestEpoch());
+  mocks.api.mockReset().mockRejectedValueOnce(error);
+  const { provider, reconciler } = setup();
+  try {
+    reconciler.handleClose(new CloseEvent("close", { code: 4403 }));
+    await vi.advanceTimersByTimeAsync(10);
+    setRealtimeAccessAccount("second\0wiki");
+    finish("ready");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(provider.connect).not.toHaveBeenCalled();
+    expect(mocks.api).toHaveBeenCalledOnce();
+  } finally {
+    stop();
+    reconciler.destroy();
+    setRealtimeAccessAccount("");
+    vi.useRealTimers();
+  }
 });

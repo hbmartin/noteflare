@@ -54,6 +54,8 @@ export type NetworkCollaborationBundle = {
   ready: Promise<void>;
   readonly synced: boolean;
   readonly hasUnsyncedChanges: boolean;
+  suspend: () => void;
+  resume: () => Promise<void>;
   destroy: () => void;
 };
 
@@ -292,6 +294,7 @@ export function createNetworkCollaboration(
   });
   const durability = new CollaborationDurability();
   let destroyed = false;
+  let suspended = false;
   let synced = false;
   let readyResolved = false;
   let resolveReady!: () => void;
@@ -304,7 +307,7 @@ export function createNetworkCollaboration(
   const barrier = createDurabilityBarrier(provider, durability, 500);
 
   const connect = () => {
-    if (destroyed) return;
+    if (destroyed || suspended) return;
     if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     retryTimer = undefined;
     onStatus("connecting");
@@ -313,7 +316,7 @@ export function createNetworkCollaboration(
         retryAttempt = 0;
       },
       (error) => {
-        if (destroyed) return;
+        if (destroyed || suspended) return;
         onStatus("offline");
         console.error("Failed to connect diagram collaboration", error);
         void reportClientError("client.realtime_connection_failed", error);
@@ -327,7 +330,7 @@ export function createNetworkCollaboration(
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {
     if (status === "disconnected") {
       synced = false;
-      if (!destroyed && document.visibilityState !== "hidden" && retryTimer === undefined) {
+      if (!destroyed && !suspended && document.visibilityState !== "hidden" && retryTimer === undefined) {
         retryTimer = window.setTimeout(connect, connectionRetryDelay(retryAttempt++));
       }
     } else if (retryTimer !== undefined) {
@@ -363,6 +366,7 @@ export function createNetworkCollaboration(
     barrier.schedule();
   };
   const visibility = () => {
+    if (destroyed || suspended) return;
     if (document.visibilityState === "hidden") {
       barrier.send();
       hiddenTimer = window.setTimeout(() => {
@@ -388,6 +392,22 @@ export function createNetworkCollaboration(
     doc,
     provider,
     ready,
+    suspend() {
+      suspended = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      retryTimer = undefined;
+      if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
+      hiddenTimer = undefined;
+      provider.disconnect();
+    },
+    async resume() {
+      if (destroyed) return;
+      suspended = false;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      retryTimer = undefined;
+      onStatus("connecting");
+      await provider.connect();
+    },
     get synced() {
       return synced;
     },

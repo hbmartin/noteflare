@@ -141,7 +141,7 @@ async function addEffect(pageId: string, revision: number) {
 }
 
 describe("per-table authority", () => {
-  it.each([undefined, null, -1, "invalid", 1e20])(
+  it.each([undefined, null, Number.NaN, Number.POSITIVE_INFINITY, -1, "invalid", 1e20])(
     "rejects socket deadline %s before accepting a pair",
     async (deadline) => {
       const { pageId, member } = await fixture();
