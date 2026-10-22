@@ -415,3 +415,43 @@ test("contradictory diagram authorization pauses after three cycles until delibe
   await expect(page.getByRole("button", { name: "Undo", exact: true })).toBeEnabled();
   await expect(page.getByText("Access could not be confirmed. Your local edits are preserved.")).toHaveCount(0);
 });
+
+for (const reload of [false, true]) {
+  test(`discard after an ambiguous comment transport failure cancels its preparation${reload ? " after reload" : ""}`, async ({
+    page,
+  }) => {
+    await signInOwner(page);
+    const document = await create(page, "document", "Ambiguous comment cancellation");
+    await page.goto(`/?page=${document.id}`);
+    const editor = page.locator(".notes-editor .bn-editor");
+    await expect(editor).toHaveAttribute("contenteditable", "true");
+    await editor.click();
+    await page.keyboard.insertText("Ambiguous original selection");
+    await page.keyboard.down("Shift");
+    for (let index = 0; index < "Ambiguous original selection".length; index++) await page.keyboard.press("ArrowLeft");
+    await page.keyboard.up("Shift");
+    await page.getByRole("button", { name: /add comment/i }).click();
+    const composer = page.locator(".bn-thread .bn-editor");
+    await composer.fill("Preserve this uncertain submission");
+    await page.route(`**/api/pages/${document.id}/comment-submissions/*/publish`, (route) => route.abort("failed"));
+    const preparing = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname === `/api/pages/${document.id}/comment-submissions`,
+    );
+    await composer.press("Enter");
+    const { submission } = await (await preparing).json();
+    await expect(page.getByText(/comment could not be posted/)).toBeVisible();
+    if (reload) {
+      await page.reload();
+      await page.getByRole("button", { name: "Resume saved comment" }).click();
+      await expect(composer).toContainText("Preserve this uncertain submission");
+    }
+    page.once("dialog", (dialog) => dialog.accept());
+    await composer.press("Escape");
+    await expect(composer).toHaveCount(0);
+    const status = await page.request.get(`/api/pages/${document.id}/comment-submissions/${submission.operationId}`);
+    expect((await status.json()).submission.state).toBe("canceled");
+    expect((await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads).toHaveLength(0);
+  });
+}

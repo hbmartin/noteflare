@@ -1,3 +1,4 @@
+import { purgeCommentDrafts } from "./comment-drafts";
 import { DiagramRestoreOwner } from "./diagram-restore-owner";
 import { useRealtimeAccessCoordinator } from "./RealtimeAccessCoordinator";
 import { preserveBeforeAuthorizationExit, trackAuthorization } from "./authorization-lifecycle";
@@ -991,6 +992,11 @@ export function App() {
     const onLocalSignOut = (event: StorageEvent) => {
       if (event.key !== LOCAL_SIGNOUT_KEY || !event.newValue) return;
       clearLiveRecoveryCopies(event.newValue);
+      try {
+        purgeCommentDrafts(event.newValue);
+      } catch (error) {
+        console.error("Cross-tab comment cleanup remains pending", error);
+      }
       invalidateUnauthorizedRequests();
       showState({ screen: "signin" });
     };

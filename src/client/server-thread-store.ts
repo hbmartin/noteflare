@@ -1,10 +1,11 @@
 import { realtimeAccessAccount } from "./realtime-access-status";
 import type { CommentSubmissionStatus } from "../shared/comment-submissions";
-import { registerCommentPublication } from "./comment-publication";
+import { registerCommentPublication, forgetCommentPublication } from "./comment-publication";
 import {
   readCommentDraft,
   clearCommentDraft,
   replaceCommentDraftOperation,
+  warnCommentDraftPersistence,
   type CommentDraftScope,
 } from "./comment-drafts";
 import {
@@ -20,6 +21,7 @@ import * as Y from "yjs";
 import type { CommentThread, SessionUser } from "../shared/types";
 import { api, apiErrorMessage, json } from "./api";
 
+const finishedWithoutStorage = () => true;
 type NotesThreadMetadata = {
   pageId: string;
   createdBy: string;
@@ -200,6 +202,24 @@ export class ServerThreadStore extends ThreadStore {
     });
   }
 
+  async cancelAnchoredDraft(operationId: string) {
+    const account = realtimeAccessAccount();
+    const result = await api<{ submission: CommentSubmissionStatus }>(
+      `/api/pages/${encodeURIComponent(this.pageId)}/comment-submissions/${encodeURIComponent(operationId)}/cancel`,
+      {
+        method: "POST",
+        readOnly: true,
+        headers: this.draftScope ? { "x-notes-content-epoch": String(this.draftScope.epoch) } : {},
+      },
+    );
+    if (account !== realtimeAccessAccount()) throw new Error("This comment belongs to a retired account.");
+    if (result.submission.state === "canceled" || result.submission.state === "expired")
+      this.terminalPreparations.add(operationId);
+    if (this.draftScope && !forgetCommentPublication(this.draftScope, operationId))
+      warnCommentDraftPersistence(this.draftScope);
+    return result.submission;
+  }
+
   private readonly terminalPreparations = new Set<string>();
   anchoredSubmission(body: BlockNoteCommentBody) {
     const account = realtimeAccessAccount();
@@ -222,7 +242,14 @@ export class ServerThreadStore extends ThreadStore {
       operationId = headers["x-notes-operation-id"];
     const root = `/api/pages/${encodeURIComponent(this.pageId)}/comment-submissions`;
     type Result = { submission: CommentSubmissionStatus; thread?: CommentThread };
+    let terminal = false;
+    let finish = finishedWithoutStorage;
     const remember = (result: Result) => {
+      if (account !== realtimeAccessAccount()) return result;
+      if (result.submission.state !== "prepared") {
+        terminal = true;
+        if (!finish() && this.draftScope) warnCommentDraftPersistence(this.draftScope);
+      }
       if (result.submission.state === "canceled" || result.submission.state === "expired")
         this.terminalPreparations.add(operationId);
       return result;
@@ -238,7 +265,14 @@ export class ServerThreadStore extends ThreadStore {
           throw error;
         }));
     };
-    const release = this.draftScope ? registerCommentPublication(this.draftScope, cancel) : () => {};
+    if (this.draftScope) {
+      const registration = registerCommentPublication(this.draftScope, operationId, cancel);
+      finish = registration.finish;
+      if (!registration.durable) warnCommentDraftPersistence(this.draftScope);
+    }
+    const release = () => {
+      if (terminal) finish();
+    };
     return {
       prepare: async () => {
         assertAccount();

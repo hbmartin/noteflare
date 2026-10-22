@@ -1,4 +1,4 @@
-import { activeCommentCancellation } from "./comment-publication";
+import { activeCommentCancellation, CommentCancellationUncertainError } from "./comment-publication";
 import {
   createContext,
   memo,
@@ -319,7 +319,18 @@ export function DraftCommentsControllers() {
       const draft = id ? readCommentDraft(scope, id) : null;
       if (!id || !draft) return true;
       if (!window.confirm("Discard your unfinished comment?")) return false;
-      const cancel = id === "new" ? activeCommentCancellation(scope) : undefined;
+      const store = comments.threadStore as typeof comments.threadStore & {
+        cancelAnchoredDraft?: (
+          operationId: string,
+        ) => Promise<import("../shared/comment-submissions").CommentSubmissionStatus>;
+      };
+      const cancel =
+        id === "new"
+          ? activeCommentCancellation(
+              scope,
+              store.cancelAnchoredDraft ? (operationId) => store.cancelAnchoredDraft!(operationId) : undefined,
+            )
+          : undefined;
       if (cancel) {
         setDiscardError("Canceling unpublished comment…");
         void cancel()
@@ -341,9 +352,11 @@ export function DraftCommentsControllers() {
               );
             }
           })
-          .catch(() =>
+          .catch((error) =>
             setDiscardError(
-              "Cancellation could not be confirmed. Your draft is preserved; retry before discarding it.",
+              error instanceof CommentCancellationUncertainError
+                ? error.message
+                : "Cancellation could not be confirmed. Your draft is preserved; retry before discarding it.",
             ),
           );
         return false;

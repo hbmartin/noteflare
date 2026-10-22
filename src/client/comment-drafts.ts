@@ -1,3 +1,4 @@
+import { purgeCommentPublications } from "./comment-publication";
 import type { CommentBody } from "@blocknote/core/comments";
 export type CommentDraftScope = { account: string; pageId: string; epoch: number };
 export type CommentDraftAnchor = { head: unknown; anchor: unknown };
@@ -117,6 +118,11 @@ export function purgeCommentDrafts(account: string) {
       failures.push(error);
     }
   }
+  try {
+    purgeCommentPublications(account);
+  } catch (error) {
+    failures.push(error);
+  }
   if (failures.length) throw new AggregateError(failures, "Comment drafts could not be removed from this device.");
 }
 if (typeof window !== "undefined")
@@ -153,4 +159,12 @@ export function replaceCommentDraftOperation(scope: CommentDraftScope, expected:
     next.storageFailed = true;
   }
   notify(name);
+}
+
+export function warnCommentDraftPersistence(scope: CommentDraftScope) {
+  const current = readCommentDraft(scope, "new");
+  if (current) {
+    memory.set(key(scope, "new"), { ...current, storageFailed: true });
+    notify(key(scope, "new"));
+  }
 }
