@@ -188,3 +188,62 @@ test("legacy comment drafts remain recoverable without attaching to a new select
   await page.getByRole("button", { name: "Discard saved draft" }).click();
   await expect(page.locator(".bn-thread .bn-editor")).toHaveCount(1);
 });
+
+test("diagram access refresh resumes after one recoverable security check", async ({ page }) => {
+  await signInOwner(page);
+  const space = await createTestSpace(page, "Recoverable diagram auth");
+  const diagram = (
+    await (
+      await page.request.post("/api/pages", {
+        data: { kind: "diagram", title: `Recoverable auth ${Date.now()}`, spaceId: space.id },
+      })
+    ).json()
+  ).page;
+  await page.goto(`/?page=${diagram.id}`);
+  const undo = page.getByRole("button", { name: "Undo", exact: true });
+  await expect(undo).toBeEnabled();
+  await page
+    .getByRole("navigation", { name: "Diagram stencils" })
+    .getByRole("button", { name: /Process/ })
+    .click();
+  await expect(page.locator(".react-flow__node")).toHaveCount(1);
+  let denied = false,
+    checks = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/security/status") checks++;
+  });
+  await page.route(`**/api/pages/${diagram.id}`, async (route) => {
+    if (route.request().method() === "GET" && !denied) {
+      denied = true;
+      await route.fulfill({ status: 401, json: { error: { code: "challenge_required", message: "Verify again." } } });
+    } else await route.continue();
+  });
+  expect((await page.request.patch(`/api/spaces/${space.id}`, { data: { visibility: "private" } })).ok()).toBe(true);
+  await expect.poll(() => denied).toBe(true);
+  await expect(undo).toBeEnabled({ timeout: 20_000 });
+  expect(checks).toBe(1);
+  await expect(page.getByRole("heading", { name: "Page unavailable", exact: true })).toHaveCount(0);
+  await page
+    .getByRole("navigation", { name: "Diagram stencils" })
+    .getByRole("button", { name: /Process/ })
+    .click();
+  await expect
+    .poll(async () => (await (await page.request.get(`/api/pages/${diagram.id}/content`)).json()).nodes.length)
+    .toBe(2);
+  await page.reload();
+  await expect(page.locator(".react-flow__node")).toHaveCount(2);
+});
+
+test("diagram access refresh after actual sign-out reaches sign-in", async ({ page }) => {
+  await signInOwner(page);
+  const diagram = await create(page, "diagram", "Expired diagram session");
+  await page.goto(`/?page=${diagram.id}`);
+  await expect(page.getByRole("button", { name: "Undo", exact: true })).toBeEnabled();
+  const signedOut = await page.request.post("/api/auth/sign-out", {
+    data: {},
+    headers: { origin: new URL(page.url()).origin },
+  });
+  expect(signedOut.ok()).toBe(true);
+  await expect(page.getByRole("heading", { name: "Sign in", exact: true })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByRole("heading", { name: "Page unavailable", exact: true })).toHaveCount(0);
+});
