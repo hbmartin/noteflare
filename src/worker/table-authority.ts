@@ -210,6 +210,14 @@ export async function tableActorSignature(secret: string, actor: TableActor) {
 }
 
 /** SQLite owns table ordering and receipts. D1 is rebuilt from durable projection events. */
+/** Existing grants may outlive short internal actor leases, but never their fixed deadline. */
+function validSocketGrant(
+  actor: TableActor | null | undefined,
+  now = Date.now(),
+): actor is TableActor & { socketExpiresAt: number } {
+  return Boolean(actor && Number.isFinite(actor.socketExpiresAt) && actor.socketExpiresAt! > now);
+}
+
 export class TableAuthority extends DurableObject<Env> {
   private readonly relations: CanonicalRelations;
   private projecting: Promise<boolean> | null = null;
@@ -858,12 +866,7 @@ export class TableAuthority extends DurableObject<Env> {
         });
       }
       if (path === "/socket") {
-        if (
-          !Number.isFinite(actor.socketExpiresAt) ||
-          !actor.socketExpiresAt ||
-          actor.socketExpiresAt <= Date.now() ||
-          actor.socketExpiresAt > Date.now() + REALTIME_GRANT_MS + REALTIME_CLOCK_SKEW_MS
-        )
+        if (!validSocketGrant(actor) || actor.socketExpiresAt > Date.now() + REALTIME_GRANT_MS + REALTIME_CLOCK_SKEW_MS)
           return fail("Reconnect to refresh authorization.", 403, "table_forbidden");
         const pair = new WebSocketPair();
         this.ctx.acceptWebSocket(pair[1], [actor.userId]);
@@ -1869,12 +1872,7 @@ export class TableAuthority extends DurableObject<Env> {
     for (const socket of this.ctx.getWebSockets()) {
       if (socket.readyState !== WebSocket.OPEN) continue;
       const socketActor = socket.deserializeAttachment() as TableActor | null;
-      if (
-        !socketActor?.socketExpiresAt ||
-        !Number.isFinite(socketActor.socketExpiresAt) ||
-        socketActor.socketExpiresAt <= Date.now()
-      )
-        continue;
+      if (!validSocketGrant(socketActor)) continue;
       try {
         socket.send(JSON.stringify({ type: "table-changed", revision, operationId: command.operationId }));
       } catch {
@@ -4068,8 +4066,7 @@ export class TableAuthority extends DurableObject<Env> {
     for (const socket of this.ctx.getWebSockets()) {
       if (socket.readyState !== WebSocket.OPEN) continue;
       const actor = socket.deserializeAttachment() as TableActor | null;
-      if (!actor?.socketExpiresAt || !Number.isFinite(actor.socketExpiresAt) || actor.socketExpiresAt <= Date.now())
-        socket.close(4401, "Authorization expired. Reconnect to continue.");
+      if (!validSocketGrant(actor)) socket.close(4401, "Authorization expired. Reconnect to continue.");
       else next = Math.min(next, actor.socketExpiresAt);
     }
     return next;
@@ -4078,7 +4075,7 @@ export class TableAuthority extends DurableObject<Env> {
   async webSocketMessage(socket: WebSocket) {
     if (socket.readyState !== WebSocket.OPEN) return;
     const grant = socket.deserializeAttachment() as TableActor | null;
-    if (!grant?.socketExpiresAt || !Number.isFinite(grant.socketExpiresAt) || grant.socketExpiresAt <= Date.now()) {
+    if (!validSocketGrant(grant)) {
       socket.close(4401, "Authorization expired. Reconnect to continue.");
       return;
     }
