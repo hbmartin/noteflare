@@ -86,6 +86,8 @@ vi.mock("./collaboration", async () => ({
           return mocks.unsynced;
         },
         destroy: mocks.destroy,
+        suspend: () => mocks.provider.disconnect(),
+        resume: () => mocks.provider.connect(),
         stop: mocks.stop,
       };
     },
@@ -579,7 +581,9 @@ describe("EditorPage close reconciliation", () => {
     mocks.api.mockResolvedValue({ page });
     await advanceRetry(16_000);
     expect(mocks.provider.connect).not.toHaveBeenCalled();
-    await advanceRetry(1_000);
+    await advanceRetry(29_999);
+    expect(mocks.provider.connect).not.toHaveBeenCalled();
+    await advanceRetry(1);
     expect(mocks.provider.connect).toHaveBeenCalledOnce();
   });
 

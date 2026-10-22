@@ -1610,7 +1610,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       lookupPending: true,
     };
   }
-  const diagramRestores = useMemo(() => new DiagramRestoreOwner(), [member.user.id, member.workspace.id]);
+  const diagramRestores = useMemo(
+    () => new DiagramRestoreOwner(`${member.user.id}\0${member.workspace.id}`),
+    [member.user.id, member.workspace.id],
+  );
   const diagramRestoresRef = useCommittedRef(diagramRestores);
   const [{ pages, pagesLoaded, selectedId, pendingSelectionId }, dispatchRawPageAction] = useReducer(
     workspacePageReducer,
@@ -2041,6 +2044,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       reportWorkspaceError,
       setSidebarHiddenPage,
       startWorkspaceErrorAttempt,
+      dispatchPageAction,
     ],
   );
   const navigateToPage = useCallback(
@@ -2060,7 +2064,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setView("pages");
       closeSidebar(true);
     },
-    [cancelPageAccessRequest, closeSidebar, loadPageForNavigation, member.workspace.id, pages, pendingSelectionIdRef],
+    [
+      cancelPageAccessRequest,
+      closeSidebar,
+      loadPageForNavigation,
+      member.workspace.id,
+      pages,
+      pendingSelectionIdRef,
+      dispatchPageAction,
+    ],
   );
 
   useEffect(() => {
@@ -2201,6 +2213,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     loadPageForNavigation,
     pendingSelectionIdRef,
     selectedIdRef,
+    dispatchPageAction,
   ]);
   const loadFreshPages = useCallback(
     async (observerSignal: AbortSignal) => {
@@ -2399,7 +2412,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         if (!signal.aborted) dispatchPageAction({ type: "clear-restored-root", token: selectionToken });
       });
     },
-    [archiveRemovalTombstones, excludeConfirmedRestoresFromTrash, loadFreshPages],
+    [archiveRemovalTombstones, excludeConfirmedRestoresFromTrash, loadFreshPages, dispatchPageAction],
   );
   const reconcileRestoredEvent = useCallback(
     async (restoredPages: Page[], tombstoneCheckpoint: number, restoredRootId?: string) => {
@@ -2437,7 +2450,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         signal,
       );
     },
-    [archiveRemovalTombstones, excludeConfirmedRestoresFromTrash, loadFreshPages, reconcileRestoredRoot],
+    [
+      archiveRemovalTombstones,
+      excludeConfirmedRestoresFromTrash,
+      loadFreshPages,
+      reconcileRestoredRoot,
+      dispatchPageAction,
+    ],
   );
   const loadTrash = useCallback(
     (version: number) => {
@@ -2498,6 +2517,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       ensureTrashTreeRefresh,
       recordPageRemovals,
       reportWorkspaceError,
+      dispatchPageAction,
     ],
   );
   useEffect(() => {
@@ -2662,7 +2682,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setView("pages");
       closeSidebar(true);
     },
-    [closeSidebar, member.workspace.id, pages],
+    [closeSidebar, member.workspace.id, pages, dispatchPageAction],
   );
 
   async function createSpace(event: FormEvent<HTMLFormElement>) {
@@ -2939,6 +2959,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       refreshInvalidatedWorkspace,
       reportWorkspaceError,
       setSidebarHiddenPage,
+      dispatchPageAction,
     ],
   );
 
@@ -3692,7 +3713,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       recordPageUpserts([page]);
       dispatchPageAction({ type: "merge", pages: [page] });
     },
-    [recordPageUpserts],
+    [recordPageUpserts, dispatchPageAction],
   );
   const pageUnavailable = useCallback(
     (pageId: string) => {
@@ -3709,7 +3730,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         reportWorkspaceError({ source: "page-tree" }, refreshError);
       });
     },
-    [archiveRemovalTombstones, clearConfirmedRestores, loadFreshPages, reportWorkspaceError, setSidebarHiddenPage],
+    [
+      archiveRemovalTombstones,
+      clearConfirmedRestores,
+      loadFreshPages,
+      reportWorkspaceError,
+      setSidebarHiddenPage,
+      dispatchPageAction,
+    ],
   );
   const documentAccessDenied = useCallback(
     (pageId: string, error: ApiClientError) => {

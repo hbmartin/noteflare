@@ -466,6 +466,6 @@ it("suspends document visibility and late startup until an explicit resume", asy
     expect(provider.reconnect).not.toHaveBeenCalled();
   } finally {
     bundle.stop();
-    await bundle.destroy();
+    bundle.destroy();
   }
 });

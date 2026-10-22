@@ -24,6 +24,7 @@ export type DocumentCloseReconcilerOptions = {
   onStateChange?: (state: DocumentConnectionState) => void;
 };
 const RECONCILED_CLOSE_CODES = new Set([4403, 4410, 4412, 1006]);
+const available = () => navigator.onLine && !document.hidden;
 export function createDocumentCloseReconciler({
   page,
   provider,
@@ -65,7 +66,6 @@ export function createDocumentCloseReconciler({
     setState("paused");
     provider.disconnect();
   };
-  const available = () => navigator.onLine && !document.hidden;
   const schedule = (callback: () => void, delay: number) => {
     clear();
     setState("retrying");

@@ -1174,16 +1174,7 @@ export function DiagramPage({
       reconciler.destroy();
       next.destroy();
     };
-  }, [
-    onAccessDenied,
-    onPageUnavailable,
-    onPageChanged,
-    notices,
-    page.contentEpoch,
-    page.id,
-    member.user.id,
-    member.workspace.id,
-  ]);
+  }, [onAccessDenied, onPageUnavailable, onPageChanged, notices, page.contentEpoch, page.id]);
   useEffect(() => {
     void api<{ threads: CommentThread[] }>(`/api/pages/${page.id}/comments?revision=${commentsRevision}`)
       .then((data) => setThreads(data.threads))
