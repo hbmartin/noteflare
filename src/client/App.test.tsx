@@ -2002,9 +2002,11 @@ describe("App error handling", () => {
     reconnectWorkspace();
 
     await waitFor(() => expect(treeLoads).toBe(3));
-    expect(
-      screen.queryByText("The server returned an invalid archive response. Refreshing the page tree."),
-    ).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByText("The server returned an invalid archive response. Refreshing the page tree."),
+      ).not.toBeInTheDocument(),
+    );
   });
 
   it("releases locally inferred archive tombstones after repeated authoritative presence", async () => {
