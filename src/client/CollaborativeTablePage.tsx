@@ -30,7 +30,7 @@ type CellDraft = {
   text: string;
   baseRevision: number;
 };
-const draftKey = (rowId: string, columnId: string) => `${rowId}:${columnId}`;
+const draftKey = (rowId: string, columnId: string) => JSON.stringify([rowId, columnId]);
 export type CollaborativeTableProps = {
   page: Pick<Page, "id" | "title" | "taskList">;
   member: ClientMemberContext;
@@ -721,12 +721,21 @@ function Cell({
 }) {
   const key = draftKey(row.id, column.id);
   const value = row.cells[column.id] ?? null;
-  const [draft, setDraft] = useState(drafts.get(key)?.text ?? String(value ?? ""));
+  const [draft, setDraft] = useState(() => (drafts.get(key)?.changed ? drafts.get(key)!.text : String(value ?? "")));
   const [, invalidateDraft] = useState(0);
   const focused = useRef(false);
   useEffect(() => {
-    if (!focused.current && !drafts.has(key)) setDraft(String(value ?? ""));
+    if (!focused.current && !drafts.get(key)?.changed) {
+      drafts.delete(key);
+      setDraft(String(value ?? ""));
+    }
   }, [value, drafts, key]);
+  useEffect(
+    () => () => {
+      if (!drafts.get(key)?.changed) drafts.delete(key);
+    },
+    [drafts, key],
+  );
   if (column.type === "formula") {
     const computedValue = row.computedCells?.[column.id]?.value;
     return (
@@ -894,7 +903,7 @@ function Cell({
           if (event.key === "Enter") event.currentTarget.blur();
         }}
       />
-      {drafts.get(key) && drafts.get(key)!.baseRevision !== (row.cellRevisions[column.id] ?? 0) && (
+      {drafts.get(key)?.changed && drafts.get(key)!.baseRevision !== (row.cellRevisions[column.id] ?? 0) && (
         <div aria-live="polite">
           <p>The server value changed: {String(value ?? "Empty")}. Your edit is preserved.</p>
           <button

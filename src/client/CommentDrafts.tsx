@@ -27,6 +27,7 @@ import {
   useBlockNoteEditor,
 } from "@blocknote/react";
 import { apiErrorMessage } from "./api";
+import { submitAnchoredComment } from "./comment-submission";
 import { TextSelection } from "prosemirror-state";
 import { captureCommentDraftAnchor, resolveCommentDraftAnchor } from "./comment-draft-anchor";
 import { notesCommentSchema } from "./mentions";
@@ -189,6 +190,14 @@ function NewDraftComposer({
     main = useBlockNoteEditor();
   const context = useContext(CommentDraftContext)!;
   const [error, setError] = useState("");
+  const lifetime = useMemo(() => ({ active: true }), [main, anchor, context.account, context.pageId, context.epoch]);
+  const submitting = useRef(false);
+  useLayoutEffect(() => {
+    lifetime.active = true;
+    return () => {
+      lifetime.active = false;
+    };
+  }, [lifetime]);
   const editor = useCreateBlockNote(
     {
       schema: notesCommentSchema,
@@ -197,32 +206,35 @@ function NewDraftComposer({
         commentEditorSubmitExtension({
           submitOnEnter: comments.submitOnEnter,
           onSubmit: async (commentEditor) => {
-            const submitted = JSON.stringify(commentEditor.document),
-              selection = resolveCommentDraftAnchor(main, anchor);
-            if (!selection) {
-              setError("The original comment selection is unavailable. Copy this draft before discarding it.");
-              return;
-            }
+            if (submitting.current || !lifetime.active) return;
+            submitting.current = true;
+            const submitted = JSON.stringify(commentEditor.document);
             setError("");
             try {
-              const thread = await comments.threadStore.createThread({
-                initialComment: { body: commentEditor.document },
-              });
-              await comments.threadStore.addThreadToDocument?.({
-                threadId: thread.id,
-                editor: main,
-                selection: TextSelection.create(main.prosemirrorState.doc, selection.from, selection.to),
-              });
-              if (commentEditor.isEmpty || JSON.stringify(commentEditor.document) === submitted)
+              const applied = await submitAnchoredComment(
+                main,
+                anchor,
+                commentEditor.document,
+                comments.threadStore,
+                () => lifetime.active,
+              );
+              if (applied && (commentEditor.isEmpty || JSON.stringify(commentEditor.document) === submitted))
                 comments.stopPendingComment();
             } catch (cause) {
-              setError(apiErrorMessage(cause, "The comment could not be posted. Your draft is preserved."));
+              if (lifetime.active)
+                setError(
+                  cause instanceof Error
+                    ? cause.message
+                    : apiErrorMessage(cause, "The comment could not be posted. Your draft is preserved."),
+                );
+            } finally {
+              submitting.current = false;
             }
           },
         }),
       ],
     },
-    [main, anchor],
+    [main, anchor, lifetime],
   );
   const warning = useDraft(editor, "new", anchor);
   const saved = readCommentDraft(context, "new"),
