@@ -75,3 +75,50 @@ it("ignores replacement query objects but polls target-only changes and coalesce
   });
   expect(vi.mocked(api).mock.calls.length).toBe(before + 2);
 });
+
+it("times out stalled requests, releases one trailing refresh, and aborts on disposal", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), ms);
+    return controller.signal;
+  });
+  const details = { definitions: [], cells: [], targets: [] };
+  const signals: AbortSignal[] = [];
+  vi.mocked(api)
+    .mockReset()
+    .mockImplementation(
+      (_path, init) =>
+        new Promise((_resolve, reject) => {
+          const signal = init!.signal! as AbortSignal;
+          signals.push(signal);
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        }),
+    );
+  const data = {
+    pageId: "source",
+    generation: 1,
+    revision: 1,
+    rows: [{ id: "row", cells: {} }],
+  } as unknown as TableQueryResult;
+  let view!: ReturnType<typeof render>;
+  await act(async () => {
+    view = render(<RelationPanel data={data} enabled={false} editable={false} command={vi.fn()} />);
+  });
+  await act(async () => {
+    window.dispatchEvent(new Event("notes:workspace-event"));
+    window.dispatchEvent(new Event("notes:workspace-event"));
+  });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(15_000);
+  });
+  expect(signals[0]!.aborted).toBe(true);
+  expect(api).toHaveBeenCalledTimes(2);
+  vi.mocked(api).mockResolvedValue(details);
+  await act(async () => view.unmount());
+  expect(signals[1]!.aborted).toBe(true);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(30_000);
+  });
+  expect(api).toHaveBeenCalledTimes(2);
+});
