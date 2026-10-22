@@ -4,6 +4,8 @@ User-visible and operator-relevant changes. The dated summaries below are retros
 
 ## Unreleased
 
+- Preserve comment anchors during concurrent edits, isolate cell drafts across remounts, reject invalid table sockets safely, and complete diagram/auth recovery. Order owner access status by revision, bound relation refreshes, and avoid expansion-only grant fences with migration 0102. Chromium fixtures now wait for editable documents and isolate space permissions. Keep browser schema validation compatible with strict CSP and enforce read-only offline behavior in production tests.
+
 - Fence first viewer space grants, settle removed upload promises safely in native editor callers, exclude previews from pending-write guards, and repair heading queues and comment-operation cascade indexes with forward migration 0101.
 
 - Corrected live-access completion and retry reporting, table/diagram reconnect handling, focused-cell conflicts, upload synchronization pauses, comment draft ownership/discard/recovery, and per-property relation errors.
