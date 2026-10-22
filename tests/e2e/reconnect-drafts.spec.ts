@@ -61,6 +61,95 @@ test("canonical cell drafts survive offline blur and resume normal saving after 
     })
     .toBe("Preserved browser draft");
 });
+test("table renewal preserves focused text and caret without submitting a partial value", async ({ page }) => {
+  await signInOwner(page);
+  const table = await create(page, "table", "Renewal table");
+  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
+  const columnId = crypto.randomUUID(),
+    rowId = crypto.randomUUID();
+  for (const [kind, payload] of [
+    ["create_column", { id: columnId, name: "Renewal title", type: "text" }],
+    ["create_row", { id: rowId, values: { [columnId]: "Original" } }],
+  ] as const)
+    expect(
+      (
+        await page.request.post(`/api/tables/${table.id}/commands`, {
+          data: { kind, payload, operationId: crypto.randomUUID() },
+        })
+      ).ok(),
+    ).toBeTruthy();
+  let retired = 0;
+  page.on("websocket", (socket) => {
+    if (socket.url().includes(`/api/tables/${table.id}/socket`)) socket.on("close", () => retired++);
+  });
+  await page.routeWebSocket(`**/api/tables/${table.id}/socket`, (route) => {
+    const server = route.connectToServer();
+    server.onMessage((raw) => {
+      const message = JSON.parse(String(raw));
+      // Compress client scheduling only. Server authorization remains its fixed signed five-minute grant.
+      route.send(
+        JSON.stringify(
+          message.type === "table-ready"
+            ? { ...message, authorizationRemainingMs: 10_000, renewalDelayMs: 2_000 }
+            : message,
+        ),
+      );
+    });
+  });
+  await page.goto(`/?page=${table.id}`);
+  const cell = page.getByLabel("Renewal title", { exact: true });
+  await expect(cell).toBeEnabled();
+  await cell.fill("Typing through renewal");
+  await cell.evaluate((input: HTMLInputElement) => input.setSelectionRange(3, 7));
+  await expect.poll(() => retired).toBeGreaterThanOrEqual(2);
+  await expect(cell).toBeEnabled();
+  await expect(cell).toBeFocused();
+  await expect(cell).toHaveValue("Typing through renewal");
+  expect(await cell.evaluate((input: HTMLInputElement) => [input.selectionStart, input.selectionEnd])).toEqual([3, 7]);
+  const result = await (await page.request.get(`/api/tables/${table.id}/query`)).json();
+  expect(result.rows.find((row: { id: string }) => row.id === rowId).cells[columnId]).toBe("Original");
+});
+test("cell text survives reload and appears in Personal Settings before sign-out purges it", async ({
+  page,
+  context,
+}) => {
+  await signInOwner(page);
+  const table = await create(page, "table", "Durable draft table");
+  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
+  const columnId = crypto.randomUUID(),
+    rowId = crypto.randomUUID();
+  for (const [kind, payload] of [
+    ["create_column", { id: columnId, name: "Durable title", type: "text" }],
+    ["create_row", { id: rowId, values: { [columnId]: "Original" } }],
+  ] as const)
+    expect(
+      (
+        await page.request.post(`/api/tables/${table.id}/commands`, {
+          data: { kind, payload, operationId: crypto.randomUUID() },
+        })
+      ).ok(),
+    ).toBeTruthy();
+  await page.goto(`/?page=${table.id}`);
+  const cell = page.getByLabel("Durable title", { exact: true });
+  await expect(cell).toBeEnabled();
+  await cell.fill("Persisted unfinished text");
+  await context.setOffline(true);
+  await expect(cell).toBeDisabled();
+  await context.setOffline(false);
+  await page.reload();
+  await expect(cell).toBeEnabled();
+  await expect(cell).toHaveValue("Persisted unfinished text");
+  const result = await (await page.request.get(`/api/tables/${table.id}/query`)).json();
+  expect(result.rows.find((row: { id: string }) => row.id === rowId).cells[columnId]).toBe("Original");
+  await page.getByRole("button", { name: "Members & settings", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Pending cell edits" })).toBeVisible();
+  await expect(page.getByLabel("Recovered cell draft")).toHaveValue("Persisted unfinished text");
+  await page.getByRole("button", { name: "Sign out", exact: true }).click();
+  await expect(page.getByRole("heading", { name: /sign in/i })).toBeVisible();
+  expect(
+    await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith("notes:cell-draft:v1:")).length),
+  ).toBe(0);
+});
 test("comment dismissal confirms discard and reload recovers the original selection", async ({ page }) => {
   await signInOwner(page);
   const document = await create(page, "document", "Comment draft recovery");

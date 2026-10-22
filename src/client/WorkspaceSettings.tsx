@@ -7,6 +7,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { ClientMemberContext, Space, Page, Role } from "../shared/types";
 import { api, json, apiErrorMessage, ApiClientError } from "./api";
 import { ThemeControl } from "./ThemeControl";
+import { CellDraftRecovery } from "./CellDraftRecovery";
 import { SecurityScreen } from "./SecurityScreen";
 import { SlackSettings } from "./SlackSettings";
 import { OAuthConnectionsSettings } from "./OAuthConnectionsSettings";
@@ -85,6 +86,7 @@ export function WorkspaceSettings({
       </nav>
       <h2 id="settings-personal">Personal</h2>
       <ThemeControl />
+      <CellDraftRecovery account={`${member.user.id}\0${member.workspace?.id ?? "workspace"}`} />
       <h2 id="settings-workspace">Workspace members</h2>
       {error && (
         <p role="alert" className="form-error">
