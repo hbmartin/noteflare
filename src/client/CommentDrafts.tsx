@@ -298,6 +298,7 @@ export function DraftCommentsControllers() {
   );
   const [version, update] = useState(0);
   const [discardError, setDiscardError] = useState("");
+  const [cleanup, setCleanup] = useState<{ id: string; operationId: string } | null>(null);
   const [anchor, setAnchor] = useState<CommentDraftAnchor>();
   const prior = useRef<string | null>(null),
     restoring = useRef(false);
@@ -305,14 +306,18 @@ export function DraftCommentsControllers() {
   useEffect(() => subscribeCommentDraft(scope, "new", () => update((value) => value + 1)), [scope]);
   const discard = useCallback(
     (id: string | null) => {
-      if (!id || !readCommentDraft(scope, id)) return true;
+      const draft = id ? readCommentDraft(scope, id) : null;
+      if (!id || !draft) return true;
       if (!window.confirm("Discard your unfinished comment?")) return false;
       try {
         clearCommentDraft(scope, id);
         setDiscardError("");
         return true;
       } catch {
-        setDiscardError("This draft could not be discarded on this device. Keep it open or copy the text.");
+        setCleanup({ id, operationId: draft.operationId });
+        setDiscardError(
+          "The draft was cleared from this tab, but its stored copy could not be removed. Retry cleanup before leaving.",
+        );
         return false;
       }
     },
@@ -359,6 +364,21 @@ export function DraftCommentsControllers() {
   return (
     <>
       {discardError && <p role="alert">{discardError}</p>}
+      {cleanup && (
+        <button
+          onClick={() => {
+            try {
+              clearCommentDraft(scope, cleanup.id, cleanup.operationId);
+              setCleanup(null);
+              setDiscardError("");
+            } catch {
+              /* Keep the persistent cleanup failure visible. */
+            }
+          }}
+        >
+          Retry comment draft cleanup
+        </button>
+      )}
       {!state.pendingComment && saved && (
         <aside aria-label="Saved comment draft" key={version}>
           <p>A comment draft is saved for {position ? "its original selection" : "an unavailable selection"}.</p>

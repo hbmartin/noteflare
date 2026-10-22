@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { parseWorkspaceEvent } from "../shared/validation";
 import type { CollaborativeRow, TableCommand, TableQueryResult } from "../shared/table-protocol";
 import type {
   RelationDefinition,
@@ -21,6 +22,25 @@ const label = (row: CollaborativeRow) =>
   Object.values(row.cells)
     .find((value) => typeof value === "string" && value.trim())
     ?.toString() ?? row.id;
+export function relationEventRelevant(detail: unknown, pages: ReadonlySet<string>): boolean {
+  const event = parseWorkspaceEvent(detail);
+  if (!event) return true;
+  switch (event.type) {
+    case "notifications-invalidated":
+    case "jobs-invalidated":
+    case "comments-invalidated":
+      return false;
+    case "pages-upserted":
+      return event.pages.some((page) => pages.has(page.id));
+    case "pages-removed":
+      return event.pageIds.some((id) => pages.has(id));
+    case "task-list-invalidated":
+    case "projection-updated":
+      return pages.has(event.pageId);
+    default:
+      return true;
+  }
+}
 export function RelationPanel({
   data,
   enabled,
@@ -39,12 +59,16 @@ export function RelationPanel({
     [targets, setTargets] = useState<SearchTitleSuggestion[]>([]),
     [target, setTarget] = useState(""),
     [name, setName] = useState("Related rows");
+  const targetIds = JSON.stringify(
+    [...new Set(data.relations?.definitions.map((definition) => definition.targetPageId) ?? [])].sort(),
+  );
   useEffect(() => {
     if (!rowId || !Number.isFinite(data.generation)) return undefined;
     let disposed = false,
       running = false,
       trailing = false;
     const controller = new AbortController();
+    let relevantPages = new Set<string>([data.pageId, ...JSON.parse(targetIds)]);
     const refresh = async () => {
       if (disposed || document.hidden || !navigator.onLine) return;
       if (running) {
@@ -58,6 +82,11 @@ export function RelationPanel({
           { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]) },
         );
         if (!disposed) {
+          relevantPages = new Set([
+            data.pageId,
+            ...JSON.parse(targetIds),
+            ...value.definitions.map((definition) => definition.targetPageId),
+          ]);
           setDetails(value);
           setError("");
         }
@@ -77,20 +106,23 @@ export function RelationPanel({
     const invalidate = () => {
       void refresh();
     };
+    const workspaceInvalidation = (event: Event) => {
+      if (relationEventRelevant((event as CustomEvent).detail, relevantPages)) invalidate();
+    };
     void refresh();
     const timer = setInterval(invalidate, 15_000);
-    window.addEventListener("notes:workspace-event", invalidate);
+    window.addEventListener("notes:workspace-event", workspaceInvalidation);
     window.addEventListener("online", invalidate);
     document.addEventListener("visibilitychange", invalidate);
     return () => {
       disposed = true;
       controller.abort();
       clearInterval(timer);
-      window.removeEventListener("notes:workspace-event", invalidate);
+      window.removeEventListener("notes:workspace-event", workspaceInvalidation);
       window.removeEventListener("online", invalidate);
       document.removeEventListener("visibilitychange", invalidate);
     };
-  }, [data.pageId, data.generation, data.revision, rowId]);
+  }, [data.pageId, data.generation, data.revision, rowId, targetIds]);
   useEffect(() => {
     if (!search.trim()) return undefined;
     const controller = new AbortController();

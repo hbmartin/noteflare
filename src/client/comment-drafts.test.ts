@@ -18,6 +18,22 @@ beforeEach(() => {
   vi.restoreAllMocks();
 });
 describe("private comment drafts", () => {
+  it("does not delete a newer draft started by a tombstone subscriber", () => {
+    writeCommentDraft(scope, "new", body("Submitted"));
+    const submitted = readCommentDraft(scope, "new")!;
+    const stop = subscribeCommentDraft(scope, "new", () => {
+      if (!readCommentDraft(scope, "new")) writeCommentDraft(scope, "new", body("Newer"));
+    });
+    clearCommentDraft(scope, "new", submitted.operationId);
+    stop();
+    const newer = readCommentDraft(scope, "new")!;
+    expect(newer.body).toEqual(body("Newer"));
+    expect(
+      JSON.parse(
+        localStorage.getItem(Object.keys(localStorage).find((name) => name.startsWith("notes:comment-draft:"))!)!,
+      ).operationId,
+    ).toBe(newer.operationId);
+  });
   it("survives reopening with the same operation identity and rotates it after editing", () => {
     expect(writeCommentDraft(scope, "reply:thread", body("Draft"))).toBe(true);
     const saved = readCommentDraft(scope, "reply:thread")!;
@@ -75,4 +91,50 @@ describe("private comment drafts", () => {
     });
     expect(writeCommentDraft(scope, "new", body("Draft"))).toBe(false);
   });
+});
+
+it("clears memory and notifies even when persistent deletion fails", () => {
+  const isolated = { ...scope, account: "blocked-clear" };
+  writeCommentDraft(isolated, "new", body("Posted"));
+  const submitted = readCommentDraft(isolated, "new")!;
+  const changed = vi.fn(),
+    stop = subscribeCommentDraft(isolated, "new", changed);
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  try {
+    expect(() => clearCommentDraft(isolated, "new", submitted.operationId)).toThrow("blocked");
+    expect(changed).toHaveBeenCalledOnce();
+    expect(readCommentDraft(isolated, "new")).toBeNull();
+    window.dispatchEvent(
+      new StorageEvent("storage", {
+        key: `notes:comment-draft:${JSON.stringify([isolated.account, isolated.pageId, isolated.epoch, "new"])}`,
+        newValue: JSON.stringify(submitted),
+      }),
+    );
+    expect(readCommentDraft(isolated, "new")).toBeNull();
+  } finally {
+    remove.mockRestore();
+    stop();
+  }
+});
+it("purges known memory despite failed enumeration and continues after per-key failures", () => {
+  const isolated = { ...scope, account: "blocked-purge" };
+  writeCommentDraft(isolated, "new", body("First"));
+  writeCommentDraft({ ...isolated, epoch: 2 }, "new", body("Second"));
+  const length = vi.spyOn(Storage.prototype, "length", "get").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  try {
+    expect(() => purgeCommentDrafts(isolated.account)).toThrow("could not be removed");
+    expect(remove).toHaveBeenCalledTimes(2);
+    expect(readCommentDraft(isolated, "new")).toBeNull();
+    expect(readCommentDraft({ ...isolated, epoch: 2 }, "new")).toBeNull();
+  } finally {
+    length.mockRestore();
+    remove.mockRestore();
+  }
 });
