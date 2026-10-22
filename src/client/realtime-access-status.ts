@@ -88,3 +88,8 @@ export function observeRealtimeAccessResponse(headers: Headers, requestAccount: 
 export function useRealtimeAccessStatus() {
   return useSyncExternalStore(subscribeRealtimeAccess, realtimeAccessSnapshot, realtimeAccessSnapshot);
 }
+
+/** Stable account-only snapshot: status observations must not rerender Workspace. */
+export function useRealtimeAccessAccount() {
+  return useSyncExternalStore(subscribeRealtimeAccess, realtimeAccessAccount, realtimeAccessAccount);
+}

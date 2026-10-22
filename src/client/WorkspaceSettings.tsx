@@ -59,11 +59,12 @@ export function WorkspaceSettings({
     }
   }
   useEffect(() => {
+    if (member.role === "owner") requestRealtimeAccessCheck();
     void load().catch(() => {
       setMembersStale(true);
       setError("The member list could not be loaded.");
     });
-  }, [load]);
+  }, [load, member.role]);
   async function invite(role: "editor" | "viewer") {
     const result = await api<{ invite: { token: string } }>("/api/invites", { method: "POST", body: json({ role }) });
     setInviteUrl(`${location.origin}/?invite=${result.invite.token}`);

@@ -117,3 +117,63 @@ it("reports failed checks, respects visibility, and aborts a retired owner coord
   });
   expect(api).toHaveBeenCalledTimes(count);
 });
+
+it("does not rerender the account-only owner when status changes and freshness-limits foreground reads", async () => {
+  vi.useFakeTimers();
+  let renders = 0;
+  function WorkspaceOwner() {
+    renders++;
+    useRealtimeAccessCoordinator(true);
+    return null;
+  }
+  vi.mocked(api).mockResolvedValue({ revision: 0, completedRevision: 0, complete: true });
+  await act(async () => render(<WorkspaceOwner />));
+  const baseline = renders;
+  expect(api).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    for (let i = 0; i < 5; i++) document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(api).toHaveBeenCalledTimes(1);
+  await act(async () => vi.advanceTimersByTimeAsync(30_000));
+  await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+  expect(api).toHaveBeenCalledTimes(2);
+  await act(async () =>
+    acceptRealtimeAccessStatus({ revision: 1, completedRevision: 0, complete: false }, realtimeAccessAccount()),
+  );
+  expect(renders).toBe(baseline);
+  await act(async () => {
+    requestRealtimeAccessReconciliation();
+  });
+  expect(vi.mocked(api).mock.calls.at(-1)?.[1]).toMatchObject({ method: "POST", readOnly: true });
+});
+
+it("measures account-only renders against the former full-snapshot subscription", async () => {
+  const { useRealtimeAccessAccount, useRealtimeAccessStatus } = await import("./realtime-access-status");
+  let former = 0,
+    current = 0;
+  function FormerWorkspace() {
+    useRealtimeAccessStatus();
+    former++;
+    return null;
+  }
+  function CurrentWorkspace() {
+    useRealtimeAccessAccount();
+    current++;
+    return null;
+  }
+  render(
+    <>
+      <FormerWorkspace />
+      <CurrentWorkspace />
+    </>,
+  );
+  for (let revision = 1; revision <= 4; revision++) {
+    await act(async () =>
+      acceptRealtimeAccessStatus(
+        { revision, completedRevision: revision - 1, complete: false },
+        realtimeAccessAccount(),
+      ),
+    );
+  }
+  expect({ former, current }).toEqual({ former: 5, current: 1 });
+});

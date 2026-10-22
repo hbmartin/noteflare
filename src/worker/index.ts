@@ -7504,7 +7504,14 @@ export default {
           const handle = async () => {
             const party = await handlePartyRequest(request, env);
             if (party) return party;
-            return withRealtimeAccessTracking(env, () => app.fetch(request, env, context));
+            return withRealtimeAccessTracking(
+              env,
+              () => app.fetch(request, env, context),
+              async (workspaceId) => {
+                const member = await requireMember(request, env);
+                return member.role === "owner" && member.workspace.id === workspaceId;
+              },
+            );
           };
           response = context.tracing
             ? await context.tracing.enterSpan("notes.route_request", async (span) => {

@@ -452,7 +452,7 @@ describe("Slack OAuth authorization boundaries", () => {
       expect((await env.DB.prepare("SELECT id FROM account ORDER BY id").all()).results).toEqual(accounts);
       expect(await env.DB.prepare("SELECT 1 FROM slack_primary_factor_proofs").first()).toBeNull();
       expect(response.headers.get("X-Notes-Realtime-Status")).toBe(failure === "discovery" ? "pending" : "complete");
-      expect(response.headers.has("X-Notes-Realtime-Workspace")).toBe(failure !== "discovery");
+      expect(response.headers.has("X-Notes-Realtime-Workspace")).toBe(false);
       expect(
         Boolean(await env.DB.prepare("SELECT 1 FROM realtime_revocations WHERE revision>completed_revision").first()),
       ).toBe(failure === "discovery");

@@ -97,7 +97,11 @@ export async function deleteRejectedSession(env: Env, userId: string, sessionId:
   }
 }
 /** Preserve committed responses, including authentication cookies and redirects. */
-export async function withRealtimeAccessTracking(env: Env, run: () => Promise<Response> | Response) {
+export async function withRealtimeAccessTracking(
+  env: Env,
+  run: () => Promise<Response> | Response,
+  authorizeDetails?: (workspaceId: string) => Promise<boolean>,
+) {
   return impacts.run(
     { workspaces: new Map(), users: new Map(), unresolvedUsers: new Set(), forced: new Set() },
     async () => {
@@ -148,7 +152,15 @@ export async function withRealtimeAccessTracking(env: Env, run: () => Promise<Re
       const result = new Response(response!.body, response);
       result.headers.set("X-Notes-Realtime-Status", pending ? "pending" : "complete");
       const only = affected.length === 1 && !scope.unresolvedUsers.size ? affected[0] : undefined;
-      if (only?.status) {
+      let detailsAllowed = false;
+      if (only?.status && authorizeDetails) {
+        try {
+          detailsAllowed = await authorizeDetails(only.workspaceId);
+        } catch {
+          /* Optional metadata fails closed. */
+        }
+      }
+      if (only?.status && detailsAllowed) {
         result.headers.set("X-Notes-Realtime-Workspace", only.workspaceId);
         result.headers.set("X-Notes-Realtime-Revision", String(only.status.revision));
         result.headers.set("X-Notes-Realtime-Completed-Revision", String(only.status.completedRevision));

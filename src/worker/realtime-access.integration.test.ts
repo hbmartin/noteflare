@@ -161,7 +161,7 @@ describe("realtime access barriers", () => {
       expect(response.headers.get("location")).toContain("original_failure");
       expect(response.headers.get("set-cookie")).toBeNull();
       expect(response.headers.get("X-Notes-Realtime-Status")).toBe(alwaysFails ? "pending" : "complete");
-      expect(response.headers.has("X-Notes-Realtime-Workspace")).toBe(!alwaysFails);
+      expect(response.headers.has("X-Notes-Realtime-Workspace")).toBe(false);
       expect((await realtimeAccessStatus(env, ids[0]!)).complete).toBe(!alwaysFails);
     },
   );
@@ -200,14 +200,20 @@ describe("realtime access barriers", () => {
         attempted.push(workspaceId);
         return new Response(null, { status: 503 });
       });
-      const response = await withRealtimeAccessTracking(bindings, async () => {
-        await trackRealtimeWorkspace(bindings, id);
-        await env.DB.prepare("UPDATE realtime_revocations SET revision=revision+1 WHERE workspace_id=?").bind(id).run();
-        return new Response("original result", {
-          status,
-          headers: { "set-cookie": "session=retained; HttpOnly", location: "/done" },
-        });
-      });
+      const response = await withRealtimeAccessTracking(
+        bindings,
+        async () => {
+          await trackRealtimeWorkspace(bindings, id);
+          await env.DB.prepare("UPDATE realtime_revocations SET revision=revision+1 WHERE workspace_id=?")
+            .bind(id)
+            .run();
+          return new Response("original result", {
+            status,
+            headers: { "set-cookie": "session=retained; HttpOnly", location: "/done" },
+          });
+        },
+        async () => true,
+      );
       expect(response.status).toBe(status);
       expect(await response.text()).toBe("original result");
       expect(response.headers.get("set-cookie")).toContain("session=retained");
@@ -433,3 +439,30 @@ describe("realtime access barriers", () => {
     console.log("REALTIME_IMPACT_BENCHMARK_LOCAL_MS", JSON.stringify(results));
   });
 });
+
+it.each(["owner", "editor", "viewer", "signed-out", "failure", "job"] as const)(
+  "limits detailed response counters to fresh owners: %s",
+  async (role) => {
+    const id = await workspace();
+    const bindings = runtime(async () => new Response(null, { status: 503 }));
+    const response = await withRealtimeAccessTracking(
+      bindings,
+      async () => {
+        await trackRealtimeWorkspace(bindings, id);
+        await env.DB.prepare("UPDATE realtime_revocations SET revision=revision+1 WHERE workspace_id=?").bind(id).run();
+        return new Response("committed", { status: 201, headers: { "set-cookie": "unchanged" } });
+      },
+      role === "job"
+        ? undefined
+        : async (workspaceId) => {
+            if (workspaceId !== id) throw new Error("Wrong workspace metadata authorization");
+            if (role === "failure") throw new Error("authorization unavailable");
+            return role === "owner";
+          },
+    );
+    expect(response.status).toBe(201);
+    expect(response.headers.get("set-cookie")).toBe("unchanged");
+    expect(response.headers.get("X-Notes-Realtime-Status")).toBe("pending");
+    expect(response.headers.has("X-Notes-Realtime-Revision")).toBe(role === "owner");
+  },
+);
