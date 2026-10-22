@@ -1,3 +1,4 @@
+import { DiagramRestoreOwner } from "./diagram-restore-owner";
 import { createDocumentCloseReconciler } from "./document-connection";
 import { useOnlineStatus } from "./online-status";
 import { nodeTypes, flowEdge, type FlowNode, type FlowEdge } from "./diagram-rendering";
@@ -20,7 +21,16 @@ import {
   type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type FormEvent,
+} from "react";
 import * as Y from "yjs";
 import {
   DEFAULT_NODE_SIZE,
@@ -47,6 +57,7 @@ import { createNetworkCollaboration, type NetworkCollaborationBundle, userColor 
 import { uploadAttachment } from "./uploads";
 
 export type DiagramPageProps = {
+  restoreOwner?: DiagramRestoreOwner;
   page: Page;
   metadata?: ReactNode;
   member: ClientMemberContext;
@@ -73,7 +84,6 @@ const STENCILS: Array<{ type: DiagramNodeType; label: string; icon: string }> = 
 ];
 const COLORS: DiagramColor[] = ["slate", "blue", "green", "amber", "red", "purple"];
 const LOCAL_ORIGIN = Symbol("diagram-local");
-const diagramRestoreNotices = new Set<string>();
 
 function replaceYText(map: Y.Map<unknown>, key: string, value: string) {
   const current = map.get(key);
@@ -1073,6 +1083,7 @@ function DiagramCanvas({
 }
 
 export function DiagramPage({
+  restoreOwner,
   page,
   metadata,
   member,
@@ -1095,9 +1106,13 @@ export function DiagramPage({
   const [restoreQuarantine, setRestoreQuarantine] = useState(false);
   const [authorizationPaused, setAuthorizationPaused] = useState(false);
   const retryAuthorization = useRef<() => void>(() => {});
-  // Keep only the notice across the parent's keyed epoch remount, never document data.
-  const noticeKey = `${member.user.id}\0${member.workspace.id}\0${page.id}\0${page.contentEpoch}`;
-  const [restoreNotice, setRestoreNotice] = useState(() => diagramRestoreNotices.has(noticeKey));
+  const localRestoreOwner = useMemo(() => new DiagramRestoreOwner(), []);
+  const notices = restoreOwner ?? localRestoreOwner;
+  const restoreNotice = useSyncExternalStore(
+    notices.subscribe,
+    () => notices.has(page.id, page.contentEpoch),
+    () => false,
+  );
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
   const title = titleEdit.pageId === page.id && titleEdit.revision === page.revision ? titleEdit.value : page.title;
   useEffect(() => {
@@ -1122,13 +1137,13 @@ export function DiagramPage({
       hasUnsyncedChanges: () => next.hasUnsyncedChanges,
       quarantine: () => setRestoreQuarantine(true),
       onPageChanged: (updated) => {
-        if (next.hasUnsyncedChanges && updated.contentEpoch !== page.contentEpoch)
-          diagramRestoreNotices.add(`${member.user.id}\0${member.workspace.id}\0${page.id}\0${updated.contentEpoch}`);
+        notices.observe([updated]);
         onPageChanged(updated);
       },
       onPageUnavailable,
       onAccessDenied,
     });
+    const unregisterRestore = notices.register(page.id, page.contentEpoch, () => next.hasUnsyncedChanges);
     retryAuthorization.current = () => reconciler.retry();
     const close = (event: CloseEvent) => {
       if (active) reconciler.handleClose(event);
@@ -1155,6 +1170,7 @@ export function DiagramPage({
       next.provider.off("custom-message", custom);
       next.provider.off("connection-close", close);
       next.provider.off("sync", sync);
+      unregisterRestore();
       reconciler.destroy();
       next.destroy();
     };
@@ -1162,6 +1178,7 @@ export function DiagramPage({
     onAccessDenied,
     onPageUnavailable,
     onPageChanged,
+    notices,
     page.contentEpoch,
     page.id,
     member.user.id,
@@ -1240,8 +1257,7 @@ export function DiagramPage({
           This diagram was restored. Unacknowledged local edits were not merged.{" "}
           <button
             onClick={() => {
-              diagramRestoreNotices.delete(noticeKey);
-              setRestoreNotice(false);
+              notices.dismiss(page.id, page.contentEpoch);
             }}
           >
             Dismiss restore notice

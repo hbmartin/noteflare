@@ -1,3 +1,4 @@
+import { DiagramRestoreOwner } from "./diagram-restore-owner";
 import { useRealtimeAccessCoordinator } from "./RealtimeAccessCoordinator";
 import { preserveBeforeAuthorizationExit, trackAuthorization } from "./authorization-lifecycle";
 import { realtimeAccessAccount, setRealtimeAccessAccount } from "./realtime-access-status";
@@ -1609,7 +1610,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       lookupPending: true,
     };
   }
-  const [{ pages, pagesLoaded, selectedId, pendingSelectionId }, dispatchPageAction] = useReducer(
+  const diagramRestores = useMemo(() => new DiagramRestoreOwner(), [member.user.id, member.workspace.id]);
+  const diagramRestoresRef = useCommittedRef(diagramRestores);
+  const [{ pages, pagesLoaded, selectedId, pendingSelectionId }, dispatchRawPageAction] = useReducer(
     workspacePageReducer,
     undefined,
     () => ({
@@ -1619,6 +1622,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       pendingSelectionId: startupNavigation.current!.pageId,
       pendingRestoredRoot: null,
     }),
+  );
+  const dispatchPageAction = useCallback(
+    (action: Parameters<typeof dispatchRawPageAction>[0]) => {
+      if ("pages" in action) diagramRestoresRef.current.observe(action.pages);
+      if (action.type === "remove") diagramRestoresRef.current.remove(action.pageIds);
+      dispatchRawPageAction(action);
+    },
+    [diagramRestoresRef],
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -4609,6 +4620,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           ) : (
             <Suspense fallback={<div className="editor-loading">Loading the diagram editor…</div>}>
               <DiagramPage
+                restoreOwner={diagramRestores}
                 key={`${activeSelected.id}:${activeSelected.contentEpoch}`}
                 page={activeSelected}
                 metadata={metadata}
