@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { signInOwner } from "./security-helpers";
+import { signInOwner, editableDocument } from "./security-helpers";
 
 test("date picker leaves no token on cancel and edits a saved token", async ({ page }) => {
   const first = new Date(Date.now() + 45 * 86_400_000);
@@ -17,7 +17,7 @@ test("date picker leaves no token on cancel and edits a saved token", async ({ p
   await page.waitForURL((url) =>
     Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
   );
-  const editor = page.locator(".bn-editor");
+  const editor = await editableDocument(page, new URL(page.url()).searchParams.get("page")!);
   await editor.click();
   await page.keyboard.type("@");
   await page.getByText("Choose date…").click();

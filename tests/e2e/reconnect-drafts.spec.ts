@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { signInOwner } from "./security-helpers";
+import { signInOwner, createTestSpace } from "./security-helpers";
 test.setTimeout(60_000);
 test.use({ serviceWorkers: "block" });
 async function create(page: Page, kind: string, title: string) {
@@ -9,7 +9,14 @@ async function create(page: Page, kind: string, title: string) {
 }
 test("diagram access refresh reconnects an authorized viewer without removing the page", async ({ page }) => {
   await signInOwner(page);
-  const diagram = await create(page, "diagram", "Diagram refresh");
+  const space = await createTestSpace(page, "Diagram refresh");
+  const diagram = (
+    await (
+      await page.request.post("/api/pages", {
+        data: { kind: "diagram", title: `Diagram refresh ${Date.now()}`, spaceId: space.id },
+      })
+    ).json()
+  ).page;
   await page.goto(`/?page=${diagram.id}`);
   await expect(page.locator(".react-flow")).toBeVisible();
   const result = await page.request.patch(`/api/spaces/${diagram.spaceId}`, { data: { visibility: "private" } });

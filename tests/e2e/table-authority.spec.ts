@@ -1,11 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
-import { completeEnrollment, signInOwner } from "./security-helpers";
+import { completeEnrollment, signInOwner, createTestSpace } from "./security-helpers";
 
 async function migratedTable(page: Page) {
   await signInOwner(page);
-  const spaces = await (await page.request.get("/api/spaces")).json();
+  const space = await createTestSpace(page, "Collaborative tables");
   const created = await page.request.post("/api/pages", {
-    data: { kind: "table", title: `Collaborative ${Date.now()}`, spaceId: spaces.spaces[0].id, parentId: null },
+    data: { kind: "table", title: `Collaborative ${Date.now()}`, spaceId: space.id, parentId: null },
   });
   expect(created.status()).toBe(201);
   const table = (await created.json()).page;
@@ -82,7 +82,7 @@ test("two browser writers converge on ordered cells and reload canonical data af
     const signup = await peerContext.request.post("/api/invites/accept", {
       data: {
         token: invite.token,
-        name: "Table editor",
+        name: `Table editor ${crypto.randomUUID()}`,
         email: `table-${crypto.randomUUID()}@example.test`,
         password: "password123",
       },
@@ -97,6 +97,27 @@ test("two browser writers converge on ordered cells and reload canonical data af
     const editor = await editorResponse.json();
     expect(editor.role).toBe("editor");
     expect(editor.user.id).not.toBe(owner.user.id);
+    expect((await peer.request.get(`/api/pages/${f.table.id}`)).status()).toBe(200);
+    const privateSpace = (
+      await (
+        await page.request.post("/api/spaces", {
+          data: { name: `Private comparison ${crypto.randomUUID()}`, visibility: "private" },
+        })
+      ).json()
+    ).space;
+    const privatePage = (
+      await (
+        await page.request.post("/api/pages", {
+          data: { kind: "document", title: "Private comparison", spaceId: privateSpace.id },
+        })
+      ).json()
+    ).page;
+    expect((await peer.request.get(`/api/pages/${privatePage.id}`)).status()).toBe(404);
+    expect(
+      (await (await peer.request.get("/api/spaces")).json()).spaces.some(
+        (space: { id: string; visibility: string }) => space.id === f.table.spaceId && space.visibility === "workspace",
+      ),
+    ).toBe(true);
     await peer.goto(`/?page=${f.table.id}`);
     await expect(peer.getByLabel("Title", { exact: true })).toHaveValue("Initial");
     const title = page.getByLabel("Title", { exact: true });
