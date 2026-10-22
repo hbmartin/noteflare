@@ -1,4 +1,5 @@
 import { StrictMode } from "react";
+import { config as configureZod } from "zod/v4/core";
 import { createRoot } from "react-dom/client";
 import { browserSupportsRequiredFeatures } from "./browser-support";
 import { Startup } from "./startup";
@@ -6,6 +7,10 @@ import { RenderBoundary } from "./RenderBoundary";
 import "./startup.css";
 import { installClientTelemetry } from "./telemetry";
 import { installChunkRecovery } from "./chunk-recovery";
+
+// The browser policy forbids dynamic code, including Zod's caught capability probe.
+// Configure before Startup lazily loads the editor and its validation schemas.
+configureZod({ jitless: true });
 
 installClientTelemetry();
 installChunkRecovery();
