@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
-import { signInOwner } from "./security-helpers";
+import { seedLegacyDraft, cachedDocumentText } from "./offline-fixtures";
+import { signInOwner, editableDocument } from "./security-helpers";
 
 test.setTimeout(90_000);
 
@@ -130,7 +131,10 @@ test("retires the shell cache when the worker script is removed", async ({ page,
   );
 });
 
-test("opens two visited documents offline and keeps local edits through refresh", async ({ page, context }) => {
+test("reads cached documents without authoring and preserves legacy drafts through refresh", async ({
+  page,
+  context,
+}) => {
   await signInOwner(page);
   await expect
     .poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller)), { timeout: 30_000 })
@@ -155,7 +159,7 @@ test("opens two visited documents offline and keeps local edits through refresh"
     await expect(page.locator(`[data-tree-page="${new URL(page.url()).searchParams.get("page")}"]`)).toContainText(
       title,
     );
-    await page.locator(".bn-editor").click();
+    await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
     await page.keyboard.type(text);
     await expect(page.locator(".bn-editor")).toContainText(text);
   }
@@ -186,16 +190,16 @@ test("opens two visited documents offline and keeps local edits through refresh"
   await expect(page.getByRole("button", { name: /Offline beta/ })).toBeVisible();
   await page.getByRole("button", { name: /Offline beta/ }).click();
   await expect(page.locator(".offline-document .bn-editor")).toContainText("Second online copy");
+  await expect(page.locator(".offline-document .bn-editor")).toHaveAttribute("contenteditable", "false");
   await page.locator(".offline-document .bn-editor").click();
-  await page.keyboard.type(" quick switch");
+  await page.keyboard.type(" blocked offline edit");
+  await expect(page.locator(".offline-document .bn-editor")).not.toContainText("blocked offline edit");
   await page.getByRole("button", { name: /Offline alpha/ }).click();
   await page.getByRole("button", { name: /Offline beta/ }).click();
-  await expect(page.locator(".offline-document .bn-editor")).toContainText("quick switch");
-  await page.locator(".offline-document .bn-editor").click();
-  await page.keyboard.type(" with a local edit");
-  await expect(page.locator(".offline-document .bn-editor")).toContainText("local edit");
-  await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
+  await expect(page.locator(".offline-document .bn-editor")).toContainText("Second online copy");
+  await seedLegacyDraft(page, new URL(page.url()).searchParams.get("page")!, " quick switch with a local edit");
   await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toHaveAttribute("contenteditable", "false");
   await expect(page.locator(".offline-document .bn-editor")).toContainText("local edit");
   await expect(page.locator(".offline-document .bn-editor")).toContainText("quick switch");
   const selectedPageId = new URL(page.url()).searchParams.get("page");
@@ -289,7 +293,7 @@ test("opens two visited documents offline and keeps local edits through refresh"
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
 });
 
-test("retries a failed offline write without claiming a partial save", async ({ page, context }) => {
+test("rejects offline authoring without attempting a failed storage write", async ({ page, context }) => {
   await signInOwner(page);
   await expect
     .poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller)), { timeout: 30_000 })
@@ -303,7 +307,7 @@ test("retries a failed offline write without claiming a partial save", async ({ 
   await page.waitForURL((url) =>
     Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
   );
-  await page.locator(".bn-editor").click();
+  await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
   await page.keyboard.type("Online seed");
   await expect(page.locator(".bn-editor")).toContainText("Online seed");
   await expect
@@ -314,11 +318,23 @@ test("retries a failed offline write without claiming a partial save", async ({ 
           request.addEventListener("success", () => resolve(request.result)),
         );
         const read = db.transaction("pages", "readonly").objectStore("pages").getAll();
-        const entries = await new Promise<Array<{ pageId: string }>>((resolve) =>
-          read.addEventListener("success", () => resolve(read.result)),
+        const entries = await new Promise<Array<{ pageId: string; pendingChanges?: boolean; storageKeys: string[] }>>(
+          (resolve) => read.addEventListener("success", () => resolve(read.result)),
         );
         db.close();
-        return entries.some((entry) => entry.pageId === id);
+        const entry = entries.find((item) => item.pageId === id);
+        const key = entry?.storageKeys.at(-1);
+        if (!entry || !key || entry.pendingChanges) return false;
+        const opened = indexedDB.open(key);
+        const documentDb = await new Promise<IDBDatabase>((resolve) =>
+          opened.addEventListener("success", () => resolve(opened.result)),
+        );
+        const marker = documentDb.transaction("custom", "readonly").objectStore("custom").get("noteflare-pending");
+        const pending = await new Promise<boolean>((resolve) =>
+          marker.addEventListener("success", () => resolve(Boolean(marker.result))),
+        );
+        documentDb.close();
+        return !pending;
       }, new URL(page.url()).searchParams.get("page")),
     )
     .toBe(true);
@@ -327,24 +343,25 @@ test("retries a failed offline write without claiming a partial save", async ({ 
   await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
   await expect(page.locator(".offline-document .bn-editor")).toBeVisible();
   await page.evaluate(() => {
+    (window as Window & { offlineWrites?: number }).offlineWrites = 0;
     const add = IDBObjectStore.prototype.add;
-    let failOnce = true;
     IDBObjectStore.prototype.add = function (value, key) {
-      if (this.name === "updates" && this.transaction.db.name.startsWith("account:") && failOnce) {
-        failOnce = false;
+      if (this.name === "updates" && this.transaction.db.name.startsWith("account:")) {
+        (window as Window & { offlineWrites?: number }).offlineWrites =
+          ((window as Window & { offlineWrites?: number }).offlineWrites ?? 0) + 1;
         throw new DOMException("Storage is full", "QuotaExceededError");
       }
       return add.call(this, value, key);
     };
   });
+  await expect(page.locator(".offline-document .bn-editor")).toHaveAttribute("contenteditable", "false");
   await page.locator(".offline-document .bn-editor").click();
-  await page.keyboard.type("X");
-  await expect(page.getByText("Local save failed. Export this copy before closing it.")).toBeVisible();
+  await page.keyboard.type("XY");
+  await expect(page.locator(".offline-document .bn-editor")).toHaveText("Online seed");
+  expect(await page.evaluate(() => (window as Window & { offlineWrites?: number }).offlineWrites)).toBe(0);
   await expect(page.getByText("Saved locally · pending server sync")).toHaveCount(0);
-  await page.keyboard.type("Y");
-  await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
   await page.reload();
-  await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedXY");
+  await expect(page.locator(".offline-document .bn-editor")).toHaveText("Online seed");
 });
 
 test("recovers a saved draft when the catalog pending write fails", async ({ page, context }) => {
@@ -360,7 +377,7 @@ test("recovers a saved draft when the catalog pending write fails", async ({ pag
     Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
   );
   const pageId = new URL(page.url()).searchParams.get("page")!;
-  await page.locator(".bn-editor").click();
+  await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
   await page.keyboard.type("Online seed");
   await expect(page.locator(".bn-editor")).toContainText("Online seed");
   await expect
@@ -382,21 +399,9 @@ test("recovers a saved draft when the catalog pending write fails", async ({ pag
   await context.setOffline(true);
   await page.reload();
   await expect(page.locator(".offline-document .bn-editor")).toBeVisible();
-  await page.evaluate(() => {
-    const put = IDBObjectStore.prototype.put;
-    let failOnce = true;
-    IDBObjectStore.prototype.put = function (value, key) {
-      if (this.name === "pages" && this.transaction.db.name === "noteflare-offline-catalog" && failOnce) {
-        failOnce = false;
-        throw new DOMException("Catalog unavailable", "QuotaExceededError");
-      }
-      return put.call(this, value, key);
-    };
-  });
-  await page.locator(".offline-document .bn-editor").click();
-  await page.keyboard.type("Z");
-  await expect(page.getByText("Local save failed. Export this copy before closing it.")).toBeVisible();
+  await seedLegacyDraft(page, pageId, "Z", false);
   await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toHaveAttribute("contenteditable", "false");
   await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedZ");
   await page.evaluate(async (id) => {
     const opened = indexedDB.open("noteflare-offline-catalog");
@@ -440,7 +445,7 @@ test("keeps an online editor draft when its catalog write fails", async ({ page,
     Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
   );
   const pageId = new URL(page.url()).searchParams.get("page")!;
-  await page.locator(".bn-editor").click();
+  await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
   await page.keyboard.type("Online seed");
   await expect(page.locator(".bn-editor")).toContainText("Online seed");
   await expect
@@ -471,7 +476,6 @@ test("keeps an online editor draft when its catalog write fails", async ({ page,
       }, pageId),
     )
     .toBe(true);
-  await context.setOffline(true);
   await page.evaluate(() => {
     const put = IDBObjectStore.prototype.put;
     IDBObjectStore.prototype.put = function (value, key) {
@@ -481,12 +485,17 @@ test("keeps an online editor draft when its catalog write fails", async ({ page,
       return put.call(this, value, key);
     };
   });
-  await page.locator(".bn-editor").click();
+  await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
   await page.keyboard.type("Z");
   await expect(
     page.getByText("Local changes are saved, but the offline page list could not be updated yet."),
   ).toBeVisible();
+  await (await editableDocument(page, pageId)).locator('[data-content-type="paragraph"]').last().click();
+  await page.keyboard.press("End");
   await page.keyboard.type("Q");
+  await expect(page.locator(".notes-editor .bn-editor")).toContainText("ZQ");
+  await expect.poll(() => cachedDocumentText(page, pageId)).toContain("ZQ");
+  await context.setOffline(true);
   await page.reload();
   await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedZQ");
   await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
@@ -506,7 +515,7 @@ test("opens the online workspace from a quarantined offline draft", async ({ pag
     Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
   );
   const pageId = new URL(page.url()).searchParams.get("page")!;
-  await page.locator(".bn-editor").click();
+  await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
   await page.keyboard.type("Online seed");
   await expect(page.locator(".bn-editor")).toContainText("Online seed");
   await expect
@@ -528,9 +537,9 @@ test("opens the online workspace from a quarantined offline draft", async ({ pag
   await context.setOffline(true);
   await page.reload();
   await expect(page.locator(".offline-document .bn-editor")).toBeVisible();
-  await page.locator(".offline-document .bn-editor").click();
-  await page.keyboard.type(" offline draft");
-  await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
+  await seedLegacyDraft(page, pageId, " offline draft");
+  await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toHaveAttribute("contenteditable", "false");
   await page.route(`**/api/pages/${pageId}`, async (route) => {
     const upstream = await route.fetch();
     const body = (await upstream.json()) as { page: { contentEpoch: number } };
@@ -587,7 +596,7 @@ test("warns and offers export before offline sign-out removes pending edits", as
   );
   await page.getByLabel("Page title").fill("Pending sign-out draft");
   await page.getByLabel("Page title").blur();
-  await page.locator(".bn-editor").click();
+  await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
   await page.keyboard.type("Online seed");
   await expect(page.locator(".bn-editor")).toContainText("Online seed");
   await expect.poll(() => catalogContainsPageTitle(page, "Pending sign-out draft")).toBe(true);
@@ -595,9 +604,9 @@ test("warns and offers export before offline sign-out removes pending edits", as
   await context.setOffline(true);
   await page.reload();
   await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
-  await page.locator(".offline-document .bn-editor").click();
-  await page.keyboard.type(" unsynced");
-  await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
+  await seedLegacyDraft(page, new URL(page.url()).searchParams.get("page")!, " unsynced");
+  await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toHaveAttribute("contenteditable", "false");
   await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
   await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
   await expect(page.getByText("Pending sign-out draft")).toBeVisible();
@@ -618,22 +627,22 @@ test("can finish offline sign-out when database enumeration is unavailable", asy
   await signInOwner(page);
   await page.getByLabel("Page title").fill("Enumeration fallback draft");
   await page.getByLabel("Page title").blur();
-  await page.locator(".bn-editor").click();
+  await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
   await page.keyboard.type("Cached before sign-out");
   await expect(page.locator(".bn-editor")).toContainText("Cached before sign-out");
   await expect.poll(() => catalogContainsPageTitle(page, "Enumeration fallback draft")).toBe(true);
   await context.setOffline(true);
   await page.reload();
   await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
+  await seedLegacyDraft(page, new URL(page.url()).searchParams.get("page")!, " unsynced");
+  await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toHaveAttribute("contenteditable", "false");
   await page.evaluate(() => {
     const original = indexedDB.databases.bind(indexedDB);
     (window as Window & { restoreDatabases?: () => void }).restoreDatabases = () =>
       Object.defineProperty(indexedDB, "databases", { value: original, configurable: true });
     Object.defineProperty(indexedDB, "databases", { value: undefined, configurable: true });
   });
-  await page.locator(".offline-document .bn-editor").click();
-  await page.keyboard.type(" unsynced");
-  await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
   await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
   await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
   await expect(page.getByText("Enumeration fallback draft")).toBeVisible();
@@ -708,7 +717,7 @@ test("retains drafts from both epochs in the sign-out review", async ({ page, co
   const pageId = new URL(page.url()).searchParams.get("page")!;
   await page.getByLabel("Page title").fill("Older epoch draft");
   await page.getByLabel("Page title").blur();
-  await page.locator(".bn-editor").click();
+  await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
   await page.keyboard.type("Draft from prior epoch");
   await expect(page.locator(".bn-editor")).toContainText("Draft from prior epoch");
   await expect
@@ -790,8 +799,8 @@ test("retains drafts from both epochs in the sign-out review", async ({ page, co
     .toMatchObject({ epoch: 1, pendingChanges: false, pendingCopyKeys: [olderKey] });
 
   await context.setOffline(true);
-  await page.locator(".bn-editor").click();
-  await page.keyboard.type(" Current epoch draft");
+  await seedLegacyDraft(page, pageId, " Current epoch draft");
+  await page.reload();
   await expect(page.locator(".bn-editor")).toContainText("Current epoch draft");
   await expect
     .poll(() =>
@@ -810,7 +819,7 @@ test("retains drafts from both epochs in the sign-out review", async ({ page, co
     )
     .toBe(2);
 
-  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
   await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
   await expect(page.getByText("Older epoch draft")).toBeVisible();
   const download = page.waitForEvent("download");
@@ -836,7 +845,7 @@ test("keeps an unscoped Yjs copy hidden without deleting it", async ({ page }) =
   await page.getByLabel("Page title").fill("Legacy recovery probe");
   await page.getByLabel("Page title").blur();
   await expect(page.locator(`[data-tree-page="${pageId}"]`)).toContainText("Legacy recovery probe");
-  await page.locator(".bn-editor").click();
+  await (await editableDocument(page, new URL(page.url()).searchParams.get("page")!)).click();
   await page.keyboard.type("Older local content");
   await expect(page.locator(".bn-editor")).toContainText("Older local content");
   const legacyName = await page.evaluate(async (id) => {

@@ -23,6 +23,7 @@ import { mutateTask, taskListStatements, listTasks } from "./tasks";
 import { acceptPageDeletion, processDeletionJob } from "./cleanup";
 import { logger } from "./observability";
 import { HttpError } from "./http";
+import { tableActorSignature } from "./table-authority";
 import type { ProjectionStatement, TableActor } from "./table-authority";
 
 beforeEach(async () => {
@@ -140,6 +141,63 @@ async function addEffect(pageId: string, revision: number) {
 }
 
 describe("per-table authority", () => {
+  it.each([undefined, null, Number.NaN, Number.POSITIVE_INFINITY, -1, "invalid", 1e20])(
+    "rejects socket deadline %s before accepting a pair",
+    async (deadline) => {
+      const { pageId, member } = await fixture();
+      await enableTableAuthority(env, member, pageId);
+      const before = await queryTable(env, member, pageId);
+      const actor = {
+        pageId,
+        workspaceId: member.workspace.id,
+        userId: member.user.id,
+        generation: before.generation,
+        expiresAt: Date.now() + 60_000,
+        socketExpiresAt: deadline,
+      } as TableActor;
+      const response = await env.TABLE.getByName(pageId).fetch(
+        new Request("https://table.internal/socket", {
+          headers: {
+            Upgrade: "websocket",
+            "x-table-actor": JSON.stringify(actor),
+            "x-table-signature": await tableActorSignature(env.BETTER_AUTH_SECRET, actor),
+          },
+        }),
+      );
+      expect(response.status).toBe(403);
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) =>
+        expect(state.getWebSockets()).toHaveLength(0),
+      );
+      await write(pageId, member, "create_column", { id: "valid", name: "Valid", type: "text" });
+      expect((await queryTable(env, member, pageId)).columns.some((column) => column.id === "valid")).toBe(true);
+    },
+  );
+  it.each(["null", "legacy", "expired", "closing"])("commits commands with %s socket attachments", async (kind) => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    if (kind === "null") {
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        state.acceptWebSocket(new WebSocketPair()[1]);
+      });
+    } else {
+      const socket = (await tableFetch(env, member, pageId, "/socket")).webSocket!;
+      socket.accept();
+      await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+        const server = state.getWebSockets()[0]!;
+        const actor = server.deserializeAttachment() as TableActor;
+        if (kind === "legacy") delete actor.socketExpiresAt;
+        else actor.socketExpiresAt = Date.now() - 1;
+        server.serializeAttachment(actor);
+        if (kind === "closing") server.close(4401);
+        else await instance.webSocketMessage(server);
+      });
+    }
+    const before = await queryTable(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "after-orphan", name: "After orphan", type: "text" });
+    const after = await queryTable(env, member, pageId);
+    expect(after.revision).toBe(before.revision + 1);
+    expect(after.columns.some((column) => column.id === "after-orphan")).toBe(true);
+  });
   it("covers table sockets beyond the short actor expiry and fences them before completion", async () => {
     const { pageId, member } = await fixture();
     await enableTableAuthority(env, member, pageId);

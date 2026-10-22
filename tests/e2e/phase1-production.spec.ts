@@ -1,7 +1,7 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { embedProviders } from "../../src/shared/embed-providers";
 import type { ProseMirrorJson } from "../../src/shared/types";
-import { signInOwner } from "./security-helpers";
+import { signInOwner, editableDocument } from "./security-helpers";
 
 test.setTimeout(90_000);
 
@@ -16,9 +16,11 @@ async function createDocument(page: Page) {
     Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
   );
   await expect(page.getByLabel("Page title")).toHaveValue("Untitled");
+  await editableDocument(page, new URL(page.url()).searchParams.get("page")!);
 }
 
 async function insertSlashBlock(page: Page, name: string) {
+  await editableDocument(page, new URL(page.url()).searchParams.get("page")!);
   const paragraph = page.locator('.bn-editor [data-content-type="paragraph"]').last();
   await paragraph.click();
   await page.keyboard.type("/");
@@ -29,7 +31,9 @@ async function watchCsp(page: Page) {
   await page.addInitScript(() => {
     window.addEventListener("securitypolicyviolation", (event) => {
       const violations = JSON.parse(sessionStorage.getItem("phase1:csp") ?? "[]") as string[];
-      violations.push(`${event.effectiveDirective}: ${event.blockedURI}`);
+      violations.push(
+        `${event.effectiveDirective}: ${event.blockedURI} at ${event.sourceFile}:${event.lineNumber}:${event.columnNumber}`,
+      );
       sessionStorage.setItem("phase1:csp", JSON.stringify(violations));
     });
   });

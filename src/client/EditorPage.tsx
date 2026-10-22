@@ -941,7 +941,7 @@ export function EditorPage({
   }
 
   return (
-    <main className={`page-canvas ${page.fullWidth ? "full-width" : ""}`}>
+    <main data-document-page-id={page.id} className={`page-canvas ${page.fullWidth ? "full-width" : ""}`}>
       <PageTools>
         <PageInfoPopover pageId={page.id} />
         {(!online || status !== "connected" || !connectionSynced) && (

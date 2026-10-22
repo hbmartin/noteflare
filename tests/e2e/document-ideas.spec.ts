@@ -1,6 +1,6 @@
 import * as Y from "yjs";
 import { expect, test, type Route } from "@playwright/test";
-import { signInOwner, completeEnrollment } from "./security-helpers";
+import { signInOwner, completeEnrollment, editableDocument } from "./security-helpers";
 test.setTimeout(60000);
 
 test("block links remain usable through fragment history and clipboard denial", async ({ page, context }) => {
@@ -18,11 +18,11 @@ test("block links remain usable through fragment history and clipboard denial", 
     });
   });
   await page.goto(`/?page=${created.page.id}`);
-  const editor = page.locator(".bn-editor");
-  await expect(editor).toBeVisible();
+  const editor = await editableDocument(page, created.page.id);
   await editor.click();
   await page.keyboard.insertText("Linked target");
   const block = editor.locator("[data-id]").filter({ hasText: "Linked target" }).first();
+  await expect(block).toContainText("Linked target");
   const id = await block.getAttribute("data-id");
   expect(id).toBeTruthy();
   await page.getByRole("button", { name: "Block actions", exact: true }).click();
@@ -100,8 +100,8 @@ test("live diagram embeds show remote edits with local zoom", async ({ page, con
     })
   ).json();
   await page.goto(`/?page=${document.page.id}`);
-  await expect(page.locator(".bn-editor")).toBeVisible();
-  await page.locator(".bn-editor").click();
+  const editor = await editableDocument(page, document.page.id);
+  await editor.click();
   await page.keyboard.type("/whiteboard", { delay: 30 });
   await page
     .getByRole("option", { name: /Linked whiteboard/i })
@@ -151,12 +151,12 @@ test("History previews the full saved version before restore", async ({ page }) 
     await page.request.post("/api/pages", { data: { kind: "document", title: `Saved preview ${Date.now()}` } })
   ).json();
   await page.goto(`/?page=${created.page.id}`);
-  const editor = page.locator(".bn-editor");
-  await expect(editor).toBeVisible();
+  const editor = await editableDocument(page, created.page.id);
   await editor.click();
   await page.keyboard.insertText("Unchanged paragraph");
   await page.keyboard.press("Enter");
   await page.keyboard.insertText("Original paragraph");
+  await expect(editor).toContainText("Original paragraph");
   const ids = await editor
     .locator(".bn-block-outer")
     .evaluateAll((blocks) => blocks.map((block) => block.getAttribute("data-id")!));
@@ -233,8 +233,7 @@ test("nested block links expand local toggles and remain keyboard-accessible to 
   ).json();
   await page.goto(`/?page=${created.page.id}`);
   await page.emulateMedia({ reducedMotion: "reduce" });
-  const editor = page.locator(".bn-editor");
-  await expect(editor).toBeVisible();
+  const editor = await editableDocument(page, created.page.id);
   await editor.click();
   await page.keyboard.type("/toggle", { delay: 30 });
   await page
@@ -266,7 +265,7 @@ test("nested block links expand local toggles and remain keyboard-accessible to 
       });
     });
     await guest.goto(`/?invite=${invitation.invite.token}`);
-    await guest.getByLabel("Your name").fill("Block viewer");
+    await guest.getByLabel("Your name").fill(`Block viewer ${crypto.randomUUID()}`);
     await guest.getByLabel("Email", { exact: true }).fill(`block-viewer-${Date.now()}@example.test`);
     await guest.getByLabel("Password", { exact: true }).fill("password123");
     await guest.getByRole("button", { name: "Accept invite" }).click();

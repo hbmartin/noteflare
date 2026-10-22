@@ -1,5 +1,6 @@
 import type { Page } from "../shared/types";
-import { ApiClientError, api } from "./api";
+import { ApiClientError, api, unauthorizedResolution } from "./api";
+import { realtimeAccessAccount } from "./realtime-access-status";
 import { connectionRetryDelay } from "./retry";
 
 export type ProviderControl = {
@@ -35,6 +36,7 @@ export function createDocumentCloseReconciler({
   let closeCheck = 0;
   let reconnectAttempt = 0;
   let timer: number | undefined;
+  let waitingForAuthorization = false;
 
   const clearTimer = () => {
     if (timer !== undefined) window.clearTimeout(timer);
@@ -67,6 +69,7 @@ export function createDocumentCloseReconciler({
   };
 
   const reconcileClose = async (code: number, check: number, attempt = 0): Promise<void> => {
+    const account = realtimeAccessAccount();
     try {
       const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
       if (!active || check !== closeCheck) return;
@@ -93,10 +96,19 @@ export function createDocumentCloseReconciler({
           return;
         }
         if (error.status === 401) {
-          active = false;
-          invalidate();
+          const authCheck = invalidate();
+          waitingForAuthorization = true;
           provider.disconnect();
-          onUnauthorized?.();
+          const recovery = unauthorizedResolution(error);
+          const resolution = recovery ? await recovery : "failed";
+          if (!active || authCheck !== closeCheck || account !== realtimeAccessAccount()) return;
+          waitingForAuthorization = false;
+          if (resolution === "ready" || resolution === "obsolete") {
+            schedule(() => void reconcileClose(4403, authCheck), connectionRetryDelay(attempt));
+          } else {
+            active = false;
+            if (!recovery) onUnauthorized?.();
+          }
           return;
         }
         if (error.status === 403) {
@@ -118,7 +130,7 @@ export function createDocumentCloseReconciler({
 
   return {
     handleClose(event: CloseEvent) {
-      if (!active) return;
+      if (!active || waitingForAuthorization) return;
       if (TRANSITION_CLOSE_CODES.has(event.code)) provider.disconnect();
       if (event.code === 4411) {
         unavailable();

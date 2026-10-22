@@ -425,3 +425,21 @@ describe("collaboration durability barriers", () => {
     bundle.destroy();
   });
 });
+
+it("keeps suspended diagrams paused across retry and visibility paths until authorized resume", async () => {
+  vi.useFakeTimers();
+  const bundle = createNetworkCollaboration("paused-page", 1, vi.fn());
+  const provider = mocks.providers.at(-1)!;
+  const before = provider.connect.mock.calls.length;
+  bundle.suspend();
+  provider.emit("status", { status: "disconnected" });
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(provider.connect).toHaveBeenCalledTimes(before);
+  await bundle.resume();
+  expect(provider.connect).toHaveBeenCalledTimes(before + 1);
+  bundle.destroy();
+  await bundle.resume();
+  expect(provider.connect).toHaveBeenCalledTimes(before + 1);
+  vi.useRealTimers();
+});

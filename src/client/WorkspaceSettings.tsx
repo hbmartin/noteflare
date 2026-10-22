@@ -1,4 +1,8 @@
-import { setRealtimeAccessPending, useRealtimeAccessPending, realtimeAccessAccount } from "./realtime-access-status";
+import {
+  requestRealtimeAccessCheck,
+  requestRealtimeAccessReconciliation,
+  useRealtimeAccessStatus,
+} from "./realtime-access-status";
 import { useCallback, useEffect, useState } from "react";
 import type { ClientMemberContext, Space, Page, Role } from "../shared/types";
 import { api, json, apiErrorMessage, ApiClientError } from "./api";
@@ -23,7 +27,8 @@ export function WorkspaceSettings({
   const [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
     [membersStale, setMembersStale] = useState(false);
-  const pendingAccess = useRealtimeAccessPending();
+  const access = useRealtimeAccessStatus();
+  const pendingAccess = member.role === "owner" && access.pending;
 
   const load = useCallback(
     () =>
@@ -33,18 +38,6 @@ export function WorkspaceSettings({
       }),
     [],
   );
-  const refreshAccess = useCallback(
-    async (reconcile = false) => {
-      if (member.role !== "owner") return;
-      const account = realtimeAccessAccount();
-      const status = await api<{ complete: boolean }>(
-        `/api/security/realtime/${reconcile ? "reconcile" : "status"}`,
-        reconcile ? { method: "POST" } : undefined,
-      );
-      if (account === realtimeAccessAccount()) setRealtimeAccessPending(!status.complete);
-    },
-    [member.role],
-  );
   async function change(action: () => Promise<unknown>) {
     setBusy(true);
     setError("");
@@ -52,8 +45,7 @@ export function WorkspaceSettings({
       await action();
     } catch (cause) {
       setError(apiErrorMessage(cause, "The access change could not be completed."));
-      if (cause instanceof ApiClientError && cause.code === "realtime_revocation_pending")
-        setRealtimeAccessPending(true);
+      if (cause instanceof ApiClientError && cause.code === "realtime_revocation_pending") requestRealtimeAccessCheck();
     } finally {
       try {
         await load();
@@ -61,7 +53,7 @@ export function WorkspaceSettings({
         setMembersStale(true);
         setError("The member list could not be refreshed. Refresh before changing access again.");
       }
-      await refreshAccess().catch(() => undefined);
+      requestRealtimeAccessCheck();
       setBusy(false);
     }
   }
@@ -70,24 +62,7 @@ export function WorkspaceSettings({
       setMembersStale(true);
       setError("The member list could not be loaded.");
     });
-    void refreshAccess().catch(() => undefined);
-  }, [load, refreshAccess]);
-  useEffect(() => {
-    if (!pendingAccess || member.role !== "owner") return undefined;
-    let stopped = false,
-      attempt = 0,
-      timer: ReturnType<typeof setTimeout>;
-    const retry = async () => {
-      if (stopped) return;
-      if (navigator.onLine && !document.hidden) await refreshAccess(true).catch(() => undefined);
-      if (!stopped) timer = setTimeout(() => void retry(), Math.min(30_000, 2000 * 2 ** Math.min(attempt++, 4)));
-    };
-    timer = setTimeout(() => void retry(), 2000);
-    return () => {
-      stopped = true;
-      clearTimeout(timer);
-    };
-  }, [pendingAccess, refreshAccess, member.role]);
+  }, [load]);
   async function invite(role: "editor" | "viewer") {
     const result = await api<{ invite: { token: string } }>("/api/invites", { method: "POST", body: json({ role }) });
     setInviteUrl(`${location.origin}/?invite=${result.invite.token}`);
@@ -120,15 +95,9 @@ export function WorkspaceSettings({
         <p aria-live="polite">Saved; live access refresh pending. Existing connections are still being refreshed.</p>
       )}
       {membersStale && <button onClick={() => void load().catch(() => undefined)}>Refresh member list</button>}
-      {pendingAccess && (
-        <button
-          disabled={busy}
-          onClick={() =>
-            void refreshAccess(true).catch((cause) =>
-              setError(apiErrorMessage(cause, "Live access refresh could not be completed.")),
-            )
-          }
-        >
+      {member.role === "owner" && access.error && <p role="alert">{access.error}</p>}
+      {member.role === "owner" && (pendingAccess || access.error) && (
+        <button disabled={busy} onClick={requestRealtimeAccessReconciliation}>
           Retry live access refresh
         </button>
       )}

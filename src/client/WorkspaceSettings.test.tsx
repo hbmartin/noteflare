@@ -3,8 +3,9 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import { api } from "./api";
+import { useRealtimeAccessCoordinator } from "./RealtimeAccessCoordinator";
 import { WorkspaceSettings } from "./WorkspaceSettings";
-import { setRealtimeAccessAccount, setRealtimeAccessPending } from "./realtime-access-status";
+import { setRealtimeAccessAccount, acceptRealtimeAccessStatus, realtimeAccessAccount } from "./realtime-access-status";
 vi.mock("./api", async (original) => ({ ...(await original<typeof import("./api")>()), api: vi.fn() }));
 vi.mock("./SecurityScreen", () => ({ SecurityScreen: () => null }));
 vi.mock("./SlackSettings", () => ({ SlackSettings: () => null }));
@@ -15,7 +16,6 @@ vi.mock("./ThemeControl", () => ({ ThemeControl: () => null }));
 beforeEach(() => {
   vi.useFakeTimers();
   setRealtimeAccessAccount("settings-regression");
-  setRealtimeAccessPending(false);
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -25,13 +25,13 @@ afterEach(() => {
 it("names the generated invitation link for assistive technology", async () => {
   vi.mocked(api).mockImplementation(async (path) => {
     if (path === "/api/members") return { members: [] };
-    if (path.endsWith("/status")) return { complete: true };
+    if (path.endsWith("/status")) return { revision: 1, completedRevision: 1, complete: true };
     if (path === "/api/invites") return { invite: { token: "generated-token" } };
     throw new Error(path);
   });
   await act(async () => {
     render(
-      <WorkspaceSettings
+      <CoordinatedSettings
         member={{ role: "owner", user: { id: "owner", name: "Owner" } } as ClientMemberContext}
         spaces={[]}
         pages={[]}
@@ -63,20 +63,20 @@ it("shows committed membership while fencing retries never resubmit the mutation
       role = "viewer";
       pending = true;
       changes++;
-      setRealtimeAccessPending(true);
+      acceptRealtimeAccessStatus({ revision: 1, completedRevision: 0, complete: false }, realtimeAccessAccount());
       return { ok: true };
     }
     if (path.endsWith("/reconcile")) {
       reconciles++;
       pending = false;
-      return { complete: true };
+      return { revision: 1, completedRevision: 1, complete: true };
     }
-    if (path.endsWith("/status")) return { complete: !pending };
+    if (path.endsWith("/status")) return { revision: pending ? 1 : 0, completedRevision: 0, complete: !pending };
     throw new Error(path);
   });
   await act(async () => {
     render(
-      <WorkspaceSettings
+      <CoordinatedSettings
         member={{ role: "owner", user: { id: "owner", name: "Owner" } } as ClientMemberContext}
         spaces={[]}
         pages={[]}
@@ -95,4 +95,25 @@ it("shows committed membership while fencing retries never resubmit the mutation
   expect(reconciles).toBe(1);
   expect(changes).toBe(1);
   expect(screen.queryByText(/Saved; live access refresh pending/)).toBeNull();
+});
+
+function CoordinatedSettings(props: Parameters<typeof WorkspaceSettings>[0]) {
+  useRealtimeAccessCoordinator(props.member.role === "owner");
+  return <WorkspaceSettings {...props} />;
+}
+it.each(["editor", "viewer"])("hides owner-only pending controls from %s", async (role) => {
+  acceptRealtimeAccessStatus({ revision: 1, completedRevision: 0, complete: false }, realtimeAccessAccount());
+  vi.mocked(api).mockReset().mockResolvedValue({ members: [] });
+  await act(async () =>
+    render(
+      <CoordinatedSettings
+        member={{ role, user: { id: "member", name: "Member" } } as ClientMemberContext}
+        spaces={[]}
+        pages={[]}
+      />,
+    ),
+  );
+  expect(screen.queryByText(/live access refresh pending/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Retry live access refresh" })).toBeNull();
+  expect(vi.mocked(api).mock.calls.some(([path]) => path.includes("/api/security/realtime"))).toBe(false);
 });

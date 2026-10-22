@@ -6,6 +6,21 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 const ownerCookies = process.env.NOTES_E2E_COOKIES ?? ".wrangler/e2e/owner-cookies.json";
 const WORKSPACE_READY_TIMEOUT_MS = 20_000;
 
+export async function editableDocument(page: Page, pageId: string) {
+  await expect.poll(() => new URL(page.url()).searchParams.get("page")).toBe(pageId);
+  const editor = page.locator(`[data-document-page-id=${JSON.stringify(pageId)}] .notes-editor .bn-editor`);
+  await expect(editor).toHaveAttribute("contenteditable", "true", { timeout: WORKSPACE_READY_TIMEOUT_MS });
+  return editor;
+}
+
+export async function createTestSpace(page: Page, name: string) {
+  const response = await page.request.post("/api/spaces", {
+    data: { name: `${name} ${crypto.randomUUID()}`, visibility: "workspace" },
+  });
+  expect(response.status()).toBe(201);
+  return (await response.json()).space as { id: string; visibility: string };
+}
+
 export async function openNavigation(page: Page) {
   const toggle = page.getByRole("button", { name: "Open navigation" });
   if (!(await toggle.isVisible())) return;

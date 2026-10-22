@@ -853,3 +853,47 @@ describe("collaborative table UI", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Showing all rows in Grid");
   });
 });
+
+it("isolates colon-containing cell draft pairs across remounts", async () => {
+  data.columns = [column("c", "text"), column("b:c", "text")];
+  const row = data.rows[0]!;
+  data.rows = [{ ...row, id: "a:b", cells: { c: "First" }, cellRevisions: { c: 1 } }];
+  show();
+  const first = await screen.findByLabelText("c");
+  fireEvent.focus(first);
+  fireEvent.change(first, { target: { value: "First draft" } });
+  data = { ...data, rows: [] };
+  await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+  data = { ...data, rows: [{ ...row, id: "a", cells: { "b:c": "Second" }, cellRevisions: { "b:c": 1 } }] };
+  await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+  const second = screen.getByLabelText("b:c");
+  expect(second).toHaveValue("Second");
+  fireEvent.focus(second);
+  fireEvent.change(second, { target: { value: "Second draft" } });
+  fireEvent.blur(second);
+  await waitFor(() => expect(writes).toHaveLength(1));
+  expect(writes[0]!.payload).toMatchObject({
+    rowId: "a",
+    values: { "b:c": "Second draft" },
+    expectedCellRevisions: { "b:c": 1 },
+  });
+  data = { ...data, rows: [{ ...row, id: "a:b", cells: { c: "First" }, cellRevisions: { c: 1 } }] };
+  await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+  expect(screen.getByLabelText("c")).toHaveValue("First draft");
+});
+it("drops focus-only snapshots when a filtered cell unmounts", async () => {
+  show();
+  fireEvent.focus(await screen.findByLabelText("Title"));
+  const row = data.rows[0]!;
+  data = { ...data, rows: [] };
+  await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+  data = {
+    ...data,
+    revision: 2,
+    rows: [{ ...row, cells: { ...row.cells, Title: "Remote" }, cellRevisions: { ...row.cellRevisions, Title: 2 } }],
+  };
+  await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+  expect(screen.getByLabelText("Title")).toHaveValue("Remote");
+  expect(screen.queryByText(/Your edit is preserved/)).toBeNull();
+  expect(writes).toHaveLength(0);
+});

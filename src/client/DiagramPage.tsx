@@ -73,6 +73,7 @@ const STENCILS: Array<{ type: DiagramNodeType; label: string; icon: string }> = 
 ];
 const COLORS: DiagramColor[] = ["slate", "blue", "green", "amber", "red", "purple"];
 const LOCAL_ORIGIN = Symbol("diagram-local");
+const diagramRestoreNotices = new Set<string>();
 
 function replaceYText(map: Y.Map<unknown>, key: string, value: string) {
   const current = map.get(key);
@@ -1091,6 +1092,10 @@ export function DiagramPage({
   const [anchor, setAnchor] = useState<CommentAnchor | null>(null);
   const [threads, setThreads] = useState<CommentThread[]>([]);
   const [schemaUpgrade, setSchemaUpgrade] = useState(false);
+  const [restoreQuarantine, setRestoreQuarantine] = useState(false);
+  // Keep only the notice across the parent's keyed epoch remount, never document data.
+  const noticeKey = `${member.user.id}\0${member.workspace.id}\0${page.id}\0${page.contentEpoch}`;
+  const [restoreNotice, setRestoreNotice] = useState(() => diagramRestoreNotices.has(noticeKey));
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
   const title = titleEdit.pageId === page.id && titleEdit.revision === page.revision ? titleEdit.value : page.title;
   useEffect(() => {
@@ -1108,18 +1113,26 @@ export function DiagramPage({
     };
     const reconciler = createDocumentCloseReconciler({
       page: { id: page.id, contentEpoch: page.contentEpoch },
-      provider: next.provider,
+      provider: { connect: () => next.resume(), disconnect: () => next.suspend() },
       hasUnsyncedChanges: () => next.hasUnsyncedChanges,
-      quarantine: () => setSchemaUpgrade(true),
-      onPageChanged,
+      quarantine: () => setRestoreQuarantine(true),
+      onPageChanged: (updated) => {
+        if (next.hasUnsyncedChanges && updated.contentEpoch !== page.contentEpoch)
+          diagramRestoreNotices.add(`${member.user.id}\0${member.workspace.id}\0${page.id}\0${updated.contentEpoch}`);
+        onPageChanged(updated);
+      },
       onPageUnavailable,
       onAccessDenied,
     });
     const close = (event: CloseEvent) => {
       if (active) reconciler.handleClose(event);
     };
+    const sync = (synced: boolean) => {
+      if (active) reconciler.handleSync(synced);
+    };
     next.provider.on("custom-message", custom);
     next.provider.on("connection-close", close);
+    next.provider.on("sync", sync);
     queueMicrotask(() => {
       if (active) setBundle(next);
     });
@@ -1135,10 +1148,19 @@ export function DiagramPage({
       window.removeEventListener("beforeunload", unload);
       next.provider.off("custom-message", custom);
       next.provider.off("connection-close", close);
+      next.provider.off("sync", sync);
       reconciler.destroy();
       next.destroy();
     };
-  }, [onAccessDenied, onPageUnavailable, onPageChanged, page.contentEpoch, page.id]);
+  }, [
+    onAccessDenied,
+    onPageUnavailable,
+    onPageChanged,
+    page.contentEpoch,
+    page.id,
+    member.user.id,
+    member.workspace.id,
+  ]);
   useEffect(() => {
     void api<{ threads: CommentThread[] }>(`/api/pages/${page.id}/comments?revision=${commentsRevision}`)
       .then((data) => setThreads(data.threads))
@@ -1147,7 +1169,8 @@ export function DiagramPage({
 
   const connected = status === "connected" && Boolean(bundle?.synced) && ready;
   const online = useOnlineStatus();
-  const editable = online && member.role !== "viewer" && connected && !sizeWarning?.readOnly && !schemaUpgrade;
+  const editable =
+    online && member.role !== "viewer" && connected && !sizeWarning?.readOnly && !schemaUpgrade && !restoreQuarantine;
 
   async function saveTitle() {
     const normalized = title.trim() || "Untitled";
@@ -1193,6 +1216,25 @@ export function DiagramPage({
             Reload diagram
           </button>
         </p>
+      )}
+      {restoreQuarantine && (
+        <p className="notice notice-danger" role="alert">
+          This diagram is changing versions. Unacknowledged local edits cannot be merged into the restored version.{" "}
+          <button onClick={() => window.location.reload()}>Reload current diagram</button>
+        </p>
+      )}
+      {restoreNotice && (
+        <output className="notice">
+          This diagram was restored. Unacknowledged local edits were not merged.{" "}
+          <button
+            onClick={() => {
+              diagramRestoreNotices.delete(noticeKey);
+              setRestoreNotice(false);
+            }}
+          >
+            Dismiss restore notice
+          </button>
+        </output>
       )}
       {sizeWarning ? (
         <div className={`notice ${sizeWarning.readOnly ? "notice-danger" : ""}`}>

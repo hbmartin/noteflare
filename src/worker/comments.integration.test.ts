@@ -103,6 +103,7 @@ describe("server-authoritative comments", () => {
   it("fences document and table editors when their first viewer override is inserted", async () => {
     const owner = await bootstrap();
     const editor = await invite(owner.cookie, "first-viewer-grant", "editor");
+    const expanded = await invite(owner.cookie, "expansion-grant", "editor");
     const page = await env.DB.prepare("SELECT space_id FROM pages WHERE id=?")
       .bind(owner.pageId)
       .first<{ space_id: string }>();
@@ -143,6 +144,21 @@ describe("server-authoritative comments", () => {
           body: JSON.stringify({ role }),
         }),
       );
+    const expansion = await SELF.fetch(
+      request(owner.cookie, `/api/spaces/${page!.space_id}/members/${expanded.userId}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role: "editor" }),
+      }),
+    );
+    expect(expansion.status).toBe(200);
+    expect(expansion.headers.has("X-Notes-Realtime-Status")).toBe(false);
+    expect(sockets.map((socket) => socket.readyState)).toEqual([WebSocket.OPEN, WebSocket.OPEN]);
+    expect(
+      (await env.DB.prepare("SELECT revision FROM realtime_revocations WHERE workspace_id=?")
+        .bind(owner.workspaceId)
+        .first<number>("revision")) ?? 0,
+    ).toBe(before);
     expect((await grant("viewer")).status).toBe(200);
     expect(await Promise.all(closed)).toEqual([4403, 4403]);
     const status = () =>

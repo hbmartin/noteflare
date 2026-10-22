@@ -3,7 +3,7 @@ import type { Env } from "./env";
 import { HttpError } from "./http";
 import { correlationHeaders } from "./observability";
 
-export type RealtimeAccessStatus = { revision: number; completedRevision: number; complete: boolean };
+import type { RealtimeAccessStatus } from "../shared/realtime-access";
 const impacts = new AsyncLocalStorage<Map<string, Promise<number>>>();
 async function control(env: Env, workspaceId: string, path: string, body: unknown) {
   return env.WORKSPACE_EVENTS.getByName(workspaceId).fetch(
@@ -62,44 +62,66 @@ export async function withRealtimeAccessTracking(env: Env, run: () => Promise<Re
     }
     let changed = false,
       pending = false;
+    const affected: Array<{ workspaceId: string; status: RealtimeAccessStatus | null }> = [];
     for (const [workspaceId, snapshot] of impacts.getStore()!) {
       try {
         const before = await snapshot;
         const after = await realtimeAccessStatus(env, workspaceId);
         if (after.revision <= before) continue;
         changed = true;
-        if (!(await flushRealtimeRevocations(env, workspaceId))) pending = true;
+        const status = await reconcileRealtimeAccessStatus(env, workspaceId, after);
+        affected.push({ workspaceId, status });
+        if (!status.complete) pending = true;
       } catch {
         changed = true;
         pending = true;
+        affected.push({ workspaceId, status: null });
       }
     }
     if (failed) throw failure;
     if (!changed) return response!;
     const result = new Response(response!.body, response);
     result.headers.set("X-Notes-Realtime-Status", pending ? "pending" : "complete");
+    const only = affected.length === 1 ? affected[0] : undefined;
+    if (only?.status) {
+      result.headers.set("X-Notes-Realtime-Workspace", only.workspaceId);
+      result.headers.set("X-Notes-Realtime-Revision", String(only.status.revision));
+      result.headers.set("X-Notes-Realtime-Completed-Revision", String(only.status.completedRevision));
+    }
     return result;
   });
 }
 /** A workspace-specific barrier; the final read catches concurrent newer intents. */
 export async function flushRealtimeRevocations(env: Env, workspaceId: string) {
-  const status = await realtimeAccessStatus(env, workspaceId);
-  if (status.complete) return true;
+  try {
+    return (await reconcileRealtimeAccessStatus(env, workspaceId)).complete;
+  } catch {
+    return false;
+  }
+}
+export async function reconcileRealtimeAccessStatus(
+  env: Env,
+  workspaceId: string,
+  knownStatus?: RealtimeAccessStatus,
+): Promise<RealtimeAccessStatus> {
+  const status = knownStatus ?? (await realtimeAccessStatus(env, workspaceId));
+  if (status.complete) return status;
   try {
     await env.DB.prepare("UPDATE realtime_revocations SET last_attempted_at=? WHERE workspace_id=?")
       .bind(Date.now(), workspaceId)
       .run();
     const response = await control(env, workspaceId, "/revoke-rooms", { generation: status.revision });
-    if (!response.ok) return false;
-    await env.DB.prepare(
-      "UPDATE realtime_revocations SET completed_revision=max(completed_revision,?) WHERE workspace_id=?",
-    )
-      .bind(status.revision, workspaceId)
-      .run();
-    return (await realtimeAccessStatus(env, workspaceId)).complete;
+    if (response.ok)
+      await env.DB.prepare(
+        "UPDATE realtime_revocations SET completed_revision=max(completed_revision,?) WHERE workspace_id=?",
+      )
+        .bind(status.revision, workspaceId)
+        .run();
   } catch {
-    return false;
+    // A failed fanout is pending work. Only the final read can provide verified
+    // revision metadata; a failed read must fall back to unversioned invalidation.
   }
+  return realtimeAccessStatus(env, workspaceId);
 }
 /** Fair, bounded maintenance. Batch completion is not global completion. */
 export async function drainRealtimeRevocationsBatch(env: Env) {

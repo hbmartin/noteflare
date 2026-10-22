@@ -77,6 +77,9 @@ describe("realtime access barriers", () => {
       expect(response.headers.get("set-cookie")).toContain("session=retained");
       expect(response.headers.get("location")).toBe("/done");
       expect(response.headers.get("X-Notes-Realtime-Status")).toBe("pending");
+      expect(response.headers.get("X-Notes-Realtime-Workspace")).toBe(id);
+      expect(response.headers.get("X-Notes-Realtime-Revision")).toBe("2");
+      expect(response.headers.get("X-Notes-Realtime-Completed-Revision")).toBe("0");
       expect(attempted).toEqual([id]);
       expect((await realtimeAccessStatus(env, other)).complete).toBe(false);
     },
@@ -92,6 +95,44 @@ describe("realtime access barriers", () => {
     });
     expect(response.status).toBe(201);
     expect(response.headers.has("X-Notes-Realtime-Status")).toBe(false);
+  });
+  it("keeps aggregate responses free of other workspace revision identifiers", async () => {
+    const ids = [await workspace(), await workspace()];
+    const bindings = runtime(async () => new Response(null, { status: 204 }));
+    const response = await withRealtimeAccessTracking(bindings, async () => {
+      for (const id of ids) {
+        await trackRealtimeWorkspace(bindings, id);
+        await env.DB.prepare("UPDATE realtime_revocations SET revision=revision+1 WHERE workspace_id=?").bind(id).run();
+      }
+      return Response.json({ ok: true });
+    });
+    expect(response.headers.get("X-Notes-Realtime-Status")).toBe("complete");
+    for (const name of ["Workspace", "Revision", "Completed-Revision"])
+      expect(response.headers.has(`X-Notes-Realtime-${name}`)).toBe(false);
+  });
+  it("does not emit stale revision metadata when the final verification read fails", async () => {
+    const id = await workspace();
+    let drained = false;
+    const bindings = runtime(async () => {
+      drained = true;
+      return new Response(null, { status: 204 });
+    });
+    bindings.DB = {
+      prepare: (sql: string) => {
+        if (drained && sql.startsWith("SELECT revision,completed_revision"))
+          throw new Error("read failed after commit");
+        return env.DB.prepare(sql);
+      },
+    } as D1Database;
+    const response = await withRealtimeAccessTracking(bindings, async () => {
+      await trackRealtimeWorkspace(bindings, id);
+      await env.DB.prepare("UPDATE realtime_revocations SET revision=revision+1 WHERE workspace_id=?").bind(id).run();
+      return Response.json({ saved: true }, { status: 201 });
+    });
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({ saved: true });
+    expect(response.headers.get("X-Notes-Realtime-Status")).toBe("pending");
+    expect(response.headers.has("X-Notes-Realtime-Revision")).toBe(false);
   });
   it("does not label a failed pre-mutation access read as a saved transition", async () => {
     const bindings = runtime(async () => {

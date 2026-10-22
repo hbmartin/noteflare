@@ -55,7 +55,7 @@ export function RelationPanel({
       try {
         const value = await api<Details>(
           `/api/tables/${data.pageId}/relations?rowId=${encodeURIComponent(rowId)}&sourceRevision=${data.revision}`,
-          { signal: controller.signal },
+          { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]) },
         );
         if (!disposed) {
           setDetails(value);

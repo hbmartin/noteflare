@@ -1,3 +1,4 @@
+import { useRealtimeAccessCoordinator } from "./RealtimeAccessCoordinator";
 import { setRealtimeAccessAccount } from "./realtime-access-status";
 import { loadForegroundModule } from "./chunk-recovery";
 import { slackAuthErrorMessage } from "./slack-auth-errors";
@@ -986,14 +987,22 @@ export function App() {
     return () => window.removeEventListener("storage", onLocalSignOut);
   }, [showState]);
   const sessionExpired = useCallback(
-    (failure: ApiClientError) => {
+    async (failure: ApiClientError) => {
       invalidateUnauthorizedRequests();
       const transition = ++stateTransition.current;
-      void stateAfterUnauthorized(failure)
-        .then((next) => {
-          if (next) commitState(transition, next);
-        })
-        .catch((cause) => commitState(transition, startupError(cause, "Unable to reach NoteFlare. Try again.")));
+      try {
+        const next = await stateAfterUnauthorized(failure);
+        if (stateTransition.current !== transition) return "obsolete" as const;
+        if (next) {
+          commitState(transition, next);
+          return "transitioned" as const;
+        }
+        return "ready" as const;
+      } catch (cause) {
+        if (stateTransition.current !== transition) return "obsolete" as const;
+        commitState(transition, startupError(cause, "Unable to reach NoteFlare. Try again."));
+        return "failed" as const;
+      }
     },
     [commitState],
   );
@@ -1518,10 +1527,11 @@ export function useCommittedRef<T>(value: T) {
 }
 
 function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
-  useEffect(() => {
+  useLayoutEffect(() => {
     setRealtimeAccessAccount(`${member.user.id}\0${member.workspace.id}`);
     return () => setRealtimeAccessAccount("");
   }, [member.user.id, member.workspace.id]);
+  useRealtimeAccessCoordinator(member.role === "owner");
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [installTip, setInstallTip] = useState(false);
   useEffect(() => {
