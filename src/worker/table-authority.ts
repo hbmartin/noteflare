@@ -779,14 +779,15 @@ export class TableAuthority extends DurableObject<Env> {
         });
       }
       if (path === "/socket") {
-        const pair = new WebSocketPair();
-        this.ctx.acceptWebSocket(pair[1], [actor.userId]);
         if (
+          !Number.isFinite(actor.socketExpiresAt) ||
           !actor.socketExpiresAt ||
           actor.socketExpiresAt <= Date.now() ||
           actor.socketExpiresAt > Date.now() + 5 * 60_000 + 1_000
         )
           return fail("Reconnect to refresh authorization.", 403, "table_forbidden");
+        const pair = new WebSocketPair();
+        this.ctx.acceptWebSocket(pair[1], [actor.userId]);
         pair[1].serializeAttachment(actor);
         await this.scheduleAlarm(actor.socketExpiresAt - Date.now());
         pair[1].send(JSON.stringify({ type: "table-ready", revision: meta.revision }));
@@ -1786,8 +1787,14 @@ export class TableAuthority extends DurableObject<Env> {
       );
     this.expireSockets();
     for (const socket of this.ctx.getWebSockets()) {
-      const socketActor = socket.deserializeAttachment() as TableActor;
-      if (!socketActor.socketExpiresAt || socketActor.socketExpiresAt <= Date.now()) continue;
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      const socketActor = socket.deserializeAttachment() as TableActor | null;
+      if (
+        !socketActor?.socketExpiresAt ||
+        !Number.isFinite(socketActor.socketExpiresAt) ||
+        socketActor.socketExpiresAt <= Date.now()
+      )
+        continue;
       try {
         socket.send(JSON.stringify({ type: "table-changed", revision, operationId: command.operationId }));
       } catch {
@@ -3962,8 +3969,8 @@ export class TableAuthority extends DurableObject<Env> {
     let next = Infinity;
     for (const socket of this.ctx.getWebSockets()) {
       if (socket.readyState !== WebSocket.OPEN) continue;
-      const actor = socket.deserializeAttachment() as TableActor;
-      if (!actor?.socketExpiresAt || actor.socketExpiresAt <= Date.now())
+      const actor = socket.deserializeAttachment() as TableActor | null;
+      if (!actor?.socketExpiresAt || !Number.isFinite(actor.socketExpiresAt) || actor.socketExpiresAt <= Date.now())
         socket.close(4401, "Authorization expired. Reconnect to continue.");
       else next = Math.min(next, actor.socketExpiresAt);
     }
@@ -3971,8 +3978,9 @@ export class TableAuthority extends DurableObject<Env> {
   }
   // fallow-ignore-next-line unused-class-member -- Called by Cloudflare Durable Object runtime.
   async webSocketMessage(socket: WebSocket) {
-    const grant = socket.deserializeAttachment() as TableActor;
-    if (!grant.socketExpiresAt || grant.socketExpiresAt <= Date.now()) {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    const grant = socket.deserializeAttachment() as TableActor | null;
+    if (!grant?.socketExpiresAt || !Number.isFinite(grant.socketExpiresAt) || grant.socketExpiresAt <= Date.now()) {
       socket.close(4401, "Authorization expired. Reconnect to continue.");
       return;
     }
