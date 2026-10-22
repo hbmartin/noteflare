@@ -405,6 +405,59 @@ describe("Slack OAuth authorization boundaries", () => {
     expect(destination.searchParams.get("error")).toBe("slack_unavailable");
     expect(destination.searchParams.has("view")).toBe(false);
   });
+  it.each(["capture", "discovery", "delete"])(
+    "preserves refused Slack authentication through %s cleanup failures",
+    async (failure) => {
+      const { cookie } = await account();
+      await callback(await start(cookie));
+      const sessions = (await env.DB.prepare("SELECT id FROM session ORDER BY id").all()).results;
+      const accounts = (await env.DB.prepare("SELECT id FROM account ORDER BY id").all()).results;
+      const flow = await start("", {}, "/sign-in/social");
+      let captures = 0;
+      const base = beforeAuthWrite("INSERT INTO slack_primary_factor_proofs", async () => {
+        throw new Error("original completion failure");
+      });
+      const database = new Proxy(base, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              if (
+                sql.includes("FROM workspace_members member LEFT JOIN") &&
+                (++captures === 1 || failure === "discovery")
+              )
+                throw new Error("capture failed");
+              if (failure === "delete" && sql === "DELETE FROM session WHERE id=? AND userId=?")
+                throw new Error("deletion failed");
+              return target.prepare(sql);
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      const response = await callback(flow, database);
+      expect(response.status).toBe(302);
+      expect(new URL(response.headers.get("location")!, "http://example.test").searchParams.get("error")).toBe(
+        "slack_unavailable",
+      );
+      expect(response.headers.get("set-cookie") ?? "").not.toMatch(/session_token=[^;]/);
+      const after = (await env.DB.prepare("SELECT id FROM session ORDER BY id").all()).results;
+      expect(after).toHaveLength(sessions.length + Number(failure === "delete"));
+      expect(after).toEqual(expect.arrayContaining(sessions));
+      expect(
+        log.mock.calls.some(
+          (call) => (call[0] as { event?: string })?.event === "auth.rejected_session.cleanup_failed",
+        ),
+      ).toBe(failure === "delete");
+      expect((await env.DB.prepare("SELECT id FROM account ORDER BY id").all()).results).toEqual(accounts);
+      expect(await env.DB.prepare("SELECT 1 FROM slack_primary_factor_proofs").first()).toBeNull();
+      expect(response.headers.get("X-Notes-Realtime-Status")).toBe(failure === "discovery" ? "pending" : "complete");
+      expect(response.headers.has("X-Notes-Realtime-Workspace")).toBe(false);
+      expect(
+        Boolean(await env.DB.prepare("SELECT 1 FROM realtime_revocations WHERE revision>completed_revision").first()),
+      ).toBe(failure === "discovery");
+    },
+  );
 
   it("backfills known grant starts when upgrading from 0071", async () => {
     await reset();

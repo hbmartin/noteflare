@@ -9,6 +9,8 @@ named here.
 Existing installations intentionally retain their `cloudflare-realtime-notes` Worker and resource
 identifiers. These deployment names are compatibility details; the product presented to users is NoteFlare.
 
+For the collaboration lifecycle follow-up, apply migration 0103 before uploading the updated Worker. Review [anchored comment upgrade and rollback requirements](UPGRADING.md#migration-0103-anchored-comment-publication), including private preparation expiry and provisional-anchor reconciliation. Keep table relations disabled.
+
 ## Browser deployment
 
 The portable deployment implementation is integrated on `main`. The native GitHub authorization and five editor-flow acceptance checks remain pending; the README deploy button is available as a preview. See [deployment evidence](evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate).

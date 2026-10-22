@@ -39,6 +39,8 @@ export type CollaborationBundle = {
   /** Settles if an initially slow store finishes after the readiness deadline. */
   lateReady: Promise<void>;
   readonly hasUnsyncedChanges: boolean;
+  suspend: () => void;
+  resume: () => void;
   stop: () => void;
   destroy: () => void;
 };
@@ -118,13 +120,16 @@ export function createCollaboration(
   let connectionAttempt = 0;
   let connecting = false;
   let destroyed = false;
+  let suspended = false;
+  let connectionGeneration = 0;
   let closed = false;
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
   const barrier = createDurabilityBarrier(provider, durability, 1_000);
   const reconnectWebSocket = provider["_reconnectWS"].bind(provider);
   const connect = (socketOnly = false) => {
-    if (destroyed) return;
+    if (destroyed || suspended) return;
+    const generation = connectionGeneration;
     if (provider.wsconnected && provider.shouldConnect) {
       onStatus("connected");
       return;
@@ -137,23 +142,23 @@ export function createCollaboration(
     void (async () => {
       try {
         if (beforeConnect && !(await beforeConnect())) {
-          if (destroyed) return;
+          if (destroyed || suspended || generation !== connectionGeneration) return;
           provider.disconnect();
           onStatus("offline");
           return;
         }
-        if (destroyed) return;
+        if (destroyed || suspended || generation !== connectionGeneration) return;
         if (socketOnly && provider.shouldConnect) {
           if (!provider.bcconnected) provider.connectBc();
           await reconnectWebSocket();
         } else await provider.connect();
-        if (destroyed) {
+        if (destroyed || suspended || generation !== connectionGeneration) {
           provider.disconnect();
           return;
         }
         connectionAttempt = 0;
       } catch (error) {
-        if (destroyed) return;
+        if (destroyed || suspended || generation !== connectionGeneration) return;
         onStatus("offline");
         console.error("Failed to connect document collaboration", error);
         void reportClientError("client.realtime_connection_failed", error);
@@ -162,6 +167,7 @@ export function createCollaboration(
         }
       } finally {
         connecting = false;
+        if (!destroyed && !suspended && generation !== connectionGeneration) connect();
       }
     })();
   };
@@ -224,6 +230,7 @@ export function createCollaboration(
     });
 
   const visibility = () => {
+    if (destroyed || suspended) return;
     if (document.visibilityState === "hidden") {
       if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
       connectionTimer = undefined;
@@ -261,6 +268,20 @@ export function createCollaboration(
     provider,
     ready,
     lateReady,
+    suspend() {
+      suspended = true;
+      connectionGeneration++;
+      if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
+      if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
+      connectionTimer = hiddenTimer = undefined;
+      provider.disconnect();
+      onStatus("offline");
+    },
+    resume() {
+      if (destroyed) return;
+      suspended = false;
+      if (indexeddbSynced) connect();
+    },
     get hasUnsyncedChanges() {
       return durability.hasUnsyncedChanges;
     },

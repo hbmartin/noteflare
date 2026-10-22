@@ -153,3 +153,25 @@ describe("ServerThreadStore", () => {
     expect(store.getThread("thread-1").comments.map((comment) => comment.id)).toEqual(["comment-1", "comment-2"]);
   });
 });
+
+it("retires prepared comment operations without sending cancellation or publication as another account", async () => {
+  const { setRealtimeAccessAccount } = await import("./realtime-access-status");
+  setRealtimeAccessAccount("first\0wiki");
+  const store = new ServerThreadStore("page", "first", vi.fn(), () => true, {
+    account: "first\0wiki",
+    pageId: "page",
+    epoch: 1,
+  });
+  const submission = store.anchoredSubmission([
+    { type: "paragraph", content: [{ type: "text", text: "Private draft" }] },
+  ] as never);
+  try {
+    setRealtimeAccessAccount("second\0wiki");
+    await expect(submission.prepare()).rejects.toThrow("retired account");
+    await expect(submission.cancel()).rejects.toThrow("retired account");
+    await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow("retired account");
+  } finally {
+    submission.release();
+    setRealtimeAccessAccount("");
+  }
+});

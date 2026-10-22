@@ -1,10 +1,16 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Env } from "./env";
 import { HttpError } from "./http";
-import { correlationHeaders } from "./observability";
+import { correlationHeaders, logger } from "./observability";
 
 import type { RealtimeAccessStatus } from "../shared/realtime-access";
-const impacts = new AsyncLocalStorage<Map<string, Promise<number>>>();
+type ImpactScope = {
+  workspaces: Map<string, Promise<number>>;
+  users: Map<string, Promise<void>>;
+  unresolvedUsers: Set<string>;
+  forced: Set<string>;
+};
+const impacts = new AsyncLocalStorage<ImpactScope>();
 async function control(env: Env, workspaceId: string, path: string, body: unknown) {
   return env.WORKSPACE_EVENTS.getByName(workspaceId).fetch(
     new Request(`https://workspace-events.internal${path}`, {
@@ -26,70 +32,142 @@ export async function realtimeAccessStatus(env: Env, workspaceId: string): Promi
 export async function trackRealtimeWorkspace(env: Env, workspaceId: string) {
   const scope = impacts.getStore();
   if (!scope) return;
-  if (!scope.has(workspaceId))
-    scope.set(
+  if (!scope.workspaces.has(workspaceId))
+    scope.workspaces.set(
       workspaceId,
       realtimeAccessStatus(env, workspaceId).then((status) => status.revision),
     );
-  const snapshot = scope.get(workspaceId)!;
+  const snapshot = scope.workspaces.get(workspaceId)!;
   try {
     await snapshot;
   } catch (error) {
     // No caller may start its write until this baseline succeeds. A failed
     // baseline is a rejected operation, not a committed pending transition.
-    if (scope.get(workspaceId) === snapshot) scope.delete(workspaceId);
+    if (scope.workspaces.get(workspaceId) === snapshot) scope.workspaces.delete(workspaceId);
     throw error;
   }
 }
-export async function trackRealtimeUser(env: Env, userId: string) {
-  if (!impacts.getStore()) return;
-  const rows = await env.DB.prepare("SELECT workspace_id FROM workspace_members WHERE user_id=?")
+async function captureUser(env: Env, userId: string, forced = false) {
+  const scope = impacts.getStore();
+  if (!scope) return;
+  const rows = await env.DB.prepare(`SELECT member.workspace_id,coalesce(revocation.revision,0) revision
+    FROM workspace_members member LEFT JOIN realtime_revocations revocation ON revocation.workspace_id=member.workspace_id
+    WHERE member.user_id=?`)
     .bind(userId)
-    .all<{ workspace_id: string }>();
-  for (const row of rows.results) await trackRealtimeWorkspace(env, row.workspace_id);
+    .all<{ workspace_id: string; revision: number }>();
+  for (const row of rows.results) {
+    if (!scope.workspaces.has(row.workspace_id)) scope.workspaces.set(row.workspace_id, Promise.resolve(row.revision));
+    if (forced) scope.forced.add(row.workspace_id);
+  }
+  scope.unresolvedUsers.delete(userId);
+}
+export async function trackRealtimeUser(env: Env, userId: string) {
+  const scope = impacts.getStore();
+  if (!scope) return;
+  let pending = scope.users.get(userId);
+  if (!pending) {
+    pending = captureUser(env, userId);
+    scope.users.set(userId, pending);
+  }
+  try {
+    await pending;
+  } catch (error) {
+    if (scope.users.get(userId) === pending) scope.users.delete(userId);
+    throw error;
+  }
+}
+/** Membership writers retire enumeration only; earlier workspace baselines remain intact. */
+export function invalidateRealtimeUserMembership(userId: string) {
+  impacts.getStore()?.users.delete(userId);
+}
+/** A rejected new session must be deleted even when optional impact capture is unavailable. */
+export async function deleteRejectedSession(env: Env, userId: string, sessionId: string) {
+  const scope = impacts.getStore();
+  try {
+    await trackRealtimeUser(env, userId);
+  } catch {
+    scope?.unresolvedUsers.add(userId);
+    logger.warn("auth.rejected_session.tracking_pending", "auth", "Rejected-session impact capture is pending.");
+  }
+  try {
+    await env.DB.prepare("DELETE FROM session WHERE id=? AND userId=?").bind(sessionId, userId).run();
+  } catch (error) {
+    logger.error("auth.rejected_session.cleanup_failed", "auth", "Rejected-session deletion failed.", {}, error);
+    throw error;
+  }
 }
 /** Preserve committed responses, including authentication cookies and redirects. */
-export async function withRealtimeAccessTracking(env: Env, run: () => Promise<Response> | Response) {
-  return impacts.run(new Map(), async () => {
-    let response: Response | undefined,
-      failure: unknown,
-      failed = false;
-    try {
-      response = await run();
-    } catch (error) {
-      failure = error;
-      failed = true;
-    }
-    let changed = false,
-      pending = false;
-    const affected: Array<{ workspaceId: string; status: RealtimeAccessStatus | null }> = [];
-    for (const [workspaceId, snapshot] of impacts.getStore()!) {
+export async function withRealtimeAccessTracking(
+  env: Env,
+  run: () => Promise<Response> | Response,
+  authorizeDetails?: (workspaceId: string) => Promise<boolean>,
+) {
+  return impacts.run(
+    { workspaces: new Map(), users: new Map(), unresolvedUsers: new Set(), forced: new Set() },
+    async () => {
+      let response: Response | undefined,
+        failure: unknown,
+        failed = false;
       try {
-        const before = await snapshot;
-        const after = await realtimeAccessStatus(env, workspaceId);
-        if (after.revision <= before) continue;
-        changed = true;
-        const status = await reconcileRealtimeAccessStatus(env, workspaceId, after);
-        affected.push({ workspaceId, status });
-        if (!status.complete) pending = true;
-      } catch {
-        changed = true;
-        pending = true;
-        affected.push({ workspaceId, status: null });
+        response = await run();
+      } catch (error) {
+        failure = error;
+        failed = true;
       }
-    }
-    if (failed) throw failure;
-    if (!changed) return response!;
-    const result = new Response(response!.body, response);
-    result.headers.set("X-Notes-Realtime-Status", pending ? "pending" : "complete");
-    const only = affected.length === 1 ? affected[0] : undefined;
-    if (only?.status) {
-      result.headers.set("X-Notes-Realtime-Workspace", only.workspaceId);
-      result.headers.set("X-Notes-Realtime-Revision", String(only.status.revision));
-      result.headers.set("X-Notes-Realtime-Completed-Revision", String(only.status.completedRevision));
-    }
-    return result;
-  });
+      const scope = impacts.getStore()!;
+      for (const userId of scope.unresolvedUsers) {
+        try {
+          await captureUser(env, userId, true);
+        } catch {
+          /* Durable session-delete triggers retain pending intents. */
+        }
+      }
+      let changed = scope.unresolvedUsers.size > 0,
+        pending = changed;
+      const entries = [...scope.workspaces];
+      const affected: Array<{ workspaceId: string; status: RealtimeAccessStatus | null }> = [];
+      let position = 0;
+      await Promise.all(
+        Array.from({ length: Math.min(4, entries.length) }, async () => {
+          while (position < entries.length) {
+            const [workspaceId, snapshot] = entries[position++]!;
+            try {
+              const before = await snapshot;
+              const after = await realtimeAccessStatus(env, workspaceId);
+              if (after.revision <= before && !scope.forced.has(workspaceId)) continue;
+              changed = true;
+              const status = await reconcileRealtimeAccessStatus(env, workspaceId, after);
+              affected.push({ workspaceId, status });
+              if (!status.complete) pending = true;
+            } catch {
+              changed = true;
+              pending = true;
+              affected.push({ workspaceId, status: null });
+            }
+          }
+        }),
+      );
+      if (failed) throw failure;
+      if (!changed) return response!;
+      const result = new Response(response!.body, response);
+      result.headers.set("X-Notes-Realtime-Status", pending ? "pending" : "complete");
+      const only = affected.length === 1 && !scope.unresolvedUsers.size ? affected[0] : undefined;
+      let detailsAllowed = false;
+      if (only?.status && authorizeDetails) {
+        try {
+          detailsAllowed = await authorizeDetails(only.workspaceId);
+        } catch {
+          /* Optional metadata fails closed. */
+        }
+      }
+      if (only?.status && detailsAllowed) {
+        result.headers.set("X-Notes-Realtime-Workspace", only.workspaceId);
+        result.headers.set("X-Notes-Realtime-Revision", String(only.status.revision));
+        result.headers.set("X-Notes-Realtime-Completed-Revision", String(only.status.completedRevision));
+      }
+      return result;
+    },
+  );
 }
 /** A workspace-specific barrier; the final read catches concurrent newer intents. */
 export async function flushRealtimeRevocations(env: Env, workspaceId: string) {

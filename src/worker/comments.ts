@@ -128,7 +128,7 @@ function validateJsonTree(value: unknown, depth = 0, counter = { count: 0 }): vo
   for (const item of Object.values(value)) validateJsonTree(item, depth + 1, counter);
 }
 
-function validatedCommentBody(value: unknown): { body: CommentBody; json: string; plainText: string } {
+export function validatedCommentBody(value: unknown): { body: CommentBody; json: string; plainText: string } {
   if (!value || (typeof value !== "object" && !Array.isArray(value))) {
     throw new HttpError(422, "invalid_comment", "A structured comment body is required.");
   }
@@ -395,7 +395,14 @@ export async function createCommentThread(
   bodyValue: unknown,
   anchor: CommentAnchor | null = null,
   blockId: string | null = null,
-  source?: { threadId: string; commentId: string; receipt: D1PreparedStatement },
+  source?: {
+    threadId: string;
+    commentId: string;
+    receipt: D1PreparedStatement;
+    before?: D1PreparedStatement[];
+    after?: D1PreparedStatement[];
+    anchorJson?: string;
+  },
 ) {
   if (blockId !== null && !ID_PATTERN.test(blockId)) {
     throw new HttpError(422, "invalid_comment_block", "The comment block is invalid.");
@@ -406,6 +413,7 @@ export async function createCommentThread(
   const timestamp = Date.now();
   const mentionedUserIds = commentMentionUserIds(body.body);
   await env.DB.batch([
+    ...(source?.before ?? []),
     env.DB.prepare(
       `INSERT INTO comment_threads
         (id, workspace_id, space_id, page_id, block_id, created_by, anchor_json, created_at, updated_at)
@@ -417,7 +425,7 @@ export async function createCommentThread(
       page.id,
       blockId,
       member.user.id,
-      anchor ? JSON.stringify(anchor) : null,
+      source?.anchorJson ?? (anchor ? JSON.stringify(anchor) : null),
       timestamp,
       timestamp,
     ),
@@ -461,6 +469,7 @@ export async function createCommentThread(
     }),
     ...refreshPageSearchV2Statements(env.DB, page.id),
     ...(source ? [source.receipt] : []),
+    ...(source?.after ?? []),
   ]);
   return commentThread(env, member, page, threadId);
 }

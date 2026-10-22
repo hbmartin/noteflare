@@ -45,8 +45,8 @@ function silenceApiResponseReport() {
 }
 
 describe("offline mutation classification", () => {
-  it.each(["/api/link-previews", "/api/slack/link-preview"])(
-    "does not retain pending writes for a preview at %s",
+  it.each(["/api/link-previews", "/api/slack/link-preview", "/api/security/realtime/reconcile"])(
+    "does not retain pending writes for background reads or maintenance at %s",
     async (path) => {
       let finish!: (response: Response) => void;
       const fetcher = vi.fn<typeof fetch>(

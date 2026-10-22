@@ -1,3 +1,10 @@
+import {
+  prepareCommentSubmission,
+  publishCommentSubmission,
+  cancelCommentSubmission,
+  commentSubmissionStatus,
+  expireCommentSubmissions,
+} from "./comment-submissions";
 import { previewSlackLink } from "./slack-link-preview";
 import { TableAuthority } from "./table-authority";
 import {
@@ -100,6 +107,7 @@ import { Document } from "./document";
 import {
   registerRealtimeRoom,
   trackRealtimeWorkspace,
+  invalidateRealtimeUserMembership,
   withRealtimeAccessTracking,
   reconcileRealtimeAccessStatus,
   realtimeAccessStatus,
@@ -1295,6 +1303,7 @@ app.post("/api/install/bootstrap", async (c) => {
        VALUES (?, ?, ?, 'Welcome', '', '', '', '')`,
     ).bind(pageId, workspaceId, `${workspaceId}-general`),
   ]);
+  invalidateRealtimeUserMembership(signup.user.id);
   return signup.response;
 });
 
@@ -1537,7 +1546,10 @@ app.post("/api/invites/complete", async (c) => {
     ),
   ]);
   if (!result[2]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
-  if (result[0]!.meta.changes) sweepMutationOutbox(c);
+  if (result[0]!.meta.changes) {
+    invalidateRealtimeUserMembership(session.user.id);
+    sweepMutationOutbox(c);
+  }
   return c.json({ success: true });
 });
 
@@ -1695,6 +1707,7 @@ app.delete("/api/members/:id", async (c) => {
       targetId,
     ),
   ]);
+  invalidateRealtimeUserMembership(targetId);
   sweepMutationOutbox(c);
   return c.json({ ok: true });
 });
@@ -3712,6 +3725,59 @@ app.post("/api/slack/link-preview", async (c) => {
   return c.json({ preview });
 });
 
+app.post("/api/pages/:id/comment-submissions", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  if (page.kind !== "document")
+    throw new HttpError(422, "invalid_comment_anchor", "Text preparations require a document.");
+  const body = await jsonBody(c.req.raw);
+  const result = await prepareCommentSubmission(
+    c.env,
+    member,
+    commentPage(page),
+    c.req.header("x-notes-operation-id") ?? "",
+    c.req.header("x-notes-content-epoch") ?? null,
+    object(body.initialComment).body,
+  );
+  c.header("Cache-Control", "private, no-store");
+  return c.json(result, 201);
+});
+app.get("/api/pages/:id/comment-submissions/:operationId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  c.header("Cache-Control", "private, no-store");
+  return c.json(await commentSubmissionStatus(c.env, member, commentPage(page), c.req.param("operationId")));
+});
+app.post("/api/pages/:id/comment-submissions/:operationId/cancel", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  return c.json(await cancelCommentSubmission(c.env, member, commentPage(page), c.req.param("operationId")));
+});
+app.post("/api/pages/:id/comment-submissions/:operationId/publish", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const body = await jsonBody(c.req.raw),
+    selection = object(body.selection);
+  if (new TextEncoder().encode(JSON.stringify(selection)).byteLength > 16 * 1024)
+    throw new HttpError(422, "invalid_comment_anchor", "The comment selection is invalid.");
+  const result = await publishCommentSubmission(
+    c.env,
+    member,
+    commentPage(page),
+    c.req.param("operationId"),
+    selection.yjs,
+    async () => {
+      const current = await requireMember(c.req.raw, c.env);
+      if (current.user.id !== member.user.id) throw new HttpError(401, "unauthorized", "Sign in again.");
+      const latest = await pageForMember(c.env, current, page.id);
+      if (latest.content_epoch !== page.content_epoch)
+        throw new HttpError(409, "comment_epoch_changed", "Review the restored version before posting.");
+    },
+  );
+  sendCommentMutationEvents(c, member.workspace.id, page.id);
+  return c.json(result);
+});
+
 app.get("/api/pages/:id/comments", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
@@ -5059,6 +5125,22 @@ app.get("/api/pages/:id/linked-tables/:tableId", async (c) => {
   await pageForMember(c.env, current, c.req.param("tableId"));
   return c.json(table);
 });
+app.post("/api/pages/:id/linked-tables/:tableId/draft-rows", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await pageForMember(c.env, member, c.req.param("id"));
+  const response = await tableFetch(
+    c.env,
+    member,
+    c.req.param("tableId"),
+    "/draft-rows",
+    "POST",
+    await limitedJsonBody(c.req.raw, 20_000),
+  );
+  const current = await requireMember(c.req.raw, c.env);
+  await pageForMember(c.env, current, c.req.param("id"));
+  await pageForMember(c.env, current, c.req.param("tableId"));
+  return response;
+});
 
 function linkedHostAuthorization(host: PageRow, member: MemberContext) {
   return {
@@ -6081,6 +6163,19 @@ app.get("/api/tables/:pageId/query", async (c) => {
   const result = await queryTable(c.env, member, c.req.param("pageId"), new URL(c.req.url).searchParams.toString());
   await pageForMember(c.env, await requireMember(c.req.raw, c.env), c.req.param("pageId"));
   return c.json(result);
+});
+app.post("/api/tables/:pageId/draft-rows", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const response = await tableFetch(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    "/draft-rows",
+    "POST",
+    await limitedJsonBody(c.req.raw, 20_000),
+  );
+  await pageForMember(c.env, await requireMember(c.req.raw, c.env), c.req.param("pageId"));
+  return response;
 });
 app.get("/api/tables/:pageId/socket", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
@@ -7409,7 +7504,14 @@ export default {
           const handle = async () => {
             const party = await handlePartyRequest(request, env);
             if (party) return party;
-            return withRealtimeAccessTracking(env, () => app.fetch(request, env, context));
+            return withRealtimeAccessTracking(
+              env,
+              () => app.fetch(request, env, context),
+              async (workspaceId) => {
+                const member = await requireMember(request, env);
+                return member.role === "owner" && member.workspace.id === workspaceId;
+              },
+            );
           };
           response = context.tracing
             ? await context.tracing.enterSpan("notes.route_request", async (span) => {
@@ -7497,6 +7599,7 @@ export default {
         webhook_history: () => pruneWebhookHistory(env),
         search_headings: () => backfillSearchHeadings(env),
         security_state: async () => {
+          await expireCommentSubmissions(env);
           await pruneSecurityState(env);
           if (!(await drainRealtimeRevocationsBatch(env))) throw new Error("Live access revocation is still pending.");
         },

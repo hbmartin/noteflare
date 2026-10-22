@@ -1,0 +1,84 @@
+{
+  "date": "2026-10-22",
+  "baseline": "dce5d254102905c76fd82aece6c50a322b0abdd9",
+  "environment": "Local Cloudflare Vitest/workerd, D1 emulator and real WorkspaceEvents Durable Objects; no remote services",
+  "samplesPerCase": 20,
+  "workload": "Three user-impact capture hooks, one revision change per workspace, request-boundary fencing. Cold uses newly named coordinators; warm reuses coordinators. No document/table rooms are populated.",
+  "counts": "Request-side D1 prepare/execute operations and coordinator fetches; excludes fixture setup, mutation statements and coordinator-internal D1 work. Latencies include the same mutation statements in both variants.",
+  "precision": "Local performance.now resolves to integer milliseconds; p50 is sorted sample 11 and p95 is sample 19 of 20. These are local regression observations, not production network latency estimates.",
+  "results": {
+    "1_cold_before": {
+      "d1": 8,
+      "do": 1,
+      "p50": 6,
+      "p95": 7
+    },
+    "1_cold_after": {
+      "d1": 5,
+      "do": 1,
+      "p50": 5,
+      "p95": 6
+    },
+    "1_warm_before": {
+      "d1": 8,
+      "do": 1,
+      "p50": 3,
+      "p95": 5
+    },
+    "1_warm_after": {
+      "d1": 5,
+      "do": 1,
+      "p50": 2,
+      "p95": 3
+    },
+    "4_cold_before": {
+      "d1": 23,
+      "do": 4,
+      "p50": 19,
+      "p95": 20
+    },
+    "4_cold_after": {
+      "d1": 17,
+      "do": 4,
+      "p50": 15,
+      "p95": 17
+    },
+    "4_warm_before": {
+      "d1": 23,
+      "do": 4,
+      "p50": 10,
+      "p95": 13
+    },
+    "4_warm_after": {
+      "d1": 17,
+      "do": 4,
+      "p50": 7,
+      "p95": 7
+    },
+    "12_cold_before": {
+      "d1": 63,
+      "do": 12,
+      "p50": 58,
+      "p95": 71
+    },
+    "12_cold_after": {
+      "d1": 49,
+      "do": 12,
+      "p50": 52,
+      "p95": 59
+    },
+    "12_warm_before": {
+      "d1": 63,
+      "do": 12,
+      "p50": 32,
+      "p95": 75
+    },
+    "12_warm_after": {
+      "d1": 49,
+      "do": 12,
+      "p50": 23,
+      "p95": 25
+    }
+  },
+  "p95RegressionAboveTenPercent": false
+}

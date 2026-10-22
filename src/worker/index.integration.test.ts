@@ -9443,7 +9443,7 @@ describe("collaborative table repair responses", () => {
     expect(requests).toEqual(["/repair-status"]);
     let completed: { repair: TableRepairStatus; verification: { projectionMatches: boolean } | null } | undefined;
     for (let attempt = 0; attempt < 10; attempt++) {
-      await runDurableObjectAlarm(f.stub);
+      await advanceTableAlarm(f.stub);
       const response = await SELF.fetch(authenticatedRequest(f.cookie, statusPath));
       const result = await response.json<{
         repair: TableRepairStatus;
@@ -9574,3 +9574,20 @@ describe("collaborative table repair responses", () => {
     }
   });
 });
+
+/** Unlike runDurableObjectAlarm, reach the stored deadline before invoking work.
+ * Table alarms distinguish work deadlines from earlier socket-only wakes. */
+async function advanceTableAlarm(stub: DurableObjectStub) {
+  return runInDurableObject(stub, async (instance, state) => {
+    const deadline = await state.storage.getAlarm();
+    if (deadline === null) return false;
+    const original = Date.now;
+    Date.now = () => Math.max(original(), deadline + 1);
+    try {
+      await (instance as { alarm(): Promise<void> }).alarm();
+      return true;
+    } finally {
+      Date.now = original;
+    }
+  });
+}

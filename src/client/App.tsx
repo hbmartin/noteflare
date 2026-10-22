@@ -1,5 +1,8 @@
+import { purgeCommentDrafts } from "./comment-drafts";
+import { DiagramRestoreOwner } from "./diagram-restore-owner";
 import { useRealtimeAccessCoordinator } from "./RealtimeAccessCoordinator";
-import { setRealtimeAccessAccount } from "./realtime-access-status";
+import { preserveBeforeAuthorizationExit, trackAuthorization } from "./authorization-lifecycle";
+import { realtimeAccessAccount, setRealtimeAccessAccount } from "./realtime-access-status";
 import { loadForegroundModule } from "./chunk-recovery";
 import { slackAuthErrorMessage } from "./slack-auth-errors";
 import { ActivityView } from "./ActivityView";
@@ -906,6 +909,15 @@ async function resolveAppState(alreadyPurgedAccount?: string): Promise<AppState>
 
 export function App() {
   const [state, setState] = useState<AppState>({ screen: "loading" });
+  const refreshWorkspaceMember = useCallback((member: ClientMemberContext) => {
+    setState((previous) =>
+      previous.screen === "workspace" &&
+      previous.member.user.id === member.user.id &&
+      previous.member.workspace.id === member.workspace.id
+        ? { ...previous, member }
+        : previous,
+    );
+  }, []);
   const stateTransition = useRef(0);
   const commitState = useCallback((transition: number, next: AppState) => {
     if (stateTransition.current === transition) setState(next);
@@ -980,6 +992,11 @@ export function App() {
     const onLocalSignOut = (event: StorageEvent) => {
       if (event.key !== LOCAL_SIGNOUT_KEY || !event.newValue) return;
       clearLiveRecoveryCopies(event.newValue);
+      try {
+        purgeCommentDrafts(event.newValue);
+      } catch (error) {
+        console.error("Cross-tab comment cleanup remains pending", error);
+      }
       invalidateUnauthorizedRequests();
       showState({ screen: "signin" });
     };
@@ -987,22 +1004,27 @@ export function App() {
     return () => window.removeEventListener("storage", onLocalSignOut);
   }, [showState]);
   const sessionExpired = useCallback(
-    async (failure: ApiClientError) => {
-      invalidateUnauthorizedRequests();
-      const transition = ++stateTransition.current;
-      try {
-        const next = await stateAfterUnauthorized(failure);
-        if (stateTransition.current !== transition) return "obsolete" as const;
-        if (next) {
-          commitState(transition, next);
-          return "transitioned" as const;
+    (failure: ApiClientError) => {
+      const account = realtimeAccessAccount();
+      return trackAuthorization(account, async () => {
+        invalidateUnauthorizedRequests();
+        const transition = ++stateTransition.current;
+        try {
+          const next = await stateAfterUnauthorized(failure);
+          if (stateTransition.current !== transition) return "obsolete" as const;
+          if (next) {
+            preserveBeforeAuthorizationExit(account);
+            commitState(transition, next);
+            return "transitioned" as const;
+          }
+          return "ready" as const;
+        } catch (cause) {
+          if (stateTransition.current !== transition) return "obsolete" as const;
+          preserveBeforeAuthorizationExit(account);
+          commitState(transition, startupError(cause, "Unable to reach NoteFlare. Try again."));
+          return "failed" as const;
         }
-        return "ready" as const;
-      } catch (cause) {
-        if (stateTransition.current !== transition) return "obsolete" as const;
-        commitState(transition, startupError(cause, "Unable to reach NoteFlare. Try again."));
-        return "failed" as const;
-      }
+      });
     },
     [commitState],
   );
@@ -1230,7 +1252,13 @@ export function App() {
         onSignOut={() => void signOut(state.account.key)}
       />
     );
-  return <Workspace member={state.member} onSignOut={() => void signOut(offlineAccountKey(state.member))} />;
+  return (
+    <Workspace
+      member={state.member}
+      onMemberChanged={refreshWorkspaceMember}
+      onSignOut={() => void signOut(offlineAccountKey(state.member))}
+    />
+  );
 }
 
 function AuthLayout({
@@ -1526,12 +1554,30 @@ export function useCommittedRef<T>(value: T) {
   return ref;
 }
 
-function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
+function Workspace({
+  member,
+  onSignOut,
+  onMemberChanged,
+}: {
+  member: ClientMemberContext;
+  onSignOut: () => void;
+  onMemberChanged: (member: ClientMemberContext) => void;
+}) {
   useLayoutEffect(() => {
     setRealtimeAccessAccount(`${member.user.id}\0${member.workspace.id}`);
     return () => setRealtimeAccessAccount("");
   }, [member.user.id, member.workspace.id]);
-  useRealtimeAccessCoordinator(member.role === "owner");
+  const refreshOwnerRole = useCallback(async () => {
+    const account = realtimeAccessAccount();
+    const current = await api<ClientMemberContext>("/api/me");
+    if (
+      account === realtimeAccessAccount() &&
+      current.user.id === member.user.id &&
+      current.workspace.id === member.workspace.id
+    )
+      onMemberChanged(current);
+  }, [member.user.id, member.workspace.id, onMemberChanged]);
+  useRealtimeAccessCoordinator(member.role === "owner", refreshOwnerRole);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [installTip, setInstallTip] = useState(false);
   useEffect(() => {
@@ -1603,7 +1649,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       lookupPending: true,
     };
   }
-  const [{ pages, pagesLoaded, selectedId, pendingSelectionId }, dispatchPageAction] = useReducer(
+  const diagramRestores = useMemo(
+    () => new DiagramRestoreOwner(`${member.user.id}\0${member.workspace.id}`),
+    [member.user.id, member.workspace.id],
+  );
+  const diagramRestoresRef = useCommittedRef(diagramRestores);
+  const [{ pages, pagesLoaded, selectedId, pendingSelectionId }, dispatchRawPageAction] = useReducer(
     workspacePageReducer,
     undefined,
     () => ({
@@ -1613,6 +1664,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       pendingSelectionId: startupNavigation.current!.pageId,
       pendingRestoredRoot: null,
     }),
+  );
+  const dispatchPageAction = useCallback(
+    (action: Parameters<typeof dispatchRawPageAction>[0]) => {
+      if ("pages" in action) diagramRestoresRef.current.observe(action.pages);
+      if (action.type === "remove") diagramRestoresRef.current.remove(action.pageIds);
+      dispatchRawPageAction(action);
+    },
+    [diagramRestoresRef],
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -2024,6 +2083,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       reportWorkspaceError,
       setSidebarHiddenPage,
       startWorkspaceErrorAttempt,
+      dispatchPageAction,
     ],
   );
   const navigateToPage = useCallback(
@@ -2043,7 +2103,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setView("pages");
       closeSidebar(true);
     },
-    [cancelPageAccessRequest, closeSidebar, loadPageForNavigation, member.workspace.id, pages, pendingSelectionIdRef],
+    [
+      cancelPageAccessRequest,
+      closeSidebar,
+      loadPageForNavigation,
+      member.workspace.id,
+      pages,
+      pendingSelectionIdRef,
+      dispatchPageAction,
+    ],
   );
 
   useEffect(() => {
@@ -2184,6 +2252,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     loadPageForNavigation,
     pendingSelectionIdRef,
     selectedIdRef,
+    dispatchPageAction,
   ]);
   const loadFreshPages = useCallback(
     async (observerSignal: AbortSignal) => {
@@ -2382,7 +2451,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         if (!signal.aborted) dispatchPageAction({ type: "clear-restored-root", token: selectionToken });
       });
     },
-    [archiveRemovalTombstones, excludeConfirmedRestoresFromTrash, loadFreshPages],
+    [archiveRemovalTombstones, excludeConfirmedRestoresFromTrash, loadFreshPages, dispatchPageAction],
   );
   const reconcileRestoredEvent = useCallback(
     async (restoredPages: Page[], tombstoneCheckpoint: number, restoredRootId?: string) => {
@@ -2420,7 +2489,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         signal,
       );
     },
-    [archiveRemovalTombstones, excludeConfirmedRestoresFromTrash, loadFreshPages, reconcileRestoredRoot],
+    [
+      archiveRemovalTombstones,
+      excludeConfirmedRestoresFromTrash,
+      loadFreshPages,
+      reconcileRestoredRoot,
+      dispatchPageAction,
+    ],
   );
   const loadTrash = useCallback(
     (version: number) => {
@@ -2481,6 +2556,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       ensureTrashTreeRefresh,
       recordPageRemovals,
       reportWorkspaceError,
+      dispatchPageAction,
     ],
   );
   useEffect(() => {
@@ -2645,7 +2721,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       setView("pages");
       closeSidebar(true);
     },
-    [closeSidebar, member.workspace.id, pages],
+    [closeSidebar, member.workspace.id, pages, dispatchPageAction],
   );
 
   async function createSpace(event: FormEvent<HTMLFormElement>) {
@@ -2922,6 +2998,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       refreshInvalidatedWorkspace,
       reportWorkspaceError,
       setSidebarHiddenPage,
+      dispatchPageAction,
     ],
   );
 
@@ -3675,7 +3752,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       recordPageUpserts([page]);
       dispatchPageAction({ type: "merge", pages: [page] });
     },
-    [recordPageUpserts],
+    [recordPageUpserts, dispatchPageAction],
   );
   const pageUnavailable = useCallback(
     (pageId: string) => {
@@ -3692,7 +3769,14 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         reportWorkspaceError({ source: "page-tree" }, refreshError);
       });
     },
-    [archiveRemovalTombstones, clearConfirmedRestores, loadFreshPages, reportWorkspaceError, setSidebarHiddenPage],
+    [
+      archiveRemovalTombstones,
+      clearConfirmedRestores,
+      loadFreshPages,
+      reportWorkspaceError,
+      setSidebarHiddenPage,
+      dispatchPageAction,
+    ],
   );
   const documentAccessDenied = useCallback(
     (pageId: string, error: ApiClientError) => {
@@ -4603,6 +4687,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           ) : (
             <Suspense fallback={<div className="editor-loading">Loading the diagram editor…</div>}>
               <DiagramPage
+                restoreOwner={diagramRestores}
                 key={`${activeSelected.id}:${activeSelected.contentEpoch}`}
                 page={activeSelected}
                 metadata={metadata}

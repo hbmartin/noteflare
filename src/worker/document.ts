@@ -601,6 +601,7 @@ async function addCommentMark(
   threadId: string,
   selection: { head: RelativePositionJson; anchor: RelativePositionJson },
 ) {
+  const markName = `comment--${(await sha256Hex(threadId)).slice(0, 8)}`;
   let head: Y.AbsolutePosition | null;
   let anchor: Y.AbsolutePosition | null;
   try {
@@ -627,7 +628,6 @@ async function addCommentMark(
   });
   const selectedLength = ranges.reduce((total, range) => total + range.length, 0);
   if (!selectedLength || selectedLength > 100_000) return false;
-  const markName = `comment--${(await sha256Hex(threadId)).slice(0, 8)}`;
   document.transact(() => {
     removeCommentMark(document, threadId);
     for (const range of ranges) {
@@ -701,6 +701,9 @@ export class Document extends YServer {
     this.observedMentionRoot = null;
     this.observedMentionDocument = null;
     const sql = this.state.storage.sql;
+    sql.exec(
+      "CREATE TABLE IF NOT EXISTS provisional_comment_anchors(user_id TEXT NOT NULL,operation_id TEXT NOT NULL,thread_id TEXT NOT NULL,token TEXT NOT NULL,PRIMARY KEY(user_id,operation_id))",
+    );
     sql.exec(`CREATE TABLE IF NOT EXISTS document_meta (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       snapshot_seq INTEGER NOT NULL DEFAULT 0,
@@ -819,6 +822,7 @@ export class Document extends YServer {
     this.document.on("update", this.updateObserver);
     this.observedMentionRoot = mentionRoot;
     this.observedMentionDocument = this.document;
+    await this.reconcileCommentAnchors();
     // A restored epoch starts with an R2 snapshot but no local update log. Seed
     // one idempotent Yjs update so the new room regenerates search projections,
     // references, thumbnails, and the epoch-scoped current projection.
@@ -1089,6 +1093,7 @@ export class Document extends YServer {
         connection.close(4401, "Authorization expired. Reconnect to continue.");
       }
     }
+    await this.state.blockConcurrencyWhile(() => this.reconcileCommentAnchors());
     if (this.metadata.dirty) await this.compact();
 
     const nextExpiry = Array.from(this.getConnections<ConnectionAuth>())
@@ -1423,6 +1428,63 @@ export class Document extends YServer {
         if (this.metadata.dirty) await this.compact();
       }
       return Response.json({ cleared: true });
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/comment-submission-anchor")) {
+      return this.state.blockConcurrencyWhile(async () => {
+        const body = await request.json<{
+          operation: string;
+          userId: string;
+          operationId: string;
+          token?: string;
+          selection?: { head?: unknown; anchor?: unknown };
+        }>();
+        if (typeof body.userId !== "string" || typeof body.operationId !== "string")
+          return Response.json({ error: "Invalid preparation." }, { status: 400 });
+        if (body.operation === "reconcile") {
+          await this.reconcileCommentAnchors(body.userId, body.operationId, body.token);
+          return Response.json({ complete: true });
+        }
+        if (
+          body.operation !== "prepare" ||
+          this.metadata.content_kind !== "document" ||
+          this.purged ||
+          this.metadata.retired ||
+          this.metadata.restore_pending ||
+          this.transition ||
+          this.metadata.read_only
+        )
+          return Response.json({ error: "This version cannot accept a comment anchor." }, { status: 409 });
+        await this.reconcileCommentAnchors();
+        const now = Date.now(),
+          token = crypto.randomUUID();
+        const claim =
+          await this.bindings.DB.prepare(`UPDATE anchored_comment_submissions SET anchor_token=?,anchor_expires_at=?
+          WHERE user_id=? AND operation_id=? AND page_id=? AND content_epoch=? AND state='prepared' AND expires_at>?
+          AND (anchor_token IS NULL OR anchor_expires_at<=?) RETURNING thread_id`)
+            .bind(token, now + 30_000, body.userId, body.operationId, this.ids.pageId, this.ids.epoch, now, now)
+            .first<{ thread_id: string }>();
+        if (!claim) return Response.json({ error: "Comment publication is pending or unavailable." }, { status: 409 });
+        this.state.storage.sql.exec(
+          "INSERT OR REPLACE INTO provisional_comment_anchors VALUES(?,?,?,?)",
+          body.userId,
+          body.operationId,
+          claim.thread_id,
+          token,
+        );
+        await this.scheduleAlarm(now + 30_000);
+        this.pendingAuthorId = body.userId;
+        const anchored =
+          body.selection?.head && body.selection.anchor
+            ? await addCommentMark(
+                this.document,
+                claim.thread_id,
+                body.selection as { head: RelativePositionJson; anchor: RelativePositionJson },
+              )
+            : false;
+        this.flushPendingUpdates();
+        if (!anchored) await this.reconcileCommentAnchors(body.userId, body.operationId, token);
+        return Response.json({ anchored, token, selection: body.selection });
+      });
     }
     if (request.method === "POST" && url.pathname.endsWith("/comment-anchor")) {
       if (this.metadata.content_kind !== "document") {
@@ -3470,6 +3532,67 @@ export class Document extends YServer {
         error,
       );
     }
+  }
+
+  /** Clearing the D1 lease fences late publishers before removing a provisional mark. */
+  private async reconcileCommentAnchors(userId?: string, operationId?: string, token?: string) {
+    const entries = this.state.storage.sql
+      .exec<{ user_id: string; operation_id: string; thread_id: string; token: string }>(
+        "SELECT * FROM provisional_comment_anchors LIMIT 100",
+      )
+      .toArray();
+    for (const entry of entries) {
+      if (userId && (entry.user_id !== userId || entry.operation_id !== operationId)) continue;
+      try {
+        let row = await this.bindings.DB.prepare(
+          "SELECT state,anchor_token,anchor_expires_at FROM anchored_comment_submissions WHERE user_id=? AND operation_id=?",
+        )
+          .bind(entry.user_id, entry.operation_id)
+          .first<{ state: string; anchor_token: string | null; anchor_expires_at: number | null }>();
+        if (
+          row?.state === "prepared" &&
+          row.anchor_token === entry.token &&
+          (row.anchor_expires_at ?? 0) > Date.now() &&
+          token !== entry.token
+        ) {
+          await this.scheduleAlarm(row.anchor_expires_at!);
+          continue;
+        }
+        if (row?.state === "prepared") {
+          await this.bindings.DB.prepare(
+            "UPDATE anchored_comment_submissions SET anchor_token=NULL,anchor_expires_at=NULL WHERE user_id=? AND operation_id=? AND state='prepared' AND anchor_token=?",
+          )
+            .bind(entry.user_id, entry.operation_id, entry.token)
+            .run();
+          // Publication and lease removal are serialized by D1. A committed winner keeps its mark.
+          row = await this.bindings.DB.prepare(
+            "SELECT state,anchor_token FROM anchored_comment_submissions WHERE user_id=? AND operation_id=?",
+          )
+            .bind(entry.user_id, entry.operation_id)
+            .first<typeof row>();
+        }
+        if (row?.state !== "published") {
+          removeCommentMark(this.document, entry.thread_id);
+          this.flushPendingUpdates();
+        }
+        this.state.storage.sql.exec(
+          "DELETE FROM provisional_comment_anchors WHERE user_id=? AND operation_id=? AND token=?",
+          entry.user_id,
+          entry.operation_id,
+          entry.token,
+        );
+      } catch (error) {
+        logger.warn(
+          "comment.anchor_cleanup.pending",
+          "comments",
+          "Provisional anchor reconciliation will retry.",
+          { pageId: this.ids.pageId },
+          error,
+        );
+        await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
+      }
+    }
+    if (entries.length === 100) await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
   }
 
   private async scheduleAlarm(when: number) {

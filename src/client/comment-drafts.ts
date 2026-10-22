@@ -1,3 +1,4 @@
+import { purgeCommentPublications } from "./comment-publication";
 import type { CommentBody } from "@blocknote/core/comments";
 export type CommentDraftScope = { account: string; pageId: string; epoch: number };
 export type CommentDraftAnchor = { head: unknown; anchor: unknown };
@@ -9,6 +10,7 @@ export type CommentDraft = {
 };
 const listeners = new Map<string, Set<() => void>>();
 const memory = new Map<string, CommentDraft | null>();
+const clearedOperations = new Map<string, string | undefined>();
 function notify(name: string) {
   for (const listener of listeners.get(name) ?? []) listener();
 }
@@ -59,6 +61,7 @@ export function writeCommentDraft(
     const value = JSON.stringify(record);
     if (value.length > 128_000) return false;
     const name = key(scope, id);
+    clearedOperations.delete(name);
     memory.set(name, record);
     let saved = true;
     try {
@@ -74,17 +77,31 @@ export function writeCommentDraft(
   }
 }
 export function clearCommentDraft(scope: CommentDraftScope, id: string, operationId?: string) {
-  if (operationId && readCommentDraft(scope, id)?.operationId !== operationId) return;
   const name = key(scope, id);
-  localStorage.removeItem(name);
-  memory.delete(name);
+  const current = readCommentDraft(scope, id)?.operationId ?? clearedOperations.get(name);
+  if (operationId && current !== operationId) return;
+  clearedOperations.set(name, current);
+  memory.set(name, null);
   notify(name);
+  // A subscriber may synchronously start a newer draft while observing the
+  // tombstone. Its persisted copy belongs to that newer version.
+  if (memory.get(name) !== null) return;
+  localStorage.removeItem(name);
 }
 export function purgeCommentDrafts(account: string) {
   const names = new Set(memory.keys());
-  for (let index = localStorage.length - 1; index >= 0; index--) {
-    const name = localStorage.key(index);
-    if (name?.startsWith(prefix)) names.add(name);
+  const failures: unknown[] = [];
+  try {
+    for (let index = localStorage.length - 1; index >= 0; index--) {
+      try {
+        const name = localStorage.key(index);
+        if (name?.startsWith(prefix)) names.add(name);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+  } catch (error) {
+    failures.push(error);
   }
   for (const name of names) {
     try {
@@ -92,19 +109,62 @@ export function purgeCommentDrafts(account: string) {
     } catch {
       continue;
     }
-    localStorage.removeItem(name);
-    memory.delete(name);
+    clearedOperations.set(name, memory.get(name)?.operationId);
+    memory.set(name, null);
     notify(name);
+    try {
+      localStorage.removeItem(name);
+    } catch (error) {
+      failures.push(error);
+    }
   }
+  try {
+    purgeCommentPublications(account);
+  } catch (error) {
+    failures.push(error);
+  }
+  if (failures.length) throw new AggregateError(failures, "Comment drafts could not be removed from this device.");
 }
 if (typeof window !== "undefined")
   window.addEventListener("storage", (event) => {
     if (event.key === null) {
       const names = [...memory.keys()];
-      memory.clear();
+      for (const name of names) memory.set(name, null);
       for (const name of names) notify(name);
     } else if (event.key.startsWith(prefix)) {
+      if (event.newValue && clearedOperations.has(event.key)) {
+        try {
+          const cleared = clearedOperations.get(event.key);
+          if (cleared === undefined || JSON.parse(event.newValue).operationId === cleared) return;
+        } catch {
+          return;
+        }
+      }
+      clearedOperations.delete(event.key);
       memory.delete(event.key);
       notify(event.key);
     }
   });
+
+/** Explicit retry after a confirmed terminal preparation preserves text and anchor. */
+export function replaceCommentDraftOperation(scope: CommentDraftScope, expected: string, operationId: string) {
+  const current = readCommentDraft(scope, "new");
+  if (!current || current.operationId !== expected) return;
+  const name = key(scope, "new"),
+    next = { ...current, operationId };
+  memory.set(name, next);
+  try {
+    localStorage.setItem(name, JSON.stringify(next));
+  } catch {
+    next.storageFailed = true;
+  }
+  notify(name);
+}
+
+export function warnCommentDraftPersistence(scope: CommentDraftScope) {
+  const current = readCommentDraft(scope, "new");
+  if (current) {
+    memory.set(key(scope, "new"), { ...current, storageFailed: true });
+    notify(key(scope, "new"));
+  }
+}

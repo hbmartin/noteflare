@@ -1,17 +1,18 @@
 import { useEffect } from "react";
-import { api } from "./api";
+import { jitteredBackoff } from "../shared/retry";
+import { api, ApiClientError } from "./api";
 import type { RealtimeAccessStatus } from "../shared/realtime-access";
 import {
   acceptRealtimeAccessStatus,
   failRealtimeAccessCheck,
   realtimeAccessSnapshot,
   subscribeRealtimeAccess,
-  useRealtimeAccessStatus,
+  useRealtimeAccessAccount,
 } from "./realtime-access-status";
 
 /** Exactly one owner coordinator per mounted workspace, including outside Settings. */
-export function useRealtimeAccessCoordinator(owner: boolean) {
-  const { account } = useRealtimeAccessStatus();
+export function useRealtimeAccessCoordinator(owner: boolean, onOwnerAccessLost?: () => Promise<void>) {
+  const account = useRealtimeAccessAccount();
   useEffect(() => {
     if (!owner || !account) return undefined;
     let stopped = false,
@@ -19,6 +20,8 @@ export function useRealtimeAccessCoordinator(owner: boolean) {
       attempt = 0,
       manual = realtimeAccessSnapshot().reconcileRequest;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let lastSuccessful = -Infinity;
+    let retryAt = 0;
     const controller = new AbortController();
     const clear = () => {
       clearTimeout(timer);
@@ -34,10 +37,17 @@ export function useRealtimeAccessCoordinator(owner: boolean) {
       try {
         const status = await api<RealtimeAccessStatus>(`/api/security/realtime/${reconcile ? "reconcile" : "status"}`, {
           ...(reconcile ? { method: "POST" } : {}),
+          readOnly: true,
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
         });
-        if (!stopped && !acceptRealtimeAccessStatus(status, account, version)) failRealtimeAccessCheck(account);
-      } catch {
+        if (!stopped) {
+          if (acceptRealtimeAccessStatus(status, account, version)) lastSuccessful = Date.now();
+          else failRealtimeAccessCheck(account);
+        }
+      } catch (error) {
+        if (!stopped && error instanceof ApiClientError && error.status === 403 && error.code === "owner_required") {
+          await onOwnerAccessLost?.().catch(() => {});
+        }
         if (!stopped) failRealtimeAccessCheck(account);
       } finally {
         running = false;
@@ -45,14 +55,16 @@ export function useRealtimeAccessCoordinator(owner: boolean) {
           const state = realtimeAccessSnapshot();
           if (state.reconcileRequest > manual || (state.checkVersion > version && !state.error)) wake();
           else if (state.pending || state.error || state.checkVersion > state.checkedVersion) {
-            timer = setTimeout(
-              () => {
-                timer = undefined;
-                void run(realtimeAccessSnapshot().pending);
-              },
-              Math.min(30_000, 2000 * 2 ** Math.min(attempt++, 4)),
-            );
-          } else attempt = 0;
+            const delay = jitteredBackoff(attempt++, 2000, 30_000);
+            retryAt = Date.now() + delay;
+            timer = setTimeout(() => {
+              timer = undefined;
+              void run(realtimeAccessSnapshot().pending);
+            }, delay);
+          } else {
+            attempt = 0;
+            retryAt = 0;
+          }
         }
       }
     };
@@ -65,18 +77,29 @@ export function useRealtimeAccessCoordinator(owner: boolean) {
       const state = realtimeAccessSnapshot();
       if (state.reconcileRequest > manual) void run(true);
       else if (!timer && state.checkVersion > state.checkedVersion && !state.error) void run(false);
-      else if (!timer && (state.pending || state.error))
-        timer = setTimeout(() => {
-          timer = undefined;
-          void run(realtimeAccessSnapshot().pending);
-        }, 2000);
-      else if (!state.pending && !state.error && state.checkVersion === state.checkedVersion) clear();
+      else if (!timer && (state.pending || state.error)) {
+        if (!retryAt) retryAt = Date.now() + jitteredBackoff(attempt++, 2000, 30_000);
+        timer = setTimeout(
+          () => {
+            timer = undefined;
+            void run(realtimeAccessSnapshot().pending);
+          },
+          Math.max(0, retryAt - Date.now()),
+        );
+      } else if (!state.pending && !state.error && state.checkVersion === state.checkedVersion) clear();
     };
     const visibility = () => {
       if (!available()) clear();
       else {
-        clear();
-        void run(realtimeAccessSnapshot().pending);
+        const state = realtimeAccessSnapshot();
+        if (
+          state.pending ||
+          state.error ||
+          state.checkVersion > state.checkedVersion ||
+          state.reconcileRequest > manual
+        )
+          wake();
+        else if (Date.now() - lastSuccessful >= 30_000) void run(false);
       }
     };
     const unsubscribe = subscribeRealtimeAccess(wake);
@@ -93,5 +116,5 @@ export function useRealtimeAccessCoordinator(owner: boolean) {
       window.removeEventListener("offline", visibility);
       document.removeEventListener("visibilitychange", visibility);
     };
-  }, [owner, account]);
+  }, [owner, account, onOwnerAccessLost]);
 }

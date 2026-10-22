@@ -1,0 +1,32 @@
+{
+  "baseline_revision": "c7f4a99",
+  "date": "2026-10-22",
+  "method": "Deterministic React external-store render counts and fake-clock coordinator request assertions; no production latency benchmark is claimed.",
+  "workspace_status_observations": {
+    "observations": 4,
+    "full_snapshot_subscription_renders_including_mount": 5,
+    "account_only_subscription_renders_including_mount": 1,
+    "test": "src/client/realtime-access-status.test.tsx: measures account-only renders against the former full-snapshot subscription"
+  },
+  "foreground_status_reads": {
+    "foreground_events": 6,
+    "events_with_fresh_status": 5,
+    "events_after_30_seconds": 1,
+    "former_unconditional_handler_requests_including_mount": 7,
+    "former_count_method": "One initial request plus one request per foreground event, as implemented at the baseline revision.",
+    "current_observed_requests_including_mount": 2,
+    "test": "src/client/realtime-access-status.test.tsx: does not rerender the account-only owner when status changes and freshness-limits foreground reads"
+  },
+  "repeated_contradictory_authorization": {
+    "automatic_page_reads_before_pause": 3,
+    "timer_ceiling_ms_before_reads": [0, 1000, 2000],
+    "automatic_reads_during_60_seconds_after_pause": 0,
+    "manual_retry_resumes": true,
+    "test": "src/client/document-connection.test.ts: pauses after three contradictory authorization cycles and resumes only on deliberate Retry"
+  },
+  "owner_revision_metadata": {
+    "fresh_authorization_callbacks_per_verified_single_workspace_response": 1,
+    "callbacks_for_unrelated_or_aggregate_responses": 0,
+    "note": "Fresh owner verification deliberately adds an authorization check. It is never reused as an authorization grant. No D1 or DO latency reduction is claimed."
+  }
+}

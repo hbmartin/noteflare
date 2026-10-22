@@ -1,3 +1,4 @@
+import { registerAuthorizationPreservation } from "./authorization-lifecycle";
 import { useOnlineStatus } from "./online-status";
 import { CommentDraftContext, DraftCommentsControllers, DraftThreadsSidebar } from "./CommentDrafts";
 import { createPortal } from "react-dom";
@@ -208,6 +209,8 @@ export function EditorPage({
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
   const online = useOnlineStatus();
   const [connectionSynced, setConnectionSynced] = useState(false);
+  const [authorizationPaused, setAuthorizationPaused] = useState(false);
+  const retryAuthorization = useRef<() => void>(() => {});
   const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [storageWriteFailed, setStorageWriteFailed] = useState(false);
@@ -794,7 +797,10 @@ export function EditorPage({
     next.provider.on("custom-message", customMessage);
     const closeReconciler = createDocumentCloseReconciler({
       page: { id: page.id, contentEpoch: page.contentEpoch },
-      provider: next.provider,
+      provider: { connect: () => next.resume(), disconnect: () => next.suspend() },
+      onStateChange: (state) => {
+        if (active) setAuthorizationPaused(state === "paused");
+      },
       hasUnsyncedChanges: () => next.hasUnsyncedChanges,
       quarantine,
       onPageChanged,
@@ -813,6 +819,19 @@ export function EditorPage({
           onAccessDenied(page.id, new ApiClientError(401, "unauthorized", "Sign in again to edit this page."));
         }
       },
+    });
+    retryAuthorization.current = () => closeReconciler.retry();
+    const stopPreserving = registerAuthorizationPreservation(() => {
+      if (!active || !next.hasUnsyncedChanges) return;
+      quarantine(currentStorageKey, "access");
+      const markdown = offlineCopyMarkdown(next.doc, offlineMetadata.current.page.title);
+      liveRecoveryCopies.set(currentStorageKey, markdown);
+      liveRecoveryEntries.set(currentStorageKey, {
+        key: currentStorageKey,
+        epoch: page.contentEpoch,
+        reason: "access",
+      });
+      next.suspend();
     });
     const connectionClose = (event: CloseEvent) => {
       if (active) closeReconciler.handleClose(event);
@@ -860,6 +879,7 @@ export function EditorPage({
     })();
     return () => {
       active = false;
+      stopPreserving();
       closeReconciler.destroy();
       next.provider.off("custom-message", customMessage);
       next.provider.off("connection-close", connectionClose);
@@ -1026,6 +1046,12 @@ export function EditorPage({
           </button>
         </ActionMenu>
       </PageTools>
+      {authorizationPaused && (
+        <p className="notice" role="alert">
+          Access could not be confirmed. Your local edits are preserved.{" "}
+          <button onClick={() => retryAuthorization.current()}>Retry access</button>
+        </p>
+      )}
       {schemaUpgrade && (
         <div className="notice notice-danger" role="alert">
           This page uses a newer editor feature. Reload to continue editing.

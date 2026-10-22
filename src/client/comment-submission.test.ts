@@ -5,8 +5,8 @@ import type { ThreadStore } from "@blocknote/core/comments";
 import { TextSelection } from "prosemirror-state";
 import * as Y from "yjs";
 import { expect, it, vi } from "vitest";
-import { captureCommentDraftAnchor } from "./comment-draft-anchor";
-import { submitAnchoredComment } from "./comment-submission";
+import { captureCommentDraftAnchor, resolveCommentDraftAnchor } from "./comment-draft-anchor";
+import { CommentSubmissionOwner, submitAnchoredComment } from "./comment-submission";
 
 it.each(["insert", "delete-before", "delete-selection", "disposed"])(
   "resolves the current comment anchor after %s during creation",
@@ -96,7 +96,7 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
   let finishCreation!: () => void, finishAnchor!: () => void;
   const identities = new Set<string>();
   let failAnchor = true;
-  let persisted: Parameters<InstanceType<typeof ServerThreadStore>["addThreadToDocument"]>[0]["selection"] | undefined;
+  let persisted: Parameters<typeof resolveCommentDraftAnchor>[1];
   const thread = {
     id: "thread-1",
     pageId: "page-1",
@@ -113,23 +113,37 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
     updatedAt: 1,
   };
   const spy = vi.spyOn(apiModule, "api").mockImplementation(async (path, init) => {
-    if (path.endsWith("/comments")) {
+    if (path.endsWith("/comment-submissions")) {
       identities.add(new Headers(init?.headers).get("x-notes-operation-id")!);
       if (identities.size === 1 && !finishCreation)
         await new Promise<void>((resolve) => {
           finishCreation = resolve;
         });
-      return { thread } as never;
+      return {
+        submission: {
+          operationId: new Headers(init?.headers).get("x-notes-operation-id"),
+          state: "prepared",
+          threadId: thread.id,
+          expiresAt: Date.now() + 86400_000,
+        },
+      } as never;
     }
     if (failAnchor) {
       failAnchor = false;
       throw new Error("anchor transport interrupted");
     }
-    persisted = JSON.parse(String(init?.body)).selection.prosemirror;
+    persisted = JSON.parse(String(init?.body)).selection.yjs;
     await new Promise<void>((resolve) => {
       finishAnchor = resolve;
     });
-    return { thread: { ...thread, anchored: true } } as never;
+    return {
+      submission: {
+        operationId: new Headers(init?.headers).get("x-notes-operation-id"),
+        state: "published",
+        threadId: thread.id,
+      },
+      thread: { ...thread, anchored: true },
+    } as never;
   });
   try {
     editor.replaceBlocks(editor.document, [{ type: "paragraph", content: "Before selected after" }]);
@@ -151,7 +165,8 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
     const retry = submitAnchoredComment(editor, anchor, body, store, () => true);
     await vi.waitFor(() => expect(finishAnchor).toBeTypeOf("function"));
     expect(persisted).toBeDefined();
-    expect(editor.prosemirrorState.doc.textBetween(persisted!.anchor, persisted!.head)).toBe("selected");
+    const selected = resolveCommentDraftAnchor(editor, persisted)!;
+    expect(editor.prosemirrorState.doc.textBetween(selected.from, selected.to)).toBe("selected");
     writeCommentDraft(
       scope,
       "new",
@@ -168,5 +183,21 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
     editor.unmount();
     host.remove();
     doc.destroy();
+  }
+});
+
+it("detects editor-only unmount despite Tiptap's live-looking view proxy", () => {
+  const editor = BlockNoteEditor.create();
+  const host = document.body.appendChild(document.createElement("div"));
+  editor.mount(host);
+  const owner = new CommentSubmissionOwner({ editor, account: "author", pageId: "page", epoch: 1 });
+  try {
+    expect(owner.isCurrent()).toBe(true);
+    editor.unmount();
+    expect(editor.prosemirrorView.isDestroyed).toBe(false);
+    expect(owner.isCurrent()).toBe(false);
+  } finally {
+    owner.destroy();
+    host.remove();
   }
 });

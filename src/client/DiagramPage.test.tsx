@@ -1,3 +1,4 @@
+import { DiagramRestoreOwner } from "./diagram-restore-owner";
 // @vitest-environment jsdom
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -82,7 +83,7 @@ function show() {
     onAccessDenied: vi.fn(),
     onSelectPage: vi.fn(),
   };
-  const props = { page, member, backlinksRevision: 0, ...callbacks };
+  const props = { restoreOwner: new DiagramRestoreOwner(), page, member, backlinksRevision: 0, ...callbacks };
   const view = render(<DiagramPage {...props} />);
   return { next, callbacks, view, props };
 }
@@ -126,7 +127,7 @@ it("resumes after the shared ready auth result without another security status c
     expect(next.resume).not.toHaveBeenCalled();
     await act(async () => {
       finish("ready");
-      await vi.advanceTimersByTimeAsync(2000);
+      await vi.advanceTimersByTimeAsync(3000);
     });
     expect(next.resume).toHaveBeenCalledOnce();
     expect(callbacks.onAccessDenied).not.toHaveBeenCalled();
@@ -160,4 +161,20 @@ it("separates restore warnings from schema upgrades across the actual keyed remo
   expect(screen.queryByText(/local edits were not merged/)).toBeNull();
   await act(async () => fresh.emit("custom-message", JSON.stringify({ type: "document-schema-upgrade" })));
   expect(screen.getByText(/Reload to edit linked page cards/)).toBeVisible();
+});
+
+it("shows the restore notice when a workspace event remounts before the close response", async () => {
+  const { next, view, props } = show();
+  next.hasUnsyncedChanges = true;
+  const fresh = bundle(() => {});
+  vi.mocked(createNetworkCollaboration).mockReturnValue(
+    fresh as unknown as ReturnType<typeof createNetworkCollaboration>,
+  );
+  await act(async () => {
+    props.restoreOwner.observe([{ ...page, contentEpoch: 2 }]);
+    view.rerender(<DiagramPage key="event-first:2" {...props} page={{ ...page, contentEpoch: 2 }} />);
+  });
+  expect(next.destroy).toHaveBeenCalledOnce();
+  expect(screen.getByText(/local edits were not merged/)).toBeVisible();
+  expect(screen.queryByText(/Reload to edit linked page cards/)).toBeNull();
 });

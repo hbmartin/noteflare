@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { CollaborativeColumn, TableCommand, TableQueryResult, TableView } from "../shared/table-protocol";
 import { api, ApiClientError } from "./api";
 import { CollaborativeTablePage } from "./CollaborativeTablePage";
+import { purgeCellDrafts } from "./cell-drafts";
 import { taskColumns } from "../shared/tasks";
 
 vi.mock("./api", async (original) => ({ ...(await original<typeof import("./api")>()), api: vi.fn() }));
@@ -62,6 +63,7 @@ let deniedRead: boolean;
 let writes: TableCommand[];
 let commandDelay: Promise<void> | null;
 beforeEach(() => {
+  purgeCellDrafts("owner\0workspace");
   AuthorizedTableSocket.instances = [];
   AuthorizedTableSocket.autoReady = true;
   vi.stubGlobal("WebSocket", AuthorizedTableSocket);
@@ -232,6 +234,122 @@ function show(initialViewId = "", context = member, onSelectPage = vi.fn(), task
   );
 }
 describe("collaborative table UI", () => {
+  it("keeps authorization when a view query supersedes a pending socket query", async () => {
+    await act(async () => {
+      render(
+        <CollaborativeTablePage page={{ id: "table", title: "Roadmap" }} member={member} onSelectPage={vi.fn()} />,
+      );
+    });
+    const socket = AuthorizedTableSocket.instances[0]!;
+    const title = screen.getByLabelText("Title");
+    let release!: (value: TableQueryResult) => void;
+    vi.mocked(api).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    await act(async () => {
+      socket.dispatchEvent(new MessageEvent("message", { data: '{"type":"table-ready"}' }));
+    });
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Alpha" } });
+    });
+    await act(async () => {
+      release(data);
+    });
+    expect(title).not.toBeDisabled();
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(AuthorizedTableSocket.instances).toHaveLength(1);
+    expect(writes).toHaveLength(0);
+  });
+  it("preserves focused input and caret through proactive canonical renewal without submitting text", async () => {
+    vi.useFakeTimers();
+    AuthorizedTableSocket.autoReady = false;
+    await act(async () => {
+      render(
+        <CollaborativeTablePage page={{ id: "table", title: "Roadmap" }} member={member} onSelectPage={vi.fn()} />,
+      );
+    });
+    const ready = (socket: AuthorizedTableSocket) =>
+      socket.dispatchEvent(
+        new MessageEvent("message", {
+          data: JSON.stringify({
+            type: "table-ready",
+            generation: 1,
+            authorizationRemainingMs: 300_000,
+            renewalDelayMs: 270_000,
+          }),
+        }),
+      );
+    await act(async () => {
+      ready(AuthorizedTableSocket.instances[0]!);
+    });
+    const title = screen.getByLabelText<HTMLInputElement>("Title");
+    title.focus();
+    fireEvent.change(title, { target: { value: "Still typing" } });
+    title.setSelectionRange(3, 5);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(270_001);
+    });
+    expect(title).not.toBeDisabled();
+    expect(AuthorizedTableSocket.instances).toHaveLength(2);
+    await act(async () => {
+      ready(AuthorizedTableSocket.instances[1]!);
+    });
+    expect(document.activeElement).toBe(title);
+    expect(title.selectionStart).toBe(3);
+    expect(title.selectionEnd).toBe(5);
+    expect(title).toHaveValue("Still typing");
+    expect(writes).toHaveLength(0);
+  });
+  it("restores drafts after navigation and explicitly saves rows outside the loaded view", async () => {
+    show();
+    const title = await screen.findByLabelText("Title");
+    fireEvent.focus(title);
+    fireEvent.change(title, { target: { value: "Hidden pending edit" } });
+    cleanup();
+    const hidden = structuredClone(data.rows[0]!);
+    data = { ...data, rows: [] };
+    const previous = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/draft-rows")) return { ...data, rows: [hidden], missingRowIds: [] };
+      if (path.endsWith("/commands")) {
+        const command = JSON.parse(String(init?.body));
+        writes.push(command);
+        return { revision: 2, operationId: command.operationId, result: {}, projectionPending: false };
+      }
+      return previous(path, init);
+    });
+    show();
+    expect(await screen.findByText("Outside the loaded view")).toBeInTheDocument();
+    expect(screen.getByLabelText("Recovered cell draft")).toHaveValue("Hidden pending edit");
+    const request = vi.mocked(api).mock.calls.find(([path]) => path.endsWith("/draft-rows"));
+    expect(request?.[1]).toMatchObject({ method: "POST", readOnly: true });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await waitFor(() => expect(screen.queryByLabelText("Recovered cell draft")).toBeNull());
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.payload).toMatchObject({
+      rowId: "row",
+      values: { Title: "Hidden pending edit" },
+      expectedCellRevisions: { Title: 1 },
+    });
+  });
+  it("does not call an unverified hidden row deleted", async () => {
+    show();
+    const title = await screen.findByLabelText("Title");
+    fireEvent.focus(title);
+    fireEvent.change(title, { target: { value: "Recover me" } });
+    const previous = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation((path, init) =>
+      path.endsWith("/draft-rows") ? Promise.reject(new TypeError("offline")) : previous(path, init),
+    );
+    data = { ...data, rows: [] };
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText(/Verification unavailable/)).toBeInTheDocument();
+    expect(screen.queryByText(/Confirmed deleted/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save draft" })).toBeNull();
+  });
   it("restores canonical socket readiness without dropping a focused draft or saving on disconnect blur", async () => {
     vi.useFakeTimers();
     await act(async () => {
@@ -243,6 +361,7 @@ describe("collaborative table UI", () => {
     expect(title).not.toBeDisabled();
     fireEvent.focus(title);
     fireEvent.change(title, { target: { value: "Preserved draft" } });
+    AuthorizedTableSocket.autoReady = false;
     await act(async () => {
       const socket = AuthorizedTableSocket.instances.at(-1)!;
       socket.readyState = 3;
@@ -252,7 +371,9 @@ describe("collaborative table UI", () => {
     fireEvent.blur(title);
     expect(writes).toHaveLength(0);
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(2000);
+      AuthorizedTableSocket.instances
+        .at(-1)!
+        .dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-ready", revision: 1 }) }));
     });
     expect(title).not.toBeDisabled();
     expect(title).toHaveValue("Preserved draft");
@@ -349,7 +470,9 @@ describe("collaborative table UI", () => {
     vi.useRealTimers();
     await waitFor(() => expect(screen.queryByLabelText("Title")).toBeNull());
     expect(screen.getByRole("status")).toHaveTextContent("Table access was removed");
-    expect(screen.queryByText("Unsaved draft")).toBeNull();
+    expect(screen.getByLabelText("Recovered cell draft")).toHaveValue("Unsaved draft");
+    expect(screen.queryByRole("button", { name: "Save draft" })).toBeNull();
+    expect(screen.queryByText("Alpha")).toBeNull();
   });
   it("clears cached rows and pending controls when a command loses source permission", async () => {
     show();

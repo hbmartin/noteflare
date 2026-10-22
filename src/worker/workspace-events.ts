@@ -1,4 +1,5 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
+import { REALTIME_GRANT_MS, REALTIME_ROOM_MARGIN_MS, REALTIME_CLOCK_SKEW_MS } from "../shared/realtime-limits";
 import { YServer } from "y-partyserver";
 import type { Page, WorkspaceEvent } from "../shared/types";
 import { ID_PATTERN, parseWorkspaceEvent } from "../shared/validation";
@@ -236,7 +237,7 @@ export class WorkspaceEvents extends YServer {
             !/^(?:[a-zA-Z0-9-]{1,100}~[1-9][0-9]*|table:[a-zA-Z0-9-]{1,100})$/.test(body.room) ||
             !Number.isFinite(body.expiresAt) ||
             Number(body.expiresAt) <= Date.now() ||
-            Number(body.expiresAt) > Date.now() + 5 * 60_000 + 5_000
+            Number(body.expiresAt) > Date.now() + REALTIME_GRANT_MS + REALTIME_ROOM_MARGIN_MS + REALTIME_CLOCK_SKEW_MS
           ) {
             return new Response("Invalid room", { status: 400 });
           }

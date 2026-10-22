@@ -1,4 +1,4 @@
-import { trackRealtimeUser } from "./realtime-access";
+import { trackRealtimeUser, deleteRejectedSession } from "./realtime-access";
 import { betterAuth } from "better-auth";
 import type { GenericEndpointContext } from "@better-auth/core";
 import { passkey } from "@better-auth/passkey";
@@ -354,10 +354,12 @@ export function createAuth(env: Env, allowRegistration = false) {
             try {
               await finishSlackAuthentication(env, ctx, session.userId, session.id);
             } catch (error) {
-              await trackRealtimeUser(env, session.userId);
-              await env.DB.prepare("DELETE FROM session WHERE id=? AND userId=?")
-                .bind(session.id, session.userId)
-                .run();
+              try {
+                await deleteRejectedSession(env, session.userId, session.id);
+              } catch {
+                // Cleanup logs its own failure. Preserve the original refused
+                // authentication outcome, including its callback destination.
+              }
               await slackCallbackFailure(env, ctx, error);
             }
           },

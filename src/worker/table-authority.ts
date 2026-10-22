@@ -14,6 +14,7 @@ import {
   type RelationInput,
 } from "../shared/table-relations";
 import { DurableObject } from "cloudflare:workers";
+import { REALTIME_GRANT_MS, REALTIME_CLOCK_SKEW_MS, TABLE_RENEWAL_LEAD_MS } from "../shared/realtime-limits";
 import type { Env } from "./env";
 import type { ColumnType } from "../shared/types";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
@@ -102,6 +103,7 @@ export type TableActor = {
   generation: number;
   expiresAt: number;
   socketExpiresAt?: number;
+  socketRenewable?: boolean;
   authGeneration?: number;
   creation?: { board: boolean; calendar: boolean };
   authorization?: { sql: string; binds: unknown[] };
@@ -208,16 +210,26 @@ export async function tableActorSignature(secret: string, actor: TableActor) {
 }
 
 /** SQLite owns table ordering and receipts. D1 is rebuilt from durable projection events. */
+/** Existing grants may outlive short internal actor leases, but never their fixed deadline. */
+function validSocketGrant(
+  actor: TableActor | null | undefined,
+  now = Date.now(),
+): actor is TableActor & { socketExpiresAt: number } {
+  return Boolean(actor && Number.isFinite(actor.socketExpiresAt) && actor.socketExpiresAt! > now);
+}
+
 export class TableAuthority extends DurableObject<Env> {
   private readonly relations: CanonicalRelations;
   private projecting: Promise<boolean> | null = null;
   private repairWork: Promise<unknown> | null = null;
   private deletionIntent: DeletionIntent | null = null;
   private purged = false;
+  private deadlinesLoading: Promise<void> | null = null;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.relations = new CanonicalRelations(ctx.storage.sql);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS meta(id INTEGER PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS alarm_deadlines(id INTEGER PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS access_fence(id INTEGER PRIMARY KEY,generation INTEGER NOT NULL);
       INSERT OR IGNORE INTO access_fence VALUES(1,0);
       CREATE TABLE IF NOT EXISTS properties(id TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -258,16 +270,68 @@ export class TableAuthority extends DurableObject<Env> {
     if (this.deletionIntent || this.purged)
       fail("Permanent deletion has been accepted for this table.", 409, "deletion_pending");
   }
-  private async scheduleAlarm(delay: number) {
-    if (this.deletionIntent || this.purged) return;
-    const deadline = Date.now() + delay,
-      current = await this.ctx.storage.getAlarm();
-    if (current === null || current <= Date.now() || deadline < current) await this.ctx.storage.setAlarm(deadline);
+  private async initializeDeadlines() {
+    this.deadlinesLoading ??= (async () => {
+      if (this.rows("SELECT id FROM alarm_deadlines WHERE id=1").length) return;
+      const legacy = await this.ctx.storage.getAlarm();
+      const meta = this.rows<{ value: string }>("SELECT value FROM meta WHERE id=1")[0];
+      const state = meta ? (JSON.parse(meta.value) as Meta) : null;
+      const repair = state?.repairIntent && state.repairIntent.phase !== "blocked" ? (legacy ?? Date.now()) : null;
+      const projection = !repair && legacy !== null ? legacy : null;
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO alarm_deadlines VALUES(1,?)",
+        JSON.stringify({ version: 1, repair, projection }),
+      );
+    })();
+    await this.deadlinesLoading;
   }
-  private async clearWorkAlarm() {
-    await this.ctx.storage.deleteAlarm();
-    const socketDeadline = this.expireSockets();
-    if (Number.isFinite(socketDeadline)) await this.scheduleAlarm(Math.max(1, socketDeadline - Date.now()));
+  private deadlines() {
+    return JSON.parse(this.rows<{ value: string }>("SELECT value FROM alarm_deadlines WHERE id=1")[0]!.value) as {
+      version: 1;
+      repair: number | null;
+      projection: number | null;
+    };
+  }
+  private async armAlarm() {
+    const deadlines = this.deadlines();
+    const repairing = this.rows<{ value: string }>("SELECT value FROM meta WHERE id=1")[0];
+    const intent = repairing ? (JSON.parse(repairing.value) as Meta).repairIntent : undefined;
+    const next = Math.min(
+      this.expireSockets(),
+      this.deletionIntent || this.purged ? Infinity : (deadlines.repair ?? Infinity),
+      this.deletionIntent || this.purged || intent ? Infinity : (deadlines.projection ?? Infinity),
+    );
+    if (Number.isFinite(next)) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, next));
+    else await this.ctx.storage.deleteAlarm();
+  }
+  private async scheduleAlarm(delay: number, owner: "repair" | "projection" = "projection") {
+    await this.initializeDeadlines();
+    if (this.deletionIntent || this.purged) return;
+    const state = this.deadlines();
+    state[owner] = Date.now() + delay;
+    this.ctx.storage.sql.exec("INSERT OR REPLACE INTO alarm_deadlines VALUES(1,?)", JSON.stringify(state));
+    await this.armAlarm();
+  }
+  private async clearWorkAlarm(owner?: "repair" | "projection") {
+    await this.initializeDeadlines();
+    const state = this.deadlines();
+    if (owner) state[owner] = null;
+    else {
+      state.repair = null;
+      state.projection = null;
+    }
+    this.ctx.storage.sql.exec("INSERT OR REPLACE INTO alarm_deadlines VALUES(1,?)", JSON.stringify(state));
+    await this.armAlarm();
+  }
+  private ready(actor: TableActor) {
+    const remaining = Math.max(0, (actor.socketExpiresAt ?? 0) - Date.now());
+    return JSON.stringify({
+      type: "table-ready",
+      revision: this.meta().revision,
+      generation: this.meta().generation,
+      authorizationRemainingMs: remaining,
+      renewalDelayMs: actor.socketRenewable ? Math.max(0, remaining - TABLE_RENEWAL_LEAD_MS) : null,
+    });
   }
   private async trackRepair<T>(work: () => Promise<T>): Promise<T> {
     this.requireActive();
@@ -602,6 +666,29 @@ export class TableAuthority extends DurableObject<Env> {
       const meta = this.meta();
       if (meta.pageId !== actor.pageId || meta.generation !== actor.generation || !meta.seeded)
         return fail("Table generation is not active.", 503);
+      if (path === "/draft-rows" && request.method === "POST") {
+        const raw = await request.text();
+        if (new TextEncoder().encode(raw).byteLength > 20_000) return fail("Draft lookup body is too large.", 413);
+        const body = JSON.parse(raw) as { rowIds?: unknown };
+        if (!body || !Array.isArray(body.rowIds) || body.rowIds.length > 100 || !body.rowIds.length)
+          return fail("Choose between one and 100 draft rows.");
+        const ids = [...new Set(body.rowIds.map((value) => id(value)))];
+        const rows = ids.flatMap((rowId) =>
+          this.rows<StoredRow>("SELECT * FROM rows WHERE id=?", rowId).map((row) => this.rowValue(row)),
+        );
+        const result = {
+          pageId: meta.pageId,
+          generation: meta.generation,
+          revision: meta.revision,
+          columns: this.columns(),
+          rows,
+          missingRowIds: ids.filter((rowId) => !rows.some((row) => row.id === rowId)),
+        };
+        await this.authorize(request, false);
+        if (this.meta().revision !== meta.revision)
+          return fail("The table changed. Retry draft verification.", 409, "table_revision_conflict");
+        return Response.json(result);
+      }
       if (path === "/commands") {
         const raw = await request.text();
         if (new TextEncoder().encode(raw).byteLength > TABLE_BULK_MAX_BODY_BYTES)
@@ -779,18 +866,14 @@ export class TableAuthority extends DurableObject<Env> {
         });
       }
       if (path === "/socket") {
-        if (
-          !Number.isFinite(actor.socketExpiresAt) ||
-          !actor.socketExpiresAt ||
-          actor.socketExpiresAt <= Date.now() ||
-          actor.socketExpiresAt > Date.now() + 5 * 60_000 + 1_000
-        )
+        if (!validSocketGrant(actor) || actor.socketExpiresAt > Date.now() + REALTIME_GRANT_MS + REALTIME_CLOCK_SKEW_MS)
           return fail("Reconnect to refresh authorization.", 403, "table_forbidden");
         const pair = new WebSocketPair();
         this.ctx.acceptWebSocket(pair[1], [actor.userId]);
         pair[1].serializeAttachment(actor);
-        await this.scheduleAlarm(actor.socketExpiresAt - Date.now());
-        pair[1].send(JSON.stringify({ type: "table-ready", revision: meta.revision }));
+        await this.initializeDeadlines();
+        await this.armAlarm();
+        pair[1].send(this.ready(actor));
         return new Response(null, { status: 101, webSocket: pair[0] });
       }
       return new Response("Not found", { status: 404 });
@@ -1789,12 +1872,7 @@ export class TableAuthority extends DurableObject<Env> {
     for (const socket of this.ctx.getWebSockets()) {
       if (socket.readyState !== WebSocket.OPEN) continue;
       const socketActor = socket.deserializeAttachment() as TableActor | null;
-      if (
-        !socketActor?.socketExpiresAt ||
-        !Number.isFinite(socketActor.socketExpiresAt) ||
-        socketActor.socketExpiresAt <= Date.now()
-      )
-        continue;
+      if (!validSocketGrant(socketActor)) continue;
       try {
         socket.send(JSON.stringify({ type: "table-changed", revision, operationId: command.operationId }));
       } catch {
@@ -3557,7 +3635,7 @@ export class TableAuthority extends DurableObject<Env> {
         this.putMeta({ ...initial, repairIntent: { ...retry, phase: blocked?.resumePhase ?? "drain" } });
       } else if (!initial.repairIntent)
         this.putMeta({ ...initial, repairIntent: { generation: initial.generation, version: 2, phase: "fence" } });
-      await this.scheduleAlarm(1000);
+      await this.scheduleAlarm(1000, "repair");
       let intent = this.meta().repairIntent!;
       const registry = await this.env.DB.prepare("SELECT generation,state FROM table_authority WHERE page_id=?")
         .bind(initial.pageId)
@@ -3640,7 +3718,7 @@ export class TableAuthority extends DurableObject<Env> {
                   ...intent,
                   bookkeeping: { revision: event.revision, position: step.position, statement: index },
                 });
-                await this.scheduleAlarm(1000);
+                await this.scheduleAlarm(1000, "repair");
                 return { pending: true as const };
               }
             }
@@ -3682,12 +3760,12 @@ export class TableAuthority extends DurableObject<Env> {
           await this.applyOwnedProjection(batches[position]!, intent.revision!, false);
           setIntent({ ...intent, headerStep: position + 1 });
           if (position + 1 < batches.length) {
-            await this.scheduleAlarm(1000);
+            await this.scheduleAlarm(1000, "repair");
             return { pending: true as const };
           }
         }
         setIntent({ ...intent, phase: "rows" });
-        await this.scheduleAlarm(1000);
+        await this.scheduleAlarm(1000, "repair");
         return { pending: true as const };
       }
       if (intent.phase === "rows") {
@@ -3701,7 +3779,7 @@ export class TableAuthority extends DurableObject<Env> {
           setIntent({ ...intent, rowCursor: rows.at(-1)!.id });
         }
         if (rows.length === 100 && this.rows("SELECT id FROM rows WHERE id>? LIMIT 1", intent.rowCursor!).length) {
-          await this.scheduleAlarm(1000);
+          await this.scheduleAlarm(1000, "repair");
           return { pending: true as const };
         }
         setIntent({ ...intent, phase: "reconcile" });
@@ -3732,11 +3810,11 @@ export class TableAuthority extends DurableObject<Env> {
         }
         if (projected.results.length) setIntent({ ...intent, reconcileCursor: projected.results.at(-1)!.id });
         if (projected.results.length === 1000) {
-          await this.scheduleAlarm(1000);
+          await this.scheduleAlarm(1000, "repair");
           return { pending: true as const };
         }
         setIntent({ ...intent, phase: "verify" });
-        await this.scheduleAlarm(1000);
+        await this.scheduleAlarm(1000, "repair");
         return { pending: true as const };
       }
       if (intent.phase === "verify") {
@@ -3762,10 +3840,10 @@ export class TableAuthority extends DurableObject<Env> {
                 }),
           });
           if (mismatches < 2) {
-            await this.scheduleAlarm(1000);
+            await this.scheduleAlarm(1000, "repair");
             return { pending: true as const };
           }
-          await this.clearWorkAlarm();
+          await this.clearWorkAlarm("repair");
           fail("Projection verification failed. The write fence remains active.", 503, "table_projection_mismatch");
         }
         setIntent({
@@ -3801,6 +3879,7 @@ export class TableAuthority extends DurableObject<Env> {
         this.putMeta({ ...current, projectedRevision: intent.revision! });
         this.ctx.storage.sql.exec("DELETE FROM projection_steps WHERE revision<=?", intent.revision!);
       });
+      await this.clearWorkAlarm("repair");
       return { ...(await this.verification()), ...intent.hashes!, consistent: true, projectionMatches: true };
     } catch (error) {
       if (!this.purged && !this.deletionIntent) {
@@ -3826,8 +3905,8 @@ export class TableAuthority extends DurableObject<Env> {
               },
             },
           });
-          await this.clearWorkAlarm();
-        } else if (this.meta().repairIntent?.phase !== "blocked") await this.scheduleAlarm(10_000);
+          await this.clearWorkAlarm("repair");
+        } else if (this.meta().repairIntent?.phase !== "blocked") await this.scheduleAlarm(10_000, "repair");
       }
       throw error;
     }
@@ -3938,9 +4017,23 @@ export class TableAuthority extends DurableObject<Env> {
   }
   // fallow-ignore-next-line unused-class-member -- Called by Cloudflare Durable Object runtime.
   async alarm() {
-    const socketDeadline = this.expireSockets();
-    if (Number.isFinite(socketDeadline)) await this.scheduleAlarm(Math.max(1, socketDeadline - Date.now()));
-    if (this.purged || this.deletionIntent) return;
+    await this.initializeDeadlines();
+    this.expireSockets();
+    if (this.purged || this.deletionIntent) {
+      await this.armAlarm();
+      return;
+    }
+    const deadlines = this.deadlines(),
+      now = Date.now();
+    const repairDue = deadlines.repair !== null && deadlines.repair <= now;
+    const projectionDue = deadlines.projection !== null && deadlines.projection <= now;
+    if (!repairDue && (!projectionDue || this.meta().repairIntent)) {
+      await this.armAlarm();
+      return;
+    }
+    if (repairDue) deadlines.repair = null;
+    if (projectionDue) deadlines.projection = null;
+    this.ctx.storage.sql.exec("INSERT OR REPLACE INTO alarm_deadlines VALUES(1,?)", JSON.stringify(deadlines));
     try {
       const meta = this.meta();
       if (!meta.repairIntent && meta.seeded) {
@@ -3948,21 +4041,24 @@ export class TableAuthority extends DurableObject<Env> {
           .bind(meta.pageId)
           .first<{ generation: number; state: string }>();
         if (this.purged || this.deletionIntent) return;
-        this.ctx.storage.transactionSync(() => {
-          const current = this.meta();
-          if (
-            !current.repairIntent &&
-            current.seeded &&
-            registry?.state === "repairing" &&
-            registry.generation === current.generation
-          )
-            this.putMeta({ ...current, repairIntent: { generation: current.generation, version: 2, phase: "fence" } });
-        });
+        const current = this.meta();
+        if (
+          !current.repairIntent &&
+          current.seeded &&
+          registry?.state === "repairing" &&
+          registry.generation === current.generation
+        )
+          this.putMeta({ ...current, repairIntent: { generation: current.generation, version: 2, phase: "fence" } });
       }
-      if (this.meta().repairIntent) await this.resumeRepair();
-      else await this.project();
+      if (this.meta().repairIntent?.phase !== "blocked") {
+        if (this.meta().repairIntent) await this.resumeRepair();
+        else await this.project();
+      }
     } catch {
-      if (!this.purged && this.meta().repairIntent?.phase !== "blocked") await this.scheduleAlarm(10_000);
+      if (!this.purged && !this.deletionIntent && this.meta().repairIntent?.phase !== "blocked")
+        await this.scheduleAlarm(10_000, this.meta().repairIntent ? "repair" : "projection");
+    } finally {
+      await this.armAlarm();
     }
   }
   private expireSockets() {
@@ -3970,8 +4066,7 @@ export class TableAuthority extends DurableObject<Env> {
     for (const socket of this.ctx.getWebSockets()) {
       if (socket.readyState !== WebSocket.OPEN) continue;
       const actor = socket.deserializeAttachment() as TableActor | null;
-      if (!actor?.socketExpiresAt || !Number.isFinite(actor.socketExpiresAt) || actor.socketExpiresAt <= Date.now())
-        socket.close(4401, "Authorization expired. Reconnect to continue.");
+      if (!validSocketGrant(actor)) socket.close(4401, "Authorization expired. Reconnect to continue.");
       else next = Math.min(next, actor.socketExpiresAt);
     }
     return next;
@@ -3980,7 +4075,7 @@ export class TableAuthority extends DurableObject<Env> {
   async webSocketMessage(socket: WebSocket) {
     if (socket.readyState !== WebSocket.OPEN) return;
     const grant = socket.deserializeAttachment() as TableActor | null;
-    if (!grant?.socketExpiresAt || !Number.isFinite(grant.socketExpiresAt) || grant.socketExpiresAt <= Date.now()) {
+    if (!validSocketGrant(grant)) {
       socket.close(4401, "Authorization expired. Reconnect to continue.");
       return;
     }
@@ -3995,7 +4090,7 @@ export class TableAuthority extends DurableObject<Env> {
         }),
         false,
       );
-      socket.send(JSON.stringify({ type: "table-ready", revision: this.meta().revision }));
+      socket.send(this.ready(grant));
     } catch {
       socket.close(1008, "Access expired.");
     }

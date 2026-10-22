@@ -146,7 +146,7 @@ describe("document close reconciliation", () => {
     reconciler.handleClose(new CloseEvent("close", { code: 1006 }));
     await flushPromises();
 
-    expect(provider.disconnect).toHaveBeenCalledOnce();
+    expect(provider.disconnect).toHaveBeenCalledTimes(2);
     expect(onPageUnavailable).toHaveBeenCalledWith(page.id);
   });
 
@@ -157,7 +157,7 @@ describe("document close reconciliation", () => {
     reconciler.handleClose(new CloseEvent("close", { code: 4410 }));
     await flushPromises();
 
-    expect(provider.disconnect).toHaveBeenCalledTimes(2);
+    expect(provider.disconnect).toHaveBeenCalledTimes(3);
     expect(onPageUnavailable).not.toHaveBeenCalled();
     expect(onAccessDenied).not.toHaveBeenCalled();
     reconciler.handleClose(new CloseEvent("close", { code: 1006 }));
@@ -257,6 +257,68 @@ it("never resumes a retired account after authorization completes", async () => 
     stop();
     reconciler.destroy();
     setRealtimeAccessAccount("");
+    vi.useRealTimers();
+  }
+});
+
+it("pauses after three contradictory authorization cycles and resumes only on deliberate Retry", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(1);
+  const stop = onApiUnauthorized(() => "ready");
+  mocks.api.mockImplementation(() => {
+    const failure = new ApiClientError(401, "challenge_required", "Verify");
+    notifyApiUnauthorized(failure, apiRequestEpoch());
+    return Promise.reject(failure);
+  });
+  const { provider, reconciler } = setup(true);
+  try {
+    reconciler.handleClose(new CloseEvent("close", { code: 4403 }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mocks.api).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(mocks.api).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mocks.api).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(mocks.api).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reconciler.state).toBe("paused");
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("online"));
+    reconciler.handleClose(new CloseEvent("close", { code: 1006 }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(mocks.api).toHaveBeenCalledTimes(3);
+    expect(provider.connect).not.toHaveBeenCalled();
+    mocks.api.mockResolvedValue({ page });
+    reconciler.retry();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(provider.connect).toHaveBeenCalledOnce();
+    reconciler.handleSync(true);
+    expect(reconciler.state).toBe("active");
+  } finally {
+    stop();
+    reconciler.destroy();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+it("does not treat an obsolete result without a winning authorization as approval", async () => {
+  vi.useFakeTimers();
+  const stop = onApiUnauthorized(() => "obsolete");
+  const failure = new ApiClientError(401, "challenge_required", "Verify");
+  notifyApiUnauthorized(failure, apiRequestEpoch());
+  mocks.api.mockReset().mockRejectedValue(failure);
+  const { provider, reconciler } = setup();
+  try {
+    reconciler.handleClose(new CloseEvent("close", { code: 4403 }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(reconciler.state).toBe("paused");
+    expect(mocks.api).toHaveBeenCalledOnce();
+    expect(provider.connect).not.toHaveBeenCalled();
+  } finally {
+    stop();
+    reconciler.destroy();
     vi.useRealTimers();
   }
 });

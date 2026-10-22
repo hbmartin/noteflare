@@ -1,4 +1,5 @@
 import { registerRealtimeRoom } from "./realtime-access";
+import { REALTIME_GRANT_MS, REALTIME_ROOM_MARGIN_MS } from "../shared/realtime-limits";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { decodeTableResponse, tableReadPages } from "./table-transport";
@@ -61,16 +62,17 @@ export async function tableFetch(
 ) {
   const page = await pageForMember(env, member, pageId);
   if (page.kind !== "table") throw new HttpError(422, "table_required", "Choose a table.");
-  if (method !== "GET") requirePageEditor(page);
+  const write = method !== "GET" && !(method === "POST" && path === "/draft-rows");
+  if (write) requirePageEditor(page);
   const registry = await tableRegistry(env, pageId);
   if (!registry || !["do", "repairing"].includes(registry.state))
     throw new HttpError(409, "table_authority_required", "Enable collaboration for this table first.");
-  if (method !== "GET" && registry.state === "repairing")
+  if (write && registry.state === "repairing")
     throw new HttpError(503, "table_projection_repairing", "Table projection repair is running. Retry shortly.");
-  const socketExpiresAt = Math.min(member.session.expiresAt.getTime(), Date.now() + 5 * 60_000);
+  const socketExpiresAt = Math.min(member.session.expiresAt.getTime(), Date.now() + REALTIME_GRANT_MS);
   const expiresAt = path.startsWith("/socket") ? Math.min(socketExpiresAt, Date.now() + 60_000) : Date.now() + 60_000;
   const authGeneration = path.startsWith("/socket")
-    ? await registerRealtimeRoom(env, member.workspace.id, `table:${pageId}`, socketExpiresAt + 5_000)
+    ? await registerRealtimeRoom(env, member.workspace.id, `table:${pageId}`, socketExpiresAt + REALTIME_ROOM_MARGIN_MS)
     : ((await env.DB.prepare("SELECT revision FROM realtime_revocations WHERE workspace_id=?")
         .bind(member.workspace.id)
         .first<number>("revision")) ?? 0);
@@ -80,7 +82,9 @@ export async function tableFetch(
     userId: member.user.id,
     generation: registry.generation,
     expiresAt,
-    ...(path.startsWith("/socket") ? { socketExpiresAt } : {}),
+    ...(path.startsWith("/socket")
+      ? { socketExpiresAt, socketRenewable: socketExpiresAt < member.session.expiresAt.getTime() }
+      : {}),
     authGeneration,
     creation: { board: env.TABLE_BOARD_ENABLED === "true", calendar: env.TABLE_CALENDAR_ENABLED === "true" },
     ...extras,

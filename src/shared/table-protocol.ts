@@ -171,6 +171,9 @@ export type TableQueryResult = {
   calculations?: Record<string, CalculationResult>;
   people?: Array<{ id: string; name: string; active: boolean }>;
 };
+export type TableDraftRows = Pick<TableQueryResult, "pageId" | "generation" | "revision" | "columns" | "rows"> & {
+  missingRowIds: string[];
+};
 
 export const metadataColumns = new Set<ColumnType>([
   "created_time",
