@@ -724,3 +724,212 @@ describe("server-authoritative comments", () => {
     });
   });
 });
+
+it("keeps anchored preparations private, cancels them terminally, and expires unpublished text", async () => {
+  const installed = await bootstrap();
+  const operationId = crypto.randomUUID(),
+    root = `/api/pages/${installed.pageId}/comment-submissions`;
+  const headers = {
+    "content-type": "application/json",
+    "x-notes-operation-id": operationId,
+    "x-notes-content-epoch": "1",
+  };
+  const prepare = () =>
+    SELF.fetch(
+      request(installed.cookie, root, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ initialComment: { body: commentBody("Private staged text") } }),
+      }),
+    );
+  const first = await prepare();
+  expect(first.status).toBe(201);
+  expect(await first.json()).toMatchObject({ submission: { operationId, state: "prepared" } });
+  expect(
+    (
+      await (
+        await SELF.fetch(request(installed.cookie, `/api/pages/${installed.pageId}/comments`))
+      ).json<{ threads: unknown[] }>()
+    ).threads,
+  ).toHaveLength(0);
+  expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(0);
+  expect(await env.DB.prepare("SELECT count(*) n FROM comments").first<number>("n")).toBe(0);
+  const viewer = await invite(installed.cookie, "preparation-private");
+  expect((await SELF.fetch(request(viewer.cookie, `${root}/${operationId}`))).status).toBe(404);
+  const canceled = await SELF.fetch(request(installed.cookie, `${root}/${operationId}/cancel`, { method: "POST" }));
+  expect(await canceled.json()).toMatchObject({ submission: { state: "canceled" } });
+  expect(
+    (
+      await SELF.fetch(
+        request(installed.cookie, `${root}/${operationId}/publish`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ selection: { yjs: {} } }),
+        }),
+      )
+    ).status,
+  ).toBe(409);
+  expect(
+    await env.DB.prepare("SELECT body_json FROM anchored_comment_submissions WHERE operation_id=?")
+      .bind(operationId)
+      .first<string>("body_json"),
+  ).toBeNull();
+  const expiring = crypto.randomUUID();
+  const created = await SELF.fetch(
+    request(installed.cookie, root, {
+      method: "POST",
+      headers: { ...headers, "x-notes-operation-id": expiring },
+      body: JSON.stringify({ initialComment: { body: commentBody("Expires") } }),
+    }),
+  );
+  expect(created.status).toBe(201);
+  await env.DB.prepare("UPDATE anchored_comment_submissions SET expires_at=0 WHERE operation_id=?")
+    .bind(expiring)
+    .run();
+  expect(await (await SELF.fetch(request(installed.cookie, `${root}/${expiring}`))).json()).toMatchObject({
+    submission: { state: "expired" },
+  });
+  expect(
+    await env.DB.prepare("SELECT body_json FROM anchored_comment_submissions WHERE operation_id=?")
+      .bind(expiring)
+      .first<string>("body_json"),
+  ).toBeNull();
+});
+
+it("publishes a durable anchor exactly once and reports publication winning cancellation", async () => {
+  const installed = await bootstrap(),
+    operationId = crypto.randomUUID();
+  const root = `/api/pages/${installed.pageId}/comment-submissions`;
+  const headers = {
+    "content-type": "application/json",
+    "x-notes-operation-id": operationId,
+    "x-notes-content-epoch": "1",
+  };
+  const body = { initialComment: { body: commentBody("Anchored publication") } };
+  const prepared = await SELF.fetch(
+    request(installed.cookie, root, { method: "POST", headers, body: JSON.stringify(body) }),
+  );
+  expect(prepared.status).toBe(201);
+  const selection = await runInDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`), async (instance) => {
+    const document = (instance as unknown as { document: Y.Doc }).document;
+    const paragraph = new Y.XmlElement("paragraph"),
+      text = new Y.XmlText();
+    text.insert(0, "The original selection");
+    paragraph.insert(0, [text]);
+    document.getXmlFragment("document-store").insert(0, [paragraph]);
+    return {
+      head: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(text, 4)),
+      anchor: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(text, 12)),
+    };
+  });
+  const publish = () =>
+    SELF.fetch(
+      request(installed.cookie, `${root}/${operationId}/publish`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ selection: { yjs: selection } }),
+      }),
+    );
+  const first = await publish();
+  expect(first.status).toBe(200);
+  const result = await first.json<{ submission: { state: string }; thread: CommentThread }>();
+  expect(result).toMatchObject({ submission: { state: "published" }, thread: { anchored: true } });
+  expect((await (await publish()).json<{ thread: CommentThread }>()).thread.id).toBe(result.thread.id);
+  expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(1);
+  expect(await env.DB.prepare("SELECT count(*) n FROM comments").first<number>("n")).toBe(1);
+  const canceled = await SELF.fetch(request(installed.cookie, `${root}/${operationId}/cancel`, { method: "POST" }));
+  expect(await canceled.json()).toMatchObject({ submission: { state: "published" }, thread: { id: result.thread.id } });
+  await runInDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`), async (instance, state) => {
+    expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(0);
+    expect(
+      JSON.stringify((instance as unknown as { document: Y.Doc }).document.getXmlFragment("document-store").toJSON()),
+    ).toContain(result.thread.id);
+  });
+});
+
+it.each(["cancel-before-commit", "lost-commit-response"] as const)(
+  "recovers publication at the transaction boundary: %s",
+  async (failure) => {
+    const { publishCommentSubmission } = await import("./comment-submissions");
+    const installed = await bootstrap(),
+      operationId = crypto.randomUUID();
+    const root = `/api/pages/${installed.pageId}/comment-submissions`;
+    const prepared = await SELF.fetch(
+      request(installed.cookie, root, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-notes-operation-id": operationId,
+          "x-notes-content-epoch": "1",
+        },
+        body: JSON.stringify({ initialComment: { body: commentBody("Boundary text") } }),
+      }),
+    );
+    const { submission } = await prepared.json<{ submission: { threadId: string } }>();
+    const selection = await runInDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`), async (instance) => {
+      const document = (instance as unknown as { document: Y.Doc }).document;
+      const paragraph = new Y.XmlElement("paragraph"),
+        text = new Y.XmlText();
+      text.insert(0, "Selected boundary text");
+      paragraph.insert(0, [text]);
+      document.getXmlFragment("document-store").insert(0, [paragraph]);
+      return {
+        head: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(text, 0)),
+        anchor: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(text, 8)),
+      };
+    });
+    const page = await env.DB.prepare("SELECT id,workspace_id,space_id,content_epoch,created_by FROM pages WHERE id=?")
+      .bind(installed.pageId)
+      .first<import("./comments").CommentPage>();
+    let injected = false;
+    const database = {
+      prepare: (sql: string) => env.DB.prepare(sql),
+      batch: async (statements: D1PreparedStatement[]) => {
+        if (!injected) {
+          injected = true;
+          if (failure === "cancel-before-commit")
+            await env.DB.prepare(
+              "UPDATE anchored_comment_submissions SET state='canceled',body_json=NULL WHERE operation_id=?",
+            )
+              .bind(operationId)
+              .run();
+          const result = await env.DB.batch(statements);
+          if (failure === "lost-commit-response") throw new Error("Commit response interrupted");
+          return result;
+        }
+        return env.DB.batch(statements);
+      },
+    } as D1Database;
+    const result = publishCommentSubmission(
+      { ...env, DB: database },
+      { role: "owner", user: { id: installed.userId } },
+      { ...page!, effective_role: "owner" },
+      operationId,
+      selection,
+      async () => {},
+    );
+    const outcome = await result.then(
+      (value) => ({ state: value.submission.state, anchored: value.thread?.anchored, error: null }),
+      (error: { code: string }) => ({ state: null, anchored: null, error: error.code }),
+    );
+    expect(outcome).toEqual(
+      failure === "cancel-before-commit"
+        ? { state: null, anchored: null, error: "comment_submission_canceled" }
+        : { state: "published", anchored: true, error: null },
+    );
+    expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(
+      failure === "cancel-before-commit" ? 0 : 1,
+    );
+    expect(await env.DB.prepare("SELECT count(*) n FROM comment_operations").first<number>("n")).toBe(
+      failure === "cancel-before-commit" ? 0 : 1,
+    );
+    await runInDurableObject(env.DOCUMENT.getByName(`${installed.pageId}~1`), async (instance, state) => {
+      expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(0);
+      expect(
+        JSON.stringify(
+          (instance as unknown as { document: Y.Doc }).document.getXmlFragment("document-store").toJSON(),
+        ).includes(submission.threadId),
+      ).toBe(failure === "lost-commit-response");
+    });
+  },
+);

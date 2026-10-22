@@ -336,3 +336,82 @@ test("diagram access refresh after actual sign-out reaches sign-in", async ({ pa
   await expect(page.getByRole("heading", { name: "Sign in", exact: true })).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole("heading", { name: "Page unavailable", exact: true })).toHaveCount(0);
 });
+
+for (const outcome of ["cancellation-wins", "publication-wins"] as const) {
+  test(`closing an in-flight anchored comment reports ${outcome}`, async ({ page }) => {
+    await signInOwner(page);
+    const document = await create(page, "document", `Comment publication ${outcome}`);
+    await page.goto(`/?page=${document.id}`);
+    const editor = page.locator(".notes-editor .bn-editor");
+    await expect(editor).toHaveAttribute("contenteditable", "true");
+    await editor.click();
+    await page.keyboard.insertText("Original publication anchor");
+    await page.keyboard.down("Shift");
+    for (let index = 0; index < "Original publication anchor".length; index++) await page.keyboard.press("ArrowLeft");
+    await page.keyboard.up("Shift");
+    await page.getByRole("button", { name: /add comment/i }).click();
+    const composer = page.locator(".bn-thread .bn-editor");
+    await composer.fill(`Private comment ${outcome}`);
+    let release!: () => void,
+      intercepted = false;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route(`**/api/pages/${document.id}/comment-submissions/*/publish`, async (route) => {
+      const response = outcome === "publication-wins" ? await route.fetch() : undefined;
+      intercepted = true;
+      await gate;
+      if (response) await route.fulfill({ response });
+      else await route.continue();
+    });
+    try {
+      await composer.press("Enter");
+      await expect.poll(() => intercepted).toBe(true);
+      page.once("dialog", (dialog) => dialog.accept());
+      await composer.press("Escape");
+      await expect(composer).toHaveCount(0);
+      if (outcome === "publication-wins")
+        await expect(page.getByText("Comment posted before cancellation completed.")).toBeVisible();
+      const settled = page.waitForResponse(
+        (response) => response.url().endsWith("/publish") && response.request().method() === "POST",
+      );
+      release();
+      expect((await settled).status()).toBe(outcome === "cancellation-wins" ? 409 : 200);
+      const threads = (await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads;
+      expect(threads).toHaveLength(outcome === "cancellation-wins" ? 0 : 1);
+      expect(threads.every((thread: { anchored: boolean }) => thread.anchored)).toBe(true);
+    } finally {
+      release();
+    }
+  });
+}
+
+test("contradictory diagram authorization pauses after three cycles until deliberate Retry", async ({ page }) => {
+  await signInOwner(page);
+  const space = await createTestSpace(page, "Contradictory diagram authorization");
+  const diagram = (
+    await (
+      await page.request.post("/api/pages", {
+        data: { kind: "diagram", title: "Paused authorization", spaceId: space.id },
+      })
+    ).json()
+  ).page;
+  await page.goto(`/?page=${diagram.id}`);
+  await expect(page.getByRole("button", { name: "Undo", exact: true })).toBeEnabled();
+  let checks = 0;
+  const path = `**/api/pages/${diagram.id}`;
+  await page.route(path, async (route) => {
+    checks++;
+    await route.fulfill({ status: 401, json: { error: { code: "challenge_required", message: "Verify again." } } });
+  });
+  expect((await page.request.patch(`/api/spaces/${space.id}`, { data: { visibility: "private" } })).ok()).toBe(true);
+  await expect(page.getByText("Access could not be confirmed. Your local edits are preserved.")).toBeVisible({
+    timeout: 20_000,
+  });
+  expect(checks).toBe(3);
+  await expect(page.getByRole("button", { name: "Undo", exact: true })).toBeDisabled();
+  await page.unroute(path);
+  await page.getByRole("button", { name: "Retry access", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Undo", exact: true })).toBeEnabled();
+  await expect(page.getByText("Access could not be confirmed. Your local edits are preserved.")).toHaveCount(0);
+});

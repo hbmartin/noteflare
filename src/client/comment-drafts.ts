@@ -139,3 +139,18 @@ if (typeof window !== "undefined")
       notify(event.key);
     }
   });
+
+/** Explicit retry after a confirmed terminal preparation preserves text and anchor. */
+export function replaceCommentDraftOperation(scope: CommentDraftScope, expected: string, operationId: string) {
+  const current = readCommentDraft(scope, "new");
+  if (!current || current.operationId !== expected) return;
+  const name = key(scope, "new"),
+    next = { ...current, operationId };
+  memory.set(name, next);
+  try {
+    localStorage.setItem(name, JSON.stringify(next));
+  } catch {
+    next.storageFailed = true;
+  }
+  notify(name);
+}

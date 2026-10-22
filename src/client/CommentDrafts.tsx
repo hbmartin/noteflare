@@ -1,3 +1,4 @@
+import { activeCommentCancellation } from "./comment-publication";
 import {
   createContext,
   memo,
@@ -192,19 +193,28 @@ function NewDraftComposer({
   const [error, setError] = useState("");
   const lifetime = useMemo(
     () =>
-      new CommentSubmissionOwner({
-        editor: main,
-        anchor,
-        account: context.account,
-        pageId: context.pageId,
-        epoch: context.epoch,
-      }),
+      new CommentSubmissionOwner(
+        {
+          editor: main,
+          anchor,
+          account: context.account,
+          pageId: context.pageId,
+          epoch: context.epoch,
+        },
+        () => {
+          void activeCommentCancellation({
+            account: context.account,
+            pageId: context.pageId,
+            epoch: context.epoch,
+          })?.().catch(() => {});
+        },
+      ),
     [main, anchor, context.account, context.pageId, context.epoch],
   );
   useLayoutEffect(() => {
     lifetime.activate();
     return () => {
-      lifetime.dispose();
+      lifetime.destroy();
     };
   }, [lifetime]);
   const editor = useCreateBlockNote(
@@ -305,10 +315,39 @@ export function DraftCommentsControllers() {
   const current = state.pendingComment ? "new" : state.selectedThreadId ? `reply:${state.selectedThreadId}` : null;
   useEffect(() => subscribeCommentDraft(scope, "new", () => update((value) => value + 1)), [scope]);
   const discard = useCallback(
-    (id: string | null) => {
+    (id: string | null, afterCancellation?: () => void) => {
       const draft = id ? readCommentDraft(scope, id) : null;
       if (!id || !draft) return true;
       if (!window.confirm("Discard your unfinished comment?")) return false;
+      const cancel = id === "new" ? activeCommentCancellation(scope) : undefined;
+      if (cancel) {
+        setDiscardError("Canceling unpublished comment…");
+        void cancel()
+          .then((result) => {
+            const latest = readCommentDraft(scope, id);
+            if (latest && latest.operationId !== draft.operationId) {
+              setDiscardError("Newer draft edits are preserved. Review them before closing.");
+              return;
+            }
+            try {
+              clearCommentDraft(scope, id, draft.operationId);
+              setDiscardError(result.state === "published" ? "Comment posted before cancellation completed." : "");
+              if (afterCancellation) afterCancellation();
+              else comments.stopPendingComment();
+            } catch {
+              setCleanup({ id, operationId: draft.operationId });
+              setDiscardError(
+                "The draft was cleared from this tab, but its stored copy could not be removed. Retry cleanup before leaving.",
+              );
+            }
+          })
+          .catch(() =>
+            setDiscardError(
+              "Cancellation could not be confirmed. Your draft is preserved; retry before discarding it.",
+            ),
+          );
+        return false;
+      }
       try {
         clearCommentDraft(scope, id);
         setDiscardError("");
@@ -321,7 +360,7 @@ export function DraftCommentsControllers() {
         return false;
       }
     },
-    [scope],
+    [scope, comments],
   );
   useLayoutEffect(() => {
     if (restoring.current) {
@@ -330,7 +369,15 @@ export function DraftCommentsControllers() {
       return;
     }
     const old = prior.current;
-    if (old !== current && old && !discard(old)) {
+    if (
+      old !== current &&
+      old &&
+      !discard(old, () => {
+        restoring.current = true;
+        if (old === "new") comments.stopPendingComment();
+        if (current?.startsWith("reply:")) comments.selectThread(current.slice(6));
+      })
+    ) {
       restoring.current = true;
       if (old === "new") {
         const position = resolveCommentDraftAnchor(main, readCommentDraft(scope, "new")?.anchor);

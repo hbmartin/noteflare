@@ -1,4 +1,11 @@
-import { readCommentDraft, clearCommentDraft, type CommentDraftScope } from "./comment-drafts";
+import type { CommentSubmissionStatus } from "../shared/comment-submissions";
+import { registerCommentPublication } from "./comment-publication";
+import {
+  readCommentDraft,
+  clearCommentDraft,
+  replaceCommentDraftOperation,
+  type CommentDraftScope,
+} from "./comment-drafts";
 import {
   ThreadStore,
   ThreadStoreAuth,
@@ -190,6 +197,70 @@ export class ServerThreadStore extends ThreadStore {
       const user = this.users.get(id);
       return { id, username: user?.name ?? "Former collaborator", avatarUrl: "" };
     });
+  }
+
+  private readonly terminalPreparations = new Set<string>();
+  anchoredSubmission(body: BlockNoteCommentBody) {
+    const prior = this.pendingOperations.get("new"),
+      draft = this.draftScope ? readCommentDraft(this.draftScope, "new") : null;
+    const previous = prior?.id ?? draft?.operationId;
+    if (previous && this.terminalPreparations.has(previous)) {
+      if (draft && draft.operationId !== previous) this.pendingOperations.delete("new");
+      else {
+        const id = crypto.randomUUID();
+        this.pendingOperations.set("new", { body: json(body), id });
+        if (this.draftScope) replaceCommentDraftOperation(this.draftScope, previous, id);
+      }
+    }
+    const headers = this.operationHeaders("new", body),
+      operationId = headers["x-notes-operation-id"];
+    const root = `/api/pages/${encodeURIComponent(this.pageId)}/comment-submissions`;
+    type Result = { submission: CommentSubmissionStatus; thread?: CommentThread };
+    const remember = (result: Result) => {
+      if (result.submission.state === "canceled" || result.submission.state === "expired")
+        this.terminalPreparations.add(operationId);
+      return result;
+    };
+    let canceling: Promise<CommentSubmissionStatus> | undefined;
+    const cancel = () =>
+      (canceling ??= api<Result>(`${root}/${operationId}/cancel`, { method: "POST", headers, readOnly: true })
+        .then((value) => remember(value).submission)
+        .catch((error) => {
+          canceling = undefined;
+          throw error;
+        }));
+    const release = this.draftScope ? registerCommentPublication(this.draftScope, cancel) : () => {};
+    return {
+      prepare: async () =>
+        remember(await api<Result>(root, { method: "POST", headers, body: json({ initialComment: { body } }) })),
+      publish: async (editor: BlockNoteEditor<any, any, any>, selection: { head: number; anchor: number }) => {
+        const binding = ySyncPluginKey.getState(editor.prosemirrorState)?.binding;
+        if (!binding) throw new Error("The original comment selection is unavailable.");
+        const yjs = {
+          head: Y.relativePositionToJSON(
+            absolutePositionToRelativePosition(selection.head, binding.type, binding.mapping),
+          ),
+          anchor: Y.relativePositionToJSON(
+            absolutePositionToRelativePosition(selection.anchor, binding.type, binding.mapping),
+          ),
+        };
+        return remember(
+          await api<Result>(`${root}/${operationId}/publish`, {
+            method: "POST",
+            headers,
+            body: json({ selection: { yjs } }),
+          }),
+        );
+      },
+      acknowledge: (result: Result) => {
+        if (result.submission.state !== "published" || !result.thread?.anchored)
+          throw new Error("Comment publication could not be confirmed. Your draft is preserved.");
+        this.posted("new", operationId);
+        this.upsert(result.thread);
+      },
+      cancel,
+      release,
+    };
   }
 
   async createThread(options: {
