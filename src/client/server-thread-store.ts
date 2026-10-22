@@ -1,3 +1,4 @@
+import { realtimeAccessAccount } from "./realtime-access-status";
 import type { CommentSubmissionStatus } from "../shared/comment-submissions";
 import { registerCommentPublication } from "./comment-publication";
 import {
@@ -201,6 +202,11 @@ export class ServerThreadStore extends ThreadStore {
 
   private readonly terminalPreparations = new Set<string>();
   anchoredSubmission(body: BlockNoteCommentBody) {
+    const account = realtimeAccessAccount();
+    const assertAccount = () => {
+      if (account !== realtimeAccessAccount())
+        throw new Error("This comment belongs to a retired account. Its local draft is preserved.");
+    };
     const prior = this.pendingOperations.get("new"),
       draft = this.draftScope ? readCommentDraft(this.draftScope, "new") : null;
     const previous = prior?.id ?? draft?.operationId;
@@ -222,18 +228,24 @@ export class ServerThreadStore extends ThreadStore {
       return result;
     };
     let canceling: Promise<CommentSubmissionStatus> | undefined;
-    const cancel = () =>
-      (canceling ??= api<Result>(`${root}/${operationId}/cancel`, { method: "POST", headers, readOnly: true })
+    const cancel = () => {
+      if (account !== realtimeAccessAccount())
+        return Promise.reject(new Error("This comment belongs to a retired account."));
+      return (canceling ??= api<Result>(`${root}/${operationId}/cancel`, { method: "POST", headers, readOnly: true })
         .then((value) => remember(value).submission)
         .catch((error) => {
           canceling = undefined;
           throw error;
         }));
+    };
     const release = this.draftScope ? registerCommentPublication(this.draftScope, cancel) : () => {};
     return {
-      prepare: async () =>
-        remember(await api<Result>(root, { method: "POST", headers, body: json({ initialComment: { body } }) })),
+      prepare: async () => {
+        assertAccount();
+        return remember(await api<Result>(root, { method: "POST", headers, body: json({ initialComment: { body } }) }));
+      },
       publish: async (editor: BlockNoteEditor<any, any, any>, selection: { head: number; anchor: number }) => {
+        assertAccount();
         const binding = ySyncPluginKey.getState(editor.prosemirrorState)?.binding;
         if (!binding) throw new Error("The original comment selection is unavailable.");
         const yjs = {
@@ -253,6 +265,7 @@ export class ServerThreadStore extends ThreadStore {
         );
       },
       acknowledge: (result: Result) => {
+        assertAccount();
         if (result.submission.state !== "published" || !result.thread?.anchored)
           throw new Error("Comment publication could not be confirmed. Your draft is preserved.");
         this.posted("new", operationId);
