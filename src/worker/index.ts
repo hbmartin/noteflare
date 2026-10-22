@@ -100,6 +100,7 @@ import { Document } from "./document";
 import {
   registerRealtimeRoom,
   trackRealtimeWorkspace,
+  invalidateRealtimeUserMembership,
   withRealtimeAccessTracking,
   reconcileRealtimeAccessStatus,
   realtimeAccessStatus,
@@ -1295,6 +1296,7 @@ app.post("/api/install/bootstrap", async (c) => {
        VALUES (?, ?, ?, 'Welcome', '', '', '', '')`,
     ).bind(pageId, workspaceId, `${workspaceId}-general`),
   ]);
+  invalidateRealtimeUserMembership(signup.user.id);
   return signup.response;
 });
 
@@ -1537,7 +1539,10 @@ app.post("/api/invites/complete", async (c) => {
     ),
   ]);
   if (!result[2]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
-  if (result[0]!.meta.changes) sweepMutationOutbox(c);
+  if (result[0]!.meta.changes) {
+    invalidateRealtimeUserMembership(session.user.id);
+    sweepMutationOutbox(c);
+  }
   return c.json({ success: true });
 });
 
@@ -1695,6 +1700,7 @@ app.delete("/api/members/:id", async (c) => {
       targetId,
     ),
   ]);
+  invalidateRealtimeUserMembership(targetId);
   sweepMutationOutbox(c);
   return c.json({ ok: true });
 });
@@ -5059,6 +5065,22 @@ app.get("/api/pages/:id/linked-tables/:tableId", async (c) => {
   await pageForMember(c.env, current, c.req.param("tableId"));
   return c.json(table);
 });
+app.post("/api/pages/:id/linked-tables/:tableId/draft-rows", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await pageForMember(c.env, member, c.req.param("id"));
+  const response = await tableFetch(
+    c.env,
+    member,
+    c.req.param("tableId"),
+    "/draft-rows",
+    "POST",
+    await limitedJsonBody(c.req.raw, 20_000),
+  );
+  const current = await requireMember(c.req.raw, c.env);
+  await pageForMember(c.env, current, c.req.param("id"));
+  await pageForMember(c.env, current, c.req.param("tableId"));
+  return response;
+});
 
 function linkedHostAuthorization(host: PageRow, member: MemberContext) {
   return {
@@ -6081,6 +6103,19 @@ app.get("/api/tables/:pageId/query", async (c) => {
   const result = await queryTable(c.env, member, c.req.param("pageId"), new URL(c.req.url).searchParams.toString());
   await pageForMember(c.env, await requireMember(c.req.raw, c.env), c.req.param("pageId"));
   return c.json(result);
+});
+app.post("/api/tables/:pageId/draft-rows", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const response = await tableFetch(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    "/draft-rows",
+    "POST",
+    await limitedJsonBody(c.req.raw, 20_000),
+  );
+  await pageForMember(c.env, await requireMember(c.req.raw, c.env), c.req.param("pageId"));
+  return response;
 });
 app.get("/api/tables/:pageId/socket", async (c) => {
   const member = await requireMember(c.req.raw, c.env);

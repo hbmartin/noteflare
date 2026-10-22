@@ -3,7 +3,6 @@ import {
   env,
   abortAllDurableObjects,
   runInDurableObject,
-  runDurableObjectAlarm,
   evictDurableObject,
 } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -87,7 +86,7 @@ async function repairTableProjection(
   const initial = await requestRepairTableProjection(...args);
   if (!("repair" in initial)) return initial;
   for (let attempt = 0; attempt < 100; attempt++) {
-    await runDurableObjectAlarm(args[0].TABLE.getByName(args[2]));
+    await advanceTableAlarm(args[0].TABLE.getByName(args[2]));
     const status = await tableRepairStatus(args[0], args[2]);
     if (status.state === "complete") return verifyTableProjection(args[0], args[2]);
     if (status.state === "blocked")
@@ -97,7 +96,7 @@ async function repairTableProjection(
 }
 async function finishAlarmRepair(pageId: string) {
   for (let attempt = 0; attempt < 100; attempt++) {
-    await runDurableObjectAlarm(env.TABLE.getByName(pageId));
+    await advanceTableAlarm(env.TABLE.getByName(pageId));
     const status = await tableRepairStatus(env, pageId);
     if (status.state === "complete" || status.state === "blocked") return;
   }
@@ -141,6 +140,94 @@ async function addEffect(pageId: string, revision: number) {
 }
 
 describe("per-table authority", () => {
+  it("keeps a ten-second repair retry across socket-only alarms and hibernation", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    const clock = Date.now();
+    const socket = (
+      await tableFetch(
+        env,
+        { ...member, session: { ...member.session, expiresAt: new Date(clock + 2_000) } },
+        pageId,
+        "/socket",
+      )
+    ).webSocket!;
+    socket.accept();
+    await env.DB.prepare(
+      "CREATE TRIGGER fail_repair_start BEFORE UPDATE OF state ON table_authority WHEN NEW.state='repairing' BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    const stub = env.TABLE.getByName(pageId);
+    try {
+      await runInDurableObject(stub, async (instance, state) => {
+        const now = vi.spyOn(Date, "now").mockReturnValue(clock);
+        try {
+          expect(
+            (
+              await instance.fetch(
+                new Request("https://table.internal/repair", {
+                  method: "POST",
+                  headers: { "x-table-internal": env.BETTER_AUTH_SECRET },
+                }),
+              )
+            ).status,
+          ).toBe(500);
+          const deadline = JSON.parse(
+            state.storage.sql.exec<{ value: string }>("SELECT value FROM alarm_deadlines WHERE id=1").one().value,
+          );
+          expect(deadline).toMatchObject({ version: 1, repair: clock + 10_000 });
+          expect(await state.storage.getAlarm()).toBe(clock + 2_000);
+        } finally {
+          now.mockRestore();
+        }
+      });
+      await evictDurableObject(stub);
+      await runInDurableObject(stub, async (instance, state) => {
+        const now = vi.spyOn(Date, "now").mockReturnValue(clock + 2_001);
+        try {
+          await instance.alarm();
+          expect(await state.storage.getAlarm()).toBe(clock + 10_000);
+          expect(
+            JSON.parse(
+              state.storage.sql.exec<{ value: string }>("SELECT value FROM alarm_deadlines WHERE id=1").one().value,
+            ).repair,
+          ).toBe(clock + 10_000);
+        } finally {
+          now.mockRestore();
+        }
+      });
+    } finally {
+      await env.DB.prepare("DROP TRIGGER fail_repair_start").run();
+      socket.close();
+    }
+    await advanceTableAlarm(stub);
+    await finishAlarmRepair(pageId);
+    expect((await tableRepairStatus(env, pageId)).state).toBe("complete");
+  });
+  it("looks up draft rows independently of views with read authorization and bounded input", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "title", name: "Title", type: "text" });
+    await write(pageId, member, "create_row", { id: "hidden", values: { title: "Hidden text" } });
+    const visitor = await fixture();
+    await env.DB.prepare("INSERT INTO workspace_members VALUES(?,?,'viewer',1)")
+      .bind(member.workspace.id, visitor.member.user.id)
+      .run();
+    const viewer = { ...visitor.member, workspace: member.workspace, role: "viewer" as const };
+    const response = await tableFetch(env, viewer, pageId, "/draft-rows", "POST", { rowIds: ["hidden", "missing"] });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      pageId,
+      generation: 1,
+      rows: [{ id: "hidden", cells: { title: "Hidden text" } }],
+      missingRowIds: ["missing"],
+    });
+    expect(
+      (await tableFetch(env, viewer, pageId, "/draft-rows", "POST", { rowIds: Array(101).fill("hidden") })).status,
+    ).toBe(422);
+    expect(
+      (await tableFetch(env, viewer, pageId, "/draft-rows", "POST", { rowIds: ["x".repeat(21_000)] })).status,
+    ).toBe(413);
+  });
   it.each([undefined, null, Number.NaN, Number.POSITIVE_INFINITY, -1, "invalid", 1e20])(
     "rejects socket deadline %s before accepting a pair",
     async (deadline) => {
@@ -737,7 +824,7 @@ describe("per-table authority", () => {
       });
       expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "do", projected_revision: later.revision });
       await evictDurableObject(stub);
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(await advanceTableAlarm(stub)).toBe(true);
       await finishAlarmRepair(pageId);
       expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
       await runInDurableObject(stub, (_instance, state) => {
@@ -847,7 +934,7 @@ describe("per-table authority", () => {
         ).toMatchObject({ phase: "blocked", blocked: { resumePhase: "drain" } });
         expect(await state.storage.getAlarm()).toBeNull();
       });
-      expect(await runDurableObjectAlarm(stub)).toBe(false);
+      expect(await advanceTableAlarm(stub)).toBe(false);
       await changeProjection(pageId, [
         {
           sql: "INSERT INTO table_columns(id,page_id,name,type,position,config_json,property_revision,property_generation,name_key) VALUES('old',?,'Old','text',0,?,1,1,'old')",
@@ -882,7 +969,7 @@ describe("per-table authority", () => {
     } finally {
       await env.DB.prepare("DROP TRIGGER IF EXISTS hold_link_repair").run();
     }
-    expect(await runDurableObjectAlarm(env.TABLE.getByName(pageId))).toBe(true);
+    expect(await advanceTableAlarm(env.TABLE.getByName(pageId))).toBe(true);
     await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
 
@@ -903,11 +990,11 @@ describe("per-table authority", () => {
         repair: { state: "pending" },
         verification: null,
       });
-      expect(await runDurableObjectAlarm(env.TABLE.getByName(next.pageId))).toBe(true);
+      expect(await advanceTableAlarm(env.TABLE.getByName(next.pageId))).toBe(true);
       await runInDurableObject(env.TABLE.getByName(next.pageId), async (_instance, state) => {
-        expect(await state.storage.getAlarm()).toBe(now + 1000);
+        expect(await state.storage.getAlarm()).toBe(now + 2001);
       });
-      expect(await runDurableObjectAlarm(env.TABLE.getByName(next.pageId))).toBe(true);
+      expect(await advanceTableAlarm(env.TABLE.getByName(next.pageId))).toBe(true);
       await finishAlarmRepair(next.pageId);
       expect((await verifyTableProjection(env, next.pageId)).projectionMatches).toBe(true);
     } finally {
@@ -961,7 +1048,7 @@ describe("per-table authority", () => {
     } finally {
       await env.DB.prepare("DROP TRIGGER IF EXISTS hold_computed_batch").run();
     }
-    expect(await runDurableObjectAlarm(env.TABLE.getByName(pageId))).toBe(true);
+    expect(await advanceTableAlarm(env.TABLE.getByName(pageId))).toBe(true);
     await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
   });
@@ -1085,6 +1172,8 @@ describe("per-table authority", () => {
         }),
       };
       try {
+        state.storage.sql.exec("DELETE FROM alarm_deadlines");
+        await state.storage.setAlarm(Date.now() - 1);
         await internal.alarm();
         const meta = JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta").one().value);
         expect(meta).toMatchObject({ revision: 2, projectedRevision: 2 });
@@ -1987,7 +2076,7 @@ describe("per-table authority", () => {
       expect(result.result.publicationFailed).toBeUndefined();
       expect((await queryTable(env, member, pageId)).rowCount).toBe(1);
       await env.DB.prepare("DROP TRIGGER unrelated_publication_error").run();
-      await runDurableObjectAlarm(env.TABLE.getByName(pageId));
+      await advanceTableAlarm(env.TABLE.getByName(pageId));
       expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
     } finally {
       await env.DB.prepare("DROP TRIGGER IF EXISTS unrelated_publication_error").run();
@@ -2534,8 +2623,8 @@ describe("per-table authority", () => {
         repair: { state: "pending" },
         verification: null,
       });
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(await advanceTableAlarm(stub)).toBe(true);
+      expect(await advanceTableAlarm(stub)).toBe(true);
       await runInDurableObject(stub, (_instance, state) => {
         const intent = JSON.parse(
           state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
@@ -2548,8 +2637,8 @@ describe("per-table authority", () => {
         repair: { state: "pending" },
         verification: null,
       });
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(await advanceTableAlarm(stub)).toBe(true);
+      expect(await advanceTableAlarm(stub)).toBe(true);
       await runInDurableObject(stub, (_instance, state) => {
         expect(
           JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value)
@@ -2565,7 +2654,7 @@ describe("per-table authority", () => {
         expect(intent).toMatchObject({ phase: "blocked", mismatches: 2, blocked: { resumePhase: "headers" } });
         expect(await state.storage.getAlarm()).toBeNull();
       });
-      expect(await runDurableObjectAlarm(stub)).toBe(false);
+      expect(await advanceTableAlarm(stub)).toBe(false);
       await env.DB.prepare("DROP TRIGGER permanent_parity_mismatch").run();
       expect((await repairTableProjection(env, member, pageId)).projectionMatches).toBe(true);
     } finally {
@@ -2695,7 +2784,7 @@ describe("per-table authority", () => {
       ).run();
       try {
         if (phase === "rows" || phase === "verify") await requestRepairTableProjection(env, member, pageId);
-        if (phase === "verify") await runDurableObjectAlarm(env.TABLE.getByName(pageId));
+        if (phase === "verify") await advanceTableAlarm(env.TABLE.getByName(pageId));
         await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
         await expect(write(pageId, member, "save_view", { name: "Blocked" })).rejects.toMatchObject({
           code: "table_projection_repairing",
@@ -2711,7 +2800,7 @@ describe("per-table authority", () => {
           ).run();
         const stub = env.TABLE.getByName(pageId);
         await evictDurableObject(stub);
-        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        expect(await advanceTableAlarm(stub)).toBe(true);
         await finishAlarmRepair(pageId);
         expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
         expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "do", projected_revision: 4 });
@@ -2732,7 +2821,7 @@ describe("per-table authority", () => {
     const stub = env.TABLE.getByName(pageId);
     try {
       await requestRepairTableProjection(env, member, pageId);
-      await runDurableObjectAlarm(stub);
+      await advanceTableAlarm(stub);
       await runInDurableObject(stub, async (instance, state) => {
         const clock = Date.now() + 1_000_000,
           now = vi.spyOn(Date, "now").mockReturnValue(clock);
@@ -2766,7 +2855,7 @@ describe("per-table authority", () => {
       expect((await queryTable(env, member, pageId)).rows[0]?.cells.title).toBe("Canonical");
       await env.DB.prepare("DROP TRIGGER corrupt_repair_projection").run();
       await evictDurableObject(stub);
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(await advanceTableAlarm(stub)).toBe(true);
       await finishAlarmRepair(pageId);
       expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
       expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "do", generation: 1 });
@@ -2785,12 +2874,12 @@ describe("per-table authority", () => {
     const stub = env.TABLE.getByName(pageId);
     try {
       await requestRepairTableProjection(env, member, pageId);
-      await runDurableObjectAlarm(stub);
+      await advanceTableAlarm(stub);
       await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
       await env.DB.prepare("DROP TRIGGER hold_repair_verification").run();
       await env.DB.prepare("UPDATE table_authority SET generation=2 WHERE page_id=?").bind(pageId).run();
       await evictDurableObject(stub);
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(await advanceTableAlarm(stub)).toBe(true);
       expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "repairing", generation: 2 });
       await expect(tableInternal(env, pageId, "/repair", {})).rejects.toMatchObject({
         code: "table_generation_conflict",
@@ -2804,7 +2893,7 @@ describe("per-table authority", () => {
         text_value: "Canonical",
       });
       await env.DB.prepare("UPDATE table_authority SET generation=1 WHERE page_id=?").bind(pageId).run();
-      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(await advanceTableAlarm(stub)).toBe(true);
       await finishAlarmRepair(pageId);
       expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
     } finally {
@@ -2829,7 +2918,7 @@ describe("per-table authority", () => {
     expect(await env.DB.prepare("SELECT count(*) count FROM table_rows WHERE page_id=?").bind(pageId).first()).toEqual({
       count: 105,
     });
-    expect(await runDurableObjectAlarm(env.TABLE.getByName(pageId))).toBe(true);
+    expect(await advanceTableAlarm(env.TABLE.getByName(pageId))).toBe(true);
     await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
     expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "do" });
@@ -2854,7 +2943,7 @@ describe("per-table authority", () => {
       }
       await state.storage.setAlarm(Date.now() + 1000);
     });
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await advanceTableAlarm(stub)).toBe(true);
     await runInDurableObject(stub, (_instance, state) => {
       expect(state.storage.sql.exec("SELECT count(*) count FROM events").one()).toEqual({ count: 100 });
       expect(state.storage.sql.exec("SELECT count(*) count FROM projection_steps").one()).toEqual({ count: 0 });
@@ -2879,7 +2968,7 @@ describe("per-table authority", () => {
     } finally {
       await env.DB.prepare("DROP TRIGGER IF EXISTS retained_pending_projection").run();
     }
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await advanceTableAlarm(stub)).toBe(true);
     await runInDurableObject(stub, (_instance, state) => {
       expect(state.storage.sql.exec("SELECT count(*) count FROM events").one()).toEqual({ count: 100 });
       expect(state.storage.sql.exec("SELECT count(*) count FROM projection_steps").one()).toEqual({ count: 0 });
@@ -3665,4 +3754,21 @@ async function tableRegistryForTest(pageId: string) {
   return env.DB.prepare("SELECT state,generation,projected_revision FROM table_authority WHERE page_id=?")
     .bind(pageId)
     .first();
+}
+
+/** Unlike runDurableObjectAlarm, reach the stored deadline before invoking work.
+ * Table alarms distinguish work deadlines from earlier socket-only wakes. */
+async function advanceTableAlarm(stub: DurableObjectStub) {
+  return runInDurableObject(stub, async (instance, state) => {
+    const deadline = await state.storage.getAlarm();
+    if (deadline === null) return false;
+    const original = Date.now;
+    Date.now = () => Math.max(original(), deadline + 1);
+    try {
+      await (instance as { alarm(): Promise<void> }).alarm();
+      return true;
+    } finally {
+      Date.now = original;
+    }
+  });
 }

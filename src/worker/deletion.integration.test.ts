@@ -3,7 +3,6 @@ import {
   applyD1Migrations,
   env,
   evictDurableObject,
-  runDurableObjectAlarm,
   runInDurableObject,
 } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2895,7 +2894,7 @@ describe("accepted permanent deletion", () => {
         await env.DB.prepare("DROP TRIGGER failed_seeded_row_deletion").run();
         if (recovery === "alarm after eviction") {
           await evictDurableObject(stub);
-          if (!(await runDurableObjectAlarm(stub))) throw new Error("Missing deletion retry alarm");
+          if (!(await advanceTableAlarm(stub))) throw new Error("Missing deletion retry alarm");
         }
         await retry(accepted.jobId);
         expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id=?").bind(f.rowId).first()).toBeNull();
@@ -3245,3 +3244,20 @@ describe("accepted permanent deletion", () => {
     });
   });
 });
+
+/** Unlike runDurableObjectAlarm, reach the stored deadline before invoking work.
+ * Table alarms distinguish work deadlines from earlier socket-only wakes. */
+async function advanceTableAlarm(stub: DurableObjectStub) {
+  return runInDurableObject(stub, async (instance, state) => {
+    const deadline = await state.storage.getAlarm();
+    if (deadline === null) return false;
+    const original = Date.now;
+    Date.now = () => Math.max(original(), deadline + 1);
+    try {
+      await (instance as { alarm(): Promise<void> }).alarm();
+      return true;
+    } finally {
+      Date.now = original;
+    }
+  });
+}

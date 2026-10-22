@@ -93,6 +93,30 @@ beforeEach(async () => {
 });
 
 describe("task authority and linked task writes", () => {
+  it("verifies hidden draft rows through both canonical and linked read endpoints and rechecks host/source access", async () => {
+    const f = await fixture();
+    const task = await f.create(f.owner, f.direct, "Hidden draft task", "draft-lookup-create", 1);
+    const rows = { rowIds: [task.rowId, "missing"] };
+    for (const path of [`/api/tables/${f.source.id}/draft-rows`, `${f.linked}/draft-rows`]) {
+      const response = await SELF.fetch(request(f.editor, path, rows));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        pageId: f.source.id,
+        rows: [{ id: task.rowId }],
+        missingRowIds: ["missing"],
+      });
+    }
+    await env.DB.prepare("DELETE FROM space_members WHERE space_id=? AND user_id=?")
+      .bind(f.sourceSpace, f.editorId)
+      .run();
+    expect((await SELF.fetch(request(f.editor, `${f.linked}/draft-rows`, rows))).status).toBe(404);
+    await env.DB.prepare("INSERT INTO space_members(space_id,user_id,role,created_at) VALUES(?,?,'editor',1)")
+      .bind(f.sourceSpace, f.editorId)
+      .run();
+    await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(f.host.spaceId).run();
+    expect((await SELF.fetch(request(f.editor, `${f.linked}/draft-rows`, rows))).status).toBe(404);
+    expect((await SELF.fetch(request(f.editor, `/api/tables/${f.source.id}/draft-rows`, rows))).status).toBe(200);
+  });
   it.each(["direct", "linked"] as const)(
     "blocks %s generic commands from bypassing task-owned fields or creating orphan rows",
     async (route) => {
