@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { jitteredBackoff } from "../shared/retry";
-import { api } from "./api";
+import { api, ApiClientError } from "./api";
 import type { RealtimeAccessStatus } from "../shared/realtime-access";
 import {
   acceptRealtimeAccessStatus,
@@ -11,7 +11,7 @@ import {
 } from "./realtime-access-status";
 
 /** Exactly one owner coordinator per mounted workspace, including outside Settings. */
-export function useRealtimeAccessCoordinator(owner: boolean) {
+export function useRealtimeAccessCoordinator(owner: boolean, onOwnerAccessLost?: () => Promise<void>) {
   const account = useRealtimeAccessAccount();
   useEffect(() => {
     if (!owner || !account) return undefined;
@@ -44,7 +44,10 @@ export function useRealtimeAccessCoordinator(owner: boolean) {
           if (acceptRealtimeAccessStatus(status, account, version)) lastSuccessful = Date.now();
           else failRealtimeAccessCheck(account);
         }
-      } catch {
+      } catch (error) {
+        if (!stopped && error instanceof ApiClientError && error.status === 403 && error.code === "owner_required") {
+          await onOwnerAccessLost?.().catch(() => {});
+        }
         if (!stopped) failRealtimeAccessCheck(account);
       } finally {
         running = false;
@@ -113,5 +116,5 @@ export function useRealtimeAccessCoordinator(owner: boolean) {
       window.removeEventListener("offline", visibility);
       document.removeEventListener("visibilitychange", visibility);
     };
-  }, [owner, account]);
+  }, [owner, account, onOwnerAccessLost]);
 }

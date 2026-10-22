@@ -177,3 +177,23 @@ it("measures account-only renders against the former full-snapshot subscription"
   }
   expect({ former, current }).toEqual({ former: 5, current: 1 });
 });
+
+it("refreshes a stale owner role after rejection and stops retries once the role is retired", async () => {
+  const { ApiClientError } = await import("./api");
+  vi.useFakeTimers();
+  vi.mocked(api).mockRejectedValue(new ApiClientError(403, "owner_required", "Owners only"));
+  const refresh = vi.fn(async () => {});
+  function RoleCoordinator({ owner }: { owner: boolean }) {
+    useRealtimeAccessCoordinator(owner, refresh);
+    return null;
+  }
+  const view = render(<RoleCoordinator owner />);
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(refresh).toHaveBeenCalledOnce();
+  await act(async () => view.rerender(<RoleCoordinator owner={false} />));
+  const count = vi.mocked(api).mock.calls.length;
+  await act(async () => vi.advanceTimersByTimeAsync(60_000));
+  expect(api).toHaveBeenCalledTimes(count);
+});

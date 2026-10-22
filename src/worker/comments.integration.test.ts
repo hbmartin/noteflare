@@ -933,3 +933,73 @@ it.each(["cancel-before-commit", "lost-commit-response"] as const)(
     });
   },
 );
+
+it("reconciles a canceled provisional anchor after hibernation and rejects cancellation-before-prepare revival", async () => {
+  const installed = await bootstrap(),
+    operationId = crypto.randomUUID();
+  const root = `/api/pages/${installed.pageId}/comment-submissions`;
+  const headers = {
+    "content-type": "application/json",
+    "x-notes-operation-id": operationId,
+    "x-notes-content-epoch": "1",
+  };
+  const prepared = await SELF.fetch(
+    request(installed.cookie, root, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ initialComment: { body: commentBody("Hibernated private text") } }),
+    }),
+  );
+  const { submission } = await prepared.json<{ submission: { threadId: string } }>();
+  const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+  const selection = await runInDurableObject(stub, async (instance) => {
+    const document = (instance as unknown as { document: Y.Doc }).document;
+    const paragraph = new Y.XmlElement("paragraph"),
+      text = new Y.XmlText();
+    text.insert(0, "Private selection");
+    paragraph.insert(0, [text]);
+    document.getXmlFragment("document-store").insert(0, [paragraph]);
+    return {
+      head: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(text, 0)),
+      anchor: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(text, 7)),
+    };
+  });
+  const anchored = await stub.fetch(
+    new Request("https://document.internal/comment-submission-anchor", {
+      method: "POST",
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "content-type": "application/json" },
+      body: JSON.stringify({ operation: "prepare", operationId, userId: installed.userId, selection }),
+    }),
+  );
+  expect(await anchored.json()).toMatchObject({ anchored: true });
+  await env.DB.prepare("UPDATE anchored_comment_submissions SET state='canceled',body_json=NULL WHERE operation_id=?")
+    .bind(operationId)
+    .run();
+  await abortAllDurableObjects();
+  const restarted = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+  await restarted.fetch(
+    new Request("https://document.internal/content", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+  );
+  await runInDurableObject(restarted, async (instance, state) => {
+    expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(0);
+    expect(
+      JSON.stringify((instance as unknown as { document: Y.Doc }).document.getXmlFragment("document-store").toJSON()),
+    ).not.toContain(submission.threadId);
+  });
+  const preempted = crypto.randomUUID();
+  expect(
+    await (await SELF.fetch(request(installed.cookie, `${root}/${preempted}/cancel`, { method: "POST" }))).json(),
+  ).toMatchObject({ submission: { state: "canceled" } });
+  expect(
+    await (
+      await SELF.fetch(
+        request(installed.cookie, root, {
+          method: "POST",
+          headers: { ...headers, "x-notes-operation-id": preempted },
+          body: JSON.stringify({ initialComment: { body: commentBody("Never publish") } }),
+        }),
+      )
+    ).json(),
+  ).toMatchObject({ submission: { state: "canceled" } });
+  expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(0);
+});

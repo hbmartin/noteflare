@@ -908,6 +908,15 @@ async function resolveAppState(alreadyPurgedAccount?: string): Promise<AppState>
 
 export function App() {
   const [state, setState] = useState<AppState>({ screen: "loading" });
+  const refreshWorkspaceMember = useCallback((member: ClientMemberContext) => {
+    setState((previous) =>
+      previous.screen === "workspace" &&
+      previous.member.user.id === member.user.id &&
+      previous.member.workspace.id === member.workspace.id
+        ? { ...previous, member }
+        : previous,
+    );
+  }, []);
   const stateTransition = useRef(0);
   const commitState = useCallback((transition: number, next: AppState) => {
     if (stateTransition.current === transition) setState(next);
@@ -1237,7 +1246,13 @@ export function App() {
         onSignOut={() => void signOut(state.account.key)}
       />
     );
-  return <Workspace member={state.member} onSignOut={() => void signOut(offlineAccountKey(state.member))} />;
+  return (
+    <Workspace
+      member={state.member}
+      onMemberChanged={refreshWorkspaceMember}
+      onSignOut={() => void signOut(offlineAccountKey(state.member))}
+    />
+  );
 }
 
 function AuthLayout({
@@ -1533,12 +1548,30 @@ export function useCommittedRef<T>(value: T) {
   return ref;
 }
 
-function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
+function Workspace({
+  member,
+  onSignOut,
+  onMemberChanged,
+}: {
+  member: ClientMemberContext;
+  onSignOut: () => void;
+  onMemberChanged: (member: ClientMemberContext) => void;
+}) {
   useLayoutEffect(() => {
     setRealtimeAccessAccount(`${member.user.id}\0${member.workspace.id}`);
     return () => setRealtimeAccessAccount("");
   }, [member.user.id, member.workspace.id]);
-  useRealtimeAccessCoordinator(member.role === "owner");
+  const refreshOwnerRole = useCallback(async () => {
+    const account = realtimeAccessAccount();
+    const current = await api<ClientMemberContext>("/api/me");
+    if (
+      account === realtimeAccessAccount() &&
+      current.user.id === member.user.id &&
+      current.workspace.id === member.workspace.id
+    )
+      onMemberChanged(current);
+  }, [member.user.id, member.workspace.id, onMemberChanged]);
+  useRealtimeAccessCoordinator(member.role === "owner", refreshOwnerRole);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [installTip, setInstallTip] = useState(false);
   useEffect(() => {
