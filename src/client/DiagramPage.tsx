@@ -1093,6 +1093,8 @@ export function DiagramPage({
   const [threads, setThreads] = useState<CommentThread[]>([]);
   const [schemaUpgrade, setSchemaUpgrade] = useState(false);
   const [restoreQuarantine, setRestoreQuarantine] = useState(false);
+  const [authorizationPaused, setAuthorizationPaused] = useState(false);
+  const retryAuthorization = useRef<() => void>(() => {});
   // Keep only the notice across the parent's keyed epoch remount, never document data.
   const noticeKey = `${member.user.id}\0${member.workspace.id}\0${page.id}\0${page.contentEpoch}`;
   const [restoreNotice, setRestoreNotice] = useState(() => diagramRestoreNotices.has(noticeKey));
@@ -1114,6 +1116,9 @@ export function DiagramPage({
     const reconciler = createDocumentCloseReconciler({
       page: { id: page.id, contentEpoch: page.contentEpoch },
       provider: { connect: () => next.resume(), disconnect: () => next.suspend() },
+      onStateChange: (state) => {
+        if (active) setAuthorizationPaused(state === "paused");
+      },
       hasUnsyncedChanges: () => next.hasUnsyncedChanges,
       quarantine: () => setRestoreQuarantine(true),
       onPageChanged: (updated) => {
@@ -1124,6 +1129,7 @@ export function DiagramPage({
       onPageUnavailable,
       onAccessDenied,
     });
+    retryAuthorization.current = () => reconciler.retry();
     const close = (event: CloseEvent) => {
       if (active) reconciler.handleClose(event);
     };
@@ -1209,6 +1215,12 @@ export function DiagramPage({
       {!connected ? (
         <div className="notice">This diagram is read-only until the server reconnects and finishes syncing.</div>
       ) : null}
+      {authorizationPaused && (
+        <p className="notice" role="alert">
+          Access could not be confirmed. Your local edits are preserved.{" "}
+          <button onClick={() => retryAuthorization.current()}>Retry access</button>
+        </p>
+      )}
       {schemaUpgrade && (
         <p className="notice notice-danger" role="alert">
           Reload to edit linked page cards.

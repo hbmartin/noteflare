@@ -443,3 +443,29 @@ it("keeps suspended diagrams paused across retry and visibility paths until auth
   expect(provider.connect).toHaveBeenCalledTimes(before + 1);
   vi.useRealTimers();
 });
+
+it("suspends document visibility and late startup until an explicit resume", async () => {
+  const before = deferred<boolean>();
+  const bundle = createCollaboration("wiki", "suspended-document", 1, vi.fn(), "user", () => before.promise);
+  try {
+    await Promise.resolve();
+    bundle.suspend();
+    const provider = mocks.providers.at(-1)!;
+    const count = provider.connect.mock.calls.length;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await Promise.resolve();
+    expect(provider.connect.mock.calls.length).toBe(count);
+    before.resolve(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(provider.connect.mock.calls.length).toBe(count);
+    bundle.resume();
+    await Promise.resolve();
+    await Promise.resolve();
+    // No suspended attempt may connect, even if persistence is still loading.
+    expect(provider.reconnect).not.toHaveBeenCalled();
+  } finally {
+    bundle.stop();
+    await bundle.destroy();
+  }
+});

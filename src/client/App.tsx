@@ -1,5 +1,6 @@
 import { useRealtimeAccessCoordinator } from "./RealtimeAccessCoordinator";
-import { setRealtimeAccessAccount } from "./realtime-access-status";
+import { preserveBeforeAuthorizationExit, trackAuthorization } from "./authorization-lifecycle";
+import { realtimeAccessAccount, setRealtimeAccessAccount } from "./realtime-access-status";
 import { loadForegroundModule } from "./chunk-recovery";
 import { slackAuthErrorMessage } from "./slack-auth-errors";
 import { ActivityView } from "./ActivityView";
@@ -987,22 +988,27 @@ export function App() {
     return () => window.removeEventListener("storage", onLocalSignOut);
   }, [showState]);
   const sessionExpired = useCallback(
-    async (failure: ApiClientError) => {
-      invalidateUnauthorizedRequests();
-      const transition = ++stateTransition.current;
-      try {
-        const next = await stateAfterUnauthorized(failure);
-        if (stateTransition.current !== transition) return "obsolete" as const;
-        if (next) {
-          commitState(transition, next);
-          return "transitioned" as const;
+    (failure: ApiClientError) => {
+      const account = realtimeAccessAccount();
+      return trackAuthorization(account, async () => {
+        invalidateUnauthorizedRequests();
+        const transition = ++stateTransition.current;
+        try {
+          const next = await stateAfterUnauthorized(failure);
+          if (stateTransition.current !== transition) return "obsolete" as const;
+          if (next) {
+            preserveBeforeAuthorizationExit(account);
+            commitState(transition, next);
+            return "transitioned" as const;
+          }
+          return "ready" as const;
+        } catch (cause) {
+          if (stateTransition.current !== transition) return "obsolete" as const;
+          preserveBeforeAuthorizationExit(account);
+          commitState(transition, startupError(cause, "Unable to reach NoteFlare. Try again."));
+          return "failed" as const;
         }
-        return "ready" as const;
-      } catch (cause) {
-        if (stateTransition.current !== transition) return "obsolete" as const;
-        commitState(transition, startupError(cause, "Unable to reach NoteFlare. Try again."));
-        return "failed" as const;
-      }
+      });
     },
     [commitState],
   );
