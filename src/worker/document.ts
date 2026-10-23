@@ -600,6 +600,7 @@ async function addCommentMark(
   document: Y.Doc,
   threadId: string,
   selection: { head: RelativePositionJson; anchor: RelativePositionJson },
+  isCurrent: () => boolean = () => true,
 ) {
   const markName = `comment--${(await sha256Hex(threadId)).slice(0, 8)}`;
   let head: Y.AbsolutePosition | null;
@@ -627,7 +628,7 @@ async function addCommentMark(
     return { text, from, length: Math.max(0, to - from) };
   });
   const selectedLength = ranges.reduce((total, range) => total + range.length, 0);
-  if (!selectedLength || selectedLength > 100_000) return false;
+  if (!selectedLength || selectedLength > 100_000 || !isCurrent()) return false;
   document.transact(() => {
     removeCommentMark(document, threadId);
     for (const range of ranges) {
@@ -663,6 +664,7 @@ export class Document extends YServer {
   ) => this.bufferUpdate(update, origin, transaction);
   private currentMentionTargets = new Set<string>();
   private pendingNotifyEdit = false;
+  private commentAnchorQueue: Promise<void> = Promise.resolve();
   private purged = false;
   private transition: "archive" | "restore" | null = null;
   private transitionAlarmDeferred = false;
@@ -822,7 +824,6 @@ export class Document extends YServer {
     this.document.on("update", this.updateObserver);
     this.observedMentionRoot = mentionRoot;
     this.observedMentionDocument = this.document;
-    await this.reconcileCommentAnchors();
     // A restored epoch starts with an R2 snapshot but no local update log. Seed
     // one idempotent Yjs update so the new room regenerates search projections,
     // references, thumbnails, and the epoch-scoped current projection.
@@ -870,6 +871,26 @@ export class Document extends YServer {
         sql.exec(`UPDATE document_meta SET dirty = 1 WHERE id = 1`);
       }
       await this.scheduleAlarm(Date.now() + COMPACTION_DELAY_MS);
+    }
+    if (sql.exec("SELECT 1 FROM provisional_comment_anchors LIMIT 1").toArray().length) {
+      // partyserver runs onStart behind its initialization gate. Never await
+      // external journal reads there: recovery has a durable wake and its own queue.
+      try {
+        await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
+      } catch (error) {
+        logger.warn(
+          "comment.anchor_cleanup.schedule_failed",
+          "comments",
+          "Anchor recovery will retry on the next wake.",
+          { pageId: this.ids.pageId },
+          error,
+        );
+      }
+      this.state.waitUntil(
+        this.queueCommentAnchors(() => this.reconcileCommentAnchors()).catch((error) =>
+          this.retryCommentAnchors(error),
+        ),
+      );
     }
   }
 
@@ -1093,7 +1114,11 @@ export class Document extends YServer {
         connection.close(4401, "Authorization expired. Reconnect to continue.");
       }
     }
-    await this.state.blockConcurrencyWhile(() => this.reconcileCommentAnchors());
+    try {
+      await this.queueCommentAnchors(() => this.reconcileCommentAnchors());
+    } catch (error) {
+      await this.retryCommentAnchors(error);
+    }
     if (this.metadata.dirty) await this.compact();
 
     const nextExpiry = Array.from(this.getConnections<ConnectionAuth>())
@@ -1430,31 +1455,30 @@ export class Document extends YServer {
       return Response.json({ cleared: true });
     }
     if (request.method === "POST" && url.pathname.endsWith("/comment-submission-anchor")) {
-      return this.state.blockConcurrencyWhile(async () => {
-        const body = await request.json<{
-          operation: string;
-          userId: string;
-          operationId: string;
-          token?: string;
-          selection?: { head?: unknown; anchor?: unknown };
-        }>();
-        if (typeof body.userId !== "string" || typeof body.operationId !== "string")
+      let body: {
+        operation: string;
+        userId: string;
+        operationId: string;
+        token?: string;
+        selection?: { head?: unknown; anchor?: unknown };
+      };
+      try {
+        body = await request.json<typeof body>();
+        if (!body || typeof body.userId !== "string" || typeof body.operationId !== "string")
           return Response.json({ error: "Invalid preparation." }, { status: 400 });
+      } catch {
+        return Response.json({ error: "Invalid preparation." }, { status: 400 });
+      }
+      return this.queueCommentAnchors(async () => {
         if (body.operation === "reconcile") {
-          await this.reconcileCommentAnchors(body.userId, body.operationId, body.token);
-          return Response.json({ complete: true });
+          const complete = await this.reconcileCommentAnchors(body.userId, body.operationId, body.token);
+          return Response.json({ complete }, { status: complete ? 200 : 503 });
         }
-        if (
-          body.operation !== "prepare" ||
-          this.metadata.content_kind !== "document" ||
-          this.purged ||
-          this.metadata.retired ||
-          this.metadata.restore_pending ||
-          this.transition ||
-          this.metadata.read_only
-        )
+        if (body.operation !== "prepare" || !this.commentAnchorsWritable())
           return Response.json({ error: "This version cannot accept a comment anchor." }, { status: 409 });
-        await this.reconcileCommentAnchors();
+        await this.reconcileCommentAnchors(body.userId, body.operationId);
+        if (!this.commentAnchorsWritable())
+          return Response.json({ error: "This version cannot accept a comment anchor." }, { status: 409 });
         const now = Date.now(),
           token = crypto.randomUUID();
         const claim =
@@ -1472,18 +1496,28 @@ export class Document extends YServer {
           token,
         );
         await this.scheduleAlarm(now + 30_000);
-        this.pendingAuthorId = body.userId;
         const anchored =
           body.selection?.head && body.selection.anchor
             ? await addCommentMark(
                 this.document,
                 claim.thread_id,
                 body.selection as { head: RelativePositionJson; anchor: RelativePositionJson },
+                () => {
+                  if (!this.commentAnchorsWritable()) return false;
+                  this.pendingAuthorId = body.userId;
+                  return true;
+                },
               )
             : false;
         this.flushPendingUpdates();
         if (!anchored) await this.reconcileCommentAnchors(body.userId, body.operationId, token);
         return Response.json({ anchored, token, selection: body.selection });
+      }).catch(async (error) => {
+        await this.retryCommentAnchors(error);
+        return Response.json(
+          { error: "Comment anchoring is temporarily unavailable. Your draft is preserved." },
+          { status: 503 },
+        );
       });
     }
     if (request.method === "POST" && url.pathname.endsWith("/comment-anchor")) {
@@ -3534,16 +3568,69 @@ export class Document extends YServer {
     }
   }
 
+  private commentAnchorsWritable() {
+    return (
+      this.metadata.content_kind === "document" &&
+      !this.purged &&
+      !this.metadata.retired &&
+      !this.metadata.restore_pending &&
+      !this.transition &&
+      !this.metadata.read_only
+    );
+  }
+
+  private queueCommentAnchors<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.commentAnchorQueue.then(operation);
+    this.commentAnchorQueue = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  private async retryCommentAnchors(error: unknown) {
+    logger.warn(
+      "comment.anchor_cleanup.pending",
+      "comments",
+      "Provisional anchor work remains journaled.",
+      { pageId: this.ids.pageId },
+      error,
+    );
+    try {
+      await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
+    } catch (scheduleError) {
+      logger.warn(
+        "comment.anchor_cleanup.schedule_failed",
+        "comments",
+        "Anchor recovery will retry on the next wake.",
+        { pageId: this.ids.pageId },
+        scheduleError,
+      );
+    }
+  }
+
+  private commentAnchorCleanupBlocked() {
+    // Lifecycle transitions suppress bufferUpdate. Retain the journal until a
+    // removal can enter the durable update log, including after a rollback.
+    return Boolean(this.purged || this.metadata.retired || this.metadata.restore_pending || this.transition);
+  }
+
   /** Clearing the D1 lease fences late publishers before removing a provisional mark. */
   private async reconcileCommentAnchors(userId?: string, operationId?: string, token?: string) {
     const entries = this.state.storage.sql
       .exec<{ user_id: string; operation_id: string; thread_id: string; token: string }>(
-        "SELECT * FROM provisional_comment_anchors LIMIT 100",
+        `SELECT * FROM provisional_comment_anchors ${userId ? "WHERE user_id=? AND operation_id=?" : ""} LIMIT 100`,
+        ...(userId ? [userId, operationId!] : []),
       )
       .toArray();
+    let complete = true;
     for (const entry of entries) {
-      if (userId && (entry.user_id !== userId || entry.operation_id !== operationId)) continue;
       try {
+        if (this.commentAnchorCleanupBlocked()) {
+          complete = false;
+          if (!this.purged && !this.metadata.retired) await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
+          continue;
+        }
         let row = await this.bindings.DB.prepare(
           "SELECT state,anchor_token,anchor_expires_at FROM anchored_comment_submissions WHERE user_id=? AND operation_id=?",
         )
@@ -3555,6 +3642,7 @@ export class Document extends YServer {
           (row.anchor_expires_at ?? 0) > Date.now() &&
           token !== entry.token
         ) {
+          complete = false;
           await this.scheduleAlarm(row.anchor_expires_at!);
           continue;
         }
@@ -3571,6 +3659,11 @@ export class Document extends YServer {
             .bind(entry.user_id, entry.operation_id)
             .first<typeof row>();
         }
+        if (this.commentAnchorCleanupBlocked()) {
+          complete = false;
+          if (!this.purged && !this.metadata.retired) await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
+          continue;
+        }
         if (row?.state !== "published") {
           removeCommentMark(this.document, entry.thread_id);
           this.flushPendingUpdates();
@@ -3582,6 +3675,7 @@ export class Document extends YServer {
           entry.token,
         );
       } catch (error) {
+        complete = false;
         logger.warn(
           "comment.anchor_cleanup.pending",
           "comments",
@@ -3593,6 +3687,7 @@ export class Document extends YServer {
       }
     }
     if (entries.length === 100) await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
+    return complete;
   }
 
   private async scheduleAlarm(when: number) {

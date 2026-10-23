@@ -3766,6 +3766,7 @@ app.post("/api/pages/:id/comment-submissions/:operationId/publish", async (c) =>
     commentPage(page),
     c.req.param("operationId"),
     selection.yjs,
+    { userId: member.user.id, sessionId: member.session.id, workspaceId: member.workspace.id },
     async () => {
       const current = await requireMember(c.req.raw, c.env);
       if (current.user.id !== member.user.id) throw new HttpError(401, "unauthorized", "Sign in again.");
