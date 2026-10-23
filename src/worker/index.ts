@@ -7486,6 +7486,36 @@ export async function runSlackMaintenance(env: Env) {
   if (failures.length) throw new AggregateError(failures, `Slack maintenance failed; ${summaries.join("; ")}`);
 }
 
+export async function runSecurityMaintenance(env: Env) {
+  const operations = [
+    ["comment_expiry", () => expireCommentSubmissions(env)],
+    ["security_pruning", () => pruneSecurityState(env)],
+    [
+      "realtime_revocations",
+      async () => {
+        if (!(await drainRealtimeRevocationsBatch(env))) throw new Error("Live access revocation is still pending.");
+      },
+    ],
+  ] as const;
+  const results = await Promise.allSettled(operations.map(([, run]) => Promise.resolve().then(run)));
+  const failures: unknown[] = [];
+  const labels: string[] = [];
+  for (const [index, result] of results.entries()) {
+    if (result.status !== "rejected") continue;
+    const operation = operations[index]![0];
+    logger.error(
+      "scheduled.security_maintenance.failed",
+      "scheduler",
+      "Security maintenance operation failed",
+      { operation },
+      result.reason,
+    );
+    failures.push(result.reason);
+    labels.push(operation);
+  }
+  if (failures.length) throw new AggregateError(failures, `Security maintenance failed: ${labels.join(", ")}`);
+}
+
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext) {
     const requestId = crypto.randomUUID();
@@ -7599,11 +7629,7 @@ export default {
         },
         webhook_history: () => pruneWebhookHistory(env),
         search_headings: () => backfillSearchHeadings(env),
-        security_state: async () => {
-          await expireCommentSubmissions(env);
-          await pruneSecurityState(env);
-          if (!(await drainRealtimeRevocationsBatch(env))) throw new Error("Live access revocation is still pending.");
-        },
+        security_state: () => runSecurityMaintenance(env),
         oauth_security_records: () => pruneOAuthSecurityRecords(env),
         mcp_staged_pages: () => pruneStagedMcpPages(env),
         table_search_values: async () => {

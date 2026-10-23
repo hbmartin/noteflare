@@ -291,7 +291,7 @@ describe("collaborative table UI", () => {
       }
       let refreshBlocked: boolean | undefined, blockedAttemptCount: number | undefined;
       if (mode === "failed-refresh") {
-        await screen.findByText("The task list changed. Review the latest value before saving again.");
+        await screen.findByText("The table could not be loaded.");
         refreshBlocked = (input as HTMLInputElement).disabled;
         fireEvent.blur(input);
         blockedAttemptCount = submissions.length;
@@ -453,6 +453,7 @@ describe("collaborative table UI", () => {
     fireEvent.blur(title);
     expect(writes).toHaveLength(0);
     await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
       AuthorizedTableSocket.instances
         .at(-1)!
         .dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-ready", revision: 1 }) }));
@@ -1100,5 +1101,96 @@ it("drops focus-only snapshots when a filtered cell unmounts", async () => {
   await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
   expect(screen.getByLabelText("Title")).toHaveValue("Remote");
   expect(screen.queryByText(/Your edit is preserved/)).toBeNull();
+  expect(writes).toHaveLength(0);
+});
+
+it.each(["saved", "conflict", "failed-refresh", "newer-edit"] as const)(
+  "keeps task draft ownership through top-level Retry: %s",
+  async (mode) => {
+    const titleId = taskColumns("table").title;
+    data.columns = [{ ...column(titleId, "text"), name: "Task" }];
+    data.rows[0]!.cells = { [titleId]: "Original" };
+    data.rows[0]!.cellRevisions = { [titleId]: 1 };
+    const read = vi.mocked(api).getMockImplementation()!;
+    const submissions: { operationId: string; expectedRevision: number; title: string }[] = [];
+    let readsFail = false;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/task-lists/table/tasks/row") {
+        const body = JSON.parse(String(init?.body));
+        submissions.push(body);
+        if (submissions.length === 1) throw new TypeError("response lost");
+        if (submissions.length === 2 && (mode === "conflict" || mode === "failed-refresh")) {
+          data = { ...data, revision: 2 };
+          readsFail = mode === "failed-refresh";
+          throw new ApiClientError(409, "table_revision_conflict", "Changed");
+        }
+        if (submissions.length === 2 && mode === "newer-edit") {
+          const drafts = new CellDraftMap({
+            account: "owner\0workspace",
+            host: "table",
+            tableId: "table",
+            generation: 1,
+          });
+          drafts.set(cellDraftKey("row", titleId), {
+            ...drafts.get(cellDraftKey("row", titleId))!,
+            text: "Newer text",
+          });
+        }
+        data.rows[0]!.cells[titleId] = body.title;
+        return {};
+      }
+      if (readsFail && path.startsWith("/api/tables/table/query")) throw new TypeError("refresh down");
+      return read(path, init);
+    });
+    show("", member, vi.fn(), true);
+    const input = await screen.findByLabelText("Task");
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "Retry text" } });
+    fireEvent.blur(input);
+    fireEvent.click(await screen.findByRole("button", { name: "Retry saved operation" }));
+    await waitFor(() => expect(submissions).toHaveLength(2));
+    expect(submissions[1]!.operationId).toBe(submissions[0]!.operationId);
+    let refreshBlocked: boolean | undefined, misleadingMessage: boolean | undefined;
+    if (mode === "failed-refresh") {
+      await screen.findByText("The table could not be loaded.");
+      refreshBlocked = (input as HTMLInputElement).disabled;
+      misleadingMessage =
+        screen.queryByText("The task list changed. Review the latest value before saving again.") !== null;
+      readsFail = false;
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    }
+    if (mode === "conflict" || mode === "failed-refresh") {
+      const save = await screen.findByRole("button", { name: "Save draft" });
+      fireEvent.click(save);
+    }
+    const conflict = mode === "conflict" || mode === "failed-refresh";
+    await waitFor(() => expect(submissions).toHaveLength(conflict ? 3 : 2));
+    await waitFor(() => expect(screen.queryByLabelText("Pending cell edits") !== null).toBe(mode === "newer-edit"));
+    expect(refreshBlocked).toBe(mode === "failed-refresh" ? true : undefined);
+    expect(misleadingMessage).toBe(mode === "failed-refresh" ? false : undefined);
+    expect(submissions.length > 2 && submissions[2]!.operationId !== submissions[0]!.operationId).toBe(conflict);
+    expect(submissions.at(-1)!.expectedRevision).toBe(conflict ? 2 : 1);
+    expect((screen.queryByLabelText("Recovered cell draft") as HTMLTextAreaElement | null)?.value).toBe(
+      mode === "newer-edit" ? "Newer text" : undefined,
+    );
+  },
+);
+it("shows an active unsaved indicator without duplicate recovery controls", async () => {
+  show();
+  const input = await screen.findByLabelText("Title");
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Active text" } });
+  expect(screen.getByText("Unsaved edit")).toBeInTheDocument();
+  expect(screen.queryByLabelText("Recovered cell draft")).toBeNull();
+  const read = vi.mocked(api).getMockImplementation()!;
+  vi.mocked(api).mockImplementation((path, init) =>
+    path.startsWith("/linked?")
+      ? Promise.reject(new ApiClientError(503, "unavailable", "Try later"))
+      : read(path, init),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await waitFor(() => expect(input).toBeDisabled());
+  expect(await screen.findByLabelText("Recovered cell draft")).toHaveValue("Active text");
   expect(writes).toHaveLength(0);
 });

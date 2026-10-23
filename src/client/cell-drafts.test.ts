@@ -1,11 +1,14 @@
 // @vitest-environment jsdom
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { act, cleanup, render } from "@testing-library/react";
 import {
   accountCellDrafts,
   CellDraftMap,
   cellDraftKey,
   discardCellDraft,
   purgeCellDrafts,
+  useMissingCellDraftRowIds,
   type CellDraftScope,
 } from "./cell-drafts";
 let scope: CellDraftScope;
@@ -21,8 +24,31 @@ beforeEach(() => {
   scope = { account: crypto.randomUUID(), host: "host", tableId: "table", generation: 1 };
 });
 afterEach(() => {
+  cleanup();
   vi.restoreAllMocks();
   purgeCellDrafts(scope.account);
+});
+it("does not rerender the table's verification subscription on the first or later loaded-cell edit", () => {
+  const map = new CellDraftMap(scope),
+    loaded = new Set(["row:a"]),
+    observed: string[] = [];
+  function Verification() {
+    observed.push(useMissingCellDraftRowIds(scope, loaded));
+    return null;
+  }
+  render(createElement(Verification));
+  const before = observed.length;
+  act(() => {
+    map.set(cellDraftKey("row:a", "b"), edit("First character"));
+  });
+  act(() => {
+    map.set(cellDraftKey("row:a", "b"), edit("Second character"));
+  });
+  expect(observed).toHaveLength(before);
+  act(() => {
+    map.set(cellDraftKey("outside", "b"), { ...edit(), rowId: "outside" });
+  });
+  expect(observed.at(-1)).toBe('["outside"]');
 });
 describe("durable cell draft ownership", () => {
   it("persists changed text and its original revision across remount and a fresh runtime", async () => {
@@ -148,4 +174,75 @@ describe("durable cell draft ownership", () => {
     window.dispatchEvent(new StorageEvent("storage", { key: "notes:local-signout", newValue: scope.account }));
     expect(accountCellDrafts(scope.account)).toHaveLength(0);
   });
+});
+
+it("keeps failed-delete tombstones through focus and accepts a distinct cross-tab version", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const old = accountCellDrafts(scope.account)[0]!;
+  const name = Object.keys(localStorage).find((storedKey) => localStorage.getItem(storedKey)?.includes(old.version))!;
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  map.delete(key);
+  map.set(key, { ...edit("server"), changed: false });
+  expect(accountCellDrafts(scope.account)).toHaveLength(0);
+  expect(map.get(key)?.changed).toBe(false);
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: localStorage.getItem(name) }));
+  expect(accountCellDrafts(scope.account)).toHaveLength(0);
+  remove.mockRestore();
+  const next = { ...old, version: "other-tab", operationId: "other-operation", text: "Other tab text" };
+  localStorage.setItem(name, JSON.stringify(next));
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(next) }));
+  expect(map.get(key)?.text).toBe("Other tab text");
+  discardCellDraft(old);
+  expect(map.get(key)?.text).toBe("Other tab text");
+});
+it("rejects delayed events, wrong keys and stale submissions without scanning storage while typing", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const first = map.submission(key, 10)!;
+  const name = Object.keys(localStorage).find((storedKey) =>
+    localStorage.getItem(storedKey)?.includes(first.version!),
+  )!;
+  const newer = { ...first, scope, version: "newer-tab", text: "Newest" };
+  localStorage.setItem(name, JSON.stringify(newer));
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(first) }));
+  expect(map.submission(key, 11, first.version)).toBeUndefined();
+  expect(map.get(key)?.text).toBe("Newest");
+  const length = vi.spyOn(Storage.prototype, "length", "get");
+  const keyRead = vi.spyOn(Storage.prototype, "key");
+  const write = vi.spyOn(Storage.prototype, "setItem");
+  for (let index = 0; index < 20; index++) {
+    map.set(key, edit(`Text ${index}`));
+    accountCellDrafts(scope.account);
+  }
+  expect(length).not.toHaveBeenCalled();
+  expect(keyRead).not.toHaveBeenCalled();
+  expect(write).toHaveBeenCalledTimes(20);
+  map.set(key, edit("Text 19"));
+  expect(write).toHaveBeenCalledTimes(20);
+});
+it("adopts another tab's submission and definite-rejection reset without changing the text version", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const draft = accountCellDrafts(scope.account)[0]!;
+  const name = Object.keys(localStorage).find((storedKey) => localStorage.getItem(storedKey)?.includes(draft.version))!;
+  localStorage.setItem(name, JSON.stringify({ ...draft, operationId: "other-attempt", submissionRevision: 10 }));
+  expect(map.submission(key, 11, draft.version)).toMatchObject({
+    operationId: "other-attempt",
+    submissionRevision: 10,
+    version: draft.version,
+  });
+  // Definite rejection clears metadata while retaining the original text version.
+  localStorage.setItem(name, JSON.stringify(draft));
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(draft) }));
+  expect(map.get(key)?.operationId).toBeUndefined();
+  const retry = map.submission(key, 12, draft.version)!;
+  expect(retry.operationId).not.toBe("other-attempt");
+  expect(retry.submissionRevision).toBe(12);
+  expect(retry.version).toBe(draft.version);
 });

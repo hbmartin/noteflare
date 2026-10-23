@@ -1,5 +1,6 @@
 import { REALTIME_GRANT_MS } from "../shared/realtime-limits";
 import type { TableQueryResult } from "../shared/table-protocol";
+import { jitteredBackoff } from "../shared/retry";
 
 type Slot = {
   socket: WebSocket;
@@ -22,7 +23,8 @@ export function tableConnection(options: {
   let active: Slot | null = null,
     replacement: Slot | null = null,
     stopped = false,
-    backoff = 2000,
+    attempt = 0,
+    retryAt = 0,
     renewNotBefore = 0;
   let renewal: ReturnType<typeof setTimeout> | undefined, expiry: ReturnType<typeof setTimeout> | undefined;
   let retry: ReturnType<typeof setTimeout> | undefined;
@@ -44,6 +46,7 @@ export function tableConnection(options: {
         retire(active);
         active = null;
         clearTimeout(retry);
+        retryAt = 0;
         if (available()) connect();
       },
       Math.max(0, active.deadline - Date.now()),
@@ -59,11 +62,12 @@ export function tableConnection(options: {
       active = null;
       options.ready(false);
     }
-    renewNotBefore = Date.now() + backoff;
+    const delay = immediate ? 0 : jitteredBackoff(attempt++, 2000, 30_000);
+    retryAt = Date.now() + delay;
+    renewNotBefore = retryAt;
     schedule();
     clearTimeout(retry);
-    if (available()) retry = setTimeout(connect, immediate ? 0 : backoff);
-    if (!immediate) backoff = Math.min(30_000, backoff * 2);
+    if (available()) retry = setTimeout(connect, delay);
   };
   const verify = async (slot: Slot) => {
     if (slot.checking) {
@@ -87,7 +91,8 @@ export function tableConnection(options: {
         active = slot;
         replacement = null;
         retire(previous);
-        backoff = 2000;
+        attempt = 0;
+        retryAt = 0;
         renewNotBefore = 0;
       }
       if (active === slot) {
@@ -108,6 +113,10 @@ export function tableConnection(options: {
   function connect() {
     if (stopped || replacement || !available()) return;
     clearTimeout(retry);
+    if (retryAt > Date.now()) {
+      retry = setTimeout(connect, retryAt - Date.now());
+      return;
+    }
     const slot: Slot = {
       socket: new WebSocket(options.url),
       started: Date.now(),
@@ -163,7 +172,9 @@ export function tableConnection(options: {
         clearTimeout(renewal);
         clearTimeout(expiry);
         clearTimeout(retry);
-        if (available()) connect();
+        retryAt = Date.now() + jitteredBackoff(attempt++, 2000, 30_000);
+        renewNotBefore = retryAt;
+        if (available()) retry = setTimeout(connect, retryAt - Date.now());
       } else failed(slot, event.code === 4401 || slot.deadline <= Date.now());
     });
   }

@@ -277,10 +277,12 @@ export class ServerThreadStore extends ThreadStore {
     return {
       prepare: async () => {
         assertAccount();
+        if (!this.ready()) throw new Error("Connect and sync the document before posting. Your draft is preserved.");
         return remember(await api<Result>(root, { method: "POST", headers, body: json({ initialComment: { body } }) }));
       },
       publish: async (editor: BlockNoteEditor<any, any, any>, selection: { head: number; anchor: number }) => {
         assertAccount();
+        if (!this.ready()) throw new Error("Connect and sync the document before posting. Your draft is preserved.");
         const binding = ySyncPluginKey.getState(editor.prosemirrorState)?.binding;
         if (!binding) throw new Error("The original comment selection is unavailable.");
         const yjs = {

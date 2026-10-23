@@ -10,6 +10,7 @@ import type { Env } from "./env";
 import { HttpError, sha256 } from "./http";
 import { clearRateLimit, consumeFixedWindow } from "./rate-limit";
 import { logger } from "./observability";
+import { SQL_NOW_MS, SQL_NOW_ISO } from "./sql-clock";
 
 const TRUST_MS = 30 * 24 * 60 * 60_000;
 const FRESH_MS = 5 * 60_000;
@@ -189,13 +190,10 @@ export async function freshSecurityAuthorization(
 export function protectedSessionGuard(
   authorization: { userId: string; sessionId: string; generation?: number },
   policy: "fresh" | "active",
-  now: number | "transaction" = Date.now(),
 ) {
-  // SQLite's stable statement clock also covers time spent queued before a
-  // publication transaction starts. Existing callers retain their request clock.
-  const milliseconds = now === "transaction" ? "CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)" : "?";
-  const sessionTime = now === "transaction" ? "strftime('%Y-%m-%dT%H:%M:%fZ','now')" : "?";
-  const proofTime = policy === "fresh" && now === "transaction" ? `(${milliseconds}-${FRESH_MS})` : milliseconds;
+  const milliseconds = SQL_NOW_MS;
+  const sessionTime = SQL_NOW_ISO;
+  const proofTime = `(${milliseconds}-${FRESH_MS})`;
   return {
     sql: `EXISTS(SELECT 1 FROM session live JOIN session_security proof ON proof.session_id=live.id AND proof.user_id=live.userId
       JOIN slack_protected_accounts security ON security.user_id=live.userId AND security.generation=proof.generation
@@ -213,15 +211,13 @@ export function protectedSessionGuard(
       authorization.userId,
       authorization.sessionId,
       ...(authorization.generation === undefined ? [] : [authorization.generation]),
-      ...(now === "transaction" ? [] : [new Date(now).toISOString(), now, policy === "fresh" ? now - FRESH_MS : now]),
     ],
   };
 }
 
 export function freshSecurityGuard(authorization: FreshSecurityAuthorization) {
-  const now = Date.now();
-  const guard = protectedSessionGuard(authorization, "fresh", now);
-  return { sql: `? > ? AND ${guard.sql}`, binds: [authorization.expiresAt, now, ...guard.binds] };
+  const guard = protectedSessionGuard(authorization, "fresh");
+  return { sql: `? > ${SQL_NOW_MS} AND ${guard.sql}`, binds: [authorization.expiresAt, ...guard.binds] };
 }
 
 async function identity(ctx: GenericEndpointContext): Promise<Identity | null> {

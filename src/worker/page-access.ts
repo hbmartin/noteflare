@@ -31,8 +31,11 @@ export function requirePageEditor(page: PageRow) {
 }
 
 /** SQL expressions supplied here are fixed by callers, never request input. */
-export function spaceVisibleSql(role = "?") {
-  return `(${role} = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`;
+export function spaceVisibleSql(role = "?", aliases = { space: "s", grant: "sm" }) {
+  return `(${role} = 'owner' OR ${aliases.space}.visibility = 'workspace' OR ${aliases.grant}.user_id IS NOT NULL)`;
+}
+export function pageReadableSql(includeArchived = false) {
+  return `p.import_job_id IS NULL${includeArchived ? "" : " AND p.archived_at IS NULL"}`;
 }
 
 export async function spaceForMember(env: Env, member: MemberContext, spaceId: string) {
@@ -74,8 +77,7 @@ export async function pageForMember(env: Env, member: MemberContext, pageId: str
        FROM pages p
        JOIN spaces s ON s.id = p.space_id AND s.workspace_id = p.workspace_id
        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
-      WHERE p.id = ? AND p.workspace_id = ? ${includeArchived ? "" : "AND p.archived_at IS NULL"}
-        AND p.import_job_id IS NULL
+      WHERE p.id = ? AND p.workspace_id = ? AND ${pageReadableSql(includeArchived)}
         AND ${spaceVisibleSql()}`,
   )
     .bind(member.user.id, pageId, member.workspace.id, member.role)

@@ -311,7 +311,8 @@ export class TableAuthority extends DurableObject<Env> {
     await this.initializeDeadlines();
     if (this.deletionIntent || this.purged) return;
     const state = this.deadlines();
-    state[owner] = Date.now() + delay;
+    const requested = Date.now() + delay;
+    state[owner] = owner === "projection" ? Math.min(state.projection ?? Infinity, requested) : requested;
     this.ctx.storage.sql.exec("INSERT OR REPLACE INTO alarm_deadlines VALUES(1,?)", JSON.stringify(state));
     await this.armAlarm();
   }

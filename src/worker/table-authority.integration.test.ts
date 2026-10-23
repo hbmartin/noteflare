@@ -3831,3 +3831,33 @@ async function advanceTableAlarm(stub: DurableObjectStub) {
     }
   });
 }
+
+it("keeps the earliest projection deadline while allowing explicit repair retry replacement", async () => {
+  const { pageId, member } = await fixture();
+  await enableTableAuthority(env, member, pageId);
+  await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+    const internal = instance as unknown as {
+      scheduleAlarm(delay: number, owner?: "repair" | "projection"): Promise<void>;
+    };
+    const clock = Date.now(),
+      now = vi.spyOn(Date, "now").mockReturnValue(clock);
+    try {
+      await internal.scheduleAlarm(1000);
+      await internal.scheduleAlarm(10_000);
+      let deadlines = JSON.parse(
+        state.storage.sql.exec<{ value: string }>("SELECT value FROM alarm_deadlines WHERE id=1").one().value,
+      );
+      expect(deadlines.projection).toBe(clock + 1000);
+      expect(await state.storage.getAlarm()).toBe(clock + 1000);
+      await internal.scheduleAlarm(1000, "repair");
+      await internal.scheduleAlarm(10_000, "repair");
+      deadlines = JSON.parse(
+        state.storage.sql.exec<{ value: string }>("SELECT value FROM alarm_deadlines WHERE id=1").one().value,
+      );
+      expect(deadlines.repair).toBe(clock + 10_000);
+      expect(deadlines.projection).toBe(clock + 1000);
+    } finally {
+      now.mockRestore();
+    }
+  });
+});

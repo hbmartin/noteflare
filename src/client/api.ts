@@ -5,6 +5,7 @@ import { twoFactorClient } from "better-auth/client/plugins";
 import { passkeyClient } from "@better-auth/passkey/client";
 import { observeWorkerResponse, reportClientError } from "./telemetry";
 import { retainPendingWork } from "./pending-work";
+import { currentAuthorizationAttempt, type AuthorizationAttempt } from "./authorization-lifecycle";
 
 export const authClient = createAuthClient({
   baseURL: window.location.origin,
@@ -157,6 +158,10 @@ export type UnauthorizedHandler = (
   error: ApiClientError,
 ) => void | UnauthorizedResolution | Promise<void | UnauthorizedResolution>;
 const unauthorizedResolutions = new WeakMap<ApiClientError, Promise<UnauthorizedResolution>>();
+const unauthorizedAttempts = new WeakMap<ApiClientError, AuthorizationAttempt>();
+export function unauthorizedAttempt(error: ApiClientError) {
+  return unauthorizedAttempts.get(error);
+}
 export function unauthorizedResolution(error: ApiClientError) {
   return unauthorizedResolutions.get(error);
 }
@@ -232,6 +237,8 @@ export function apiRequestEpoch() {
 }
 export function notifyApiUnauthorized(failure: ApiClientError, requestEpoch: number) {
   if (failure.status !== 401) return;
+  const account = realtimeAccessAccount();
+  const before = currentAuthorizationAttempt(account);
   if (requestEpoch !== unauthorizedRequestEpoch) {
     unauthorizedResolutions.set(failure, Promise.resolve("obsolete"));
     return;
@@ -252,6 +259,8 @@ export function notifyApiUnauthorized(failure: ApiClientError, requestEpoch: num
       outcomes.push(Promise.resolve(failed(handlerError)));
     }
   }
+  const attempt = currentAuthorizationAttempt(account);
+  if (attempt && attempt !== before) unauthorizedAttempts.set(failure, attempt);
   if (outcomes.length)
     unauthorizedResolutions.set(
       failure,

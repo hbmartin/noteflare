@@ -2,16 +2,22 @@ import type { UnauthorizedResolution } from "./api";
 import { realtimeAccessAccount, type RealtimeAccessAccount } from "./realtime-access-status";
 
 const preservation = new Set<{ account: RealtimeAccessAccount | null; preserve: () => void }>();
-let current: { account: RealtimeAccessAccount | null; result: Promise<UnauthorizedResolution> } | undefined;
+export type AuthorizationAttempt = {
+  id: number;
+  account: RealtimeAccessAccount | null;
+  result: Promise<UnauthorizedResolution>;
+};
+let sequence = 0;
+let current: AuthorizationAttempt | undefined;
 
 /** Publish the winning attempt before invoking App, including synchronous failures. */
 export function trackAuthorization(account: RealtimeAccessAccount | null, run: () => Promise<UnauthorizedResolution>) {
   const result = Promise.resolve().then(run);
-  current = { account, result };
+  current = { id: ++sequence, account, result };
   return result;
 }
-export function currentAuthorization(account: RealtimeAccessAccount | null) {
-  return account === realtimeAccessAccount() && current?.account === account ? current.result : undefined;
+export function currentAuthorizationAttempt(account: RealtimeAccessAccount | null) {
+  return account === realtimeAccessAccount() && current?.account === account ? current : undefined;
 }
 export function registerAuthorizationPreservation(preserve: () => void) {
   const registration = { account: realtimeAccessAccount(), preserve };
