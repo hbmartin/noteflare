@@ -1,0 +1,378 @@
+{
+  "baselineRevision": "ac826e9",
+  "updatedRevision": "0d24be8a4c62df9ba38c2014fcea11160ee38b41",
+  "fixture": {
+    "rows": 100,
+    "columns": 3,
+    "accountDrafts": 500,
+    "unrelatedStorageKeys": 5000,
+    "typingEditsPerContext": 20,
+    "contextsPerVersion": 3,
+    "reconnectingClients": 20,
+    "includesFirstChangedValue": true
+  },
+  "limits": "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
+  "runs": {
+    "baseline": [
+      {
+        "typing": {
+          "samples": 20,
+          "p50Ms": 4,
+          "p95Ms": 5.300000011920929,
+          "counts": {
+            "length": 220080,
+            "key": 220040,
+            "writes": 20,
+            "wholeTableRenders": 20
+          },
+          "requests": 1
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 0.30000001192092896,
+          "p95Ms": 0.30000001192092896,
+          "maximumReadyIn100ms": 20,
+          "webSockets": 40,
+          "queries": 40
+        }
+      },
+      {
+        "typing": {
+          "samples": 20,
+          "p50Ms": 4.100000023841858,
+          "p95Ms": 5,
+          "counts": {
+            "length": 220080,
+            "key": 220040,
+            "writes": 20,
+            "wholeTableRenders": 20
+          },
+          "requests": 1
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 0.19999998807907104,
+          "p95Ms": 0.19999998807907104,
+          "maximumReadyIn100ms": 20,
+          "webSockets": 40,
+          "queries": 40
+        }
+      },
+      {
+        "typing": {
+          "samples": 20,
+          "p50Ms": 4.300000011920929,
+          "p95Ms": 5.300000011920929,
+          "counts": {
+            "length": 220080,
+            "key": 220040,
+            "writes": 20,
+            "wholeTableRenders": 20
+          },
+          "requests": 1
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 0.40000003576278687,
+          "p95Ms": 0.40000003576278687,
+          "maximumReadyIn100ms": 20,
+          "webSockets": 40,
+          "queries": 40
+        }
+      }
+    ],
+    "updated": [
+      {
+        "typing": {
+          "samples": 20,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.6000000238418579,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "wholeTableRenders": 0
+          },
+          "requests": 1
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1383.5,
+          "p95Ms": 1886.800000011921,
+          "maximumReadyIn100ms": 3,
+          "webSockets": 40,
+          "queries": 40
+        }
+      },
+      {
+        "typing": {
+          "samples": 20,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.5999999642372131,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "wholeTableRenders": 0
+          },
+          "requests": 1
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1530.0999999642372,
+          "p95Ms": 1801.0999999642372,
+          "maximumReadyIn100ms": 6,
+          "webSockets": 40,
+          "queries": 40
+        }
+      },
+      {
+        "typing": {
+          "samples": 20,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.699999988079071,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "wholeTableRenders": 0
+          },
+          "requests": 1
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1530.9000000357628,
+          "p95Ms": 1929.699999988079,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        }
+      }
+    ]
+  },
+  "date": "2026-10-23",
+  "reproduce": "node scripts/measure-collaboration-recovery.mjs ac826e9 /tmp/noteflare-265-collaboration-measurements.json",
+  "cancellation": {
+    "limits": "Local D1 and Document objects; request-side D1 statement/DO fetch counts exclude coordinator and room-internal reads. Baseline reproduces the previous cancellation algorithm. Page seeding excluded.",
+    "samplesPerCase": 12,
+    "baseline_cold": {
+      "p50Ms": 5,
+      "p95Ms": 6,
+      "counts": [
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        }
+      ]
+    },
+    "baseline_warm": {
+      "p50Ms": 2,
+      "p95Ms": 3,
+      "counts": [
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        },
+        {
+          "d1": 6,
+          "do": 1
+        }
+      ]
+    },
+    "updated_cold": {
+      "p50Ms": 0,
+      "p95Ms": 1,
+      "counts": [
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        }
+      ]
+    },
+    "updated_warm": {
+      "p50Ms": 0,
+      "p95Ms": 1,
+      "counts": [
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        },
+        {
+          "d1": 3,
+          "do": 0
+        }
+      ]
+    },
+    "reproduce": "pnpm exec vitest run --config vitest.worker.config.ts src/worker/comments.integration.test.ts -t \"measures cancellation request calls\"",
+    "implementationRevision": "446d45a",
+    "clockResolutionMs": 1
+  }
+}
