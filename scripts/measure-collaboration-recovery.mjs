@@ -38,7 +38,7 @@ globalThis.measureTyping=async()=>{
  input.focus();
  const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
  const edit=text=>flushSync(()=>{setter.call(input,text);input.dispatchEvent(new Event('input',{bubbles:true}));});
- edit('Warm draft');await frame();
+ await frame();
  const count={length:0,key:0,writes:0};
  const descriptor=Object.getOwnPropertyDescriptor(Storage.prototype,'length'),key=Storage.prototype.key,set=Storage.prototype.setItem;
  Object.defineProperty(Storage.prototype,'length',{configurable:true,get(){count.length++;return descriptor.get.call(this)}});

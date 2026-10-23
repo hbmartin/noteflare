@@ -25,7 +25,7 @@ import "./collaborative-table.css";
 import {
   CellDraftMap,
   cellDraftKey as draftKey,
-  useCellDraftRowIds,
+  useMissingCellDraftRowIds,
   useCellDraft,
   type StoredCellDraft,
 } from "./cell-drafts";
@@ -76,10 +76,8 @@ export function CollaborativeTablePage({
     [account, host, page.id, data?.generation],
   );
   const [verifiedDraftRows, setVerifiedDraftRows] = useState<TableDraftRows | null>(null);
-  const draftRowIds = useCellDraftRowIds(drafts.scope);
-  const missingDraftIds = JSON.stringify(
-    [...new Set((JSON.parse(draftRowIds) as string[]).filter((id) => !data?.rows.some((row) => row.id === id)))].sort(),
-  );
+  const loadedRowIds = useMemo(() => new Set(data?.rows.map((row) => row.id)), [data?.rows]);
+  const missingDraftIds = useMissingCellDraftRowIds(drafts.scope, loadedRowIds);
   const draftGeneration = data?.generation,
     draftRevision = data?.revision;
   useEffect(() => {

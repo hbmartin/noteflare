@@ -1,11 +1,14 @@
 // @vitest-environment jsdom
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { act, cleanup, render } from "@testing-library/react";
 import {
   accountCellDrafts,
   CellDraftMap,
   cellDraftKey,
   discardCellDraft,
   purgeCellDrafts,
+  useMissingCellDraftRowIds,
   type CellDraftScope,
 } from "./cell-drafts";
 let scope: CellDraftScope;
@@ -21,8 +24,31 @@ beforeEach(() => {
   scope = { account: crypto.randomUUID(), host: "host", tableId: "table", generation: 1 };
 });
 afterEach(() => {
+  cleanup();
   vi.restoreAllMocks();
   purgeCellDrafts(scope.account);
+});
+it("does not rerender the table's verification subscription on the first or later loaded-cell edit", () => {
+  const map = new CellDraftMap(scope),
+    loaded = new Set(["row:a"]),
+    observed: string[] = [];
+  function Verification() {
+    observed.push(useMissingCellDraftRowIds(scope, loaded));
+    return null;
+  }
+  render(createElement(Verification));
+  const before = observed.length;
+  act(() => {
+    map.set(cellDraftKey("row:a", "b"), edit("First character"));
+  });
+  act(() => {
+    map.set(cellDraftKey("row:a", "b"), edit("Second character"));
+  });
+  expect(observed).toHaveLength(before);
+  act(() => {
+    map.set(cellDraftKey("outside", "b"), { ...edit(), rowId: "outside" });
+  });
+  expect(observed.at(-1)).toBe('["outside"]');
 });
 describe("durable cell draft ownership", () => {
   it("persists changed text and its original revision across remount and a fresh runtime", async () => {

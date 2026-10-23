@@ -124,7 +124,7 @@ export function useCellDrafts(account: string, scope?: CellDraftSelection, exclu
   );
   return useSyncExternalStore((listener) => subscribe(listeners, account, listener), snapshot, snapshot);
 }
-export function useCellDraftRowIds(scope: CellDraftScope) {
+export function useMissingCellDraftRowIds(scope: CellDraftScope, loaded: ReadonlySet<string>) {
   const snapshot = () =>
     JSON.stringify(
       [
@@ -134,7 +134,8 @@ export function useCellDraftRowIds(scope: CellDraftScope) {
               (draft) =>
                 draft.scope.host === scope.host &&
                 draft.scope.tableId === scope.tableId &&
-                draft.scope.generation === scope.generation,
+                draft.scope.generation === scope.generation &&
+                !loaded.has(draft.rowId),
             )
             .map((draft) => draft.rowId),
         ),
