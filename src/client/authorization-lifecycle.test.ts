@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from "vitest";
 import {
-  currentAuthorization,
+  currentAuthorizationAttempt,
   preserveBeforeAuthorizationExit,
   registerAuthorizationPreservation,
   trackAuthorization,
@@ -26,13 +26,13 @@ it("preserves current recovery before terminal transitions and isolates broken s
       expect(recovery).toEqual(["local draft"]);
       return "transitioned";
     });
-    expect(currentAuthorization(account)).toBe(result);
+    expect(currentAuthorizationAttempt(account)?.result).toBe(result);
     expect(await result).toBe("transitioned");
     expect(log).toHaveBeenCalledOnce();
     setRealtimeAccessAccount("other\0wiki");
     preserveBeforeAuthorizationExit(account);
     expect(recovery).toEqual(["local draft"]);
-    expect(currentAuthorization(account)).toBeUndefined();
+    expect(currentAuthorizationAttempt(account)).toBeUndefined();
   } finally {
     off();
     offBroken();

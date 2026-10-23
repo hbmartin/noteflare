@@ -38,6 +38,7 @@ let ready: ReturnType<typeof vi.fn<(value: boolean) => void>>;
 const result = { generation: 1, canEdit: true } as TableQueryResult;
 beforeEach(() => {
   vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(1);
   Socket.all = [];
   vi.stubGlobal("WebSocket", Socket);
   vi.spyOn(document, "hidden", "get").mockReturnValue(false);
@@ -122,6 +123,7 @@ describe("table grant handover", () => {
     release(result);
     await settle();
     expect(stop.authorized()).toBe(false);
+    await vi.advanceTimersByTimeAsync(2000);
     Socket.all[2]!.ready();
     await settle();
     expect(stop.authorized()).toBe(true);
@@ -171,4 +173,23 @@ describe("table grant handover", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(Socket.all).toHaveLength(2);
   });
+});
+
+it("jitters fenced reconnects and does not bypass the pending delay on visibility changes", async () => {
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  Socket.all[0]!.ready();
+  await settle();
+  Socket.all[0]!.closed(4403);
+  expect(stop.authorized()).toBe(false);
+  expect(Socket.all).toHaveLength(1);
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.advanceTimersByTimeAsync(999);
+  expect(Socket.all).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(Socket.all).toHaveLength(2);
+  Socket.all[1]!.closed(4403);
+  await vi.advanceTimersByTimeAsync(1999);
+  expect(Socket.all).toHaveLength(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(Socket.all).toHaveLength(3);
 });

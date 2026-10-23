@@ -1,6 +1,6 @@
 import type { Page } from "../shared/types";
-import { ApiClientError, api, unauthorizedResolution } from "./api";
-import { currentAuthorization } from "./authorization-lifecycle";
+import { ApiClientError, api, unauthorizedResolution, unauthorizedAttempt } from "./api";
+import { currentAuthorizationAttempt } from "./authorization-lifecycle";
 import { realtimeAccessAccount, subscribeRealtimeAccess } from "./realtime-access-status";
 import { connectionRetryDelay } from "./retry";
 
@@ -120,15 +120,20 @@ export function createDocumentCloseReconciler({
           setState("awaiting-authorization");
           provider.disconnect();
           const recovery = unauthorizedResolution(error);
+          let followed = unauthorizedAttempt(error)?.id ?? 0;
           let resolution = recovery ? await recovery : "failed";
           if (!alive() || authCheck !== check) return;
-          if (resolution === "obsolete") {
-            const winning = currentAuthorization(account);
-            if (!winning || winning === recovery) {
+          while (
+            resolution === "obsolete" ||
+            (followed > 0 && (currentAuthorizationAttempt(account)?.id ?? followed) > followed)
+          ) {
+            const winning = currentAuthorizationAttempt(account);
+            if (!winning || winning.id <= followed) {
               pause();
               return;
             }
-            resolution = await winning;
+            followed = winning.id;
+            resolution = await winning.result;
             if (!alive() || authCheck !== check) return;
           }
           if (resolution === "ready") {

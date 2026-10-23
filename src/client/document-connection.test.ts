@@ -3,7 +3,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
 import { ApiClientError, apiRequestEpoch, notifyApiUnauthorized, onApiUnauthorized } from "./api";
-import { setRealtimeAccessAccount } from "./realtime-access-status";
+import { trackAuthorization } from "./authorization-lifecycle";
+import { realtimeAccessAccount, setRealtimeAccessAccount } from "./realtime-access-status";
 import { createDocumentCloseReconciler } from "./document-connection";
 
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
@@ -322,3 +323,51 @@ it("does not treat an obsolete result without a winning authorization as approva
     vi.useRealTimers();
   }
 });
+
+it.each(["same-obsolete", "newer-ready", "newer-obsolete"] as const)(
+  "tracks authorization attempt identity for %s",
+  async (mode) => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    setRealtimeAccessAccount("attempt-owner\0workspace");
+    const account = realtimeAccessAccount();
+    let finish!: (value: "obsolete") => void;
+    const stop = onApiUnauthorized(() =>
+      trackAuthorization(
+        account,
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      ),
+    );
+    const failure = new ApiClientError(401, "challenge_required", "Verify");
+    notifyApiUnauthorized(failure, apiRequestEpoch());
+    mocks.api.mockReset().mockRejectedValueOnce(failure).mockResolvedValue({ page });
+    const { reconciler, provider } = setup();
+    try {
+      reconciler.handleClose(new CloseEvent("close", { code: 4403 }));
+      await vi.advanceTimersByTimeAsync(0);
+      if (mode !== "same-obsolete")
+        void trackAuthorization(account, async () => (mode === "newer-ready" ? "ready" : "obsolete"));
+      finish("obsolete");
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(reconciler.state).toBe(mode === "newer-ready" ? "retrying" : "paused");
+      expect(provider.connect).toHaveBeenCalledTimes(mode === "newer-ready" ? 1 : 0);
+      if (mode !== "newer-ready") {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await vi.advanceTimersByTimeAsync(30_000);
+        reconciler.retry();
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+      expect(provider.connect).toHaveBeenCalledOnce();
+      expect(mocks.api).toHaveBeenCalledTimes(2);
+    } finally {
+      stop();
+      reconciler.destroy();
+      setRealtimeAccessAccount("");
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  },
+);
