@@ -149,3 +149,53 @@ describe("durable cell draft ownership", () => {
     expect(accountCellDrafts(scope.account)).toHaveLength(0);
   });
 });
+
+it("keeps failed-delete tombstones through focus and accepts a distinct cross-tab version", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const old = accountCellDrafts(scope.account)[0]!;
+  const name = Object.keys(localStorage).find((storedKey) => localStorage.getItem(storedKey)?.includes(old.version))!;
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  map.delete(key);
+  map.set(key, { ...edit("server"), changed: false });
+  expect(accountCellDrafts(scope.account)).toHaveLength(0);
+  expect(map.get(key)?.changed).toBe(false);
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: localStorage.getItem(name) }));
+  expect(accountCellDrafts(scope.account)).toHaveLength(0);
+  remove.mockRestore();
+  const next = { ...old, version: "other-tab", operationId: "other-operation", text: "Other tab text" };
+  localStorage.setItem(name, JSON.stringify(next));
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(next) }));
+  expect(map.get(key)?.text).toBe("Other tab text");
+  discardCellDraft(old);
+  expect(map.get(key)?.text).toBe("Other tab text");
+});
+it("rejects delayed events, wrong keys and stale submissions without scanning storage while typing", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const first = map.submission(key, 10)!;
+  const name = Object.keys(localStorage).find((storedKey) =>
+    localStorage.getItem(storedKey)?.includes(first.version!),
+  )!;
+  const newer = { ...first, scope, version: "newer-tab", text: "Newest" };
+  localStorage.setItem(name, JSON.stringify(newer));
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(first) }));
+  expect(map.submission(key, 11, first.version)).toBeUndefined();
+  expect(map.get(key)?.text).toBe("Newest");
+  const length = vi.spyOn(Storage.prototype, "length", "get");
+  const keyRead = vi.spyOn(Storage.prototype, "key");
+  const write = vi.spyOn(Storage.prototype, "setItem");
+  for (let index = 0; index < 20; index++) {
+    map.set(key, edit(`Text ${index}`));
+    accountCellDrafts(scope.account);
+  }
+  expect(length).not.toHaveBeenCalled();
+  expect(keyRead).not.toHaveBeenCalled();
+  expect(write).toHaveBeenCalledTimes(20);
+  map.set(key, edit("Text 19"));
+  expect(write).toHaveBeenCalledTimes(20);
+});
