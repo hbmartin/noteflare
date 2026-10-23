@@ -1,0 +1,1 @@
+CREATE INDEX idx_anchored_comment_page ON anchored_comment_submissions(page_id);

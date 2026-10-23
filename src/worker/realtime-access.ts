@@ -59,7 +59,7 @@ async function captureUser(env: Env, userId: string, forced = false) {
     if (!scope.workspaces.has(row.workspace_id)) scope.workspaces.set(row.workspace_id, Promise.resolve(row.revision));
     if (forced) scope.forced.add(row.workspace_id);
   }
-  scope.unresolvedUsers.delete(userId);
+  if (forced) scope.unresolvedUsers.delete(userId);
 }
 export async function trackRealtimeUser(env: Env, userId: string) {
   const scope = impacts.getStore();
