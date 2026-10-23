@@ -45,7 +45,12 @@ import { enableTableAuthority, queryTable } from "./table-service";
 import type { TableRepairStatus } from "./table-authority";
 import type { Env } from "./env";
 import { HttpError } from "./http";
-import worker, { backfillTableSearchValues, executeScheduledTasks, runSlackMaintenance } from "./index";
+import worker, {
+  backfillTableSearchValues,
+  executeScheduledTasks,
+  runSecurityMaintenance,
+  runSlackMaintenance,
+} from "./index";
 import { linkPreview } from "./link-previews";
 import { SCHEDULED_TASK_NAMES } from "./scheduled-task-names";
 import { broadcastWorkspaceEvent, eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
@@ -9617,3 +9622,57 @@ async function advanceTableAlarm(stub: DurableObjectStub) {
     }
   });
 }
+
+it.each(["comment_expiry", "security_pruning", "realtime_revocations"] as const)(
+  "settles all security maintenance substeps after %s fails",
+  async (failure) => {
+    const installed = await bootstrap();
+    await env.DB.prepare("UPDATE realtime_revocations SET revision=revision+1 WHERE workspace_id=?")
+      .bind(installed.workspaceId)
+      .run();
+    const attempted = new Set<string>();
+    let completion: boolean | undefined;
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            const operation = sql.includes("UPDATE anchored_comment_submissions SET state='expired'")
+              ? "comment_expiry"
+              : sql.includes("DELETE FROM rateLimit")
+                ? "security_pruning"
+                : sql.includes("revision>completed_revision")
+                  ? "realtime_revocations"
+                  : null;
+            if (operation) {
+              attempted.add(operation);
+              if (operation === failure) throw new Error(`Injected ${operation}`);
+            }
+            return target.prepare(sql);
+          };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const bindings = {
+      ...env,
+      DB: database,
+      WORKSPACE_EVENTS: { getByName: () => ({ fetch: async () => Response.json({ complete: true }) }) },
+    } as unknown as Env;
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(runSecurityMaintenance(bindings)).rejects.toThrow(failure);
+      expect([...attempted].sort()).toEqual(["comment_expiry", "realtime_revocations", "security_pruning"]);
+      if (failure !== "realtime_revocations") {
+        const status = await env.DB.prepare(
+          "SELECT revision,completed_revision FROM realtime_revocations WHERE workspace_id=?",
+        )
+          .bind(installed.workspaceId)
+          .first<{ revision: number; completed_revision: number }>();
+        completion = status!.completed_revision === status!.revision;
+      }
+      expect(completion).toBe(failure === "realtime_revocations" ? undefined : true);
+    } finally {
+      log.mockRestore();
+    }
+  },
+);
