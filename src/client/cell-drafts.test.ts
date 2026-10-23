@@ -225,3 +225,24 @@ it("rejects delayed events, wrong keys and stale submissions without scanning st
   map.set(key, edit("Text 19"));
   expect(write).toHaveBeenCalledTimes(20);
 });
+it("adopts another tab's submission and definite-rejection reset without changing the text version", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const draft = accountCellDrafts(scope.account)[0]!;
+  const name = Object.keys(localStorage).find((storedKey) => localStorage.getItem(storedKey)?.includes(draft.version))!;
+  localStorage.setItem(name, JSON.stringify({ ...draft, operationId: "other-attempt", submissionRevision: 10 }));
+  expect(map.submission(key, 11, draft.version)).toMatchObject({
+    operationId: "other-attempt",
+    submissionRevision: 10,
+    version: draft.version,
+  });
+  // Definite rejection clears metadata while retaining the original text version.
+  localStorage.setItem(name, JSON.stringify(draft));
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(draft) }));
+  expect(map.get(key)?.operationId).toBeUndefined();
+  const retry = map.submission(key, 12, draft.version)!;
+  expect(retry.operationId).not.toBe("other-attempt");
+  expect(retry.submissionRevision).toBe(12);
+  expect(retry.version).toBe(draft.version);
+});

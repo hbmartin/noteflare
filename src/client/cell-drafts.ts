@@ -159,13 +159,28 @@ function tombstone(name: string, version?: string) {
   }
   records.set(name, null);
 }
+function sameDraft(left: StoredCellDraft | null | undefined, right: StoredCellDraft | null) {
+  return (
+    left === right ||
+    Boolean(
+      left &&
+      right &&
+      left.version === right.version &&
+      left.text === right.text &&
+      left.type === right.type &&
+      left.baseRevision === right.baseRevision &&
+      left.operationId === right.operationId &&
+      left.submissionRevision === right.submissionRevision,
+    )
+  );
+}
 /** Read the actual latest write before a save or discard, without enumerating storage. */
 function refresh(name: string, account: string) {
   try {
     const current = records.get(name);
     if (current && !current.durable) return;
     const next = parse(name, localStorage.getItem(name));
-    if (current?.version === next?.version) return;
+    if (sameDraft(current, next)) return;
     if (!next && current) tombstone(name, current.version);
     else records.set(name, next);
     notify(account, name);
@@ -383,7 +398,7 @@ if (typeof window !== "undefined") {
           previous = records.get(event.key);
         if (raw !== null && !next) return;
         const account = next?.scope.account ?? (JSON.parse(event.key.slice(prefix.length)) as string[])[0];
-        if (!account || previous?.version === next?.version) return;
+        if (!account || sameDraft(previous, next)) return;
         if (!next) tombstone(event.key, previous?.version);
         else records.set(event.key, next);
         notify(account, event.key);
