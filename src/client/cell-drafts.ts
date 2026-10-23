@@ -179,6 +179,29 @@ export class CellDraftMap extends Map<string, CellDraft> {
       this.set(key, { ...draft, operationId: crypto.randomUUID(), submissionRevision: tableRevision });
     return this.get(key);
   }
+  resetRejectedSubmission(key: string, version: string | undefined, operationId: string) {
+    const current = this.get(key);
+    if (!current?.changed || current.version !== version || current.operationId !== operationId) return false;
+    // Bypass set's intentional ambiguous-submission preservation. A definite
+    // rejection is the only unchanged draft allowed to retire this identity.
+    const next = {
+      ...current,
+      operationId: undefined,
+      submissionRevision: undefined,
+      durable: false,
+    } as StoredCellDraft;
+    const name = nameOf(this.scope, key);
+    records.set(name, next);
+    super.set(key, next);
+    try {
+      localStorage.setItem(name, JSON.stringify(next));
+      next.durable = true;
+    } catch {
+      /* Recovery remains available in memory and reports its durability. */
+    }
+    notify();
+    return true;
+  }
 }
 export function purgeCellDrafts(account: string) {
   loadCellDrafts(account);

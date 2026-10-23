@@ -61,6 +61,42 @@ describe("durable cell draft ownership", () => {
     map.acknowledge(key, newer.version);
     expect(map.get(key)).toBeUndefined();
   });
+  it("persists a version-guarded rejected-submission reset without changing text or its cell revision", async () => {
+    const map = new CellDraftMap(scope),
+      key = cellDraftKey("row:a", "b");
+    map.set(key, edit());
+    const submitted = map.submission(key, 10)!;
+    expect(map.resetRejectedSubmission(key, submitted.version, "another-operation")).toBe(false);
+    expect(map.resetRejectedSubmission(key, submitted.version, submitted.operationId!)).toBe(true);
+    expect(map.get(key)).toMatchObject({
+      text: "Unfinished",
+      baseRevision: 7,
+      version: submitted.version,
+      operationId: undefined,
+      submissionRevision: undefined,
+    });
+    vi.resetModules();
+    const fresh = await import("./cell-drafts");
+    const restored = new fresh.CellDraftMap(scope);
+    expect(restored.get(key)).toMatchObject({ text: "Unfinished", baseRevision: 7 });
+    const retried = restored.submission(key, 11)!;
+    expect(retried.operationId).not.toBe(submitted.operationId);
+    expect(retried.submissionRevision).toBe(11);
+    restored.set(key, edit("Newer text"));
+    expect(restored.resetRejectedSubmission(key, retried.version, retried.operationId!)).toBe(false);
+    expect(restored.get(key)?.text).toBe("Newer text");
+  });
+  it("retains a reset in memory and reports failed persistence", () => {
+    const map = new CellDraftMap(scope),
+      key = cellDraftKey("row:a", "b");
+    map.set(key, edit());
+    const submitted = map.submission(key, 10)!;
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    expect(map.resetRejectedSubmission(key, submitted.version, submitted.operationId!)).toBe(true);
+    expect(map.get(key)).toMatchObject({ text: "Unfinished", durable: false, operationId: undefined });
+  });
   it("isolates linked hosts, generations and accounts without hiding retired text recovery", () => {
     const map = new CellDraftMap(scope),
       key = cellDraftKey("row:a", "b");

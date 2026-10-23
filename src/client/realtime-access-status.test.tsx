@@ -197,3 +197,45 @@ it("refreshes a stale owner role after rejection and stops retries once the role
   await act(async () => vi.advanceTimersByTimeAsync(60_000));
   expect(api).toHaveBeenCalledTimes(count);
 });
+
+it("bounds owner refresh with a fresh deadline and cancels it on disposal", async () => {
+  const { ApiClientError } = await import("./api");
+  vi.useFakeTimers();
+  vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), ms);
+    return controller.signal;
+  });
+  vi.mocked(api).mockRejectedValue(new ApiClientError(403, "owner_required", "Owners only"));
+  const signals: AbortSignal[] = [];
+  const refresh = vi.fn(
+    (signal: AbortSignal) =>
+      new Promise<void>((_resolve, reject) => {
+        signals.push(signal);
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+  );
+  function RoleCoordinator({ owner }: { owner: boolean }) {
+    useRealtimeAccessCoordinator(owner, refresh);
+    return null;
+  }
+  const view = render(<RoleCoordinator owner />);
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(refresh).toHaveBeenCalledOnce();
+  await act(async () => vi.advanceTimersByTimeAsync(14_999));
+  expect(api).toHaveBeenCalledTimes(1);
+  expect(signals[0]!.aborted).toBe(false);
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  expect(signals[0]!.aborted).toBe(true);
+  expect(realtimeAccessSnapshot().error).toContain("could not be confirmed");
+  await act(async () => vi.advanceTimersByTimeAsync(2_000));
+  expect(refresh).toHaveBeenCalledTimes(2);
+  expect(signals[1]!.aborted).toBe(false);
+  await act(async () => view.rerender(<RoleCoordinator owner={false} />));
+  expect(signals[1]!.aborted).toBe(true);
+  const calls = vi.mocked(api).mock.calls.length;
+  await act(async () => vi.advanceTimersByTimeAsync(60_000));
+  expect(api).toHaveBeenCalledTimes(calls);
+});

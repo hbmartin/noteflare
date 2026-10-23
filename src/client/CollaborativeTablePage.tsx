@@ -37,6 +37,7 @@ export type CollaborativeTableProps = {
   onViewChanged?: (id: string) => void;
   embedded?: boolean;
 };
+type TaskSaveResult = { state: "saved" } | { state: "rejected"; code?: string } | { state: "uncertain" };
 
 /** Shared host/source renderer. A linked host uses its permission-checking endpoint for every read/write. */
 export function CollaborativeTablePage({
@@ -55,6 +56,8 @@ export function CollaborativeTablePage({
   const writeReady = useRef(false);
   const connectionPermit = useRef<() => boolean>(() => true);
   const busyRef = useRef(false);
+  const taskRefreshRequiredRef = useRef(false);
+  const [taskRefreshRequired, setTaskRefreshRequired] = useState(false);
   const [connectionReady, setConnectionReady] = useState(false);
   const [authorizedGeneration, setAuthorizedGeneration] = useState<number | null>(null);
   const [data, setData] = useState<TableQueryResult | null>(null);
@@ -130,6 +133,7 @@ export function CollaborativeTablePage({
   }, [data]);
   const editable = Boolean(
     online &&
+    !taskRefreshRequired &&
     connectionReady &&
     (queryBase || authorizedGeneration === data?.generation) &&
     member.role !== "viewer" &&
@@ -139,7 +143,12 @@ export function CollaborativeTablePage({
     writeReady.current = Boolean(editable);
   }, [editable]);
   const canCommit = useCallback(
-    () => writeReady.current && navigator.onLine && !busyRef.current && connectionPermit.current(),
+    () =>
+      writeReady.current &&
+      navigator.onLine &&
+      !busyRef.current &&
+      !taskRefreshRequiredRef.current &&
+      connectionPermit.current(),
     [],
   );
   const taskList = Boolean(page.taskList || data?.taskList);
@@ -172,6 +181,8 @@ export function CollaborativeTablePage({
         // authorization result still belongs to its live connection attempt.
         if (owner !== epoch.current) return result;
         dataRef.current = result;
+        taskRefreshRequiredRef.current = false;
+        setTaskRefreshRequired(false);
         setData((current) =>
           cursor && current?.revision === result.revision
             ? { ...result, rows: [...current.rows, ...result.rows] }
@@ -293,8 +304,8 @@ export function CollaborativeTablePage({
       kind,
       payload,
     });
-  const saveTask = async (body: Record<string, unknown>, rowId?: string): Promise<boolean> => {
-    if (!canCommit()) return false;
+  const saveTask = async (body: Record<string, unknown>, rowId?: string): Promise<TaskSaveResult> => {
+    if (!canCommit()) return { state: "rejected", code: "not_ready" };
     busyRef.current = true;
     setBusy(true);
     setError("");
@@ -309,16 +320,23 @@ export function CollaborativeTablePage({
       await load();
       if (result?.visibleInView === false)
         setError("Saved. Current filters hide this task. Choose All rows to see it.");
-      return true;
+      return { state: "saved" };
     } catch (cause) {
       setError(apiErrorMessage(cause, "The task could not be saved."));
-      if (discardDenied(cause)) return false;
-      if (!(cause instanceof ApiClientError) || cause.status >= 500) setRetry(() => () => saveTask(body, rowId));
-      else if (cause.status === 409) {
+      if (discardDenied(cause)) return { state: "rejected", code: (cause as ApiClientError).code };
+      if (!(cause instanceof ApiClientError) || (cause.status >= 500 && !cause.notSent)) {
+        setRetry(() => () => saveTask(body, rowId));
+        return { state: "uncertain" };
+      }
+      if (cause.status === 409) {
+        if (cause.code === "table_revision_conflict") {
+          taskRefreshRequiredRef.current = true;
+          setTaskRefreshRequired(true);
+        }
         await load();
         setError("The task list changed. Review the latest value before saving again.");
       }
-      return false;
+      return { state: "rejected", code: cause.code };
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -344,7 +362,9 @@ export function CollaborativeTablePage({
       };
       if (field) {
         const op = operationId ?? crypto.randomUUID();
-        return saveTask(
+        const key = draftKey(row.id, column.id),
+          submitted = drafts.get(key);
+        const result = await saveTask(
           {
             operationId: op,
             expectedRevision: submissionRevision ?? data?.revision,
@@ -357,6 +377,9 @@ export function CollaborativeTablePage({
           },
           row.id,
         );
+        if (result.state === "rejected" && result.code === "table_revision_conflict")
+          drafts.resetRejectedSubmission(key, submitted?.version, op);
+        return result.state === "saved";
       }
     }
     return send({

@@ -1567,16 +1567,20 @@ function Workspace({
     setRealtimeAccessAccount(`${member.user.id}\0${member.workspace.id}`);
     return () => setRealtimeAccessAccount("");
   }, [member.user.id, member.workspace.id]);
-  const refreshOwnerRole = useCallback(async () => {
-    const account = realtimeAccessAccount();
-    const current = await api<ClientMemberContext>("/api/me");
-    if (
-      account === realtimeAccessAccount() &&
-      current.user.id === member.user.id &&
-      current.workspace.id === member.workspace.id
-    )
-      onMemberChanged(current);
-  }, [member.user.id, member.workspace.id, onMemberChanged]);
+  const refreshOwnerRole = useCallback(
+    async (signal: AbortSignal) => {
+      const account = realtimeAccessAccount();
+      const current = await api<ClientMemberContext>("/api/me", { signal });
+      if (
+        !signal.aborted &&
+        account === realtimeAccessAccount() &&
+        current.user.id === member.user.id &&
+        current.workspace.id === member.workspace.id
+      )
+        onMemberChanged(current);
+    },
+    [member.user.id, member.workspace.id, onMemberChanged],
+  );
   useRealtimeAccessCoordinator(member.role === "owner", refreshOwnerRole);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [installTip, setInstallTip] = useState(false);
