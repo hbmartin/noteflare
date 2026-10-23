@@ -175,3 +175,24 @@ it("retires prepared comment operations without sending cancellation or publicat
     setRealtimeAccessAccount("");
   }
 });
+
+it("requires collaboration readiness at preparation and publication but can acknowledge a committed post", async () => {
+  let ready = false;
+  const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => ready);
+  const submission = store.anchoredSubmission(thread().comments[0]!.body as never);
+  mockedApi.mockClear();
+  await expect(submission.prepare()).rejects.toThrow("Connect and sync");
+  expect(mockedApi).not.toHaveBeenCalled();
+  ready = true;
+  mockedApi.mockResolvedValueOnce({ submission: { state: "prepared", operationId: "op" } });
+  await submission.prepare();
+  ready = false;
+  await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow("Connect and sync");
+  expect(mockedApi).toHaveBeenCalledOnce();
+  expect(() =>
+    submission.acknowledge({
+      submission: { state: "published", operationId: "op" },
+      thread: thread({ anchored: true }),
+    } as never),
+  ).not.toThrow();
+});

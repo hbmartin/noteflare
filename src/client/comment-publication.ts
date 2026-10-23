@@ -7,38 +7,64 @@ const pending = new Map<string, Set<string>>();
 const active = new Map<string, Map<string, { cancel: () => Promise<CommentSubmissionStatus>; detach: () => void }>>();
 const published = new Map<string, CommentSubmissionStatus>();
 const key = (scope: CommentDraftScope) => `${prefix}${JSON.stringify([scope.account, scope.pageId, scope.epoch])}`;
+const v2 = "notes:comment-publication:v2:";
+const cleanupPending = new Map<string, Set<string>>();
+const resolved = new Map<string, Set<string>>();
+const operationKey = (name: string, operationId: string, state: "pending" | "resolved") =>
+  v2 + JSON.stringify([...(JSON.parse(name.slice(prefix.length)) as unknown[]), operationId, state]);
 function ids(name: string) {
-  if (!pending.has(name)) {
-    let saved: unknown;
-    try {
-      saved = JSON.parse(localStorage.getItem(name) ?? "[]");
-    } catch {
-      saved = [];
-    }
-    pending.set(name, new Set(Array.isArray(saved) ? saved.filter((id): id is string => typeof id === "string") : []));
-  }
-  return pending.get(name)!;
-}
-function persist(name: string) {
+  const values = new Set(pending.get(name));
+  const done = new Set(resolved.get(name));
   try {
-    const values = [...ids(name)];
-    if (values.length) localStorage.setItem(name, JSON.stringify(values));
-    else {
-      localStorage.removeItem(name);
-      pending.delete(name);
+    const legacy: unknown = JSON.parse(localStorage.getItem(name) ?? "[]");
+    if (Array.isArray(legacy)) for (const id of legacy) if (typeof id === "string") values.add(id);
+    const scope = name.slice(prefix.length);
+    for (let index = 0; index < localStorage.length; index++) {
+      const entry = localStorage.key(index);
+      if (!entry?.startsWith(v2)) continue;
+      try {
+        const parts: unknown = JSON.parse(entry.slice(v2.length));
+        if (
+          !Array.isArray(parts) ||
+          parts.length !== 5 ||
+          typeof parts[3] !== "string" ||
+          JSON.stringify(parts.slice(0, 3)) !== scope
+        )
+          continue;
+        if (parts[4] === "pending") values.add(parts[3]);
+        if (parts[4] === "resolved") done.add(parts[3]);
+      } catch {
+        /* One invalid receipt cannot hide valid operations. */
+      }
     }
-    return true;
+    // Import legacy identities separately; resolved markers dominate stale old-tab echoes.
+    for (const id of values) {
+      const entry = operationKey(name, id, "pending");
+      if (!done.has(id) && localStorage.getItem(entry) !== "1") localStorage.setItem(entry, "1");
+    }
   } catch {
-    return false;
+    /* Failed writes retain the operation in memory for manual recovery. */
   }
+  for (const id of done) if (!cleanupPending.get(name)?.has(id)) values.delete(id);
+  return values;
 }
 export function forgetCommentPublication(scope: CommentDraftScope, operationId: string) {
   const name = key(scope);
-  const values = ids(name);
-  values.delete(operationId);
-  if (persist(name)) return true;
-  values.add(operationId);
-  return false;
+  try {
+    localStorage.setItem(operationKey(name, operationId, "resolved"), "1");
+    const done = resolved.get(name) ?? new Set<string>();
+    done.add(operationId);
+    resolved.set(name, done);
+    localStorage.removeItem(operationKey(name, operationId, "pending"));
+    pending.get(name)?.delete(operationId);
+    cleanupPending.get(name)?.delete(operationId);
+    return true;
+  } catch {
+    const retry = cleanupPending.get(name) ?? new Set<string>();
+    retry.add(operationId);
+    cleanupPending.set(name, retry);
+    return false;
+  }
 }
 export function registerCommentPublication(
   scope: CommentDraftScope,
@@ -47,8 +73,15 @@ export function registerCommentPublication(
 ) {
   const name = key(scope),
     account = realtimeAccessAccount();
-  ids(name).add(operationId);
-  const durable = persist(name);
+  const values = pending.get(name) ?? new Set<string>();
+  values.add(operationId);
+  pending.set(name, values);
+  let durable = true;
+  try {
+    localStorage.setItem(operationKey(name, operationId, "pending"), "1");
+  } catch {
+    durable = false;
+  }
   const entries = active.get(name) ?? new Map();
   entries.get(operationId)?.detach();
   active.set(name, entries);
@@ -116,13 +149,14 @@ export function activeCommentCancellation(
   };
 }
 export function purgeCommentPublications(account: string) {
-  const names = new Set([...pending.keys(), ...active.keys()]),
+  const names = new Set([...pending.keys(), ...active.keys(), ...cleanupPending.keys(), ...resolved.keys()]),
     failures: unknown[] = [];
+  const stored = new Set<string>();
   try {
     for (let index = 0; index < localStorage.length; index++) {
       try {
         const name = localStorage.key(index);
-        if (name?.startsWith(prefix)) names.add(name);
+        if (name?.startsWith(prefix)) stored.add(name);
       } catch (error) {
         failures.push(error);
       }
@@ -136,12 +170,16 @@ export function purgeCommentPublications(account: string) {
     } catch {
       continue;
     }
-    pending.set(name, new Set());
+    pending.delete(name);
+    cleanupPending.delete(name);
+    resolved.delete(name);
     published.delete(name);
     for (const entry of active.get(name)?.values() ?? []) entry.detach();
+  }
+  for (const name of stored) {
     try {
-      localStorage.removeItem(name);
-      pending.delete(name);
+      if (JSON.parse(name.slice(name.startsWith(v2) ? v2.length : prefix.length))[0] === account)
+        localStorage.removeItem(name);
     } catch (error) {
       failures.push(error);
     }

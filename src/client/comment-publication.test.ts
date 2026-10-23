@@ -81,3 +81,38 @@ it("retries persistent receipt cleanup after a confirmed cancellation and purges
   purgeCommentPublications(scope.account);
   expect(activeCommentCancellation(scope, recover)).toBeUndefined();
 });
+
+it("keeps independent tabs' receipts and suppresses resolved legacy echoes", async () => {
+  setRealtimeAccessAccount(scope.account);
+  const first = registerCommentPublication(scope, "tab-one", async () => ({
+    operationId: "tab-one",
+    threadId: "t",
+    state: "canceled",
+    expiresAt: 1,
+  }));
+  vi.resetModules();
+  const other = await import("./comment-publication");
+  const otherRegistration = other.registerCommentPublication(scope, "tab-two", async () => ({
+    operationId: "tab-two",
+    threadId: "t",
+    state: "canceled",
+    expiresAt: 1,
+  }));
+  registerCommentPublication(scope, "tab-three", async () => ({
+    operationId: "tab-three",
+    threadId: "t",
+    state: "canceled",
+    expiresAt: 1,
+  }));
+  first.finish();
+  const legacy = "notes:comment-publication:" + JSON.stringify([scope.account, scope.pageId, scope.epoch]);
+  localStorage.setItem(legacy, JSON.stringify(["tab-one", "legacy-pending"]));
+  const recovered: string[] = [];
+  await other.activeCommentCancellation(scope, async (operationId) => {
+    recovered.push(operationId);
+    return { operationId, threadId: "t", state: "canceled", expiresAt: 1 };
+  })!();
+  expect(recovered.sort()).toEqual(["legacy-pending", "tab-three"]);
+  expect(other.activeCommentCancellation(scope, vi.fn())).toBeUndefined();
+  otherRegistration.finish();
+});
