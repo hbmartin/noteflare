@@ -1,0 +1,49 @@
+{
+  "date": "2026-10-23",
+  "scope": "Local D1/Miniflare page-deletion measurement; not production D1 latency",
+  "command": "pnpm exec vitest run --config vitest.worker.config.ts src/worker/wiki-review.integration.test.ts -t 'measures page deletion' --reporter=verbose",
+  "fixture": {
+    "background_receipts": "Expired, content-free receipts belonging to one unrelated page",
+    "victim_pages": 20,
+    "receipts_per_victim": 1,
+    "timed_work": "Awaited D1 DELETE FROM pages WHERE id=?; fixture seeding excluded",
+    "clock": "performance.now(); observed 1 ms granularity",
+    "quantiles": "Sorted zero-based positions 10 (p50), 18 (p95), 20 samples",
+    "limits": "One local run, shared development machine with other validation active; no production network or sustained-load claim"
+  },
+  "results_ms": [
+    {
+      "background_receipts": 2000,
+      "index": false,
+      "samples": 20,
+      "p50": 1,
+      "p95": 3
+    },
+    {
+      "background_receipts": 2000,
+      "index": true,
+      "samples": 20,
+      "p50": 1,
+      "p95": 1
+    },
+    {
+      "background_receipts": 20000,
+      "index": false,
+      "samples": 20,
+      "p50": 3,
+      "p95": 5
+    },
+    {
+      "background_receipts": 20000,
+      "index": true,
+      "samples": 20,
+      "p50": 1,
+      "p95": 2
+    }
+  ],
+  "query_plan": {
+    "before": "SCAN anchored_comment_submissions",
+    "after": "Child lookup uses idx_anchored_comment_page, verified by EXPLAIN QUERY PLAN"
+  },
+  "correctness": "Upgrade 0103\u21920104 preserves every receipt; runner replay succeeds; page/account cascade removes only dependent receipts."
+}

@@ -257,6 +257,12 @@ Document rooms lazily add a provisional-anchor journal. A short internal publica
 
 Keep `TABLE_RELATIONS_ENABLED=false`. This change requires no feature activation, additional cron schedule, or external Slack setup.
 
+## Migration 0104: anchored comment page cascades
+
+Apply `0104_anchored_comment_page_index.sql` after 0103 through the ordinary migration runner. It adds `idx_anchored_comment_page` on `anchored_comment_submissions(page_id)`, so page deletion can find preparation and terminal-receipt children without scanning every account's receipts. It changes no rows, expiry policy, publication states, or cascade semantics. Migration 0103 remains unchanged.
+
+This additive index is compatible with the existing Worker and may precede the updated Worker. Keep it during a code rollback; the preparation and provisional-anchor rollback requirements above still apply. No Durable Object class migration, feature activation, or special quiescence confirmation is needed for 0104. Keep relations disabled.
+
 ## Automated deployment guards
 
 The production workflow stops when `0011_page_move_receipt_envelopes.sql` or a guarded Slack migration is pending. Complete the relevant quiescence procedure, then use manual workflow dispatch with `confirm_page_move_receipt_migration_safe` or `confirm_slack_review_migration_safe`. A confirmation records maintenance already completed; it does not pause live consumers. Later releases need no confirmation after these migrations are applied.
