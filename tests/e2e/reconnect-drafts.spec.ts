@@ -507,3 +507,119 @@ for (const reload of [false, true]) {
     expect((await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads).toHaveLength(0);
   });
 }
+
+test("top-level task Retry preserves identity through an unrelated conflict and clears the eventual draft", async ({
+  page,
+}) => {
+  await signInOwner(page);
+  const space = await createTestSpace(page, "Task toolbar retry");
+  const created = await page.request.post("/api/pages", {
+    data: { kind: "table", taskList: true, spaceId: space.id, title: `Toolbar retry ${Date.now()}` },
+  });
+  expect(created.ok()).toBeTruthy();
+  const table = (await created.json()).page;
+  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
+  const query = async () => await (await page.request.get(`/api/tables/${table.id}/query`)).json();
+  const rows: string[] = [];
+  for (const title of ["Retry target", "Other task"]) {
+    const response = await page.request.post(`/api/task-lists/${table.id}/tasks`, {
+      data: { title, operationId: crypto.randomUUID(), expectedRevision: (await query()).revision },
+    });
+    expect(response.ok()).toBeTruthy();
+    rows.push((await response.json()).rowId);
+  }
+  const attempts: { operationId: string; expectedRevision: number }[] = [];
+  await page.route(`**/api/task-lists/${table.id}/tasks/${rows[0]}`, async (route) => {
+    attempts.push(route.request().postDataJSON());
+    if (attempts.length === 1) {
+      await route.abort("failed");
+      return;
+    }
+    if (attempts.length === 2) {
+      const changed = await page.request.patch(`/api/task-lists/${table.id}/tasks/${rows[1]}`, {
+        data: {
+          title: "Remote task edit",
+          operationId: crypto.randomUUID(),
+          expectedRevision: (await query()).revision,
+        },
+      });
+      expect(changed.ok()).toBeTruthy();
+    }
+    await route.continue();
+  });
+  await page.goto(`/?page=${table.id}`);
+  const input = page.getByLabel("Task", { exact: true }).first();
+  await expect(input).toBeEnabled();
+  await input.fill("Toolbar retry draft");
+  await input.press("Enter");
+  const rejectedRetry = page.waitForResponse(
+    (response) =>
+      response.request().method() === "PATCH" &&
+      new URL(response.url()).pathname === `/api/task-lists/${table.id}/tasks/${rows[0]}`,
+  );
+  await page.getByRole("button", { name: "Retry saved operation", exact: true }).click();
+  expect((await rejectedRetry).status()).toBe(409);
+  // A workspace invalidation can finish another successful refresh after the
+  // conflict read. Assert the durable draft and request contracts independently
+  // of the short-lived load message.
+  await expect(page.getByLabel("Pending cell edits")).toContainText("Toolbar retry draft");
+  expect(attempts).toHaveLength(2);
+  expect(attempts[1]!.operationId).toBe(attempts[0]!.operationId);
+  await page.getByRole("button", { name: "Save draft", exact: true }).click();
+  await expect.poll(() => attempts.length).toBe(3);
+  expect(attempts[2]!.operationId).not.toBe(attempts[1]!.operationId);
+  expect(attempts[2]!.expectedRevision).toBeGreaterThan(attempts[1]!.expectedRevision);
+  await expect(page.getByLabel("Pending cell edits")).toHaveCount(0);
+  await expect
+    .poll(async () => (await query()).rows.find((row: { id: string }) => row.id === rows[0]).cells[`${table.id}-title`])
+    .toBe("Toolbar retry draft");
+});
+test("two tabs share the latest cell draft and stale Retry cannot submit or clear it", async ({ page, context }) => {
+  await signInOwner(page);
+  const table = await create(page, "table", "Cross-tab drafts");
+  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
+  const columnId = crypto.randomUUID(),
+    rowId = crypto.randomUUID();
+  for (const [kind, payload] of [
+    ["create_column", { id: columnId, name: "Shared draft", type: "text" }],
+    ["create_row", { id: rowId, values: { [columnId]: "Original" } }],
+  ] as const)
+    expect(
+      (
+        await page.request.post(`/api/tables/${table.id}/commands`, {
+          data: { kind, payload, operationId: crypto.randomUUID() },
+        })
+      ).ok(),
+    ).toBeTruthy();
+  let attempts = 0;
+  await context.route(`**/api/tables/${table.id}/commands`, async (route) => {
+    attempts++;
+    await route.abort("failed");
+  });
+  await page.goto(`/?page=${table.id}`);
+  const second = await context.newPage();
+  try {
+    await second.goto(`/?page=${table.id}`);
+    const firstCell = page.getByLabel("Shared draft", { exact: true }),
+      secondCell = second.getByLabel("Shared draft", { exact: true });
+    await expect(firstCell).toBeEnabled();
+    await expect(secondCell).toBeEnabled();
+    await firstCell.fill("First tab draft");
+    await firstCell.press("Enter");
+    await expect(page.getByRole("button", { name: "Retry saved operation", exact: true })).toBeVisible();
+    await expect(secondCell).toHaveValue("First tab draft");
+    await secondCell.fill("Newest tab draft");
+    await secondCell.press("Enter");
+    await expect(second.getByRole("button", { name: "Retry saved operation", exact: true })).toBeVisible();
+    await expect(firstCell).toHaveValue("Newest tab draft");
+    expect(attempts).toBe(2);
+    await page.getByRole("button", { name: "Retry saved operation", exact: true }).click();
+    expect(attempts).toBe(2);
+    await expect(page.getByLabel("Recovered cell draft")).toHaveValue("Newest tab draft");
+    await page.getByRole("button", { name: "Discard draft", exact: true }).click();
+    await expect(second.getByLabel("Pending cell edits")).toHaveCount(0);
+    await expect(secondCell).toHaveValue("Original");
+  } finally {
+    await second.close();
+  }
+});

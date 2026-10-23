@@ -5,6 +5,7 @@ import {
   cellDraftCleanupError,
   retryCellDraftCleanup,
   type StoredCellDraft,
+  type CellDraftSelection,
 } from "./cell-drafts";
 function originalContext(draft: StoredCellDraft) {
   const host = draft.scope.host.match(/^\/api\/pages\/([^/]+)\/linked-tables\//)?.[1];
@@ -23,7 +24,7 @@ export function CellDraftRecovery({
 }: {
   account: string;
   filter?: (draft: StoredCellDraft) => boolean;
-  scope?: { host: string; tableId: string };
+  scope?: CellDraftSelection;
   classify?: (draft: StoredCellDraft) => string;
   save?: (draft: StoredCellDraft, reviewed?: boolean) => Promise<boolean>;
 }) {

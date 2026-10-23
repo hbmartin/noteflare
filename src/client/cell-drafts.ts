@@ -85,7 +85,7 @@ export function accountCellDrafts(account: string) {
     Boolean(draft && draft.scope.account === account),
   );
 }
-type Selection = Pick<CellDraftScope, "host" | "tableId"> & { generation?: number };
+export type CellDraftSelection = Pick<CellDraftScope, "host" | "tableId"> & { generation?: number };
 function draftSelection(
   account: string,
   host: string | undefined,
@@ -114,7 +114,7 @@ function draftSelection(
     return previous;
   };
 }
-export function useCellDrafts(account: string, scope?: Selection, excludeFocused = false) {
+export function useCellDrafts(account: string, scope?: CellDraftSelection, excludeFocused = false) {
   const host = scope?.host,
     tableId = scope?.tableId,
     generation = scope?.generation;
