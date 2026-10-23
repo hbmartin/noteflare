@@ -7,7 +7,12 @@ import * as authApi from "better-auth/api";
 import { HttpError } from "./http";
 import type { Env } from "./env";
 import { encryptSlackToken } from "./slack";
-import { disconnectSlackIdentity, slackAccessAuthorization } from "./slack-identity";
+import {
+  authorizeSlackLink,
+  recordVerifiedSlackIdentity,
+  disconnectSlackIdentity,
+  slackAccessAuthorization,
+} from "./slack-identity";
 
 const configured = () =>
   ({
@@ -1013,3 +1018,110 @@ describe("Slack OAuth authorization boundaries", () => {
     expect(setup.status).toBe(200);
   });
 });
+
+it.each(["session", "proof", "trust"] as const)(
+  "rejects a queued disconnect at execution-time %s expiry",
+  async (mode) => {
+    const { cookie, user, workspace } = await account();
+    await callback(await start(cookie));
+    const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?").bind(user).first<{ id: string }>())!;
+    const clock = Date.now();
+    if (mode === "trust") {
+      await env.DB.prepare(
+        "INSERT INTO trusted_browsers(id,token_hash,user_id,generation,created_at,expires_at,name) VALUES('queued-browser','queued-token',?,0,?,?, 'Browser')",
+      )
+        .bind(user, clock, clock + 60_000)
+        .run();
+      await env.DB.prepare("UPDATE session_security SET method='trust',trust_id='queued-browser' WHERE session_id=?")
+        .bind(session.id)
+        .run();
+    }
+    const before = await env.DB.prepare("SELECT * FROM slack_user_links").all();
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            if (mode === "session")
+              await env.DB.prepare("UPDATE session SET expiresAt=? WHERE id=?")
+                .bind(new Date(clock - 1000).toISOString(), session.id)
+                .run();
+            if (mode === "proof")
+              await env.DB.prepare("UPDATE session_security SET expires_at=? WHERE session_id=?")
+                .bind(clock - 1000, session.id)
+                .run();
+            if (mode === "trust")
+              await env.DB.prepare("UPDATE trusted_browsers SET expires_at=? WHERE id='queued-browser'")
+                .bind(clock - 1000)
+                .run();
+            return target.batch(statements);
+          };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const stale = vi.spyOn(Date, "now").mockReturnValue(clock - 600_000);
+    try {
+      await expect(
+        disconnectSlackIdentity({ ...configured(), DB: database }, user, session.id, workspace),
+      ).rejects.toMatchObject({ status: 409, code: "slack_link_changed" });
+    } finally {
+      stale.mockRestore();
+    }
+    expect((await env.DB.prepare("SELECT * FROM slack_user_links").all()).results).toEqual(before.results);
+  },
+);
+it.each(["session", "proof", "freshness", "captured-permit"] as const)(
+  "rejects a Slack link write at execution-time %s expiry",
+  async (mode) => {
+    const { cookie, user, workspace } = await account();
+    await callback(await start(cookie));
+    const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?").bind(user).first<{ id: string }>())!;
+    const oauth = (await env.DB.prepare("SELECT id,accountId FROM account WHERE userId=? AND providerId='slack'")
+      .bind(user)
+      .first<{ id: string; accountId: string }>())!;
+    const permit = await authorizeSlackLink(configured(), user, session.id),
+      clock = Date.now();
+    const before = (await env.DB.prepare("SELECT * FROM slack_user_links").all()).results;
+    if (mode === "session")
+      await env.DB.prepare("UPDATE session SET expiresAt=? WHERE id=?")
+        .bind(new Date(clock - 1000).toISOString(), session.id)
+        .run();
+    if (mode === "proof")
+      await env.DB.prepare("UPDATE session_security SET expires_at=? WHERE session_id=?")
+        .bind(clock - 1000, session.id)
+        .run();
+    if (mode === "freshness")
+      await env.DB.prepare("UPDATE session_security SET verified_at=? WHERE session_id=?")
+        .bind(clock - 360_000, session.id)
+        .run();
+    if (mode === "captured-permit") {
+      permit.expiresAt = clock - 1000;
+      await env.DB.prepare("UPDATE session_security SET verified_at=?,expires_at=? WHERE session_id=?")
+        .bind(clock, clock + 60_000, session.id)
+        .run();
+    }
+    const stale = vi.spyOn(Date, "now").mockReturnValue(clock - 600_000);
+    try {
+      await expect(
+        recordVerifiedSlackIdentity(
+          configured(),
+          user,
+          session.id,
+          oauth.id,
+          {
+            installationGeneration: 1,
+            installationId: "installation",
+            workspaceId: workspace,
+            teamId: "T123",
+            slackUserId: "UOWNER",
+            accountSubject: oauth.accountId,
+          },
+          permit,
+        ),
+      ).rejects.toMatchObject({ status: 409, code: "slack_link_changed" });
+    } finally {
+      stale.mockRestore();
+    }
+    expect((await env.DB.prepare("SELECT * FROM slack_user_links").all()).results).toEqual(before);
+  },
+);
