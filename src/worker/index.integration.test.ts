@@ -9416,6 +9416,32 @@ describe("collaborative table repair responses", () => {
     return { ...installed, pageId: page.id, stub };
   }
 
+  it("preserves public draft-row JSON validation for canonical and linked reads", async () => {
+    const f = await fixture();
+    const host = await createPage(f.cookie, "document");
+    for (const path of [
+      `/api/tables/${f.pageId}/draft-rows`,
+      `/api/pages/${host.id}/linked-tables/${f.pageId}/draft-rows`,
+    ]) {
+      for (const body of ["", "{"]) {
+        const response = await SELF.fetch(authenticatedRequest(f.cookie, path, { method: "POST", body }));
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ error: { code: "invalid_json" } });
+      }
+      const oversized = await SELF.fetch(
+        authenticatedRequest(f.cookie, path, {
+          method: "POST",
+          body: JSON.stringify({ rowIds: ["x".repeat(20_001)] }),
+        }),
+      );
+      expect(oversized.status).toBe(413);
+      const valid = await SELF.fetch(
+        authenticatedRequest(f.cookie, path, { method: "POST", body: JSON.stringify({ rowIds: ["missing"] }) }),
+      );
+      expect(valid.status).toBe(200);
+      expect(await valid.json()).toMatchObject({ pageId: f.pageId, rows: [], missingRowIds: ["missing"] });
+    }
+  });
   it("accepts a one-row repair, polls without exporting rows, and returns completed verification", async () => {
     const f = await fixture();
     const path = `/api/tables/${f.pageId}/repair`;

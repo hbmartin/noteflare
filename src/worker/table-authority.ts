@@ -282,7 +282,10 @@ export class TableAuthority extends DurableObject<Env> {
         "INSERT OR IGNORE INTO alarm_deadlines VALUES(1,?)",
         JSON.stringify({ version: 1, repair, projection }),
       );
-    })();
+    })().catch((error: unknown) => {
+      this.deadlinesLoading = null;
+      throw error;
+    });
     await this.deadlinesLoading;
   }
   private deadlines() {
@@ -669,7 +672,12 @@ export class TableAuthority extends DurableObject<Env> {
       if (path === "/draft-rows" && request.method === "POST") {
         const raw = await request.text();
         if (new TextEncoder().encode(raw).byteLength > 20_000) return fail("Draft lookup body is too large.", 413);
-        const body = JSON.parse(raw) as { rowIds?: unknown };
+        let body: { rowIds?: unknown } | null;
+        try {
+          body = JSON.parse(raw) as { rowIds?: unknown } | null;
+        } catch {
+          return fail("Invalid draft lookup body.");
+        }
         if (!body || !Array.isArray(body.rowIds) || body.rowIds.length > 100 || !body.rowIds.length)
           return fail("Choose between one and 100 draft rows.");
         const ids = [...new Set(body.rowIds.map((value) => id(value)))];

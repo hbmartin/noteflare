@@ -135,7 +135,7 @@ if (typeof window !== "undefined")
       if (event.newValue && clearedOperations.has(event.key)) {
         try {
           const cleared = clearedOperations.get(event.key);
-          if (cleared === undefined || JSON.parse(event.newValue).operationId === cleared) return;
+          if (cleared !== undefined && JSON.parse(event.newValue).operationId === cleared) return;
         } catch {
           return;
         }

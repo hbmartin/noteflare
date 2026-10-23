@@ -189,28 +189,31 @@ export async function freshSecurityAuthorization(
 export function protectedSessionGuard(
   authorization: { userId: string; sessionId: string; generation?: number },
   policy: "fresh" | "active",
-  now = Date.now(),
+  now: number | "transaction" = Date.now(),
 ) {
+  // SQLite's stable statement clock also covers time spent queued before a
+  // publication transaction starts. Existing callers retain their request clock.
+  const milliseconds = now === "transaction" ? "CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)" : "?";
+  const sessionTime = now === "transaction" ? "strftime('%Y-%m-%dT%H:%M:%fZ','now')" : "?";
+  const proofTime = policy === "fresh" && now === "transaction" ? `(${milliseconds}-${FRESH_MS})` : milliseconds;
   return {
     sql: `EXISTS(SELECT 1 FROM session live JOIN session_security proof ON proof.session_id=live.id AND proof.user_id=live.userId
       JOIN slack_protected_accounts security ON security.user_id=live.userId AND security.generation=proof.generation
       WHERE live.userId=? AND live.id=? ${authorization.generation === undefined ? "" : "AND security.generation=?"}
-        AND live.expiresAt>? AND proof.expires_at>?
+        AND live.expiresAt>${sessionTime} AND proof.expires_at>${milliseconds}
         ${
           policy === "fresh"
-            ? "AND proof.method IN ('totp','passkey') AND proof.verified_at>?"
+            ? `AND proof.method IN ('totp','passkey') AND proof.verified_at>${proofTime}`
             : `AND proof.method IN ('totp','passkey','trust')
           AND (proof.method<>'trust' OR EXISTS(SELECT 1 FROM trusted_browsers browser
             WHERE browser.id=proof.trust_id AND browser.user_id=live.userId
-              AND browser.generation=security.generation AND browser.expires_at>?))`
+              AND browser.generation=security.generation AND browser.expires_at>${milliseconds}))`
         })`,
     binds: [
       authorization.userId,
       authorization.sessionId,
       ...(authorization.generation === undefined ? [] : [authorization.generation]),
-      new Date(now).toISOString(),
-      now,
-      policy === "fresh" ? now - FRESH_MS : now,
+      ...(now === "transaction" ? [] : [new Date(now).toISOString(), now, policy === "fresh" ? now - FRESH_MS : now]),
     ],
   };
 }

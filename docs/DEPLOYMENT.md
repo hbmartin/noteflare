@@ -9,7 +9,7 @@ named here.
 Existing installations intentionally retain their `cloudflare-realtime-notes` Worker and resource
 identifiers. These deployment names are compatibility details; the product presented to users is NoteFlare.
 
-For the collaboration lifecycle follow-up, apply migration 0103 before uploading the updated Worker. Review [anchored comment upgrade and rollback requirements](UPGRADING.md#migration-0103-anchored-comment-publication), including private preparation expiry and provisional-anchor reconciliation. Keep table relations disabled.
+For the collaboration lifecycle follow-up, apply migration 0103 before uploading the updated Worker. Review [anchored comment upgrade and rollback requirements](UPGRADING.md#migration-0103-anchored-comment-publication), including private preparation expiry and provisional-anchor reconciliation. Apply additive migration 0104 after 0103 in the ordinary migration sequence; its [page-cascade index](UPGRADING.md#migration-0104-anchored-comment-page-cascades) is compatible with the existing Worker and remains safe through code rollback. Keep table relations disabled.
 
 ## Browser deployment
 

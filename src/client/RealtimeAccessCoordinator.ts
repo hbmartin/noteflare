@@ -11,7 +11,10 @@ import {
 } from "./realtime-access-status";
 
 /** Exactly one owner coordinator per mounted workspace, including outside Settings. */
-export function useRealtimeAccessCoordinator(owner: boolean, onOwnerAccessLost?: () => Promise<void>) {
+export function useRealtimeAccessCoordinator(
+  owner: boolean,
+  onOwnerAccessLost?: (signal: AbortSignal) => Promise<void>,
+) {
   const account = useRealtimeAccessAccount();
   useEffect(() => {
     if (!owner || !account) return undefined;
@@ -46,7 +49,7 @@ export function useRealtimeAccessCoordinator(owner: boolean, onOwnerAccessLost?:
         }
       } catch (error) {
         if (!stopped && error instanceof ApiClientError && error.status === 403 && error.code === "owner_required") {
-          await onOwnerAccessLost?.().catch(() => {});
+          await onOwnerAccessLost?.(AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)])).catch(() => {});
         }
         if (!stopped) failRealtimeAccessCheck(account);
       } finally {

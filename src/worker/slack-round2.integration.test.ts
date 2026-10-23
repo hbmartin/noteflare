@@ -207,7 +207,7 @@ async function refreshes() {
 }
 
 beforeEach(async () => {
-  historyTimestamp = String((Date.now() - 1000) / 1000);
+  historyTimestamp = ((Date.now() - 1000) / 1000).toFixed(6);
   await reset();
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
   calls = [];
@@ -1463,33 +1463,42 @@ describe("digests and delivery receipts", () => {
       state: "pending",
     });
   });
-  it("reconciles a successful post when its database checkpoint fails", async () => {
-    const m = await mapping();
-    await page();
-    await thread();
-    const r = await receipt(m.id);
-    const original = env.DB.batch.bind(env.DB);
-    let failed = false;
-    const batch = vi.spyOn(env.DB, "batch").mockImplementation(async (statements) => {
-      if (!failed && calls.some((call) => call.method === "chat.postMessage")) {
-        failed = true;
-        throw new Error("checkpoint unavailable");
+  it.each([false, true])(
+    "reconciles a successful post when its database checkpoint fails (whole second: %s)",
+    async (wholeSecond) => {
+      if (wholeSecond) {
+        const now = Math.floor(Date.now() / 1000) * 1000;
+        vi.spyOn(Date, "now").mockReturnValue(now);
+        historyTimestamp = ((now - 1000) / 1000).toFixed(6);
+        responses["chat.postMessage"] = { ok: true, ts: historyTimestamp };
       }
-      return original(statements);
-    });
-    await expect(deliverDigest(runtime(), r.id)).rejects.toThrow("checkpoint unavailable");
-    batch.mockRestore();
-    settlePosts();
-    responses["conversations.history"] = {
-      ok: true,
-      messages: [{ ts: historyTimestamp, user: "B123", metadata: { event_payload: { delivery_id: r.id } } }],
-    };
-    await deliverDigest(runtime(), r.id);
-    expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(1);
-    expect(
-      await env.DB.prepare("SELECT state,message_ts FROM slack_digest_receipts WHERE id=?").bind(r.id).first(),
-    ).toEqual({ state: "sent", message_ts: historyTimestamp });
-  });
+      const m = await mapping();
+      await page();
+      await thread();
+      const r = await receipt(m.id);
+      const original = env.DB.batch.bind(env.DB);
+      let failed = false;
+      const batch = vi.spyOn(env.DB, "batch").mockImplementation(async (statements) => {
+        if (!failed && calls.some((call) => call.method === "chat.postMessage")) {
+          failed = true;
+          throw new Error("checkpoint unavailable");
+        }
+        return original(statements);
+      });
+      await expect(deliverDigest(runtime(), r.id)).rejects.toThrow("checkpoint unavailable");
+      batch.mockRestore();
+      settlePosts();
+      responses["conversations.history"] = {
+        ok: true,
+        messages: [{ ts: historyTimestamp, user: "B123", metadata: { event_payload: { delivery_id: r.id } } }],
+      };
+      await deliverDigest(runtime(), r.id);
+      expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(1);
+      expect(
+        await env.DB.prepare("SELECT state,message_ts FROM slack_digest_receipts WHERE id=?").bind(r.id).first(),
+      ).toEqual({ state: "sent", message_ts: historyTimestamp });
+    },
+  );
   it.each([false, true])(
     "retries OAuth preparation without losing an uncertain send (dispatched=%s)",
     async (dispatched) => {

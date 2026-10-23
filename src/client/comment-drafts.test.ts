@@ -93,6 +93,28 @@ describe("private comment drafts", () => {
   });
 });
 
+it.each(["clear", "purge"])("accepts a new cross-tab operation after an empty %s", (operation) => {
+  const isolated = { ...scope, account: `empty-${operation}-${crypto.randomUUID()}` };
+  readCommentDraft(isolated, "new");
+  if (operation === "clear") clearCommentDraft(isolated, "new");
+  else purgeCommentDrafts(isolated.account);
+  const name = `notes:comment-draft:${JSON.stringify([isolated.account, isolated.pageId, isolated.epoch, "new"])}`;
+  const next = { body: body("Another tab's text"), operationId: crypto.randomUUID() };
+  const update = vi.fn(),
+    stop = subscribeCommentDraft(isolated, "new", update);
+  try {
+    localStorage.setItem(name, JSON.stringify(next));
+    window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(next) }));
+    expect(update).toHaveBeenCalledOnce();
+    expect(readCommentDraft(isolated, "new")).toEqual(next);
+    // An older completion must not discard the operation accepted from the other tab.
+    clearCommentDraft(isolated, "new", "older-operation");
+    expect(JSON.parse(localStorage.getItem(name)!)).toEqual(next);
+  } finally {
+    stop();
+    purgeCommentDrafts(isolated.account);
+  }
+});
 it("clears memory and notifies even when persistent deletion fails", () => {
   const isolated = { ...scope, account: "blocked-clear" };
   writeCommentDraft(isolated, "new", body("Posted"));

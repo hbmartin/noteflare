@@ -6,7 +6,7 @@ import type { ClientMemberContext } from "../shared/types";
 import type { CollaborativeColumn, TableCommand, TableQueryResult, TableView } from "../shared/table-protocol";
 import { api, ApiClientError } from "./api";
 import { CollaborativeTablePage } from "./CollaborativeTablePage";
-import { purgeCellDrafts } from "./cell-drafts";
+import { purgeCellDrafts, CellDraftMap, cellDraftKey } from "./cell-drafts";
 import { taskColumns } from "../shared/tasks";
 
 vi.mock("./api", async (original) => ({ ...(await original<typeof import("./api")>()), api: vi.fn() }));
@@ -234,6 +234,88 @@ function show(initialViewId = "", context = member, onSelectPage = vi.fn(), task
   );
 }
 describe("collaborative table UI", () => {
+  it.each(["ordinary", "failed-refresh", "same-cell", "ambiguous", "newer-edit"] as const)(
+    "recovers task submission identity after %s",
+    async (mode) => {
+      const titleId = taskColumns("table").title;
+      data.columns = [{ ...column(titleId, "text"), name: "Task" }];
+      data.rows[0]!.cells = { [titleId]: "Original" };
+      data.rows[0]!.cellRevisions = { [titleId]: 1 };
+      const read = vi.mocked(api).getMockImplementation()!;
+      const submissions: { operationId: string; expectedRevision: number; title: string }[] = [];
+      let readsFail = false,
+        rejectFirst!: () => void;
+      const first = new Promise<void>((resolve) => {
+        rejectFirst = resolve;
+      });
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path === "/api/task-lists/table/tasks/row") {
+          const body = JSON.parse(String(init?.body));
+          submissions.push(body);
+          if (submissions.length === 1) {
+            if (mode === "newer-edit") await first;
+            if (mode === "ambiguous") throw new TypeError("Response interrupted");
+            data = { ...data, revision: 2 };
+            readsFail = mode === "failed-refresh";
+            if (mode === "same-cell") {
+              data.rows[0]!.cellRevisions[titleId] = 2;
+              data.rows[0]!.cells[titleId] = "Remote value";
+            }
+            throw new ApiClientError(409, "table_revision_conflict", "The task list changed.");
+          }
+          data.rows[0]!.cells[titleId] = body.title;
+          return {};
+        }
+        if (readsFail && path.startsWith("/api/tables/table/query")) throw new TypeError("Refresh unavailable");
+        return read(path, init);
+      });
+      show("", member, vi.fn(), true);
+      const input = await screen.findByLabelText("Task");
+      await waitFor(() => expect(input).toBeEnabled());
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "Preserved edit" } });
+      fireEvent.blur(input);
+      await waitFor(() => expect(submissions).toHaveLength(1));
+      if (mode === "newer-edit") {
+        const drafts = new CellDraftMap({
+          account: "owner\0workspace",
+          host: "table",
+          tableId: "table",
+          generation: 1,
+        });
+        const key = cellDraftKey("row", titleId);
+        act(() => {
+          drafts.set(key, { ...drafts.get(key)!, text: "Newer edit" });
+          rejectFirst();
+        });
+      }
+      let refreshBlocked: boolean | undefined, blockedAttemptCount: number | undefined;
+      if (mode === "failed-refresh") {
+        await screen.findByText("The task list changed. Review the latest value before saving again.");
+        refreshBlocked = (input as HTMLInputElement).disabled;
+        fireEvent.blur(input);
+        blockedAttemptCount = submissions.length;
+        readsFail = false;
+        fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      }
+      expect(refreshBlocked).toBe(mode === "failed-refresh" ? true : undefined);
+      expect(blockedAttemptCount).toBe(mode === "failed-refresh" ? 1 : undefined);
+      await waitFor(() => expect(input).toBeEnabled());
+      expect(screen.queryByText("The server value changed: Remote value. Your edit is preserved.") !== null).toBe(
+        mode === "same-cell",
+      );
+      if (mode === "same-cell") {
+        fireEvent.click(screen.getByRole("button", { name: "Keep my edit" }));
+      } else {
+        fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+      }
+      await waitFor(() => expect(submissions).toHaveLength(2));
+      expect(submissions[1]!.title).toBe(mode === "newer-edit" ? "Newer edit" : "Preserved edit");
+      expect(submissions[1]!.expectedRevision).toBe(mode === "ambiguous" ? 1 : 2);
+      expect(submissions[1]!.operationId === submissions[0]!.operationId).toBe(mode === "ambiguous");
+      await waitFor(() => expect(screen.queryByLabelText("Pending cell edits")).toBeNull());
+    },
+  );
   it("keeps authorization when a view query supersedes a pending socket query", async () => {
     await act(async () => {
       render(

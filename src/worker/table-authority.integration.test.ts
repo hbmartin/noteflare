@@ -140,6 +140,65 @@ async function addEffect(pageId: string, revision: number) {
 }
 
 describe("per-table authority", () => {
+  it("retries failed deadline initialization in the same room and shares concurrent attempts", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+      const internal = instance as unknown as {
+        deadlinesLoading: Promise<void> | null;
+        initializeDeadlines(): Promise<void>;
+      };
+      state.storage.sql.exec("DELETE FROM alarm_deadlines");
+      internal.deadlinesLoading = null;
+      const read = vi.spyOn(state.storage, "getAlarm").mockRejectedValueOnce(new Error("temporary storage failure"));
+      try {
+        const attempts = await Promise.allSettled([internal.initializeDeadlines(), internal.initializeDeadlines()]);
+        expect(attempts.map((value) => value.status)).toEqual(["rejected", "rejected"]);
+        expect(read).toHaveBeenCalledTimes(1);
+        expect(internal.deadlinesLoading).toBeNull();
+        await Promise.all([internal.initializeDeadlines(), internal.initializeDeadlines()]);
+        expect(read).toHaveBeenCalledTimes(2);
+        expect(
+          JSON.parse(
+            state.storage.sql.exec<{ value: string }>("SELECT value FROM alarm_deadlines WHERE id=1").one().value,
+          ),
+        ).toMatchObject({ version: 1 });
+      } finally {
+        read.mockRestore();
+      }
+    });
+    await write(pageId, member, "create_column", { id: "recovered", name: "Recovered", type: "text" });
+    expect((await queryTable(env, member, pageId)).columns.some((column) => column.id === "recovered")).toBe(true);
+  });
+  it.each(["", "{", "not json"])("validates malformed internal draft lookup JSON: %j", async (body) => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    const actor: TableActor = {
+      pageId,
+      workspaceId: member.workspace.id,
+      userId: member.user.id,
+      generation: 1,
+      expiresAt: Date.now() + 60_000,
+    };
+    const log = vi.spyOn(logger, "error");
+    try {
+      const response = await env.TABLE.getByName(pageId).fetch(
+        new Request("https://table.internal/draft-rows", {
+          method: "POST",
+          headers: {
+            "x-table-actor": JSON.stringify(actor),
+            "x-table-signature": await tableActorSignature(env.BETTER_AUTH_SECRET, actor),
+          },
+          body,
+        }),
+      );
+      expect(response.status).toBe(422);
+      expect(await response.json()).toMatchObject({ error: { code: "table_validation" } });
+      expect(log).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
+  });
   it("keeps a ten-second repair retry across socket-only alarms and hibernation", async () => {
     const { pageId, member } = await fixture();
     await enableTableAuthority(env, member, pageId);

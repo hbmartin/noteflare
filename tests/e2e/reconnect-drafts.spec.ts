@@ -109,6 +109,58 @@ test("table renewal preserves focused text and caret without submitting a partia
   const result = await (await page.request.get(`/api/tables/${table.id}/query`)).json();
   expect(result.rows.find((row: { id: string }) => row.id === rowId).cells[columnId]).toBe("Original");
 });
+test("task draft retries an unrelated revision conflict without retyping", async ({ page }) => {
+  await signInOwner(page);
+  const space = await createTestSpace(page, "Task conflict recovery");
+  const created = await page.request.post("/api/pages", {
+    data: { kind: "table", taskList: true, spaceId: space.id, title: `Task conflicts ${Date.now()}` },
+  });
+  expect(created.ok()).toBeTruthy();
+  const table = (await created.json()).page;
+  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
+  const query = async () => await (await page.request.get(`/api/tables/${table.id}/query`)).json();
+  const rows: string[] = [];
+  for (const title of ["Original target", "Other task"]) {
+    const response = await page.request.post(`/api/task-lists/${table.id}/tasks`, {
+      data: { title, operationId: crypto.randomUUID(), expectedRevision: (await query()).revision },
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
+    rows.push((await response.json()).rowId);
+  }
+  const attempts: Array<{ operationId: string; expectedRevision: number }> = [];
+  await page.route(`**/api/task-lists/${table.id}/tasks/${rows[0]}`, async (route) => {
+    attempts.push(route.request().postDataJSON());
+    if (attempts.length === 1) {
+      // Advance a different row only after the browser freezes its request body.
+      const updated = await page.request.patch(`/api/task-lists/${table.id}/tasks/${rows[1]}`, {
+        data: {
+          title: "Remote unrelated edit",
+          operationId: crypto.randomUUID(),
+          expectedRevision: (await query()).revision,
+        },
+      });
+      expect(updated.ok(), await updated.text()).toBeTruthy();
+    }
+    await route.continue();
+  });
+  await page.goto(`/?page=${table.id}`);
+  const input = page.getByLabel("Task", { exact: true }).first();
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveValue("Original target");
+  await input.fill("Saved without retyping");
+  await input.press("Enter");
+  await expect(page.getByText("The task list changed. Review the latest value before saving again.")).toBeVisible();
+  await expect(input).toHaveValue("Saved without retyping");
+  expect(attempts).toHaveLength(1);
+  await page.getByRole("button", { name: "Save draft", exact: true }).click();
+  await expect.poll(() => attempts.length).toBe(2);
+  expect(attempts[1]!.operationId).not.toBe(attempts[0]!.operationId);
+  expect(attempts[1]!.expectedRevision).toBeGreaterThan(attempts[0]!.expectedRevision);
+  await expect
+    .poll(async () => (await query()).rows.find((row: { id: string }) => row.id === rows[0]).cells[`${table.id}-title`])
+    .toBe("Saved without retyping");
+  await expect(page.getByLabel("Pending cell edits")).toHaveCount(0);
+});
 test("cell text survives reload and appears in Personal Settings before sign-out purges it", async ({
   page,
   context,

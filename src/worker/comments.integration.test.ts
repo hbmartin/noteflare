@@ -1,8 +1,14 @@
 import { enrollAccount } from "../../tests/helpers/security";
 import { abortAllDurableObjects, applyD1Migrations, env, reset, runInDurableObject, SELF } from "cloudflare:test";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import type { CommentThread, Page, Space } from "../shared/types";
+import { requireMember } from "./auth";
+import { pageForMember } from "./page-access";
+import { publishCommentSubmission } from "./comment-submissions";
+import { HttpError } from "./http";
+import type { Env } from "./env";
+import { joinBytes } from "../shared/bytes";
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -796,6 +802,631 @@ it("keeps anchored preparations private, cancels them terminally, and expires un
   ).toBeNull();
 });
 
+async function publicationFixture() {
+  const installed = await bootstrap(),
+    operationId = crypto.randomUUID();
+  // Permission reductions must remain legal under the final-owner invariant.
+  const backup = crypto.randomUUID();
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES(?,'Backup',?,1,1)").bind(
+      backup,
+      `${backup}@example.test`,
+    ),
+    env.DB.prepare("INSERT INTO workspace_members VALUES(?,?,'owner',1)").bind(installed.workspaceId, backup),
+  ]);
+  const root = `/api/pages/${installed.pageId}/comment-submissions`;
+  const prepared = await SELF.fetch(
+    request(installed.cookie, root, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-notes-operation-id": operationId,
+        "x-notes-content-epoch": "1",
+      },
+      body: JSON.stringify({ initialComment: { body: commentBody("Private prepared body") } }),
+    }),
+  );
+  expect(prepared.status).toBe(201);
+  const { submission } = await prepared.json<{ submission: { threadId: string } }>();
+  const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+  const selection = await runInDurableObject(stub, (instance) => {
+    const document = (instance as unknown as { document: Y.Doc }).document;
+    const paragraph = new Y.XmlElement("paragraph"),
+      text = new Y.XmlText();
+    text.insert(0, "Selected original text");
+    paragraph.insert(0, [text]);
+    document.getXmlFragment("document-store").insert(0, [paragraph]);
+    return {
+      head: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(text, 0)),
+      anchor: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(text, 8)),
+    };
+  });
+  const member = await requireMember(request(installed.cookie, "/api/me"), env);
+  const page = await pageForMember(env, member, installed.pageId);
+  const authorization = { userId: member.user.id, sessionId: member.session.id, workspaceId: member.workspace.id };
+  const authorize = async () => {
+    const current = await requireMember(request(installed.cookie, "/api/me"), env);
+    const latest = await pageForMember(env, current, page.id);
+    if (latest.content_epoch !== page.content_epoch)
+      throw new HttpError(409, "comment_epoch_changed", "The page changed.");
+  };
+  return {
+    ...installed,
+    operationId,
+    root,
+    submission,
+    stub,
+    selection,
+    member,
+    page: { ...page, space_id: page.space_id! },
+    authorization,
+    authorize,
+  };
+}
+
+type AnchorTestRoom = {
+  document: Y.Doc;
+  bindings: Env;
+  onRequest(request: Request): Promise<Response>;
+  flushPendingUpdates(): void;
+  scheduleAlarm(when: number): Promise<void>;
+};
+function anchorRequest(body: string) {
+  return new Request("https://document.internal/comment-submission-anchor", {
+    method: "POST",
+    headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "content-type": "application/json" },
+    body,
+  });
+}
+function socketBarrier(socket: WebSocket, generation: number) {
+  return new Promise<void>((resolve, reject) => {
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      socket.removeEventListener("message", message);
+      socket.removeEventListener("close", closed);
+      if (error) reject(error);
+      else resolve();
+    };
+    const message = (event: MessageEvent) => {
+      if (typeof event.data !== "string" || !event.data.startsWith("__YPS:")) return;
+      const body = JSON.parse(event.data.slice(6));
+      if (body.type === "document-update-ack" && body.generation === generation) finish();
+    };
+    const closed = () => finish(new Error("The room closed during anchor work."));
+    const timer = setTimeout(() => finish(new Error("The room blocked socket delivery.")), 5_000);
+    socket.addEventListener("message", message);
+    socket.addEventListener("close", closed);
+    socket.send(`__YPS:${JSON.stringify({ type: "document-update-barrier", generation })}`);
+  });
+}
+
+it.each(["malformed", "claim", "journal", "flush", "alarm", "reconcile", "retry-alarm"] as const)(
+  "keeps document sockets and the anchor queue usable after %s failure",
+  async (failure) => {
+    const f = await publicationFixture();
+    const opened = await SELF.fetch(
+      request(f.cookie, `/parties/document/${f.pageId}~1`, { headers: { Upgrade: "websocket" } }),
+    );
+    expect(opened.status).toBe(101);
+    const socket = opened.webSocket!;
+    socket.accept();
+    try {
+      await socketBarrier(socket, 1);
+      await runInDurableObject(f.stub, async (instance, state) => {
+        const room = instance as unknown as AnchorTestRoom;
+        const restore: Array<() => void> = [];
+        let token: string | undefined,
+          preparationStatus = 200;
+        if (failure === "reconcile" || failure === "retry-alarm") {
+          const prepared = await room.onRequest(
+            anchorRequest(
+              JSON.stringify({
+                operation: "prepare",
+                userId: f.userId,
+                operationId: f.operationId,
+                selection: f.selection,
+              }),
+            ),
+          );
+          preparationStatus = prepared.status;
+          token = (await prepared.json<{ token: string }>()).token;
+        }
+        expect(preparationStatus).toBe(200);
+        if (failure === "claim" || failure === "reconcile" || failure === "retry-alarm") {
+          const original = room.bindings.DB.prepare.bind(room.bindings.DB);
+          const mock = vi.spyOn(room.bindings.DB, "prepare").mockImplementation((sql) => {
+            if (
+              failure === "claim"
+                ? sql.startsWith("UPDATE anchored_comment_submissions SET anchor_token=?")
+                : sql.startsWith("SELECT state,anchor_token,anchor_expires_at")
+            )
+              throw new Error("D1 claim unavailable");
+            return original(sql);
+          });
+          restore.push(() => mock.mockRestore());
+          if (failure === "retry-alarm") {
+            const retry = vi
+              .spyOn(room, "scheduleAlarm")
+              .mockRejectedValueOnce(new Error("Retry alarm unavailable"))
+              .mockRejectedValueOnce(new Error("Retry alarm still unavailable"));
+            restore.push(() => retry.mockRestore());
+          }
+        } else if (failure === "journal") {
+          const original = state.storage.sql.exec.bind(state.storage.sql);
+          const mock = vi.spyOn(state.storage.sql, "exec").mockImplementation((sql, ...binds) => {
+            if (sql.startsWith("INSERT OR REPLACE INTO provisional_comment_anchors"))
+              throw new Error("Journal unavailable");
+            return original(sql, ...binds);
+          });
+          restore.push(() => mock.mockRestore());
+        } else if (failure === "flush") {
+          const mock = vi.spyOn(room, "flushPendingUpdates").mockImplementationOnce(() => {
+            throw new Error("Flush unavailable");
+          });
+          restore.push(() => mock.mockRestore());
+        } else if (failure === "alarm") {
+          const mock = vi.spyOn(room, "scheduleAlarm").mockRejectedValueOnce(new Error("Alarm unavailable"));
+          restore.push(() => mock.mockRestore());
+        }
+        try {
+          const response = await room.onRequest(
+            anchorRequest(
+              failure === "malformed"
+                ? "{"
+                : JSON.stringify({
+                    operation: token ? "reconcile" : "prepare",
+                    token,
+                    userId: f.userId,
+                    operationId: f.operationId,
+                    selection: f.selection,
+                  }),
+            ),
+          );
+          expect(response.status).toBe(failure === "malformed" ? 400 : 503);
+        } finally {
+          for (const restoreMock of restore) restoreMock();
+        }
+      });
+      await socketBarrier(socket, 2);
+      expect(socket.readyState).toBe(WebSocket.OPEN);
+      // Retire any failed claim before retrying; no operation identity or body is discarded.
+      await env.DB.prepare("UPDATE anchored_comment_submissions SET anchor_expires_at=0 WHERE operation_id=?")
+        .bind(f.operationId)
+        .run();
+      const recovered = await f.stub.fetch(
+        anchorRequest(
+          JSON.stringify({
+            operation: "prepare",
+            userId: f.userId,
+            operationId: f.operationId,
+            selection: f.selection,
+          }),
+        ),
+      );
+      expect(recovered.status).toBe(200);
+      expect(await recovered.json()).toMatchObject({ anchored: true });
+      await SELF.fetch(request(f.cookie, `${f.root}/${f.operationId}/cancel`, { method: "POST" }));
+      await socketBarrier(socket, 3);
+      await runInDurableObject(f.stub, (instance, state) => {
+        expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(0);
+        expect(
+          JSON.stringify((instance as unknown as AnchorTestRoom).document.getXmlFragment("document-store").toJSON()),
+        ).not.toContain(f.submission.threadId);
+        expect(state.storage.sql.exec("SELECT count(*) n FROM update_events").one().n).toBeGreaterThan(0);
+      });
+    } finally {
+      socket.close();
+    }
+  },
+);
+
+it("delivers durable update barriers while an anchor D1 claim waits", async () => {
+  const f = await publicationFixture();
+  const opened = await SELF.fetch(
+    request(f.cookie, `/parties/document/${f.pageId}~1`, { headers: { Upgrade: "websocket" } }),
+  );
+  expect(opened.status).toBe(101);
+  const socket = opened.webSocket!;
+  socket.accept();
+  let release!: () => void, pending!: Promise<Response>, restore!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  try {
+    await runInDurableObject(f.stub, async (instance) => {
+      const room = instance as unknown as AnchorTestRoom;
+      const original = room.bindings.DB.prepare.bind(room.bindings.DB);
+      const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+        new Proxy(statement, {
+          get(target, key) {
+            if (key === "bind") return (...binds: unknown[]) => wrap(target.bind(...binds));
+            if (key === "first")
+              return async (column?: string) => {
+                entered();
+                await held;
+                return column === undefined ? target.first() : target.first(column);
+              };
+            const value = Reflect.get(target, key);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      const mock = vi.spyOn(room.bindings.DB, "prepare").mockImplementation((sql) => {
+        const statement = original(sql);
+        return sql.startsWith("UPDATE anchored_comment_submissions SET anchor_token=?") ? wrap(statement) : statement;
+      });
+      restore = () => mock.mockRestore();
+      room.document.getMap("socket-test").set("buffered", "durable during claim");
+      pending = room.onRequest(
+        anchorRequest(
+          JSON.stringify({
+            operation: "prepare",
+            userId: f.userId,
+            operationId: f.operationId,
+            selection: f.selection,
+          }),
+        ),
+      );
+      await started;
+    });
+    await socketBarrier(socket, 1);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    release();
+    expect((await pending).status).toBe(200);
+    restore();
+    await runInDurableObject(f.stub, (instance, state) => {
+      expect((instance as unknown as AnchorTestRoom).document.getMap("socket-test").get("buffered")).toBe(
+        "durable during claim",
+      );
+      expect(state.storage.sql.exec("SELECT count(*) n FROM update_events").one().n).toBeGreaterThan(0);
+      const persisted = new Y.Doc();
+      for (const event of state.storage.sql.exec<{ seq: number }>("SELECT seq FROM update_events ORDER BY seq")) {
+        const chunks = state.storage.sql
+          .exec<{ data: ArrayBuffer }>("SELECT data FROM update_chunks WHERE seq=? ORDER BY chunk_index", event.seq)
+          .toArray();
+        Y.applyUpdate(persisted, joinBytes(chunks.map((chunk) => new Uint8Array(chunk.data))));
+      }
+      expect(persisted.getMap("socket-test").get("buffered")).toBe("durable during claim");
+      persisted.destroy();
+    });
+    await SELF.fetch(request(f.cookie, `${f.root}/${f.operationId}/cancel`, { method: "POST" }));
+  } finally {
+    release?.();
+    await pending?.catch(() => {});
+    restore?.();
+    socket.close();
+  }
+});
+
+it.each(["archive", "restore"] as const)(
+  "retains cleanup's durable journal across an interleaved %s rollback",
+  async (transition) => {
+    const f = await publicationFixture();
+    const anchored = await f.stub.fetch(
+      anchorRequest(
+        JSON.stringify({ operation: "prepare", userId: f.userId, operationId: f.operationId, selection: f.selection }),
+      ),
+    );
+    const { token } = await anchored.json<{ token: string }>();
+    expect(anchored.status).toBe(200);
+    await env.DB.prepare("UPDATE anchored_comment_submissions SET state='canceled',body_json=NULL WHERE operation_id=?")
+      .bind(f.operationId)
+      .run();
+    let release!: () => void, entered!: () => void, pending!: Promise<Response>, restore!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    try {
+      await runInDurableObject(f.stub, async (instance) => {
+        const room = instance as unknown as AnchorTestRoom & { transition: "archive" | "restore" | null };
+        const original = room.bindings.DB.prepare.bind(room.bindings.DB);
+        const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+          new Proxy(statement, {
+            get(target, key) {
+              if (key === "bind") return (...binds: unknown[]) => wrap(target.bind(...binds));
+              if (key === "first")
+                return async () => {
+                  entered();
+                  await held;
+                  return target.first();
+                };
+              const value = Reflect.get(target, key);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        const mock = vi.spyOn(room.bindings.DB, "prepare").mockImplementation((sql) => {
+          const statement = original(sql);
+          return sql.startsWith("SELECT state,anchor_token,anchor_expires_at") ? wrap(statement) : statement;
+        });
+        restore = () => mock.mockRestore();
+        pending = room.onRequest(
+          anchorRequest(
+            JSON.stringify({ operation: "reconcile", userId: f.userId, operationId: f.operationId, token }),
+          ),
+        );
+        await started;
+        room.transition = transition;
+      });
+      release();
+      expect((await pending).status).toBe(503);
+      restore();
+      await runInDurableObject(f.stub, (instance, state) => {
+        expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(1);
+        expect(
+          JSON.stringify((instance as unknown as AnchorTestRoom).document.getXmlFragment("document-store").toJSON()),
+        ).toContain(f.submission.threadId);
+        // A failed lifecycle operation restores writability. Deferred cleanup
+        // must persist its removal before dropping the durable journal.
+        (instance as unknown as { transition: null }).transition = null;
+      });
+      const retried = await f.stub.fetch(
+        anchorRequest(JSON.stringify({ operation: "reconcile", userId: f.userId, operationId: f.operationId, token })),
+      );
+      expect(retried.status).toBe(200);
+      await abortAllDurableObjects();
+      const cold = env.DOCUMENT.getByName(`${f.pageId}~1`);
+      await cold.fetch(
+        new Request("https://document.internal/content", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+      );
+      await runInDurableObject(cold, (instance, state) => {
+        expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(0);
+        expect(
+          JSON.stringify((instance as unknown as AnchorTestRoom).document.getXmlFragment("document-store").toJSON()),
+        ).not.toContain(f.submission.threadId);
+      });
+    } finally {
+      release?.();
+      await pending?.catch(() => {});
+      restore?.();
+    }
+  },
+);
+
+it.each([
+  "remove-member",
+  "remove-private-grant",
+  "demote-private-owner",
+  "private-visibility",
+  "delete-session",
+  "session-expiry",
+  "proof-expiry",
+  "security-generation",
+  "recovery-required",
+  "codes-unsaved",
+  "remove-factor",
+  "trust-revoked",
+  "trust-expiry",
+  "move-space",
+  "restore",
+  "archive",
+  "preparation-expiry",
+  "lease-expiry",
+  "database-failure",
+] as const)("rejects publication at the transaction boundary after %s", async (change) => {
+  const f = await publicationFixture();
+  if (change === "remove-private-grant" || change === "demote-private-owner") {
+    await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(f.page.space_id).run();
+    if (change === "remove-private-grant") {
+      await env.DB.prepare("UPDATE workspace_members SET role='viewer' WHERE user_id=?").bind(f.userId).run();
+      await env.DB.prepare("INSERT INTO space_members(space_id,user_id,role,created_at) VALUES(?,?,'viewer',1)")
+        .bind(f.page.space_id, f.userId)
+        .run();
+    }
+  }
+  if (change === "private-visibility")
+    await env.DB.prepare("UPDATE workspace_members SET role='viewer' WHERE user_id=?").bind(f.userId).run();
+  if (change.startsWith("trust-")) {
+    await env.DB.prepare(
+      "INSERT INTO trusted_browsers(id,token_hash,user_id,generation,created_at,expires_at,name) SELECT 'browser','hash',user_id,generation,?,?, 'Browser' FROM account_security WHERE user_id=?",
+    )
+      .bind(Date.now(), Date.now() + 600_000, f.userId)
+      .run();
+    await env.DB.prepare("UPDATE session_security SET method='trust',trust_id='browser' WHERE session_id=?")
+      .bind(f.authorization.sessionId)
+      .run();
+  }
+  const counts = () =>
+    env.DB.prepare(
+      "SELECT (SELECT count(*) FROM outbox) outbox,(SELECT count(*) FROM deliveries) deliveries,(SELECT count(*) FROM notifications) notifications,(SELECT count(*) FROM webhook_deliveries) webhooks",
+    ).first();
+  const before = await counts();
+  let injected = false;
+  const database = {
+    prepare: (sql: string) => env.DB.prepare(sql),
+    batch: async (statements: D1PreparedStatement[]) => {
+      if (!injected) {
+        injected = true;
+        switch (change) {
+          case "remove-member":
+            await env.DB.prepare("DELETE FROM workspace_members WHERE user_id=?").bind(f.userId).run();
+            break;
+          case "remove-private-grant":
+            await env.DB.prepare("DELETE FROM space_members WHERE user_id=?").bind(f.userId).run();
+            break;
+          case "demote-private-owner":
+            await env.DB.prepare("UPDATE workspace_members SET role='viewer' WHERE user_id=?").bind(f.userId).run();
+            break;
+          case "private-visibility":
+            await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(f.page.space_id).run();
+            break;
+          case "delete-session":
+            await env.DB.prepare("DELETE FROM session WHERE id=?").bind(f.authorization.sessionId).run();
+            break;
+          case "session-expiry":
+            await env.DB.prepare(
+              "UPDATE session SET expiresAt=strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 second') WHERE id=?",
+            )
+              .bind(f.authorization.sessionId)
+              .run();
+            break;
+          case "proof-expiry":
+            await env.DB.prepare("UPDATE session_security SET expires_at=0 WHERE session_id=?")
+              .bind(f.authorization.sessionId)
+              .run();
+            break;
+          case "security-generation":
+            await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?")
+              .bind(f.userId)
+              .run();
+            break;
+          case "recovery-required":
+            await env.DB.prepare("UPDATE account_security SET recovery_required=1 WHERE user_id=?")
+              .bind(f.userId)
+              .run();
+            break;
+          case "codes-unsaved":
+            await env.DB.prepare("UPDATE account_security SET codes_saved=0 WHERE user_id=?").bind(f.userId).run();
+            break;
+          case "remove-factor":
+            await env.DB.prepare("DELETE FROM twoFactor WHERE userId=?").bind(f.userId).run();
+            break;
+          case "trust-revoked":
+            await env.DB.prepare("DELETE FROM trusted_browsers WHERE id='browser'").run();
+            break;
+          case "trust-expiry":
+            await env.DB.prepare("UPDATE trusted_browsers SET expires_at=0 WHERE id='browser'").run();
+            break;
+          case "move-space":
+            await env.DB.prepare(
+              "INSERT INTO spaces(id,workspace_id,name,slug,visibility,position,created_by,created_at,updated_at) VALUES('moved',?,'Moved','moved','workspace','a9',?,1,1)",
+            )
+              .bind(f.workspaceId, f.userId)
+              .run();
+            await env.DB.prepare("UPDATE pages SET space_id='moved' WHERE id=?").bind(f.pageId).run();
+            break;
+          case "restore":
+            await env.DB.prepare("UPDATE pages SET content_epoch=content_epoch+1 WHERE id=?").bind(f.pageId).run();
+            break;
+          case "archive":
+            await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(f.pageId).run();
+            break;
+          case "preparation-expiry":
+            await env.DB.prepare("UPDATE anchored_comment_submissions SET expires_at=0 WHERE operation_id=?")
+              .bind(f.operationId)
+              .run();
+            break;
+          case "lease-expiry":
+            await env.DB.prepare("UPDATE anchored_comment_submissions SET anchor_expires_at=0 WHERE operation_id=?")
+              .bind(f.operationId)
+              .run();
+            break;
+          case "database-failure":
+            throw new Error("Temporary D1 failure");
+        }
+      }
+      return env.DB.batch(statements);
+    },
+  } as D1Database;
+  const error = await publishCommentSubmission(
+    { ...env, DB: database },
+    f.member,
+    f.page,
+    f.operationId,
+    f.selection,
+    f.authorization,
+    f.authorize,
+  ).then(
+    () => null,
+    (cause: unknown) => cause,
+  );
+  expect(injected).toBe(true);
+  expect(error).toBeInstanceOf(HttpError);
+  const status =
+    change === "database-failure"
+      ? 503
+      : ["move-space", "restore", "preparation-expiry", "lease-expiry"].includes(change)
+        ? 409
+        : ["remove-private-grant", "demote-private-owner", "private-visibility", "archive"].includes(change)
+          ? 404
+          : 401;
+  expect(error).toMatchObject({ status });
+  for (const table of ["comment_threads", "comments", "comment_operations", "anchored_comment_publication_guards"])
+    expect(await env.DB.prepare(`SELECT count(*) n FROM ${table}`).first<number>("n")).toBe(0);
+  expect(await counts()).toEqual(before);
+  const row = await env.DB.prepare("SELECT state,body_json FROM anchored_comment_submissions WHERE operation_id=?")
+    .bind(f.operationId)
+    .first<{ state: string; body_json: string | null }>();
+  expect(row?.state).toBe(change === "preparation-expiry" ? "expired" : "prepared");
+  expect(row?.body_json?.includes("Private prepared body") ?? false).toBe(change !== "preparation-expiry");
+  expect(row?.body_json === null).toBe(change === "preparation-expiry");
+  await runInDurableObject(f.stub, (instance, state) => {
+    expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(0);
+    expect(
+      JSON.stringify((instance as unknown as { document: Y.Doc }).document.getXmlFragment("document-store").toJSON()),
+    ).not.toContain(f.submission.threadId);
+  });
+});
+
+it("uses the transaction clock when a queued publication outlives request-time assurance", async () => {
+  const f = await publicationFixture();
+  const clock = Date.now();
+  await env.DB.prepare("UPDATE session_security SET expires_at=? WHERE session_id=?")
+    .bind(clock - 1_000, f.authorization.sessionId)
+    .run();
+  const stale = vi.spyOn(Date, "now").mockReturnValue(clock - 60_000);
+  try {
+    // A cached/request clock would still consider this proof active.
+    await f.authorize();
+    await expect(
+      publishCommentSubmission(env, f.member, f.page, f.operationId, f.selection, f.authorization, f.authorize),
+    ).rejects.toMatchObject({ status: 409, code: "comment_anchor_unavailable" });
+    expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(0);
+  } finally {
+    stale.mockRestore();
+  }
+});
+
+it.each(["viewer", "private-viewer", "old-totp", "passkey", "trust"] as const)(
+  "permits legitimate anchored publication with %s authorization",
+  async (kind) => {
+    const f = await publicationFixture();
+    if (kind.includes("viewer"))
+      await env.DB.prepare("UPDATE workspace_members SET role='viewer' WHERE user_id=?").bind(f.userId).run();
+    if (kind === "private-viewer") {
+      await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(f.page.space_id).run();
+      await env.DB.prepare("INSERT INTO space_members(space_id,user_id,role,created_at) VALUES(?,?,'viewer',1)")
+        .bind(f.page.space_id, f.userId)
+        .run();
+    }
+    if (kind === "old-totp" || kind === "passkey")
+      await env.DB.prepare("UPDATE session_security SET verified_at=?,expires_at=?,method=? WHERE session_id=?")
+        .bind(
+          Date.now() - 3_600_000,
+          Date.now() + 600_000,
+          kind === "passkey" ? "passkey" : "totp",
+          f.authorization.sessionId,
+        )
+        .run();
+    if (kind === "trust") {
+      await env.DB.prepare(
+        "INSERT INTO trusted_browsers(id,token_hash,user_id,generation,created_at,expires_at,name) SELECT 'browser','hash',user_id,generation,?,?, 'Browser' FROM account_security WHERE user_id=?",
+      )
+        .bind(Date.now(), Date.now() + 600_000, f.userId)
+        .run();
+      await env.DB.prepare("UPDATE session_security SET method='trust',trust_id='browser' WHERE session_id=?")
+        .bind(f.authorization.sessionId)
+        .run();
+    }
+    const result = await publishCommentSubmission(
+      env,
+      f.member,
+      f.page,
+      f.operationId,
+      f.selection,
+      f.authorization,
+      f.authorize,
+    );
+    expect(result).toMatchObject({ submission: { state: "published" }, thread: { anchored: true } });
+    expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(1);
+  },
+);
+
 it("publishes a durable anchor exactly once and reports publication winning cancellation", async () => {
   const installed = await bootstrap(),
     operationId = crypto.randomUUID();
@@ -850,7 +1481,6 @@ it("publishes a durable anchor exactly once and reports publication winning canc
 it.each(["cancel-before-commit", "lost-commit-response"] as const)(
   "recovers publication at the transaction boundary: %s",
   async (failure) => {
-    const { publishCommentSubmission } = await import("./comment-submissions");
     const installed = await bootstrap(),
       operationId = crypto.randomUUID();
     const root = `/api/pages/${installed.pageId}/comment-submissions`;
@@ -906,6 +1536,13 @@ it.each(["cancel-before-commit", "lost-commit-response"] as const)(
       { ...page!, effective_role: "owner" },
       operationId,
       selection,
+      {
+        userId: installed.userId,
+        sessionId: (await env.DB.prepare("SELECT session_id FROM session_security WHERE user_id=?")
+          .bind(installed.userId)
+          .first<string>("session_id"))!,
+        workspaceId: installed.workspaceId,
+      },
       async () => {},
     );
     const outcome = await result.then(

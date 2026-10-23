@@ -11,6 +11,9 @@ import {
 } from "./comments";
 import { correlationHeaders, logger } from "./observability";
 import type { CommentSubmissionStatus } from "../shared/comment-submissions";
+import { protectedSessionGuard } from "./security";
+
+export type CommentPublicationAuthorization = { userId: string; sessionId: string; workspaceId: string };
 
 type Preparation = {
   user_id: string;
@@ -157,18 +160,21 @@ export async function publishCommentSubmission(
   page: CommentPage,
   operationId: string,
   selection: unknown,
+  authorization: CommentPublicationAuthorization,
   authorize: () => Promise<void>,
 ) {
-  const row = await read(env, member, page, operationId);
-  if (row.state === "published") return commentSubmissionStatus(env, member, page, operationId);
-  if (row.state !== "prepared")
-    throw new HttpError(
-      409,
-      `comment_submission_${row.state}`,
-      "This unpublished comment was canceled or expired. Your local draft is preserved.",
-    );
+  if (authorization.userId !== member.user.id || authorization.workspaceId !== page.workspace_id)
+    throw new HttpError(401, "unauthorized", "Sign in again.");
   let token: string | undefined;
   try {
+    const row = await read(env, member, page, operationId);
+    if (row.state === "published") return await commentSubmissionStatus(env, member, page, operationId);
+    if (row.state !== "prepared")
+      throw new HttpError(
+        409,
+        `comment_submission_${row.state}`,
+        "This unpublished comment was canceled or expired. Your local draft is preserved.",
+      );
     const response = await room(env, page, member, operationId, { operation: "prepare", selection });
     if (!response.ok)
       throw new HttpError(
@@ -185,17 +191,30 @@ export async function publishCommentSubmission(
         "The original comment selection is unavailable. Your draft is preserved.",
       );
     await authorize();
+    const session = protectedSessionGuard(authorization, "active", "transaction");
+    const now = "CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)";
     const guard =
       env.DB.prepare(`INSERT OR REPLACE INTO anchored_comment_publication_guards VALUES(?,?,CASE WHEN EXISTS(
-      SELECT 1 FROM anchored_comment_submissions s JOIN pages p ON p.id=s.page_id WHERE s.user_id=? AND s.operation_id=?
-      AND s.state='prepared' AND s.anchor_token=? AND s.anchor_expires_at>? AND s.expires_at>? AND p.content_epoch=s.content_epoch AND p.archived_at IS NULL) THEN 1 ELSE 0 END)`).bind(
+      SELECT 1 FROM anchored_comment_submissions s JOIN pages p ON p.id=s.page_id
+      JOIN spaces space ON space.id=p.space_id AND space.workspace_id=p.workspace_id
+      JOIN workspace_members member ON member.workspace_id=p.workspace_id AND member.user_id=s.user_id
+      LEFT JOIN space_members grant ON grant.space_id=space.id AND grant.user_id=s.user_id
+      WHERE s.user_id=? AND s.operation_id=? AND p.id=? AND p.workspace_id=? AND p.space_id=?
+      AND p.kind='document' AND p.import_job_id IS NULL
+      AND (member.role='owner' OR space.visibility='workspace' OR grant.user_id IS NOT NULL)
+      AND s.state='prepared' AND s.anchor_token=? AND s.anchor_expires_at>${now} AND s.expires_at>${now}
+      AND p.content_epoch=s.content_epoch AND p.content_epoch=? AND p.archived_at IS NULL
+      AND ${session.sql}) THEN 1 ELSE 0 END)`).bind(
         member.user.id,
         operationId,
         member.user.id,
         operationId,
+        page.id,
+        authorization.workspaceId,
+        page.space_id,
         token,
-        Date.now(),
-        Date.now(),
+        page.content_epoch,
+        ...session.binds,
       );
     await createCommentThread(env, member, page, JSON.parse(row.body_json!), null, null, {
       threadId: row.thread_id,
@@ -226,7 +245,29 @@ export async function publishCommentSubmission(
         `comment_submission_${committed.submission.state}`,
         "This unpublished comment was canceled or expired. Your local draft is preserved.",
       );
-    throw error;
+    if (error instanceof HttpError) throw error;
+    if (error instanceof Error && error.message.includes("anchored_comment_publication_conflict")) {
+      try {
+        await authorize();
+      } catch (denial) {
+        if (denial instanceof HttpError) throw denial;
+        throw new HttpError(
+          503,
+          "comment_publication_unavailable",
+          "Comment access could not be confirmed. Your draft is preserved.",
+        );
+      }
+      throw new HttpError(
+        409,
+        "comment_anchor_unavailable",
+        "This page or comment anchor changed. Review your preserved draft before posting again.",
+      );
+    }
+    throw new HttpError(
+      503,
+      "comment_publication_unavailable",
+      "Comment publication could not be confirmed. Your draft is preserved.",
+    );
   } finally {
     if (token) await cleanup(env, member, page, operationId, token);
   }

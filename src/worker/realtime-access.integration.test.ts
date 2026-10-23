@@ -165,6 +165,51 @@ describe("realtime access barriers", () => {
       expect((await realtimeAccessStatus(env, ids[0]!)).complete).toBe(!alwaysFails);
     },
   );
+  it.each([false, true])(
+    "forces unknown-baseline cleanup after an ordinary recapture (final discovery fails: %s)",
+    async (fails) => {
+      const { user, ids } = await userWorkspaces(1);
+      await env.DB.prepare(
+        "INSERT INTO session(id,expiresAt,token,createdAt,updatedAt,userId) VALUES('refused',9999999999999,'refused',1,1,?)",
+      )
+        .bind(user)
+        .run();
+      let captures = 0;
+      const attempted: string[] = [];
+      const bindings = runtime(async (id) => {
+        attempted.push(id);
+        return new Response(null, { status: 204 });
+      });
+      bindings.DB = {
+        prepare(sql: string) {
+          if (
+            sql.includes("FROM workspace_members member LEFT JOIN") &&
+            (++captures === 1 || (fails && captures === 3))
+          )
+            throw new Error("capture unavailable");
+          return env.DB.prepare(sql);
+        },
+      } as D1Database;
+      const response = await withRealtimeAccessTracking(bindings, async () => {
+        await deleteRejectedSession(bindings, user, "refused");
+        await trackRealtimeUser(bindings, user);
+        return new Response("original", {
+          status: 302,
+          headers: { location: "/?error=refused", "set-cookie": "existing=kept" },
+        });
+      });
+      expect(captures).toBe(3);
+      expect(await response.text()).toBe("original");
+      expect(response.status).toBe(302);
+      expect(response.headers.get("location")).toBe("/?error=refused");
+      expect(response.headers.get("set-cookie")).toBe("existing=kept");
+      expect(response.headers.get("X-Notes-Realtime-Status")).toBe(fails ? "pending" : "complete");
+      expect(response.headers.has("X-Notes-Realtime-Workspace")).toBe(false);
+      expect(attempted).toEqual(fails ? [] : ids);
+      expect((await realtimeAccessStatus(env, ids[0]!)).complete).toBe(!fails);
+      expect(await env.DB.prepare("SELECT id FROM session WHERE id='refused'").first()).toBeNull();
+    },
+  );
   it("reports remaining work after ten workspaces and gives failed workspaces fair turns", async () => {
     const prefix = crypto.randomUUID();
     const ids = await Promise.all(

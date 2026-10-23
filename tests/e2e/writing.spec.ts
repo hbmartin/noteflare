@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { openNavigation, signInOwner } from "./security-helpers";
+import { editableDocument, openNavigation, signInOwner } from "./security-helpers";
 import type { AiConversation, AiGenerate, AiStatus } from "../../src/shared/ai";
 import type { Page } from "../../src/shared/types";
 
@@ -116,8 +116,7 @@ test("writing streams into a read-only preview, applies with undo, preserves con
     return route.fulfill({ json: { ok: true } });
   });
   await page.goto(`/?page=${document.id}`);
-  const editor = page.locator('.notes-editor [contenteditable="true"]').first();
-  await expect(editor).toBeVisible();
+  const editor = await editableDocument(page, document.id);
   await editor.fill("Original writing source.");
   await expect
     .poll(async () => JSON.stringify(await (await page.request.get(`/api/pages/${document.id}/content`)).json()))
@@ -213,10 +212,10 @@ test("writing streams into a read-only preview, applies with undo, preserves con
   const otherDocument = tree.pages.find((item) => item.kind === "document" && item.id !== document.id)!;
   await openNavigation(page);
   await page.locator(`[data-tree-page="${otherDocument.id}"]`).press("Enter");
-  await expect(page).toHaveURL(new RegExp(`page=${otherDocument.id}`));
+  await editableDocument(page, otherDocument.id);
   await openNavigation(page);
   await page.getByRole("treeitem", { name: document.title, exact: true }).press("Enter");
-  await expect(editor).toBeVisible();
+  await editableDocument(page, document.id);
   await expect(editor).toContainText("Collaborator changed this source.");
   await expect(editor).toContainText("Clear writing result.");
   await expect(writing).not.toBeVisible();

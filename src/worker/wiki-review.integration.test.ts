@@ -28,6 +28,82 @@ async function seed() {
   ]);
 }
 describe("wiki review forward migration", () => {
+  it("upgrades 0103 with an indexed preparation cascade and preserves terminal receipts", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0104"),
+    );
+    await seed();
+    const insert = (operation: string, page: string, state: string) =>
+      env.DB.prepare(
+        "INSERT INTO anchored_comment_submissions(user_id,operation_id,page_id,content_epoch,thread_id,comment_id,request_hash,body_json,state,created_at,expires_at) VALUES('owner',?,?,1,?,?,?,NULL,?,1,2)",
+      ).bind(operation, page, `thread-${operation}`, `comment-${operation}`, operation, state);
+    await env.DB.batch([
+      insert("prepared", "doc", "prepared"),
+      insert("published", "doc", "published"),
+      insert("canceled", "doc", "canceled"),
+      insert("expired", "doc", "expired"),
+      insert("other-page", "diagram", "published"),
+    ]);
+    const before = await env.DB.prepare("SELECT * FROM anchored_comment_submissions ORDER BY operation_id").all();
+    const plan = () => env.DB.prepare("EXPLAIN QUERY PLAN DELETE FROM pages WHERE id='doc'").all<{ detail: string }>();
+    expect((await plan()).results.some((row) => row.detail === "SCAN anchored_comment_submissions")).toBe(true);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect((await plan()).results.some((row) => row.detail.includes("idx_anchored_comment_page"))).toBe(true);
+    expect(
+      (await env.DB.prepare("SELECT * FROM anchored_comment_submissions ORDER BY operation_id").all()).results,
+    ).toEqual(before.results);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    await env.DB.prepare("DELETE FROM pages WHERE id='doc'").run();
+    expect((await env.DB.prepare("SELECT operation_id FROM anchored_comment_submissions").all()).results).toEqual([
+      { operation_id: "other-page" },
+    ]);
+    await env.DB.prepare(
+      "UPDATE anchored_comment_submissions SET user_id='second' WHERE operation_id='other-page'",
+    ).run();
+    await env.DB.prepare("DELETE FROM user WHERE id='second'").run();
+    expect((await env.DB.prepare("SELECT * FROM anchored_comment_submissions").all()).results).toEqual([]);
+  });
+  it("measures page deletion with small and large retained receipt populations", async ({ annotate }) => {
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    await seed();
+    const measurements: Array<{ receipts: number; indexed: boolean; samples: number; p50: number; p95: number }> = [];
+    for (const receipts of [2_000, 20_000]) {
+      await env.DB.prepare("DELETE FROM anchored_comment_submissions").run();
+      await env.DB.prepare(`WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<?)
+        INSERT INTO anchored_comment_submissions(user_id,operation_id,page_id,content_epoch,thread_id,comment_id,request_hash,state,created_at,expires_at)
+        SELECT 'owner','background-'||n,'diagram',1,'thread-'||n,'comment-'||n,'hash-'||n,'expired',1,2 FROM numbers`)
+        .bind(receipts)
+        .run();
+      for (const indexed of [false, true]) {
+        await env.DB.prepare("DROP INDEX IF EXISTS idx_anchored_comment_page").run();
+        if (indexed)
+          await env.DB.prepare("CREATE INDEX idx_anchored_comment_page ON anchored_comment_submissions(page_id)").run();
+        const prefix = `victim-${receipts}-${Number(indexed)}-`;
+        await env.DB.prepare(`WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<20)
+          INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+          SELECT ?||n,'wiki','wiki-general','document','b'||n,'Victim','owner',1,1 FROM numbers`)
+          .bind(prefix)
+          .run();
+        await env.DB.prepare(`INSERT INTO anchored_comment_submissions(user_id,operation_id,page_id,content_epoch,thread_id,comment_id,request_hash,state,created_at,expires_at)
+          SELECT 'owner',id,id,1,id,id,id,'canceled',1,2 FROM pages WHERE id LIKE ?`)
+          .bind(`${prefix}%`)
+          .run();
+        const times: number[] = [];
+        for (let sample = 1; sample <= 20; sample++) {
+          const start = performance.now();
+          await env.DB.prepare("DELETE FROM pages WHERE id=?").bind(`${prefix}${sample}`).run();
+          times.push(performance.now() - start);
+        }
+        times.sort((left, right) => left - right);
+        measurements.push({ receipts, indexed, samples: times.length, p50: times[10]!, p95: times[18]! });
+        expect(await env.DB.prepare("SELECT count(*) n FROM anchored_comment_submissions").first<number>("n")).toBe(
+          receipts,
+        );
+      }
+    }
+    await annotate(JSON.stringify(measurements), "cascade-measurements");
+  });
   it("upgrades 0101 without touching revisions and fences only reducing INSERT grants", async () => {
     await applyD1Migrations(
       env.DB,
