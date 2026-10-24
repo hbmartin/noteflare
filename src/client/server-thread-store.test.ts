@@ -339,3 +339,23 @@ it("does not loop if the one replacement identity is also canceled", async () =>
   expect(readCommentDraft(scope, "new")!.body).toEqual(body);
   purgeCommentPublications(scope.account);
 });
+
+it("treats a freshly minted fallback identity as local when no saved draft matches", async () => {
+  mockedApi.mockReset();
+  const scope = { account: crypto.randomUUID(), pageId: "page-1", epoch: 1 };
+  setRealtimeAccessAccount(scope.account);
+  const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true, scope);
+  mockedApi.mockImplementation(async (_path, init) => {
+    if (init?.method !== "POST") throw new ApiClientError(404, "comment_submission_not_found", "Missing");
+    return {
+      protocolVersion: 3,
+      submission: { state: "prepared", operationId: new Headers(init.headers).get("x-notes-operation-id") },
+    };
+  });
+  await store.anchoredSubmission(thread().comments[0]!.body as never).prepare();
+  expect(mockedApi).toHaveBeenCalledExactlyOnceWith(
+    "/api/pages/page-1/comment-submissions",
+    expect.objectContaining({ method: "POST" }),
+  );
+  purgeCommentPublications(scope.account);
+});

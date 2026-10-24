@@ -240,8 +240,12 @@ export class ServerThreadStore extends ThreadStore {
       if (account !== realtimeAccessAccount())
         throw new Error("This comment belongs to a retired account. Its local draft is preserved.");
     };
+    const previous = this.pendingOperations.get("new")?.id,
+      saved = this.draftScope ? readCommentDraft(this.draftScope, "new")?.operationId : undefined;
     let headers = this.operationHeaders("new", body),
       operationId = headers["x-notes-operation-id"];
+    if (this.draftScope && operationId !== previous && operationId !== saved)
+      markLocalCommentOperation(this.draftScope, operationId);
     const root = `/api/pages/${encodeURIComponent(this.pageId)}/comment-submissions`;
     type Result = { submission: CommentSubmissionStatus; thread?: CommentThread; protocolVersion?: number };
     let protocolConfirmed = false,
