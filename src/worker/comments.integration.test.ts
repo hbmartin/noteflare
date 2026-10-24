@@ -320,7 +320,6 @@ describe("server-authoritative comments", () => {
       "content-type": "application/json",
       "x-notes-operation-id": crypto.randomUUID(),
       "x-notes-content-epoch": "1",
-      "x-notes-comment-protocol": "3",
     };
     const post = () =>
       SELF.fetch(

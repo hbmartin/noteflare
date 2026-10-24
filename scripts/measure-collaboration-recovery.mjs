@@ -8,6 +8,9 @@ import { relative, resolve as resolvePath } from "node:path";
 const baseline = process.argv[2] ?? "ac826e9";
 const output = process.argv[3];
 const corruptStorage = process.argv[4] === "--corrupt-storage";
+const typingEdits = Number(process.env.NOTES_BENCH_TYPING_EDITS ?? 20);
+if (!Number.isSafeInteger(typingEdits) || typingEdits < 20 || typingEdits > 10000)
+  throw new Error("Invalid typing sample count");
 const root = process.cwd();
 const controlled = /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection)\.(ts|tsx)$/;
 const entry = `
@@ -48,9 +51,9 @@ globalThis.measureTyping=async()=>{
  Storage.prototype.setItem=function(...args){count.writes++;return set.apply(this,args)};
  globalThis.__wholeTableRenders=0;const durations=[];
  try{
-  for(let i=0;i<20;i++){const started=performance.now();edit('Measured draft '+i);durations.push(performance.now()-started);}
-  if(![...Object.keys(localStorage)].some(key=>localStorage.getItem(key)?.includes('Measured draft 19')))throw Error('No actual persisted input events');
-  return {samples:durations.length,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),counts:{...count,wholeTableRenders:globalThis.__wholeTableRenders},requests:globalThis.__requests};
+  for(let i=0;i<${typingEdits};i++){const started=performance.now();edit('Measured draft '+i);durations.push(performance.now()-started);}
+  if(![...Object.keys(localStorage)].some(key=>localStorage.getItem(key)?.includes('Measured draft ${typingEdits - 1}')))throw Error('No actual persisted input events');
+  return {samples:durations.length,firstEditMs:durations[0],p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),counts:{...count,wholeTableRenders:globalThis.__wholeTableRenders},requests:globalThis.__requests};
  }finally{Object.defineProperty(Storage.prototype,'length',descriptor);Storage.prototype.key=key;Storage.prototype.setItem=set;tree.unmount();host.remove();}
 };
 globalThis.measureReconnect=async()=>{
@@ -137,7 +140,7 @@ const results = {
     columns: 3,
     accountDrafts: 500,
     unrelatedStorageKeys: 5000,
-    typingEditsPerContext: 20,
+    typingEditsPerContext: typingEdits,
     contextsPerVersion: 3,
     reconnectingClients: 20,
   },
