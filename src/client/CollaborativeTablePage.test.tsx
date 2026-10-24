@@ -1038,6 +1038,10 @@ describe("collaborative table UI", () => {
     show();
     fireEvent.change(await screen.findByLabelText("New row title"), { target: { value: "Once" } });
     fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+    await screen.findByRole("button", { name: "Retry saved operation" });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh", exact: true })));
+    expect(screen.getByRole("alert")).toHaveTextContent("The table update could not be confirmed.");
+    expect(writes).toHaveLength(1);
     fireEvent.click(await screen.findByRole("button", { name: "Retry saved operation" }));
     await waitFor(() => expect(writes).toHaveLength(2));
     expect(writes[1]).toEqual(writes[0]);

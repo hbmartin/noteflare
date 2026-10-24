@@ -607,8 +607,10 @@ test("protocol mismatch preserves the anchored draft until a deliberate reload p
   expect((await page.request.get(`${root}/${operationId}`)).status()).toBe(404);
   await page.unroute(`**${root}`);
   await page.reload();
+  await editableDocument(page, document.id);
   await page.getByRole("button", { name: "Resume saved comment" }).click();
   await expect(composer).toContainText("Keep protocol recovery text");
+  await expect(composer).toHaveAttribute("contenteditable", "true");
   await composer.press("Enter");
   await expect(composer).toHaveCount(0);
   const status = await (await page.request.get(`${root}/${operationId}`)).json();
