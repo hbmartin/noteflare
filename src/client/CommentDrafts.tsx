@@ -484,7 +484,11 @@ export function DraftCommentsControllers() {
         elementProps={{ style: { zIndex: 60 } }}
       >
         {state.pendingComment && anchor && (
-          <NewDraftComposer anchor={anchor} onResume={setAnchor} onDiscard={() => discard("new")} />
+          <NewDraftComposer
+            anchor={anchor}
+            onResume={setAnchor}
+            onDiscard={() => discard("new", () => update((value) => value + 1))}
+          />
         )}
       </PositionPopover>
       <PositionPopover

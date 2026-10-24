@@ -313,6 +313,8 @@ test("legacy comment drafts remain recoverable without attaching to a new select
   });
   await page.getByRole("button", { name: "Discard saved draft" }).click();
   await expect(page.locator(".bn-thread .bn-editor")).toHaveCount(1);
+  await expect(page.locator(".bn-thread .bn-editor")).toBeEmpty();
+  expect((await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads).toHaveLength(0);
 });
 
 test("diagram access refresh resumes after one recoverable security check", async ({ page }) => {
