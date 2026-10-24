@@ -22,6 +22,22 @@ const edit = (text = "Unfinished") => ({
   text,
   baseRevision: 7,
 });
+function failedSuccessor() {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("Stored predecessor"));
+  const old = accountCellDrafts(scope.account)[0]!;
+  const name = Object.keys(localStorage).find((storedName) => localStorage.getItem(storedName)?.includes(old.version))!;
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  try {
+    map.set(key, edit("Failed successor"));
+  } finally {
+    write.mockRestore();
+  }
+  return { map, key, old, name };
+}
 beforeEach(() => {
   scope = { account: crypto.randomUUID(), host: "host", tableId: "table", generation: 1 };
 });
@@ -250,14 +266,7 @@ it("adopts another tab's submission and definite-rejection reset without changin
 });
 
 it("discards a failed write and its stored predecessor without resurrecting either on reload", async () => {
-  const map = new CellDraftMap(scope),
-    key = cellDraftKey("row:a", "b");
-  map.set(key, edit("Predecessor"));
-  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-    throw new Error("quota");
-  });
-  map.set(key, edit("Latest memory text"));
-  write.mockRestore();
+  const { key } = failedSuccessor();
   discardCellDraft(accountCellDrafts(scope.account)[0]!);
   vi.resetModules();
   const fresh = await import("./cell-drafts");
@@ -281,16 +290,7 @@ it("retries identical nondurable text and metadata without changing submission i
   expect(recovered).toHaveBeenCalledOnce();
 });
 it("cleanup retries remove only the obsolete stored snapshot and adopt a new cross-tab version", () => {
-  const map = new CellDraftMap(scope),
-    key = cellDraftKey("row:a", "b");
-  map.set(key, edit("Stored predecessor"));
-  const old = accountCellDrafts(scope.account)[0]!;
-  const name = Object.keys(localStorage).find((storedName) => localStorage.getItem(storedName)?.includes(old.version))!;
-  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-    throw new Error("quota");
-  });
-  map.set(key, edit("Memory successor"));
-  write.mockRestore();
+  const { map, key, old, name } = failedSuccessor();
   const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
     throw new Error("blocked");
   });
@@ -328,16 +328,7 @@ it("isolates corrupt values, caches initialization, and purges corruption withou
   for (let index = 0; index < 500; index++) localStorage.removeItem(`unrelated-${index}`);
 });
 it("adopts a metadata-only rewrite of the stored predecessor when discarding a failed successor", () => {
-  const map = new CellDraftMap(scope),
-    key = cellDraftKey("row:a", "b");
-  map.set(key, edit("Stored predecessor"));
-  const old = accountCellDrafts(scope.account)[0]!;
-  const name = Object.keys(localStorage).find((storedName) => localStorage.getItem(storedName)?.includes(old.version))!;
-  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-    throw new Error("quota");
-  });
-  map.set(key, edit("Failed successor"));
-  write.mockRestore();
+  const { map, key, old, name } = failedSuccessor();
   const replacement = { ...old, durable: false, operationId: "other-tab-submission", submissionRevision: 15 };
   localStorage.setItem(name, JSON.stringify(replacement));
   discardCellDraft(accountCellDrafts(scope.account)[0]!);
