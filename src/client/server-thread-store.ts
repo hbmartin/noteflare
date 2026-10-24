@@ -274,7 +274,7 @@ export class ServerThreadStore extends ThreadStore {
     };
     const confirmProtocol = async (result: Result) => {
       assertAccount();
-      if (result.protocolVersion === COMMENT_PROTOCOL_VERSION) {
+      if (result?.protocolVersion === COMMENT_PROTOCOL_VERSION) {
         protocolConfirmed = true;
         return remember(result);
       }

@@ -197,18 +197,21 @@ it("requires collaboration readiness at preparation and publication but can ackn
   ).not.toThrow();
 });
 
-it("sends protocol 3 and refuses publication after an unconfirmed preparation response", async () => {
-  mockedApi.mockReset();
-  const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true);
-  const submission = store.anchoredSubmission(thread().comments[0]!.body as never);
-  const prepared = { submission: { state: "prepared", operationId: "op" } };
-  mockedApi.mockResolvedValueOnce(prepared).mockResolvedValueOnce(prepared);
-  await expect(submission.prepare()).rejects.toThrow("Reload NoteFlare");
-  expect(mockedApi.mock.calls[0]![1]?.headers).toMatchObject({ "X-Notes-Comment-Protocol": "3" });
-  expect(mockedApi.mock.calls[1]![0]).toMatch(/comment-submissions\/[^/]+$/);
-  await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow("Reload NoteFlare");
-  expect(mockedApi).toHaveBeenCalledTimes(2);
-});
+it.each([null, {}, { protocolVersion: 2 }])(
+  "sends protocol 3 and refuses publication after an unconfirmed preparation response: %s",
+  async (response) => {
+    mockedApi.mockReset();
+    const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true);
+    const submission = store.anchoredSubmission(thread().comments[0]!.body as never);
+    const prepared = { submission: { state: "prepared", operationId: "op" } };
+    mockedApi.mockResolvedValueOnce(response).mockResolvedValueOnce(prepared);
+    await expect(submission.prepare()).rejects.toThrow("Reload NoteFlare");
+    expect(mockedApi.mock.calls[0]![1]?.headers).toMatchObject({ "X-Notes-Comment-Protocol": "3" });
+    expect(mockedApi.mock.calls[1]![0]).toMatch(/comment-submissions\/[^/]+$/);
+    await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow("Reload NoteFlare");
+    expect(mockedApi).toHaveBeenCalledTimes(2);
+  },
+);
 it("reconciles a recovered identity before preparing and acknowledges an already published outcome", async () => {
   mockedApi.mockReset();
   const scope = { account: "protocol-recovery", pageId: "page-1", epoch: 1 };

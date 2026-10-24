@@ -97,6 +97,7 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
   const identities = new Set<string>();
   let failAnchor = true;
   let persisted: Parameters<typeof resolveCommentDraftAnchor>[1];
+  let publishedResponse: unknown;
   const thread = {
     id: "thread-1",
     pageId: "page-1",
@@ -113,7 +114,10 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
     updatedAt: 1,
   };
   const spy = vi.spyOn(apiModule, "api").mockImplementation(async (path, init) => {
-    if (!init?.method) throw new apiModule.ApiClientError(404, "comment_submission_not_found", "Not prepared");
+    if (!init?.method) {
+      if (publishedResponse) return publishedResponse as never;
+      throw new apiModule.ApiClientError(404, "comment_submission_not_found", "Not prepared");
+    }
     if (path.endsWith("/comment-submissions")) {
       identities.add(new Headers(init?.headers).get("x-notes-operation-id")!);
       if (identities.size === 1 && !finishCreation)
@@ -138,15 +142,15 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
     await new Promise<void>((resolve) => {
       finishAnchor = resolve;
     });
-    return {
-      protocolVersion: 3,
+    publishedResponse = {
       submission: {
         operationId: new Headers(init?.headers).get("x-notes-operation-id"),
         state: "published",
         threadId: thread.id,
       },
       thread: { ...thread, anchored: true },
-    } as never;
+    };
+    return publishedResponse as never;
   });
   try {
     editor.replaceBlocks(editor.document, [{ type: "paragraph", content: "Before selected after" }]);
@@ -181,6 +185,8 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
     expect(await retry).toBe(true);
     expect(identities).toEqual(new Set([identity]));
     expect(store.getThreads().size).toBe(1);
+    expect(spy.mock.calls.at(-1)![0]).toBe(`/api/pages/page-1/comment-submissions/${identity}`);
+    expect(spy.mock.calls.at(-1)![1]?.method).toBeUndefined();
     expect(JSON.stringify(readCommentDraft(scope, "new")!.body)).toContain("Newer edit");
   } finally {
     spy.mockRestore();
