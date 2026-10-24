@@ -293,6 +293,9 @@ export class CellDraftMap extends Map<string, CellDraft> {
   override has(key: string) {
     return this.get(key) !== undefined;
   }
+  subscribe(key: string, listener: () => void) {
+    return subscribe(cellListeners, nameOf(this.scope, key), listener);
+  }
   focus(key: string, value: boolean) {
     const name = nameOf(this.scope, key),
       set = focused.get(name) ?? new Set<CellDraftMap>();
