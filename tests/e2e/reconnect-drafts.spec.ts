@@ -571,7 +571,7 @@ test("two tabs share the latest cell draft and stale Retry cannot submit or clea
     await expect(second.getByRole("button", { name: "Retry saved operation", exact: true })).toBeVisible();
     await expect(firstCell).toHaveValue("Newest tab draft");
     expect(attempts).toBe(2);
-    await page.getByRole("button", { name: "Retry saved operation", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Retry saved operation", exact: true })).toHaveCount(0);
     expect(attempts).toBe(2);
     await expect(page.getByLabel("Recovered cell draft")).toHaveValue("Newest tab draft");
     await page.getByRole("button", { name: "Discard draft", exact: true }).click();
@@ -606,9 +606,6 @@ test("protocol mismatch preserves the anchored draft until a deliberate reload p
   expect(publications).toBe(0);
   expect((await page.request.get(`${root}/${operationId}`)).status()).toBe(404);
   await page.unroute(`**${root}`);
-  // Keep navigation cancellation uncertain in every engine; terminal cancellation
-  // and its deliberate new-identity retry are covered separately.
-  await page.route(`**${root}/*/cancel`, (route) => route.abort("failed"));
   await page.reload();
   await editableDocument(page, document.id);
   await page.getByRole("button", { name: "Resume saved comment" }).click();
@@ -627,4 +624,105 @@ test("protocol mismatch preserves the anchored draft until a deliberate reload p
       () => Object.keys(localStorage).filter((key) => key.startsWith("notes:comment-publication:")).length,
     ),
   ).toBe(0);
+});
+
+test("never-submitted anchored text can be discarded offline without a cancellation request", async ({
+  page,
+  context,
+}) => {
+  await signInOwner(page);
+  const { composer } = await anchoredComposer(page, "Local discard", "Local original anchor");
+  let cancellations = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && /comment-submissions\/[^/]+\/cancel$/.test(new URL(request.url()).pathname))
+      cancellations++;
+  });
+  await composer.fill("Never sent");
+  await context.setOffline(true);
+  try {
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.keyboard.press("Escape");
+    await expect(composer).toHaveCount(0);
+    expect(cancellations).toBe(0);
+    expect(
+      await page.evaluate(
+        () => Object.keys(localStorage).filter((key) => key.startsWith("notes:comment-draft:")).length,
+      ),
+    ).toBe(0);
+  } finally {
+    await context.setOffline(false);
+  }
+});
+test("a recovered canceled preparation posts in one deliberate action with a new identity", async ({ page }) => {
+  await signInOwner(page);
+  const { document, composer } = await anchoredComposer(page, "Canceled recovery", "Canceled original anchor");
+  const root = `/api/pages/${document.id}/comment-submissions`;
+  await composer.fill("Post after confirmed cancellation");
+  const draft = await page.evaluate((pageId) => {
+    for (const key of Object.keys(localStorage))
+      if (key.startsWith("notes:comment-draft:")) {
+        const parts = JSON.parse(key.slice("notes:comment-draft:".length));
+        if (parts[1] === pageId && parts[3] === "new") return JSON.parse(localStorage.getItem(key)!);
+      }
+    return null;
+  }, document.id);
+  const headers = {
+    "X-Notes-Comment-Protocol": "3",
+    "x-notes-operation-id": draft.operationId,
+    "x-notes-content-epoch": "1",
+  };
+  expect((await page.request.post(root, { headers, data: { initialComment: { body: draft.body } } })).status()).toBe(
+    201,
+  );
+  expect((await page.request.post(`${root}/${draft.operationId}/cancel`)).status()).toBe(200);
+  await page.reload();
+  await editableDocument(page, document.id);
+  await page.getByRole("button", { name: "Resume saved comment" }).click();
+  let newOperation = "",
+    publications = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && new URL(request.url()).pathname === root)
+      newOperation = request.headers()["x-notes-operation-id"]!;
+    if (request.method() === "POST" && request.url().endsWith("/publish")) publications++;
+  });
+  await expect(composer).toContainText("Post after confirmed cancellation");
+  await expect(composer).toHaveAttribute("contenteditable", "true");
+  await composer.click();
+  await composer.press("Enter");
+  await expect(composer).toHaveCount(0);
+  expect(newOperation).not.toBe(draft.operationId);
+  expect(newOperation).not.toBe("");
+  expect(publications).toBe(1);
+  expect((await (await page.request.get(`${root}/${draft.operationId}`)).json()).submission.state).toBe("canceled");
+  expect((await (await page.request.get(`${root}/${newOperation}`)).json()).submission.state).toBe("published");
+  expect((await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads).toHaveLength(1);
+});
+test("uncertain preparation and navigation cancellation retain the original publication identity", async ({ page }) => {
+  await signInOwner(page);
+  const { document, composer } = await anchoredComposer(page, "Uncertain recovery", "Uncertain original anchor");
+  const root = `/api/pages/${document.id}/comment-submissions`;
+  let operationId = "";
+  await page.route(`**${root}`, async (route) => {
+    operationId = route.request().headers()["x-notes-operation-id"]!;
+    const response = await route.fetch();
+    expect(response.status()).toBe(201);
+    await route.abort("failed");
+  });
+  await composer.fill("Preserve uncertain identity");
+  await composer.press("Enter");
+  await expect(
+    page.getByText("The comment could not be posted. Your draft is preserved.", { exact: true }),
+  ).toBeVisible();
+  expect((await (await page.request.get(`${root}/${operationId}`)).json()).submission.state).toBe("prepared");
+  await page.unroute(`**${root}`);
+  await page.route(`**${root}/*/cancel`, (route) => route.abort("failed"));
+  await page.reload();
+  await editableDocument(page, document.id);
+  await page.getByRole("button", { name: "Resume saved comment" }).click();
+  await expect(composer).toHaveAttribute("contenteditable", "true");
+  await composer.click();
+  await composer.press("Enter");
+  await expect(composer).toHaveCount(0);
+  expect((await (await page.request.get(`${root}/${operationId}`)).json()).submission.state).toBe("published");
+  expect((await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads).toHaveLength(1);
 });
