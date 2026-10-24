@@ -2273,3 +2273,179 @@ it.each(["release-failure", "replacement-token", "canceled"] as const)(
     });
   },
 );
+
+it.each(["before-claim", "after-refusal"] as const)(
+  "reports a concurrent publication winner after %s",
+  async (phase) => {
+    const f = await publicationFixture();
+    let releaseLoser!: () => void, enteredLoser!: () => void, releaseWinner!: () => void, enteredWinner!: () => void;
+    const loserHeld = new Promise<void>((resolve) => {
+        releaseLoser = resolve;
+      }),
+      loserStarted = new Promise<void>((resolve) => {
+        enteredLoser = resolve;
+      }),
+      winnerHeld = new Promise<void>((resolve) => {
+        releaseWinner = resolve;
+      }),
+      winnerStarted = new Promise<void>((resolve) => {
+        enteredWinner = resolve;
+      });
+    let refusedStatus: number | undefined;
+    const bindings = {
+      ...env,
+      DOCUMENT: {
+        getByName: () => ({
+          fetch: async (input: Request) => {
+            const body = await input.clone().json<{ operation: string }>();
+            if (body.operation !== "prepare") return f.stub.fetch(input);
+            if (phase === "before-claim") {
+              enteredLoser();
+              await loserHeld;
+              return f.stub.fetch(input);
+            }
+            const response = await f.stub.fetch(input);
+            refusedStatus = response.status;
+            enteredLoser();
+            await loserHeld;
+            return response;
+          },
+        }),
+      },
+    } as unknown as Env;
+    let winner: ReturnType<typeof publishCommentSubmission> | undefined,
+      loser: ReturnType<typeof publishCommentSubmission> | undefined;
+    try {
+      if (phase === "after-refusal") {
+        winner = publishCommentSubmission(
+          env,
+          f.member,
+          f.page,
+          f.operationId,
+          f.selection,
+          f.authorization,
+          async () => {
+            enteredWinner();
+            await winnerHeld;
+            await f.authorize();
+          },
+        );
+        await winnerStarted;
+      }
+      loser = publishCommentSubmission(
+        bindings,
+        f.member,
+        f.page,
+        f.operationId,
+        f.selection,
+        f.authorization,
+        f.authorize,
+      );
+      await loserStarted;
+      if (!winner)
+        winner = publishCommentSubmission(
+          env,
+          f.member,
+          f.page,
+          f.operationId,
+          f.selection,
+          f.authorization,
+          f.authorize,
+        );
+      releaseWinner();
+      const committed = await winner;
+      const effects = await env.DB.prepare(
+        "SELECT count(*) n FROM webhook_events WHERE event_type='comment.created'",
+      ).first<number>("n");
+      releaseLoser();
+      const reconciled = await loser;
+      expect(refusedStatus).toBe(phase === "after-refusal" ? 503 : undefined);
+      expect(reconciled.thread?.id).toBe(committed.thread?.id);
+      expect(reconciled).toMatchObject({ submission: { state: "published" }, thread: { anchored: true } });
+      expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(1);
+      expect(await env.DB.prepare("SELECT count(*) n FROM comments").first<number>("n")).toBe(1);
+      expect(
+        await env.DB.prepare("SELECT count(*) n FROM comment_operations WHERE operation_id=?")
+          .bind(f.operationId)
+          .first<number>("n"),
+      ).toBe(1);
+      expect(
+        await env.DB.prepare("SELECT count(*) n FROM webhook_events WHERE event_type='comment.created'").first<number>(
+          "n",
+        ),
+      ).toBe(effects);
+      await runInDurableObject(f.stub, (instance, state) => {
+        expect(
+          JSON.stringify((instance as unknown as AnchorTestRoom).document.getXmlFragment("document-store").toJSON()),
+        ).toContain(f.submission.threadId);
+        expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(0);
+      });
+    } finally {
+      releaseWinner();
+      releaseLoser();
+      await Promise.allSettled([winner, loser]);
+    }
+  },
+);
+it.each(["archive", "restore"] as const)(
+  "completes empty anchor cleanup during %s without scheduling work",
+  async (transition) => {
+    const f = await publicationFixture();
+    await runInDurableObject(f.stub, async (instance, state) => {
+      const room = instance as unknown as AnchorTestRoom & { transition: string | null };
+      room.transition = transition;
+      const scheduled = vi.spyOn(room, "scheduleAlarm"),
+        original = await state.storage.getAlarm();
+      try {
+        const response = await room.onRequest(
+          anchorRequest(JSON.stringify({ operation: "reconcile", userId: f.userId, operationId: f.operationId })),
+        );
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ complete: true });
+        expect(scheduled).not.toHaveBeenCalled();
+        expect(await state.storage.getAlarm()).toBe(original);
+      } finally {
+        scheduled.mockRestore();
+        room.transition = null;
+      }
+    });
+  },
+);
+
+it("does not reveal a concurrent published winner after the retry loses access", async () => {
+  const f = await publicationFixture();
+  const bindings = {
+    ...env,
+    DOCUMENT: {
+      getByName: () => ({
+        fetch: async (input: Request) => {
+          await publishCommentSubmission(
+            env,
+            f.member,
+            f.page,
+            f.operationId,
+            f.selection,
+            f.authorization,
+            f.authorize,
+          );
+          await env.DB.prepare("DELETE FROM workspace_members WHERE workspace_id=? AND user_id=?")
+            .bind(f.workspaceId, f.userId)
+            .run();
+          return f.stub.fetch(input);
+        },
+      }),
+    },
+  } as unknown as Env;
+  const result = await publishCommentSubmission(
+    bindings,
+    f.member,
+    f.page,
+    f.operationId,
+    f.selection,
+    f.authorization,
+    f.authorize,
+  ).catch((error: unknown) => error);
+  expect(result).toBeInstanceOf(HttpError);
+  expect([401, 403]).toContain((result as HttpError).status);
+  expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(1);
+});

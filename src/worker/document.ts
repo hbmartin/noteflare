@@ -666,7 +666,6 @@ export class Document extends YServer {
   private pendingNotifyEdit = false;
   private commentAnchorQueue: Promise<void> = Promise.resolve();
   private commentAnchorSweep: Promise<boolean> | null = null;
-  private commentAnchorSweepInvalidated = false;
   private purged = false;
   private transition: "archive" | "restore" | null = null;
   private transitionAlarmDeferred = false;
@@ -1457,7 +1456,6 @@ export class Document extends YServer {
       } catch {
         return Response.json({ error: "Invalid preparation." }, { status: 400 });
       }
-      if (body.operation === "reconcile" && this.commentAnchorSweep) this.commentAnchorSweepInvalidated = true;
       return this.queueCommentAnchors(async () => {
         if (body.operation === "reconcile") {
           const complete = await this.reconcileCommentAnchors(body.userId, body.operationId, body.token);
@@ -1478,10 +1476,10 @@ export class Document extends YServer {
             .bind(token, now + 30_000, body.userId, body.operationId, this.ids.pageId, this.ids.epoch, now, now)
             .first<{ thread_id: string }>();
         const afterClaim = this.commentAnchorUnavailable();
-        if (afterClaim) {
-          if (claim) await this.releaseCommentAnchorLease(body.userId, body.operationId, token);
-          return this.commentAnchorUnavailable() ?? afterClaim;
-        }
+        if (afterClaim)
+          return claim
+            ? this.releaseUnavailableCommentAnchor(body.userId, body.operationId, token, afterClaim)
+            : afterClaim;
         if (!claim) {
           const current = await this.bindings.DB.prepare(
             "SELECT state,expires_at,page_id,content_epoch FROM anchored_comment_submissions WHERE user_id=? AND operation_id=?",
@@ -1518,13 +1516,9 @@ export class Document extends YServer {
           claim.thread_id,
           token,
         );
-        if (this.commentAnchorSweep) this.commentAnchorSweepInvalidated = true;
         await this.scheduleAlarm(now + 30_000);
         const beforeMark = this.commentAnchorUnavailable();
-        if (beforeMark) {
-          await this.releaseCommentAnchorLease(body.userId, body.operationId, token);
-          return this.commentAnchorUnavailable() ?? beforeMark;
-        }
+        if (beforeMark) return this.releaseUnavailableCommentAnchor(body.userId, body.operationId, token, beforeMark);
         const anchored =
           body.selection?.head && body.selection.anchor
             ? await addCommentMark(
@@ -1539,10 +1533,7 @@ export class Document extends YServer {
               )
             : false;
         const afterMark = this.commentAnchorUnavailable();
-        if (afterMark) {
-          await this.releaseCommentAnchorLease(body.userId, body.operationId, token);
-          return this.commentAnchorUnavailable() ?? afterMark;
-        }
+        if (afterMark) return this.releaseUnavailableCommentAnchor(body.userId, body.operationId, token, afterMark);
         this.flushPendingUpdates();
         if (!anchored) await this.reconcileCommentAnchors(body.userId, body.operationId, token);
         return Response.json({ anchored, token, selection: body.selection });
@@ -3636,6 +3627,16 @@ export class Document extends YServer {
     // Journals survive lease release until provisional marks have been durably reconciled.
   }
 
+  private async releaseUnavailableCommentAnchor(
+    userId: string,
+    operationId: string,
+    token: string,
+    unavailable: Response,
+  ) {
+    await this.releaseCommentAnchorLease(userId, operationId, token);
+    return this.commentAnchorUnavailable() ?? unavailable;
+  }
+
   private queueCommentAnchors<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.commentAnchorQueue.then(operation);
     this.commentAnchorQueue = result.then(
@@ -3666,16 +3667,7 @@ export class Document extends YServer {
 
   private sweepCommentAnchors(): Promise<boolean> {
     if (this.commentAnchorSweep) return this.commentAnchorSweep;
-    const work = this.queueCommentAnchors(async () => {
-      this.commentAnchorSweepInvalidated = false;
-      let complete = await this.reconcileCommentAnchors();
-      if (this.commentAnchorSweepInvalidated && !this.purged && !this.metadata.retired) {
-        this.commentAnchorSweepInvalidated = false;
-        complete = await this.reconcileCommentAnchors();
-      }
-      if (this.commentAnchorSweepInvalidated) await this.scheduleCommentAnchorRetry(Date.now() + ALARM_RETRY_DELAY_MS);
-      return complete;
-    });
+    const work = this.queueCommentAnchors(() => this.reconcileCommentAnchors());
     this.commentAnchorSweep = work;
     void work
       .finally(() => {
@@ -3726,16 +3718,17 @@ export class Document extends YServer {
       this.state.storage.sql.exec("DELETE FROM provisional_comment_anchors");
       return true;
     }
-    if (this.commentAnchorCleanupBlocked()) {
-      await this.scheduleCommentAnchorRetry(Date.now() + ALARM_RETRY_DELAY_MS);
-      return false;
-    }
     const entries = this.state.storage.sql
       .exec<{ user_id: string; operation_id: string; thread_id: string; token: string }>(
         `SELECT * FROM provisional_comment_anchors ${userId ? "WHERE user_id=? AND operation_id=?" : ""} LIMIT 100`,
         ...(userId ? [userId, operationId!] : []),
       )
       .toArray();
+    if (!entries.length) return true;
+    if (this.commentAnchorCleanupBlocked()) {
+      await this.scheduleCommentAnchorRetry(Date.now() + ALARM_RETRY_DELAY_MS);
+      return false;
+    }
     let complete = true;
     for (const entry of entries) {
       try {
@@ -3760,11 +3753,7 @@ export class Document extends YServer {
           continue;
         }
         if (row?.state === "prepared") {
-          await this.bindings.DB.prepare(
-            "UPDATE anchored_comment_submissions SET anchor_token=NULL,anchor_expires_at=NULL WHERE user_id=? AND operation_id=? AND state='prepared' AND anchor_token=?",
-          )
-            .bind(entry.user_id, entry.operation_id, entry.token)
-            .run();
+          await this.releaseCommentAnchorLease(entry.user_id, entry.operation_id, entry.token);
           if (this.commentAnchorCleanupBlocked()) {
             if (this.purged || this.metadata.retired) return this.reconcileCommentAnchors(userId, operationId, token);
             await this.scheduleCommentAnchorRetry(Date.now() + ALARM_RETRY_DELAY_MS);
