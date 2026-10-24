@@ -1,4 +1,4 @@
-import { purgeCommentPublications } from "./comment-publication";
+import { purgeCommentPublications, setCommentPublicationStorageErrorHandler } from "./comment-publication";
 import type { CommentBody } from "@blocknote/core/comments";
 export type CommentDraftScope = { account: string; pageId: string; epoch: number };
 export type CommentDraftAnchor = { head: unknown; anchor: unknown };
@@ -168,3 +168,5 @@ export function warnCommentDraftPersistence(scope: CommentDraftScope) {
     notify(key(scope, "new"));
   }
 }
+
+setCommentPublicationStorageErrorHandler(warnCommentDraftPersistence);

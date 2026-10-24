@@ -281,7 +281,7 @@ export class ServerThreadStore extends ThreadStore {
       // A stale Worker may have committed. Settle that identity before reporting a reload.
       const current = await status();
       if (current.submission.state === "published") return current;
-      throw new Error(COMMENT_RELOAD_MESSAGE);
+      throw new ApiClientError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
     };
     let canceling: Promise<CommentSubmissionStatus> | undefined;
     const cancel = () => {
@@ -325,7 +325,7 @@ export class ServerThreadStore extends ThreadStore {
       publish: async (editor: BlockNoteEditor<any, any, any>, selection: { head: number; anchor: number }) => {
         assertAccount();
         if (!this.ready()) throw new Error("Connect and sync the document before posting. Your draft is preserved.");
-        if (!protocolConfirmed) throw new Error(COMMENT_RELOAD_MESSAGE);
+        if (!protocolConfirmed) throw new ApiClientError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
         const binding = ySyncPluginKey.getState(editor.prosemirrorState)?.binding;
         if (!binding) throw new Error("The original comment selection is unavailable.");
         const yjs = {

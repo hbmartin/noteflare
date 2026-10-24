@@ -1,7 +1,11 @@
-import { warnCommentDraftPersistence, type CommentDraftScope } from "./comment-drafts";
+import type { CommentDraftScope } from "./comment-drafts";
 import type { CommentSubmissionStatus } from "../shared/comment-submissions";
 import { realtimeAccessAccount, subscribeRealtimeAccess } from "./realtime-access-status";
 const noop = () => {};
+let reportStorageError: (scope: CommentDraftScope) => void = noop;
+export function setCommentPublicationStorageErrorHandler(handler: typeof reportStorageError) {
+  reportStorageError = handler;
+}
 const prefix = "notes:comment-publication:";
 const pending = new Map<string, Set<string>>();
 const active = new Map<string, Map<string, { cancel: () => Promise<CommentSubmissionStatus>; detach: () => void }>>();
@@ -55,7 +59,7 @@ export function initializeCommentPublications(scope: CommentDraftScope) {
     storedIds(key(scope));
     return true;
   } catch {
-    warnCommentDraftPersistence(scope);
+    reportStorageError(scope);
     return false;
   }
 }
@@ -225,6 +229,6 @@ if (typeof window !== "undefined")
       if (!event.key.startsWith(v3)) localStorage.removeItem(event.key);
     } catch {
       if (typeof parts[1] === "string" && typeof parts[2] === "number")
-        warnCommentDraftPersistence({ account: parts[0] as string, pageId: parts[1], epoch: parts[2] });
+        reportStorageError({ account: parts[0] as string, pageId: parts[1], epoch: parts[2] });
     }
   });
