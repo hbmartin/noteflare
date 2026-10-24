@@ -458,7 +458,8 @@ test("creates, renames, archives, and restores a page through the UI @mobile-sid
   await trashEntry.getByRole("button", { name: "Restore" }).click();
   expect((await restored).ok()).toBe(true);
   await expect(trashEntry).toHaveCount(0, { timeout: 10_000 });
-  await expect(treeLink(page, title)).toBeAttached();
+  await openSidebar(page);
+  await expect(treeLink(page, title)).toBeVisible();
   await expect(page.locator("main.utility-view > .trash-list > div > strong")).toHaveText(
     initialTrash.pages.map((entry) => entry.title),
   );

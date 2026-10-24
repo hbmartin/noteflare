@@ -1478,8 +1478,39 @@ export class Document extends YServer {
             .bind(token, now + 30_000, body.userId, body.operationId, this.ids.pageId, this.ids.epoch, now, now)
             .first<{ thread_id: string }>();
         const afterClaim = this.commentAnchorUnavailable();
-        if (afterClaim) return afterClaim;
-        if (!claim) return Response.json({ error: "Comment publication is pending or unavailable." }, { status: 409 });
+        if (afterClaim) {
+          if (claim) await this.releaseCommentAnchorLease(body.userId, body.operationId, token);
+          return this.commentAnchorUnavailable() ?? afterClaim;
+        }
+        if (!claim) {
+          const current = await this.bindings.DB.prepare(
+            "SELECT state,expires_at,page_id,content_epoch FROM anchored_comment_submissions WHERE user_id=? AND operation_id=?",
+          )
+            .bind(body.userId, body.operationId)
+            .first<{ state: string; expires_at: number; page_id: string; content_epoch: number }>();
+          const afterLookup = this.commentAnchorUnavailable();
+          if (afterLookup) return afterLookup;
+          if (
+            current?.state === "prepared" &&
+            current.expires_at > Date.now() &&
+            current.page_id === this.ids.pageId &&
+            current.content_epoch === this.ids.epoch
+          )
+            return Response.json(
+              {
+                error: "Another anchor attempt is still pending. Retry shortly.",
+                code: "comment_anchor_lease_pending",
+              },
+              { status: 503 },
+            );
+          const code =
+            current?.state === "canceled"
+              ? "comment_submission_canceled"
+              : current && current.expires_at <= Date.now()
+                ? "comment_submission_expired"
+                : "comment_version_unavailable";
+          return Response.json({ error: "This preparation cannot accept an anchor.", code }, { status: 409 });
+        }
         this.state.storage.sql.exec(
           "INSERT OR REPLACE INTO provisional_comment_anchors VALUES(?,?,?,?)",
           body.userId,
@@ -1490,7 +1521,10 @@ export class Document extends YServer {
         if (this.commentAnchorSweep) this.commentAnchorSweepInvalidated = true;
         await this.scheduleAlarm(now + 30_000);
         const beforeMark = this.commentAnchorUnavailable();
-        if (beforeMark) return beforeMark;
+        if (beforeMark) {
+          await this.releaseCommentAnchorLease(body.userId, body.operationId, token);
+          return this.commentAnchorUnavailable() ?? beforeMark;
+        }
         const anchored =
           body.selection?.head && body.selection.anchor
             ? await addCommentMark(
@@ -1505,7 +1539,10 @@ export class Document extends YServer {
               )
             : false;
         const afterMark = this.commentAnchorUnavailable();
-        if (afterMark) return afterMark;
+        if (afterMark) {
+          await this.releaseCommentAnchorLease(body.userId, body.operationId, token);
+          return this.commentAnchorUnavailable() ?? afterMark;
+        }
         this.flushPendingUpdates();
         if (!anchored) await this.reconcileCommentAnchors(body.userId, body.operationId, token);
         return Response.json({ anchored, token, selection: body.selection });
@@ -3588,6 +3625,15 @@ export class Document extends YServer {
       !this.transition &&
       !this.metadata.read_only
     );
+  }
+
+  private async releaseCommentAnchorLease(userId: string, operationId: string, token: string) {
+    await this.bindings.DB.prepare(
+      "UPDATE anchored_comment_submissions SET anchor_token=NULL,anchor_expires_at=NULL WHERE user_id=? AND operation_id=? AND page_id=? AND content_epoch=? AND state='prepared' AND anchor_token=?",
+    )
+      .bind(userId, operationId, this.ids.pageId, this.ids.epoch, token)
+      .run();
+    // Journals survive lease release until provisional marks have been durably reconciled.
   }
 
   private queueCommentAnchors<T>(operation: () => Promise<T>): Promise<T> {

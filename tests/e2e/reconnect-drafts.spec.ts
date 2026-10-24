@@ -1,11 +1,60 @@
 import { test, expect, type Page } from "@playwright/test";
-import { signInOwner, createTestSpace } from "./security-helpers";
+import { signInOwner, createTestSpace, editableDocument } from "./security-helpers";
 test.setTimeout(60_000);
 test.use({ serviceWorkers: "block" });
 async function create(page: Page, kind: string, title: string) {
   const response = await page.request.post("/api/pages", { data: { kind, title: `${title} ${Date.now()}` } });
   expect(response.ok()).toBeTruthy();
   return (await response.json()).page;
+}
+async function taskFixture(page: Page, name: string, target: string) {
+  const space = await createTestSpace(page, name);
+  const created = await page.request.post("/api/pages", {
+    data: { kind: "table", taskList: true, spaceId: space.id, title: `${name} ${Date.now()}` },
+  });
+  expect(created.ok()).toBeTruthy();
+  const table = (await created.json()).page;
+  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
+  const query = async () => await (await page.request.get(`/api/tables/${table.id}/query`)).json();
+  const rows: string[] = [];
+  for (const title of [target, "Other task"]) {
+    const response = await page.request.post(`/api/task-lists/${table.id}/tasks`, {
+      data: { title, operationId: crypto.randomUUID(), expectedRevision: (await query()).revision },
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
+    rows.push((await response.json()).rowId);
+  }
+  return { table, rows, query };
+}
+async function textTableFixture(page: Page, title: string, columnName: string) {
+  const table = await create(page, "table", title);
+  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
+  const columnId = crypto.randomUUID(),
+    rowId = crypto.randomUUID();
+  for (const [kind, payload] of [
+    ["create_column", { id: columnId, name: columnName, type: "text" }],
+    ["create_row", { id: rowId, values: { [columnId]: "Original" } }],
+  ] as const) {
+    const response = await page.request.post(`/api/tables/${table.id}/commands`, {
+      data: { kind, payload, operationId: crypto.randomUUID() },
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
+  }
+  return { table, columnId, rowId };
+}
+async function anchoredComposer(page: Page, title: string, selectedText: string) {
+  const document = await create(page, "document", title);
+  await page.goto(`/?page=${document.id}`);
+  const editor = await editableDocument(page, document.id);
+  await editor.click();
+  await page.keyboard.insertText(selectedText);
+  await page.keyboard.down("Shift");
+  for (let index = 0; index < selectedText.length; index++) await page.keyboard.press("ArrowLeft");
+  await page.keyboard.up("Shift");
+  await page.getByRole("button", { name: /add comment/i }).click();
+  const composer = page.locator(".bn-thread .bn-editor");
+  await expect(composer).toHaveCount(1);
+  return { document, composer };
 }
 test("diagram access refresh reconnects an authorized viewer without removing the page", async ({ page }) => {
   await signInOwner(page);
@@ -63,21 +112,7 @@ test("canonical cell drafts survive offline blur and resume normal saving after 
 });
 test("table renewal preserves focused text and caret without submitting a partial value", async ({ page }) => {
   await signInOwner(page);
-  const table = await create(page, "table", "Renewal table");
-  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
-  const columnId = crypto.randomUUID(),
-    rowId = crypto.randomUUID();
-  for (const [kind, payload] of [
-    ["create_column", { id: columnId, name: "Renewal title", type: "text" }],
-    ["create_row", { id: rowId, values: { [columnId]: "Original" } }],
-  ] as const)
-    expect(
-      (
-        await page.request.post(`/api/tables/${table.id}/commands`, {
-          data: { kind, payload, operationId: crypto.randomUUID() },
-        })
-      ).ok(),
-    ).toBeTruthy();
+  const { table, columnId, rowId } = await textTableFixture(page, "Renewal table", "Renewal title");
   let retired = 0;
   page.on("websocket", (socket) => {
     if (socket.url().includes(`/api/tables/${table.id}/socket`)) socket.on("close", () => retired++);
@@ -111,22 +146,7 @@ test("table renewal preserves focused text and caret without submitting a partia
 });
 test("task draft retries an unrelated revision conflict without retyping", async ({ page }) => {
   await signInOwner(page);
-  const space = await createTestSpace(page, "Task conflict recovery");
-  const created = await page.request.post("/api/pages", {
-    data: { kind: "table", taskList: true, spaceId: space.id, title: `Task conflicts ${Date.now()}` },
-  });
-  expect(created.ok()).toBeTruthy();
-  const table = (await created.json()).page;
-  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
-  const query = async () => await (await page.request.get(`/api/tables/${table.id}/query`)).json();
-  const rows: string[] = [];
-  for (const title of ["Original target", "Other task"]) {
-    const response = await page.request.post(`/api/task-lists/${table.id}/tasks`, {
-      data: { title, operationId: crypto.randomUUID(), expectedRevision: (await query()).revision },
-    });
-    expect(response.ok(), await response.text()).toBeTruthy();
-    rows.push((await response.json()).rowId);
-  }
+  const { table, rows, query } = await taskFixture(page, "Task conflict recovery", "Original target");
   const attempts: Array<{ operationId: string; expectedRevision: number }> = [];
   await page.route(`**/api/task-lists/${table.id}/tasks/${rows[0]}`, async (route) => {
     attempts.push(route.request().postDataJSON());
@@ -166,21 +186,7 @@ test("cell text survives reload and appears in Personal Settings before sign-out
   context,
 }) => {
   await signInOwner(page);
-  const table = await create(page, "table", "Durable draft table");
-  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
-  const columnId = crypto.randomUUID(),
-    rowId = crypto.randomUUID();
-  for (const [kind, payload] of [
-    ["create_column", { id: columnId, name: "Durable title", type: "text" }],
-    ["create_row", { id: rowId, values: { [columnId]: "Original" } }],
-  ] as const)
-    expect(
-      (
-        await page.request.post(`/api/tables/${table.id}/commands`, {
-          data: { kind, payload, operationId: crypto.randomUUID() },
-        })
-      ).ok(),
-    ).toBeTruthy();
+  const { table, columnId, rowId } = await textTableFixture(page, "Durable draft table", "Durable title");
   await page.goto(`/?page=${table.id}`);
   const cell = page.getByLabel("Durable title", { exact: true });
   await expect(cell).toBeEnabled();
@@ -204,18 +210,7 @@ test("cell text survives reload and appears in Personal Settings before sign-out
 });
 test("comment dismissal confirms discard and reload recovers the original selection", async ({ page }) => {
   await signInOwner(page);
-  const document = await create(page, "document", "Comment draft recovery");
-  await page.goto(`/?page=${document.id}`);
-  const editor = page.locator(".notes-editor .bn-editor");
-  await expect(editor).toHaveAttribute("contenteditable", "true");
-  await editor.click();
-  await page.keyboard.insertText("Original comment selection");
-  await page.keyboard.down("Shift");
-  for (let index = 0; index < "Original comment selection".length; index++) await page.keyboard.press("ArrowLeft");
-  await page.keyboard.up("Shift");
-  await page.getByRole("button", { name: /add comment/i }).click();
-  const composer = page.locator(".bn-thread .bn-editor");
-  await expect(composer).toHaveCount(1);
+  const { composer } = await anchoredComposer(page, "Comment draft recovery", "Original comment selection");
   await composer.fill("Keep this anchored draft");
   page.once("dialog", async (dialog) => {
     await dialog.dismiss();
@@ -240,17 +235,7 @@ test("comment dismissal confirms discard and reload recovers the original select
 
 test("floating and sidebar replies share one draft and submit it once", async ({ page }) => {
   await signInOwner(page);
-  const document = await create(page, "document", "Shared reply draft");
-  await page.goto(`/?page=${document.id}`);
-  const editor = page.locator(".notes-editor .bn-editor");
-  await expect(editor).toHaveAttribute("contenteditable", "true");
-  await editor.click();
-  await page.keyboard.insertText("Shared reply anchor");
-  await page.keyboard.down("Shift");
-  for (let index = 0; index < "Shared reply anchor".length; index++) await page.keyboard.press("ArrowLeft");
-  await page.keyboard.up("Shift");
-  await page.getByRole("button", { name: /add comment/i }).click();
-  const composer = page.locator(".bn-thread .bn-editor");
+  const { document, composer } = await anchoredComposer(page, "Shared reply draft", "Shared reply anchor");
   await composer.fill("Root discussion");
   await composer.press("Enter");
   await expect(composer).toHaveCount(0);
@@ -328,6 +313,8 @@ test("legacy comment drafts remain recoverable without attaching to a new select
   });
   await page.getByRole("button", { name: "Discard saved draft" }).click();
   await expect(page.locator(".bn-thread .bn-editor")).toHaveCount(1);
+  await expect(page.locator(".bn-thread .bn-editor")).toBeEmpty();
+  expect((await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads).toHaveLength(0);
 });
 
 test("diagram access refresh resumes after one recoverable security check", async ({ page }) => {
@@ -512,22 +499,7 @@ test("top-level task Retry preserves identity through an unrelated conflict and 
   page,
 }) => {
   await signInOwner(page);
-  const space = await createTestSpace(page, "Task toolbar retry");
-  const created = await page.request.post("/api/pages", {
-    data: { kind: "table", taskList: true, spaceId: space.id, title: `Toolbar retry ${Date.now()}` },
-  });
-  expect(created.ok()).toBeTruthy();
-  const table = (await created.json()).page;
-  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
-  const query = async () => await (await page.request.get(`/api/tables/${table.id}/query`)).json();
-  const rows: string[] = [];
-  for (const title of ["Retry target", "Other task"]) {
-    const response = await page.request.post(`/api/task-lists/${table.id}/tasks`, {
-      data: { title, operationId: crypto.randomUUID(), expectedRevision: (await query()).revision },
-    });
-    expect(response.ok()).toBeTruthy();
-    rows.push((await response.json()).rowId);
-  }
+  const { table, rows, query } = await taskFixture(page, "Task toolbar retry", "Retry target");
   const attempts: { operationId: string; expectedRevision: number }[] = [];
   await page.route(`**/api/task-lists/${table.id}/tasks/${rows[0]}`, async (route) => {
     attempts.push(route.request().postDataJSON());
@@ -576,21 +548,7 @@ test("top-level task Retry preserves identity through an unrelated conflict and 
 });
 test("two tabs share the latest cell draft and stale Retry cannot submit or clear it", async ({ page, context }) => {
   await signInOwner(page);
-  const table = await create(page, "table", "Cross-tab drafts");
-  expect((await page.request.post(`/api/tables/${table.id}/authority`)).ok()).toBeTruthy();
-  const columnId = crypto.randomUUID(),
-    rowId = crypto.randomUUID();
-  for (const [kind, payload] of [
-    ["create_column", { id: columnId, name: "Shared draft", type: "text" }],
-    ["create_row", { id: rowId, values: { [columnId]: "Original" } }],
-  ] as const)
-    expect(
-      (
-        await page.request.post(`/api/tables/${table.id}/commands`, {
-          data: { kind, payload, operationId: crypto.randomUUID() },
-        })
-      ).ok(),
-    ).toBeTruthy();
+  const { table } = await textTableFixture(page, "Cross-tab drafts", "Shared draft");
   let attempts = 0;
   await context.route(`**/api/tables/${table.id}/commands`, async (route) => {
     attempts++;
@@ -622,4 +580,51 @@ test("two tabs share the latest cell draft and stale Retry cannot submit or clea
   } finally {
     await second.close();
   }
+});
+
+test("protocol mismatch preserves the anchored draft until a deliberate reload posts it once", async ({ page }) => {
+  await signInOwner(page);
+  const { document, composer } = await anchoredComposer(page, "Protocol cutover", "Preserved protocol anchor");
+  const root = `/api/pages/${document.id}/comment-submissions`;
+  let operationId = "",
+    publications = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().endsWith("/publish")) publications++;
+  });
+  await page.route(`**${root}`, async (route) => {
+    operationId = route.request().headers()["x-notes-operation-id"]!;
+    const headers = { ...route.request().headers() };
+    delete headers["x-notes-comment-protocol"];
+    await route.continue({ headers });
+  });
+  await composer.fill("Keep protocol recovery text");
+  await composer.press("Enter");
+  await expect(
+    page.getByText("Reload NoteFlare to continue posting comments. Your draft is preserved.", { exact: true }),
+  ).toBeVisible();
+  await expect(composer).toContainText("Keep protocol recovery text");
+  expect(publications).toBe(0);
+  expect((await page.request.get(`${root}/${operationId}`)).status()).toBe(404);
+  await page.unroute(`**${root}`);
+  // Keep navigation cancellation uncertain in every engine; terminal cancellation
+  // and its deliberate new-identity retry are covered separately.
+  await page.route(`**${root}/*/cancel`, (route) => route.abort("failed"));
+  await page.reload();
+  await editableDocument(page, document.id);
+  await page.getByRole("button", { name: "Resume saved comment" }).click();
+  await expect(composer).toContainText("Keep protocol recovery text");
+  await expect(composer).toHaveAttribute("contenteditable", "true");
+  await composer.click();
+  await expect(composer).toBeFocused();
+  await composer.press("Enter");
+  await expect(composer).toHaveCount(0);
+  const status = await (await page.request.get(`${root}/${operationId}`)).json();
+  expect(status.submission.state).toBe("published");
+  expect((await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads).toHaveLength(1);
+  expect(publications).toBe(1);
+  expect(
+    await page.evaluate(
+      () => Object.keys(localStorage).filter((key) => key.startsWith("notes:comment-publication:")).length,
+    ),
+  ).toBe(0);
 });

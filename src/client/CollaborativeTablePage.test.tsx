@@ -233,14 +233,37 @@ function show(initialViewId = "", context = member, onSelectPage = vi.fn(), task
     />,
   );
 }
+function remoteTitleChange() {
+  data = {
+    ...data,
+    revision: 2,
+    rows: [
+      {
+        ...data.rows[0]!,
+        cells: { ...data.rows[0]!.cells, Title: "Remote value" },
+        cellRevisions: { ...data.rows[0]!.cellRevisions, Title: 2 },
+      },
+    ],
+  };
+  return act(async () => {
+    window.dispatchEvent(new Event("notes:workspace-event"));
+  });
+}
+function taskDrafts() {
+  return new CellDraftMap({ account: "owner\0workspace", host: "table", tableId: "table", generation: 1 });
+}
+function taskColumnFixture() {
+  const titleId = taskColumns("table").title;
+  data.columns = [{ ...column(titleId, "text"), name: "Task" }];
+  data.rows[0]!.cells = { [titleId]: "Original" };
+  data.rows[0]!.cellRevisions = { [titleId]: 1 };
+  return titleId;
+}
 describe("collaborative table UI", () => {
   it.each(["ordinary", "failed-refresh", "same-cell", "ambiguous", "newer-edit"] as const)(
     "recovers task submission identity after %s",
     async (mode) => {
-      const titleId = taskColumns("table").title;
-      data.columns = [{ ...column(titleId, "text"), name: "Task" }];
-      data.rows[0]!.cells = { [titleId]: "Original" };
-      data.rows[0]!.cellRevisions = { [titleId]: 1 };
+      const titleId = taskColumnFixture();
       const read = vi.mocked(api).getMockImplementation()!;
       const submissions: { operationId: string; expectedRevision: number; title: string }[] = [];
       let readsFail = false,
@@ -277,12 +300,7 @@ describe("collaborative table UI", () => {
       fireEvent.blur(input);
       await waitFor(() => expect(submissions).toHaveLength(1));
       if (mode === "newer-edit") {
-        const drafts = new CellDraftMap({
-          account: "owner\0workspace",
-          host: "table",
-          tableId: "table",
-          generation: 1,
-        });
+        const drafts = taskDrafts();
         const key = cellDraftKey("row", titleId);
         act(() => {
           drafts.set(key, { ...drafts.get(key)!, text: "Newer edit" });
@@ -475,20 +493,7 @@ describe("collaborative table UI", () => {
     show();
     const title = await screen.findByLabelText("Title");
     fireEvent.focus(title);
-    data = {
-      ...data,
-      revision: 2,
-      rows: [
-        {
-          ...data.rows[0]!,
-          cells: { ...data.rows[0]!.cells, Title: "Remote value" },
-          cellRevisions: { ...data.rows[0]!.cellRevisions, Title: 2 },
-        },
-      ],
-    };
-    await act(async () => {
-      window.dispatchEvent(new Event("notes:workspace-event"));
-    });
+    await remoteTitleChange();
     fireEvent.blur(title);
     expect(writes).toHaveLength(0);
     expect(title).toHaveValue("Remote value");
@@ -498,20 +503,7 @@ describe("collaborative table UI", () => {
     const title = await screen.findByLabelText("Title");
     fireEvent.focus(title);
     fireEvent.change(title, { target: { value: "My draft" } });
-    data = {
-      ...data,
-      revision: 2,
-      rows: [
-        {
-          ...data.rows[0]!,
-          cells: { ...data.rows[0]!.cells, Title: "Remote value" },
-          cellRevisions: { ...data.rows[0]!.cellRevisions, Title: 2 },
-        },
-      ],
-    };
-    await act(async () => {
-      window.dispatchEvent(new Event("notes:workspace-event"));
-    });
+    await remoteTitleChange();
     fireEvent.blur(title);
     expect(writes).toHaveLength(0);
     expect(title).toHaveValue("My draft");
@@ -1046,6 +1038,10 @@ describe("collaborative table UI", () => {
     show();
     fireEvent.change(await screen.findByLabelText("New row title"), { target: { value: "Once" } });
     fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+    await screen.findByRole("button", { name: "Retry saved operation" });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh" })));
+    expect(screen.getByRole("alert")).toHaveTextContent("The table update could not be confirmed.");
+    expect(writes).toHaveLength(1);
     fireEvent.click(await screen.findByRole("button", { name: "Retry saved operation" }));
     await waitFor(() => expect(writes).toHaveLength(2));
     expect(writes[1]).toEqual(writes[0]);
@@ -1107,10 +1103,7 @@ it("drops focus-only snapshots when a filtered cell unmounts", async () => {
 it.each(["saved", "conflict", "failed-refresh", "newer-edit"] as const)(
   "keeps task draft ownership through top-level Retry: %s",
   async (mode) => {
-    const titleId = taskColumns("table").title;
-    data.columns = [{ ...column(titleId, "text"), name: "Task" }];
-    data.rows[0]!.cells = { [titleId]: "Original" };
-    data.rows[0]!.cellRevisions = { [titleId]: 1 };
+    const titleId = taskColumnFixture();
     const read = vi.mocked(api).getMockImplementation()!;
     const submissions: { operationId: string; expectedRevision: number; title: string }[] = [];
     let readsFail = false;
@@ -1125,12 +1118,7 @@ it.each(["saved", "conflict", "failed-refresh", "newer-edit"] as const)(
           throw new ApiClientError(409, "table_revision_conflict", "Changed");
         }
         if (submissions.length === 2 && mode === "newer-edit") {
-          const drafts = new CellDraftMap({
-            account: "owner\0workspace",
-            host: "table",
-            tableId: "table",
-            generation: 1,
-          });
+          const drafts = taskDrafts();
           drafts.set(cellDraftKey("row", titleId), {
             ...drafts.get(cellDraftKey("row", titleId))!,
             text: "Newer text",

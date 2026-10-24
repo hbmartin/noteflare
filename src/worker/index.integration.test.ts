@@ -9630,10 +9630,40 @@ it.each(["comment_expiry", "security_pruning", "realtime_revocations"] as const)
     await env.DB.prepare("UPDATE realtime_revocations SET revision=revision+1 WHERE workspace_id=?")
       .bind(installed.workspaceId)
       .run();
+    let release!: () => void, entered!: () => void, failed!: () => void;
+    const held = new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+      started = new Promise<void>((resolve) => {
+        entered = resolve;
+      }),
+      rejected = new Promise<void>((resolve) => {
+        failed = resolve;
+      });
     const attempted = new Set<string>();
+    const defer = (statement: D1PreparedStatement): D1PreparedStatement =>
+      new Proxy(statement, {
+        get(target, property) {
+          if (property === "bind") return (...values: unknown[]) => defer(target.bind(...values));
+          if (property === "run")
+            return async () => {
+              entered();
+              await held;
+              return target.run();
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
     let completion: boolean | undefined;
     const database = new Proxy(env.DB, {
       get(target, property) {
+        if (property === "batch" && failure !== "security_pruning")
+          return async (statements: D1PreparedStatement[]) => {
+            entered();
+            await held;
+            return target.batch(statements);
+          };
         if (property === "prepare")
           return (sql: string) => {
             const operation = sql.includes("UPDATE anchored_comment_submissions SET state='expired'")
@@ -9645,9 +9675,13 @@ it.each(["comment_expiry", "security_pruning", "realtime_revocations"] as const)
                   : null;
             if (operation) {
               attempted.add(operation);
-              if (operation === failure) throw new Error(`Injected ${operation}`);
+              if (operation === failure) {
+                failed();
+                throw new Error(`Injected ${operation}`);
+              }
             }
-            return target.prepare(sql);
+            const statement = target.prepare(sql);
+            return operation === "comment_expiry" && failure === "security_pruning" ? defer(statement) : statement;
           };
         const value = Reflect.get(target, property, target);
         return typeof value === "function" ? value.bind(target) : value;
@@ -9659,8 +9693,23 @@ it.each(["comment_expiry", "security_pruning", "realtime_revocations"] as const)
       WORKSPACE_EVENTS: { getByName: () => ({ fetch: async () => Response.json({ complete: true }) }) },
     } as unknown as Env;
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    let settled = false;
+    const maintenance = runSecurityMaintenance(bindings);
+    const observed = maintenance.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
     try {
-      await expect(runSecurityMaintenance(bindings)).rejects.toThrow(failure);
+      await Promise.all([started, rejected]);
+      // Let an incorrect fail-fast aggregate finish while the deferred operation is still held.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(settled).toBe(false);
+      release();
+      await expect(maintenance).rejects.toThrow(failure);
       expect([...attempted].sort()).toEqual(["comment_expiry", "realtime_revocations", "security_pruning"]);
       if (failure !== "realtime_revocations") {
         const status = await env.DB.prepare(
@@ -9672,6 +9721,8 @@ it.each(["comment_expiry", "security_pruning", "realtime_revocations"] as const)
       }
       expect(completion).toBe(failure === "realtime_revocations" ? undefined : true);
     } finally {
+      release();
+      await observed;
       log.mockRestore();
     }
   },

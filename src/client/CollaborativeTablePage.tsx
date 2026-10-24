@@ -618,9 +618,9 @@ export function CollaborativeTablePage({
         </button>
       </div>
       {recovery}
-      {error && (
+      {(error || retry) && (
         <div role="alert">
-          {error}
+          {error || "The table update could not be confirmed. Review your pending edit or retry the saved operation."}
           {retry && (
             <button disabled={busy} onClick={() => void retry()}>
               Retry saved operation

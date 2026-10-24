@@ -16,6 +16,9 @@ export type StoredCellDraft = CellDraft & { scope: CellDraftScope; version: stri
 export const cellDraftKey = (row: string, column: string) => JSON.stringify([row, column]);
 const prefix = "notes:cell-draft:v1:";
 const records = new Map<string, StoredCellDraft | null>();
+// The last confirmed storage value may precede a failed in-memory edit.
+const persistedSnapshots = new Map<string, string | null>();
+const cleanupTargets = new Map<string, { account: string; raw: string }>();
 const clearedVersions = new Map<string, Set<string>>();
 const initialized = new Set<string>();
 const listeners = new Map<string, Set<() => void>>();
@@ -55,10 +58,16 @@ function valid(value: unknown): value is StoredCellDraft {
     Number.isSafeInteger(draft.scope.generation),
   );
 }
-function parse(name: string, raw: string | null) {
-  const draft: unknown = JSON.parse(raw ?? "null");
-  if (!valid(draft) || name !== nameOf(draft.scope, cellDraftKey(draft.rowId, draft.columnId))) return null;
-  return clearedVersions.get(name)?.has(draft.version) ? null : { ...draft, durable: true };
+function parse(name: string, raw: string | null, includeCleared = false) {
+  try {
+    const draft: unknown = JSON.parse(raw ?? "null");
+    if (!valid(draft) || name !== nameOf(draft.scope, cellDraftKey(draft.rowId, draft.columnId))) return null;
+    return !includeCleared && (clearedVersions.get(name)?.has(draft.version) || cleanupTargets.get(name)?.raw === raw)
+      ? null
+      : { ...draft, durable: true };
+  } catch {
+    return null;
+  }
 }
 function loadCellDrafts(account: string) {
   if (initialized.has(account)) return;
@@ -68,8 +77,12 @@ function loadCellDrafts(account: string) {
       try {
         const name = localStorage.key(index);
         if (!name?.startsWith(prefix) || records.has(name)) continue;
-        const draft = parse(name, localStorage.getItem(name));
-        if (draft?.scope.account === account) records.set(name, draft);
+        const raw = localStorage.getItem(name),
+          draft = parse(name, raw);
+        if (draft?.scope.account === account) {
+          records.set(name, draft);
+          persistedSnapshots.set(name, raw);
+        }
       } catch {
         complete = false;
       }
@@ -151,12 +164,15 @@ export function useCellDraft(map: CellDraftMap, key: string) {
     () => map.get(key),
   );
 }
-function tombstone(name: string, version?: string) {
+function clearVersion(name: string, version?: string) {
   if (version) {
     const set = clearedVersions.get(name) ?? new Set<string>();
     set.add(version);
     clearedVersions.set(name, set);
   }
+}
+function tombstone(name: string, version?: string) {
+  clearVersion(name, version);
   records.set(name, null);
 }
 function sameDraft(left: StoredCellDraft | null | undefined, right: StoredCellDraft | null) {
@@ -179,7 +195,9 @@ function refresh(name: string, account: string) {
   try {
     const current = records.get(name);
     if (current && !current.durable) return;
-    const next = parse(name, localStorage.getItem(name));
+    const raw = localStorage.getItem(name),
+      next = parse(name, raw);
+    persistedSnapshots.set(name, raw);
     if (sameDraft(current, next)) return;
     if (!next && current) tombstone(name, current.version);
     else records.set(name, next);
@@ -192,14 +210,15 @@ export function discardCellDraft(draft: StoredCellDraft) {
   const name = nameOf(draft.scope, cellDraftKey(draft.rowId, draft.columnId));
   refresh(name, draft.scope.account);
   if (records.get(name)?.version !== draft.version) return;
+  const predecessor = persistedSnapshots.get(name);
   tombstone(name, draft.version);
+  if (predecessor !== undefined && predecessor !== null)
+    cleanupTargets.set(name, { account: draft.scope.account, raw: predecessor });
   notify(draft.scope.account, name);
   if (records.get(name) !== null) return;
   try {
     // A synchronous subscriber or another tab may already own a different version.
-    const persisted = parse(name, localStorage.getItem(name));
-    if (persisted) return;
-    localStorage.removeItem(name);
+    cleanupStoredDraft(name, draft.scope.account);
   } catch {
     const message = "Draft text was cleared from memory, but its stored copy could not be removed. Retry cleanup.";
     cleanupErrors.set(draft.scope.account, message);
@@ -208,14 +227,27 @@ export function discardCellDraft(draft: StoredCellDraft) {
   }
 }
 export const cellDraftCleanupError = (account: string) => cleanupErrors.get(account) ?? "";
+function cleanupStoredDraft(name: string, account: string) {
+  const raw = localStorage.getItem(name),
+    target = cleanupTargets.get(name);
+  if (raw !== null && raw === target?.raw) {
+    // Only the observed predecessor is cleared. A same-version metadata rewrite
+    // that arrived before this comparison belongs to the other tab.
+    clearVersion(name, parse(name, raw, true)?.version);
+    localStorage.removeItem(name);
+    persistedSnapshots.set(name, null);
+  } else {
+    const replacement = parse(name, raw);
+    persistedSnapshots.set(name, raw);
+    if (replacement) {
+      records.set(name, replacement);
+      notify(account, name);
+    }
+  }
+  cleanupTargets.delete(name);
+}
 export function retryCellDraftCleanup(account: string) {
-  for (const [name, record] of records)
-    if (
-      record === null &&
-      JSON.parse(name.slice(prefix.length))[0] === account &&
-      !parse(name, localStorage.getItem(name))
-    )
-      localStorage.removeItem(name);
+  for (const [name, target] of cleanupTargets) if (target.account === account) cleanupStoredDraft(name, account);
   cleanupErrors.delete(account);
   notify(account);
 }
@@ -252,7 +284,9 @@ export class CellDraftMap extends Map<string, CellDraft> {
     records.set(name, record);
     super.delete(key);
     try {
-      localStorage.setItem(name, JSON.stringify(record));
+      const raw = JSON.stringify(record);
+      localStorage.setItem(name, raw);
+      persistedSnapshots.set(name, raw);
       record.durable = true;
     } catch {
       /* Keep every character in memory. */
@@ -280,6 +314,7 @@ export class CellDraftMap extends Map<string, CellDraft> {
     };
     if (
       same &&
+      previous.durable &&
       previous.operationId === record.operationId &&
       previous.submissionRevision === record.submissionRevision
     )
@@ -357,6 +392,8 @@ export function purgeCellDrafts(account: string) {
     tombstone(name, ownVersion);
     try {
       localStorage.removeItem(name);
+      persistedSnapshots.delete(name);
+      cleanupTargets.delete(name);
     } catch (error) {
       errors.push(error);
     }
@@ -397,6 +434,7 @@ if (typeof window !== "undefined") {
         const next = parse(event.key, raw),
           previous = records.get(event.key);
         if (raw !== null && !next) return;
+        persistedSnapshots.set(event.key, raw);
         const account = next?.scope.account ?? (JSON.parse(event.key.slice(prefix.length)) as string[])[0];
         if (!account || sameDraft(previous, next)) return;
         if (!next) tombstone(event.key, previous?.version);

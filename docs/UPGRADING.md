@@ -263,6 +263,14 @@ Apply `0104_anchored_comment_page_index.sql` after 0103 through the ordinary mig
 
 This additive index is compatible with the existing Worker and may precede the updated Worker. Keep it during a code rollback; the preparation and provisional-anchor rollback requirements above still apply. No Durable Object class migration, feature activation, or special quiescence confirmation is needed for 0104. Keep relations disabled.
 
+## Anchored comment protocol 3 beta cutover
+
+Deploy the matching Worker and client assets together. This release adds no D1 migration; retain the existing 0103/0104 preparation and index schema. Older tabs must reload before preparing or publishing anchored document comments. Missing or unsupported `X-Notes-Comment-Protocol` receives `409 comment_client_reload_required`; the client preserves the draft and asks the member to reload deliberately. There is no automatic reload or migration-related posting pause.
+
+Browser receipt v3 retains only unresolved operations. Initialization retires v1 lists and v2 pending/resolved bookkeeping without importing them. Separate draft text, anchors, and operation identities survive, and recovered identities are reconciled before another publication. Status and cancellation remain available without the new protocol header. Server terminal receipts and 24-hour private-preparation expiry are unchanged. Page-level comments, diagram comments, and replies use their existing APIs.
+
+An updated client cannot publish against an older Worker without protocol confirmation. A code rollback also requires reloading tabs into the matching client/Worker pair; retired browser receipt formats are not reconstructed. See the [implementation and validation ledger](implementation/small-team-wiki-release.md#pr-266-storage-and-comment-lifecycle-follow-up--24-october-2026) for the cutover evidence. Keep relations disabled.
+
 ## Automated deployment guards
 
 The production workflow stops when `0011_page_move_receipt_envelopes.sql` or a guarded Slack migration is pending. Complete the relevant quiescence procedure, then use manual workflow dispatch with `confirm_page_move_receipt_migration_safe` or `confirm_slack_review_migration_safe`. A confirmation records maintenance already completed; it does not pause live consumers. Later releases need no confirmation after these migrations are applied.

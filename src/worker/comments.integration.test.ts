@@ -742,6 +742,7 @@ it("keeps anchored preparations private, cancels them terminally, and expires un
     "content-type": "application/json",
     "x-notes-operation-id": operationId,
     "x-notes-content-epoch": "1",
+    "x-notes-comment-protocol": "3",
   };
   const prepare = () =>
     SELF.fetch(
@@ -753,7 +754,7 @@ it("keeps anchored preparations private, cancels them terminally, and expires un
     );
   const first = await prepare();
   expect(first.status).toBe(201);
-  expect(await first.json()).toMatchObject({ submission: { operationId, state: "prepared" } });
+  expect(await first.json()).toMatchObject({ protocolVersion: 3, submission: { operationId, state: "prepared" } });
   expect(
     (
       await (
@@ -825,6 +826,7 @@ async function publicationFixture() {
         "content-type": "application/json",
         "x-notes-operation-id": operationId,
         "x-notes-content-epoch": "1",
+        "x-notes-comment-protocol": "3",
       },
       body: JSON.stringify({ initialComment: { body: commentBody("Private prepared body") } }),
     }),
@@ -879,6 +881,34 @@ function anchorRequest(body: string) {
     method: "POST",
     headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "content-type": "application/json" },
     body,
+  });
+}
+function interceptAnchorRead(
+  room: AnchorTestRoom,
+  prefix: string,
+  read: (statement: D1PreparedStatement) => Promise<unknown>,
+) {
+  const original = room.bindings.DB.prepare.bind(room.bindings.DB);
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+    new Proxy(statement, {
+      get(target, key) {
+        if (key === "bind") return (...binds: unknown[]) => wrap(target.bind(...binds));
+        if (key === "first") return () => read(target);
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  const mock = vi.spyOn(room.bindings.DB, "prepare").mockImplementation((sql) => {
+    const statement = original(sql);
+    return sql.startsWith(prefix) ? wrap(statement) : statement;
+  });
+  return () => mock.mockRestore();
+}
+function holdAnchorRead(room: AnchorTestRoom, prefix: string, held: Promise<void>, entered: () => void) {
+  return interceptAnchorRead(room, prefix, async (statement) => {
+    entered();
+    await held;
+    return statement.first();
   });
 }
 function socketBarrier(socket: WebSocket, generation: number) {
@@ -1128,26 +1158,7 @@ it.each(["archive", "restore"] as const)(
     try {
       await runInDurableObject(f.stub, async (instance) => {
         const room = instance as unknown as AnchorTestRoom & { transition: "archive" | "restore" | null };
-        const original = room.bindings.DB.prepare.bind(room.bindings.DB);
-        const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
-          new Proxy(statement, {
-            get(target, key) {
-              if (key === "bind") return (...binds: unknown[]) => wrap(target.bind(...binds));
-              if (key === "first")
-                return async () => {
-                  entered();
-                  await held;
-                  return target.first();
-                };
-              const value = Reflect.get(target, key);
-              return typeof value === "function" ? value.bind(target) : value;
-            },
-          });
-        const mock = vi.spyOn(room.bindings.DB, "prepare").mockImplementation((sql) => {
-          const statement = original(sql);
-          return sql.startsWith("SELECT state,anchor_token,anchor_expires_at") ? wrap(statement) : statement;
-        });
-        restore = () => mock.mockRestore();
+        restore = holdAnchorRead(room, "SELECT state,anchor_token,anchor_expires_at", held, entered);
         pending = room.onRequest(
           anchorRequest(
             JSON.stringify({ operation: "reconcile", userId: f.userId, operationId: f.operationId, token }),
@@ -1437,7 +1448,10 @@ it.each(["viewer", "private-viewer", "old-totp", "passkey", "trust"] as const)(
       f.authorization,
       f.authorize,
     );
-    expect(result).toMatchObject({ submission: { state: "published" }, thread: { anchored: true } });
+    expect(result).toMatchObject({
+      submission: { state: "published" },
+      thread: { anchored: true },
+    });
     expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(1);
   },
 );
@@ -1450,6 +1464,7 @@ it("publishes a durable anchor exactly once and reports publication winning canc
     "content-type": "application/json",
     "x-notes-operation-id": operationId,
     "x-notes-content-epoch": "1",
+    "x-notes-comment-protocol": "3",
   };
   const body = { initialComment: { body: commentBody("Anchored publication") } };
   const prepared = await SELF.fetch(
@@ -1479,7 +1494,7 @@ it("publishes a durable anchor exactly once and reports publication winning canc
   const first = await publish();
   expect(first.status).toBe(200);
   const result = await first.json<{ submission: { state: string }; thread: CommentThread }>();
-  expect(result).toMatchObject({ submission: { state: "published" }, thread: { anchored: true } });
+  expect(result).toMatchObject({ protocolVersion: 3, submission: { state: "published" }, thread: { anchored: true } });
   expect((await (await publish()).json<{ thread: CommentThread }>()).thread.id).toBe(result.thread.id);
   expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(1);
   expect(await env.DB.prepare("SELECT count(*) n FROM comments").first<number>("n")).toBe(1);
@@ -1506,6 +1521,7 @@ it.each(["cancel-before-commit", "lost-commit-response"] as const)(
           "content-type": "application/json",
           "x-notes-operation-id": operationId,
           "x-notes-content-epoch": "1",
+          "x-notes-comment-protocol": "3",
         },
         body: JSON.stringify({ initialComment: { body: commentBody("Boundary text") } }),
       }),
@@ -1594,6 +1610,7 @@ it("reconciles a canceled provisional anchor after hibernation and rejects cance
     "content-type": "application/json",
     "x-notes-operation-id": operationId,
     "x-notes-content-epoch": "1",
+    "x-notes-comment-protocol": "3",
   };
   const prepared = await SELF.fetch(
     request(installed.cookie, root, {
@@ -1681,33 +1698,15 @@ it.each(["claim", "alarm", "hash", "reconcile"] as const)(
     try {
       await runInDurableObject(f.stub, async (instance) => {
         const room = instance as unknown as AnchorTestRoom;
-        const original = room.bindings.DB.prepare.bind(room.bindings.DB);
         if (stage === "claim" || stage === "reconcile") {
-          const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
-            new Proxy(statement, {
-              get(target, key) {
-                if (key === "bind") return (...binds: unknown[]) => wrap(target.bind(...binds));
-                if (key === "first")
-                  return async () => {
-                    entered();
-                    await held;
-                    return target.first();
-                  };
-                const value = Reflect.get(target, key);
-                return typeof value === "function" ? value.bind(target) : value;
-              },
-            });
-          const mock = vi.spyOn(room.bindings.DB, "prepare").mockImplementation((sql) => {
-            const statement = original(sql);
-            return sql.startsWith(
-              stage === "claim"
-                ? "UPDATE anchored_comment_submissions SET anchor_token=?"
-                : "SELECT state,anchor_token,anchor_expires_at",
-            )
-              ? wrap(statement)
-              : statement;
-          });
-          restore = () => mock.mockRestore();
+          restore = holdAnchorRead(
+            room,
+            stage === "claim"
+              ? "UPDATE anchored_comment_submissions SET anchor_token=?"
+              : "SELECT state,anchor_token,anchor_expires_at",
+            held,
+            entered,
+          );
         } else if (stage === "alarm") {
           const originalAlarm = room.scheduleAlarm.bind(room),
             mock = vi.spyOn(room, "scheduleAlarm").mockImplementation(async (when) => {
@@ -2107,3 +2106,170 @@ it("measures cancellation request calls and local warm/cold latency against the 
     }
   await annotate(JSON.stringify(measurements), "collaboration-cancellation-measurements");
 });
+
+it.each([undefined, "2", "4"])(
+  "rejects anchored protocol %s before preparation or publication side effects",
+  async (version) => {
+    const installed = await bootstrap(),
+      operationId = crypto.randomUUID();
+    const root = `/api/pages/${installed.pageId}/comment-submissions`;
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-notes-operation-id": operationId,
+      "x-notes-content-epoch": "1",
+    };
+    if (version) headers["X-Notes-Comment-Protocol"] = version;
+    for (const path of [root, `${root}/${operationId}/publish`]) {
+      const response = await SELF.fetch(
+        request(installed.cookie, path, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ initialComment: { body: commentBody("Preserve draft") }, selection: {} }),
+        }),
+      );
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        error: {
+          code: "comment_client_reload_required",
+          message: "Reload NoteFlare to continue posting comments. Your draft is preserved.",
+        },
+      });
+    }
+    expect(await env.DB.prepare("SELECT count(*) n FROM anchored_comment_submissions").first<number>("n")).toBe(0);
+    const canceled = await SELF.fetch(request(installed.cookie, `${root}/${operationId}/cancel`, { method: "POST" }));
+    expect(canceled.status).toBe(200);
+    expect(
+      (
+        await (
+          await SELF.fetch(request(installed.cookie, `${root}/${operationId}`))
+        ).json<{ submission: { state: string } }>()
+      ).submission.state,
+    ).toBe("canceled");
+    expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(0);
+  },
+);
+it.each(["claim", "alarm", "hash"] as const)(
+  "releases a lease after the %s lifecycle exit and permits immediate deliberate Retry",
+  async (stage) => {
+    const f = await publicationFixture();
+    await runInDurableObject(f.stub, async (instance, state) => {
+      const room = instance as unknown as AnchorTestRoom & { transition: string | null };
+      const payload = anchorRequest(
+        JSON.stringify({ operation: "prepare", userId: f.userId, operationId: f.operationId, selection: f.selection }),
+      );
+      let restore: () => void;
+      if (stage === "claim") {
+        restore = interceptAnchorRead(
+          room,
+          "UPDATE anchored_comment_submissions SET anchor_token=?",
+          async (statement) => {
+            const result = await statement.first();
+            room.transition = "archive";
+            return result;
+          },
+        );
+      } else if (stage === "alarm") {
+        const original = room.scheduleAlarm.bind(room);
+        const mock = vi.spyOn(room, "scheduleAlarm").mockImplementation(async (when) => {
+          await original(when);
+          room.transition = "archive";
+        });
+        restore = () => mock.mockRestore();
+      } else {
+        const original = crypto.subtle.digest.bind(crypto.subtle);
+        const mock = vi.spyOn(crypto.subtle, "digest").mockImplementation(async (algorithm, input) => {
+          if (new TextDecoder().decode(input) === f.submission.threadId) room.transition = "restore";
+          return original(algorithm, input);
+        });
+        restore = () => mock.mockRestore();
+      }
+      try {
+        expect((await room.onRequest(payload)).status).toBe(503);
+        expect(
+          await env.DB.prepare("SELECT anchor_token FROM anchored_comment_submissions WHERE operation_id=?")
+            .bind(f.operationId)
+            .first<string>("anchor_token"),
+        ).toBeNull();
+        expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(
+          stage === "claim" ? 0 : 1,
+        );
+      } finally {
+        restore();
+        room.transition = null;
+      }
+      const retried = await room.onRequest(
+        anchorRequest(
+          JSON.stringify({
+            operation: "prepare",
+            userId: f.userId,
+            operationId: f.operationId,
+            selection: f.selection,
+          }),
+        ),
+      );
+      expect(retried.status).toBe(200);
+      expect(await retried.json()).toMatchObject({ anchored: true });
+    });
+  },
+);
+
+it.each(["release-failure", "replacement-token", "canceled"] as const)(
+  "keeps owned lease cleanup conditional through %s",
+  async (mode) => {
+    const f = await publicationFixture();
+    await runInDurableObject(f.stub, async (instance, state) => {
+      const room = instance as unknown as AnchorTestRoom & { transition: string | null };
+      const originalAlarm = room.scheduleAlarm.bind(room);
+      const alarm = vi.spyOn(room, "scheduleAlarm").mockImplementation(async (when) => {
+        await originalAlarm(when);
+        room.transition = "archive";
+        if (mode === "replacement-token")
+          await env.DB.prepare(
+            "UPDATE anchored_comment_submissions SET anchor_token='replacement' WHERE operation_id=?",
+          )
+            .bind(f.operationId)
+            .run();
+        if (mode === "canceled")
+          await env.DB.prepare(
+            "UPDATE anchored_comment_submissions SET state='canceled',body_json=NULL WHERE operation_id=?",
+          )
+            .bind(f.operationId)
+            .run();
+      });
+      const original = room.bindings.DB.prepare.bind(room.bindings.DB);
+      const release = vi.spyOn(room.bindings.DB, "prepare").mockImplementation((sql) => {
+        if (mode === "release-failure" && sql.startsWith("UPDATE anchored_comment_submissions SET anchor_token=NULL"))
+          throw new Error("Release unavailable");
+        return original(sql);
+      });
+      try {
+        const response = await room.onRequest(
+          anchorRequest(
+            JSON.stringify({
+              operation: "prepare",
+              userId: f.userId,
+              operationId: f.operationId,
+              selection: f.selection,
+            }),
+          ),
+        );
+        expect(response.status).toBe(503);
+        const current = await env.DB.prepare(
+          "SELECT state,anchor_token,anchor_expires_at FROM anchored_comment_submissions WHERE operation_id=?",
+        )
+          .bind(f.operationId)
+          .first<{ state: string; anchor_token: string | null; anchor_expires_at: number }>();
+        expect(current!.anchor_token).not.toBeNull();
+        expect(current!.anchor_token).toMatch(mode === "replacement-token" ? /^replacement$/ : /^[a-f0-9-]{36}$/);
+        expect(current!.state).toBe(mode === "canceled" ? "canceled" : "prepared");
+        expect(current!.anchor_expires_at).toBeGreaterThan(Date.now());
+        expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(1);
+        expect(stateFromDocument(room.document)).not.toContain(f.submission.threadId);
+      } finally {
+        alarm.mockRestore();
+        release.mockRestore();
+        room.transition = null;
+      }
+    });
+  },
+);

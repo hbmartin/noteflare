@@ -1,6 +1,12 @@
+import { writeCommentDraft, readCommentDraft } from "./comment-drafts";
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from "vitest";
-import { activeCommentCancellation, purgeCommentPublications, registerCommentPublication } from "./comment-publication";
+import {
+  activeCommentCancellation,
+  purgeCommentPublications,
+  registerCommentPublication,
+  initializeCommentPublications,
+} from "./comment-publication";
 import { realtimeAccessAccount, setRealtimeAccessAccount } from "./realtime-access-status";
 const scope = { account: "publication-test\0wiki", pageId: "page", epoch: 1 };
 afterEach(() => {
@@ -21,7 +27,7 @@ it("retains uncertain operation identities across account retirement and recover
     state: "canceled" as const,
     expiresAt: 1,
   }));
-  expect((await activeCommentCancellation(scope, recover)!()).state).toBe("canceled");
+  expect((await activeCommentCancellation(scope, recover)!())!.state).toBe("canceled");
   expect(recover.mock.calls.map(([id]) => id).sort()).toEqual(["attempt-one", "attempt-two"]);
   expect(activeCommentCancellation(scope, recover)).toBeUndefined();
 });
@@ -35,7 +41,7 @@ it("keeps unknown cancellations retryable and preserves a published winner acros
     .mockResolvedValue({ ...published, operationId: "pending", state: "canceled" });
   registerCommentPublication(scope, "pending", cancel);
   await expect(activeCommentCancellation(scope)!()).rejects.toThrow("A comment posted");
-  expect((await activeCommentCancellation(scope)!()).state).toBe("published");
+  expect((await activeCommentCancellation(scope)!())!.state).toBe("published");
 });
 it("does not reconcile stale cancellation results into a reincarnated account", async () => {
   setRealtimeAccessAccount(scope.account);
@@ -76,13 +82,13 @@ it("retries persistent receipt cleanup after a confirmed cancellation and purges
     state: "canceled" as const,
     expiresAt: 1,
   }));
-  expect((await activeCommentCancellation(scope, recover)!()).state).toBe("canceled");
+  expect((await activeCommentCancellation(scope, recover)!())!.state).toBe("canceled");
   registerCommentPublication(scope, "purge-attempt", () => recover("purge-attempt"));
   purgeCommentPublications(scope.account);
   expect(activeCommentCancellation(scope, recover)).toBeUndefined();
 });
 
-it("keeps independent tabs' receipts and suppresses resolved legacy echoes", async () => {
+it("keeps independent tabs' receipts and retires legacy receipts without importing them", async () => {
   setRealtimeAccessAccount(scope.account);
   const first = registerCommentPublication(scope, "tab-one", async () => ({
     operationId: "tab-one",
@@ -112,7 +118,70 @@ it("keeps independent tabs' receipts and suppresses resolved legacy echoes", asy
     recovered.push(operationId);
     return { operationId, threadId: "t", state: "canceled", expiresAt: 1 };
   })!();
-  expect(recovered.sort()).toEqual(["legacy-pending", "tab-three"]);
+  expect(recovered.sort()).toEqual(["tab-three"]);
   expect(other.activeCommentCancellation(scope, vi.fn())).toBeUndefined();
   otherRegistration.finish();
+});
+
+it("removes terminal entries without accumulating browser receipts", () => {
+  for (let index = 0; index < 1000; index++) {
+    expect(registerCommentPublication(scope, `posted-${index}`, vi.fn()).finish()).toBe(true);
+  }
+  expect(Object.keys(localStorage).filter((key) => key.startsWith("notes:comment-publication:"))).toEqual([]);
+});
+it("ignores delayed storage events and never recreates terminal receipts", () => {
+  setRealtimeAccessAccount(scope.account);
+  const entry = registerCommentPublication(scope, "finished", vi.fn());
+  const name = Object.keys(localStorage).find((key) => key.includes("finished"))!;
+  entry.finish();
+  const writes = vi.spyOn(Storage.prototype, "setItem");
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: "1" }));
+  expect(localStorage.getItem(name)).toBeNull();
+  expect(writes).not.toHaveBeenCalled();
+});
+it("reconciles a recovered draft identity even after its legacy receipt was retired", async () => {
+  const legacy = "notes:comment-publication:" + JSON.stringify([scope.account, scope.pageId, scope.epoch]);
+  localStorage.setItem(legacy, JSON.stringify(["draft-operation", "unreferenced-preparation"]));
+  const recover = vi.fn(async (operationId: string) => ({
+    operationId,
+    threadId: "t",
+    state: "canceled" as const,
+    expiresAt: 1,
+  }));
+  await activeCommentCancellation(scope, recover, "draft-operation")!();
+  expect(recover).toHaveBeenCalledExactlyOnceWith("draft-operation");
+  expect(localStorage.getItem(legacy)).toBeNull();
+});
+
+it("retires both older formats without importing identities or changing the separate recovery draft", () => {
+  setRealtimeAccessAccount(scope.account);
+  const body = [{ type: "paragraph", content: [{ type: "text", text: "Preserved body" }] }] as never;
+  writeCommentDraft(scope, "new", body);
+  const draft = readCommentDraft(scope, "new")!;
+  const legacy = "notes:comment-publication:" + JSON.stringify([scope.account, scope.pageId, scope.epoch]);
+  const pending =
+    "notes:comment-publication:v2:" +
+    JSON.stringify([scope.account, scope.pageId, scope.epoch, draft.operationId, "pending"]);
+  const resolved =
+    "notes:comment-publication:v2:" + JSON.stringify([scope.account, scope.pageId, scope.epoch, "old", "resolved"]);
+  localStorage.setItem(legacy, JSON.stringify([draft.operationId]));
+  localStorage.setItem(pending, "1");
+  localStorage.setItem(resolved, "1");
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  expect(initializeCommentPublications(scope)).toBe(false);
+  expect(readCommentDraft(scope, "new")).toMatchObject({ operationId: draft.operationId, body, storageFailed: true });
+  remove.mockRestore();
+  expect(initializeCommentPublications(scope)).toBe(true);
+  expect(localStorage.getItem(legacy)).toBeNull();
+  expect(localStorage.getItem(pending)).toBeNull();
+  expect(localStorage.getItem(resolved)).toBeNull();
+  const recover = vi.fn();
+  expect(activeCommentCancellation(scope, recover)).toBeUndefined();
+  expect(recover).not.toHaveBeenCalled();
+  localStorage.setItem(legacy, JSON.stringify(["old-tab-echo"]));
+  window.dispatchEvent(new StorageEvent("storage", { key: legacy, newValue: JSON.stringify(["old-tab-echo"]) }));
+  expect(localStorage.getItem(legacy)).toBeNull();
+  expect(readCommentDraft(scope, "new")!.operationId).toBe(draft.operationId);
 });

@@ -8,6 +8,8 @@ import {
   cellDraftKey,
   discardCellDraft,
   purgeCellDrafts,
+  retryCellDraftCleanup,
+  cellDraftCleanupError,
   useMissingCellDraftRowIds,
   type CellDraftScope,
 } from "./cell-drafts";
@@ -20,6 +22,22 @@ const edit = (text = "Unfinished") => ({
   text,
   baseRevision: 7,
 });
+function failedSuccessor() {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("Stored predecessor"));
+  const old = accountCellDrafts(scope.account)[0]!;
+  const name = Object.keys(localStorage).find((storedName) => localStorage.getItem(storedName)?.includes(old.version))!;
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  try {
+    map.set(key, edit("Failed successor"));
+  } finally {
+    write.mockRestore();
+  }
+  return { map, key, old, name };
+}
 beforeEach(() => {
   scope = { account: crypto.randomUUID(), host: "host", tableId: "table", generation: 1 };
 });
@@ -245,4 +263,82 @@ it("adopts another tab's submission and definite-rejection reset without changin
   expect(retry.operationId).not.toBe("other-attempt");
   expect(retry.submissionRevision).toBe(12);
   expect(retry.version).toBe(draft.version);
+});
+
+it("discards a failed write and its stored predecessor without resurrecting either on reload", async () => {
+  const { key } = failedSuccessor();
+  discardCellDraft(accountCellDrafts(scope.account)[0]!);
+  vi.resetModules();
+  const fresh = await import("./cell-drafts");
+  expect(new fresh.CellDraftMap(scope).get(key)).toBeUndefined();
+});
+it("retries identical nondurable text and metadata without changing submission identity", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.set(key, edit());
+  const sent = map.submission(key, 12)!;
+  expect(sent.durable).toBe(false);
+  write.mockRestore();
+  const recovered = vi.spyOn(Storage.prototype, "setItem");
+  map.set(key, { ...sent });
+  expect(map.get(key)).toMatchObject({ ...sent, durable: true });
+  expect(recovered).toHaveBeenCalledOnce();
+  map.set(key, { ...sent });
+  expect(recovered).toHaveBeenCalledOnce();
+});
+it("cleanup retries remove only the obsolete stored snapshot and adopt a new cross-tab version", () => {
+  const { map, key, old, name } = failedSuccessor();
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  map.delete(key);
+  expect(cellDraftCleanupError(scope.account)).toContain("Retry cleanup");
+  map.set(key, { ...edit("Focus only"), changed: false });
+  expect(accountCellDrafts(scope.account)).toHaveLength(0);
+  remove.mockRestore();
+  const replacement = { ...old, text: "Other tab", version: crypto.randomUUID() };
+  localStorage.setItem(name, JSON.stringify(replacement));
+  retryCellDraftCleanup(scope.account);
+  expect(map.get(key)?.text).toBe("Other tab");
+  expect(JSON.parse(localStorage.getItem(name)!).text).toBe("Other tab");
+  expect(cellDraftCleanupError(scope.account)).toBe("");
+});
+it("isolates corrupt values, caches initialization, and purges corruption without claiming an I/O failure", async () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const name = Object.keys(localStorage).find((storedName) =>
+    localStorage.getItem(storedName)?.includes(scope.account),
+  )!;
+  localStorage.setItem(name, "{broken");
+  for (let index = 0; index < 500; index++) localStorage.setItem(`unrelated-${index}`, "fixture");
+  vi.resetModules();
+  const fresh = await import("./cell-drafts");
+  expect(fresh.accountCellDrafts(scope.account)).toHaveLength(0);
+  const keyRead = vi.spyOn(Storage.prototype, "key");
+  const length = vi.spyOn(Storage.prototype, "length", "get");
+  for (let index = 0; index < 20; index++) expect(fresh.accountCellDrafts(scope.account)).toHaveLength(0);
+  expect(keyRead).not.toHaveBeenCalled();
+  expect(length).not.toHaveBeenCalled();
+  expect(() => fresh.purgeCellDrafts(scope.account)).not.toThrow();
+  expect(localStorage.getItem(name)).toBeNull();
+  for (let index = 0; index < 500; index++) localStorage.removeItem(`unrelated-${index}`);
+});
+it("adopts a metadata-only rewrite of the stored predecessor when discarding a failed successor", () => {
+  const { map, key, old, name } = failedSuccessor();
+  const replacement = { ...old, durable: false, operationId: "other-tab-submission", submissionRevision: 15 };
+  localStorage.setItem(name, JSON.stringify(replacement));
+  discardCellDraft(accountCellDrafts(scope.account)[0]!);
+  expect(map.get(key)).toMatchObject({
+    text: old.text,
+    version: old.version,
+    operationId: "other-tab-submission",
+    submissionRevision: 15,
+    durable: true,
+  });
+  expect(map.current(key, old.version)).toBe(true);
+  expect(JSON.parse(localStorage.getItem(name)!)).toMatchObject(replacement);
 });
