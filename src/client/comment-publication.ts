@@ -377,7 +377,11 @@ export function purgeCommentPublications(account: string) {
 }
 if (typeof window !== "undefined")
   window.addEventListener("storage", (event) => {
-    if (event.storageArea !== localStorage) return;
+    try {
+      if (event.storageArea !== localStorage) return;
+    } catch {
+      return;
+    }
     if (event.key === null) {
       const account = realtimeAccessAccount()?.key;
       if (account) initialized.delete(account);

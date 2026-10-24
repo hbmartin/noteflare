@@ -474,3 +474,53 @@ it("does not notify recovery subscribers for unchanged absence or focus ownershi
   });
   expect(snapshots).toHaveBeenCalled();
 });
+
+it("ignores a delayed predecessor event while newer text exists only in memory", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("Stored B"));
+  const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  const raw = localStorage.getItem(name);
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.set(key, edit("Memory C"));
+  write.mockRestore();
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: raw, storageArea: localStorage }));
+  expect(map.get(key)).toMatchObject({ text: "Memory C", durable: false });
+});
+it("accepts a genuinely newer stored replacement on a delayed clear without restoring its predecessor", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("Stored B"));
+  const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  const prior = map.get(key)!;
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.set(key, edit("Memory C"));
+  write.mockRestore();
+  localStorage.clear();
+  localStorage.setItem(name, JSON.stringify({ ...prior, scope, text: "New tab D", version: "tab-d" }));
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  expect(map.get(key)).toMatchObject({ text: "New tab D", version: "tab-d", durable: true });
+});
+it("contains a throwing storage getter during storage event delivery", () => {
+  const storage = localStorage,
+    errors: ErrorEvent[] = [];
+  const trap = (event: ErrorEvent) => {
+    errors.push(event);
+    event.preventDefault();
+  };
+  window.addEventListener("error", trap);
+  vi.spyOn(window, "localStorage", "get").mockImplementation(() => {
+    throw new Error("SecurityError");
+  });
+  try {
+    window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: storage }));
+  } finally {
+    window.removeEventListener("error", trap);
+    vi.restoreAllMocks();
+  }
+  expect(errors).toHaveLength(0);
+});

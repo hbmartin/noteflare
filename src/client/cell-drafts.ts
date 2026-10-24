@@ -201,30 +201,38 @@ function retainInvalidDraft(name: string, current: StoredCellDraft | null | unde
   records.set(name, { ...current, durable: false });
   notify(current.scope.account, name);
 }
+function observeStoredDraft(name: string, raw: string | null, account: string) {
+  const current = records.get(name),
+    result = parse(name, raw);
+  if (result.state === "invalid") {
+    retainInvalidDraft(name, current);
+    return;
+  }
+  if (result.state === "suppressed") return;
+  if (current && !current.durable && (raw === persistedSnapshots.get(name) || result.state === "missing")) {
+    if (result.state === "missing") persistedSnapshots.set(name, null);
+    return;
+  }
+  const next = result.draft ?? null;
+  persistedSnapshots.set(name, raw);
+  if (sameDraft(current, next)) return;
+  if (!next && current) tombstone(name, current.version);
+  else records.set(name, next);
+  notify(account, name);
+}
 /** Read the actual latest write before a save or discard, without enumerating storage. */
-function refresh(name: string, account: string) {
+function refresh(name: string, account: string, observation = false) {
   try {
     const current = records.get(name);
-    if (current && !current.durable) return;
-    const raw = localStorage.getItem(name),
-      result = parse(name, raw);
-    if (result.state === "invalid") {
-      retainInvalidDraft(name, current);
-      return;
-    }
-    const next = result.draft ?? null;
-    persistedSnapshots.set(name, raw);
-    if (sameDraft(current, next)) return;
-    if (!next && current) tombstone(name, current.version);
-    else records.set(name, next);
-    notify(account, name);
+    if (!observation && current && !current.durable) return;
+    observeStoredDraft(name, localStorage.getItem(name), account);
   } catch {
     /* In-memory text remains available when storage cannot be read. */
   }
 }
 export function discardCellDraft(draft: StoredCellDraft) {
   const name = nameOf(draft.scope, cellDraftKey(draft.rowId, draft.columnId));
-  refresh(name, draft.scope.account);
+  refresh(name, draft.scope.account, true);
   if (records.get(name)?.version !== draft.version) return;
   const predecessor = persistedSnapshots.get(name);
   tombstone(name, draft.version);
@@ -266,6 +274,8 @@ function cleanupStoredDraft(name: string, account: string) {
     }
   }
   cleanupTargets.delete(name);
+  if (![...cleanupTargets.values()].some((entry) => entry.account === account) && cleanupErrors.delete(account))
+    notify(account);
 }
 export function retryCellDraftCleanup(account: string) {
   const errors: unknown[] = [];
@@ -446,7 +456,11 @@ if (typeof window !== "undefined") {
     }
   });
   window.addEventListener("storage", (event) => {
-    if (event.storageArea !== localStorage) return;
+    try {
+      if (event.storageArea !== localStorage) return;
+    } catch {
+      return;
+    }
     if (event.key === "notes:local-signout" && event.newValue) {
       try {
         purgeCellDrafts(event.newValue);
@@ -456,27 +470,13 @@ if (typeof window !== "undefined") {
     } else if (event.key === null) {
       // clear() may be delivered after another write. Inspect known keys and
       // keep memory-only edits whose failed writes never belonged to storage.
-      for (const [name, draft] of records) if (draft) refresh(name, draft.scope.account);
+      for (const [name, draft] of records) if (draft) refresh(name, draft.scope.account, true);
     } else if (event.key.startsWith(prefix)) {
       try {
         const raw = localStorage.getItem(event.key);
         if (raw !== event.newValue) return;
-        const result = parse(event.key, raw),
-          previous = records.get(event.key);
-        if (result.state === "invalid") {
-          retainInvalidDraft(event.key, previous);
-          return;
-        }
-        if (result.state === "suppressed") return;
-        const next = result.draft ?? null;
-        persistedSnapshots.set(event.key, raw);
-        const account = next?.scope.account ?? (JSON.parse(event.key.slice(prefix.length)) as string[])[0];
-        if (!account || sameDraft(previous, next)) return;
-        if (!next) {
-          if (previous && !previous.durable) return;
-          tombstone(event.key, previous?.version);
-        } else records.set(event.key, next);
-        notify(account, event.key);
+        const account = (JSON.parse(event.key.slice(prefix.length)) as unknown[])[0];
+        if (typeof account === "string") observeStoredDraft(event.key, raw, account);
       } catch {
         /* Keep the last valid local copy. */
       }
