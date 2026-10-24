@@ -202,7 +202,8 @@ export function CollaborativeTablePage({
             setConnectionReady(false);
           }
           setError(apiErrorMessage(cause, "The table could not be loaded."));
-          if (cause instanceof ApiClientError && cause.code === "table_cursor_stale" && cursor) void loadRef.current();
+          if (cause instanceof ApiClientError && cause.code === "table_cursor_stale" && cursor)
+            return fetchTable(undefined, signal);
         }
       }
       return null;
@@ -215,9 +216,8 @@ export function CollaborativeTablePage({
   }, [fetchTable]);
   const linkedReads = useRef<ReturnType<typeof linkedTableReads<TableQueryResult>> | null>(null);
   useLayoutEffect(() => {
-    if (!queryBase) return undefined;
+    if (!queryBase || !page.id || (incarnation && incarnation.key !== account)) return undefined;
     writeReady.current = false;
-    setConnectionReady(false);
     const reads = linkedTableReads({
       read: (cursor, signal) => fetchRef.current(cursor, signal),
       unavailable: () => {
@@ -258,6 +258,7 @@ export function CollaborativeTablePage({
     return unsubscribe;
   }, [retry]);
   useEffect(() => {
+    if (incarnation && incarnation.key !== account) return undefined;
     active.current = true;
     void Promise.resolve().then(() => load());
     const requestEpoch = epoch;

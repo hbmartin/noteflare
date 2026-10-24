@@ -11,6 +11,7 @@ import {
   retryCellDraftCleanup,
   cellDraftCleanupError,
   useMissingCellDraftRowIds,
+  useCellDrafts,
   type CellDraftScope,
 } from "./cell-drafts";
 let scope: CellDraftScope;
@@ -451,4 +452,25 @@ it("reads current keys on a delayed clear event instead of erasing a replacement
   localStorage.setItem(name, JSON.stringify(replacement));
   window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
   expect(map.get(key)).toMatchObject({ text: "Later tab", version: "later", durable: true });
+});
+
+it("does not notify recovery subscribers for unchanged absence or focus ownership", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  function Recovery() {
+    useCellDrafts(scope.account, scope, true);
+    return null;
+  }
+  render(createElement(Recovery));
+  const snapshots = vi.spyOn(Map.prototype, "values");
+  act(() => {
+    map.focus(key, false);
+    map.current(cellDraftKey("missing", "b"));
+  });
+  expect(snapshots).not.toHaveBeenCalled();
+  act(() => {
+    map.focus(key, true);
+  });
+  expect(snapshots).toHaveBeenCalled();
 });

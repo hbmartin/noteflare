@@ -80,7 +80,7 @@ it("pauses while hidden/offline without resetting backoff and manual reads bypas
   expect(read).toHaveBeenCalledTimes(3);
   await controller.request();
   expect(read).toHaveBeenCalledTimes(4);
-  expect(controller.unavailable).toHaveBeenCalledTimes(2);
+  expect(controller.unavailable).toHaveBeenCalledTimes(3);
 });
 it("aborts active work and releases queued callers on disposal", async () => {
   const read = vi.fn(

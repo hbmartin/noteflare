@@ -6,6 +6,7 @@ export function linkedTableReads<T>(options: {
   read: (cursor: string | undefined, signal: AbortSignal) => Promise<T | null>;
   unavailable: () => void;
 }) {
+  options.unavailable();
   const controller = new AbortController();
   let stopped = false,
     running = false,

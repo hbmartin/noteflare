@@ -1194,7 +1194,9 @@ it("retires the saved-operation Retry when another edit supersedes its draft", a
   await screen.findByRole("button", { name: "Retry saved operation" });
   const drafts = new CellDraftMap({ account: "owner\0workspace", host: "/linked", tableId: "table", generation: 1 });
   const key = cellDraftKey("row", "Title");
-  act(() => drafts.set(key, { ...drafts.get(key)!, text: "Newer text" }));
+  act(() => {
+    drafts.set(key, { ...drafts.get(key)!, text: "Newer text" });
+  });
   await waitFor(() => expect(screen.queryByRole("button", { name: "Retry saved operation" })).toBeNull());
   expect(screen.getByLabelText("Recovered cell draft")).toHaveValue("Newer text");
   expect(writes).toHaveLength(1);
