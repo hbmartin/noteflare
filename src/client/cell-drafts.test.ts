@@ -524,3 +524,20 @@ it("contains a throwing storage getter during storage event delivery", () => {
   }
   expect(errors).toHaveLength(0);
 });
+
+it("checks a newer shared draft before submitting memory-only text even before its event arrives", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("Stored B"));
+  const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  const prior = map.get(key)!;
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.set(key, edit("Memory C"));
+  const version = map.get(key)!.version;
+  write.mockRestore();
+  localStorage.setItem(name, JSON.stringify({ ...prior, scope, text: "New tab D", version: "new-tab-d" }));
+  expect(map.submission(key, 30, version)).toBeUndefined();
+  expect(map.get(key)).toMatchObject({ text: "New tab D", version: "new-tab-d", durable: true });
+});

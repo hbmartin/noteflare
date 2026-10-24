@@ -214,17 +214,18 @@ function observeStoredDraft(name: string, raw: string | null, account: string) {
     return;
   }
   const next = result.draft ?? null;
+  if (sameDraft(current, next)) {
+    if (next || persistedSnapshots.has(name)) persistedSnapshots.set(name, raw);
+    return;
+  }
   persistedSnapshots.set(name, raw);
-  if (sameDraft(current, next)) return;
   if (!next && current) tombstone(name, current.version);
   else records.set(name, next);
   notify(account, name);
 }
 /** Read the actual latest write before a save or discard, without enumerating storage. */
-function refresh(name: string, account: string, observation = false) {
+function refresh(name: string, account: string) {
   try {
-    const current = records.get(name);
-    if (!observation && current && !current.durable) return;
     observeStoredDraft(name, localStorage.getItem(name), account);
   } catch {
     /* In-memory text remains available when storage cannot be read. */
@@ -232,7 +233,7 @@ function refresh(name: string, account: string, observation = false) {
 }
 export function discardCellDraft(draft: StoredCellDraft) {
   const name = nameOf(draft.scope, cellDraftKey(draft.rowId, draft.columnId));
-  refresh(name, draft.scope.account, true);
+  refresh(name, draft.scope.account);
   if (records.get(name)?.version !== draft.version) return;
   const predecessor = persistedSnapshots.get(name);
   tombstone(name, draft.version);
@@ -470,7 +471,7 @@ if (typeof window !== "undefined") {
     } else if (event.key === null) {
       // clear() may be delivered after another write. Inspect known keys and
       // keep memory-only edits whose failed writes never belonged to storage.
-      for (const [name, draft] of records) if (draft) refresh(name, draft.scope.account, true);
+      for (const [name, draft] of records) if (draft) refresh(name, draft.scope.account);
     } else if (event.key.startsWith(prefix)) {
       try {
         const raw = localStorage.getItem(event.key);
