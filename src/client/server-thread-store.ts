@@ -9,12 +9,13 @@ import {
   registerCommentPublication,
   forgetCommentPublication,
   initializeCommentPublications,
+  isLocalCommentOperation,
+  markLocalCommentOperation,
 } from "./comment-publication";
 import {
   readCommentDraft,
   clearCommentDraft,
   replaceCommentDraftOperation,
-  warnCommentDraftPersistence,
   type CommentDraftScope,
 } from "./comment-drafts";
 import {
@@ -129,7 +130,9 @@ export class ServerThreadStore extends ThreadStore {
     private readonly draftScope?: CommentDraftScope,
   ) {
     super(new ServerThreadStoreAuth(userId, ready));
-    if (draftScope) initializeCommentPublications(draftScope);
+  }
+  initialize() {
+    if (this.draftScope) initializeCommentPublications(this.draftScope);
   }
 
   private async mutate<T>(path: string, init: RequestInit): Promise<T> {
@@ -226,105 +229,139 @@ export class ServerThreadStore extends ThreadStore {
     if (account !== realtimeAccessAccount()) throw new Error("This comment belongs to a retired account.");
     if (result.submission.state === "canceled" || result.submission.state === "expired")
       this.terminalPreparations.add(operationId);
-    if (this.draftScope && !forgetCommentPublication(this.draftScope, operationId))
-      warnCommentDraftPersistence(this.draftScope);
+    if (this.draftScope) forgetCommentPublication(this.draftScope, operationId);
     return result.submission;
   }
 
   private readonly terminalPreparations = new Set<string>();
-  anchoredSubmission(body: BlockNoteCommentBody) {
+  anchoredSubmission(body: BlockNoteCommentBody, canContinue = () => true) {
     const account = realtimeAccessAccount();
     const assertAccount = () => {
       if (account !== realtimeAccessAccount())
         throw new Error("This comment belongs to a retired account. Its local draft is preserved.");
     };
-    const prior = this.pendingOperations.get("new"),
-      draft = this.draftScope ? readCommentDraft(this.draftScope, "new") : null;
-    const previous = prior?.id ?? draft?.operationId;
-    if (previous && this.terminalPreparations.has(previous)) {
-      if (draft && draft.operationId !== previous) this.pendingOperations.delete("new");
-      else {
-        const id = crypto.randomUUID();
-        this.pendingOperations.set("new", { body: json(body), id });
-        if (this.draftScope) replaceCommentDraftOperation(this.draftScope, previous, id);
-      }
-    }
-    const headers = this.operationHeaders("new", body),
+    let headers = this.operationHeaders("new", body),
       operationId = headers["x-notes-operation-id"];
     const root = `/api/pages/${encodeURIComponent(this.pageId)}/comment-submissions`;
     type Result = { submission: CommentSubmissionStatus; thread?: CommentThread; protocolVersion?: number };
-    const protocolHeaders = { ...headers, [COMMENT_PROTOCOL_HEADER]: String(COMMENT_PROTOCOL_VERSION) };
-    let protocolConfirmed = false;
-    let terminal = false;
-    let finish = finishedWithoutStorage;
-    const remember = (result: Result) => {
-      if (account !== realtimeAccessAccount()) return result;
+    let protocolConfirmed = false,
+      terminal = false,
+      rotated = false;
+    let finish = () =>
+      this.draftScope ? forgetCommentPublication(this.draftScope, operationId) : finishedWithoutStorage();
+    const local = () =>
+      this.draftScope
+        ? isLocalCommentOperation(this.draftScope, operationId)
+        : !this.terminalPreparations.has(operationId);
+    const remember = (result: Result, id = operationId) => {
+      assertAccount();
       if (result.submission.state !== "prepared") {
-        terminal = true;
-        if (!finish() && this.draftScope) warnCommentDraftPersistence(this.draftScope);
+        if (id === operationId) {
+          terminal = true;
+          finish();
+        } else if (this.draftScope) forgetCommentPublication(this.draftScope, id);
       }
       if (result.submission.state === "canceled" || result.submission.state === "expired")
-        this.terminalPreparations.add(operationId);
+        this.terminalPreparations.add(id);
       return result;
     };
-    const status = async () => {
-      const result = await api<Result>(`${root}/${operationId}`, { headers });
-      assertAccount();
-      return remember(result);
-    };
+    const status = async () => remember(await api<Result>(`${root}/${operationId}`, { headers }));
     const confirmProtocol = async (result: Result) => {
       assertAccount();
       if (result?.protocolVersion === COMMENT_PROTOCOL_VERSION) {
         protocolConfirmed = true;
         return remember(result);
       }
-      // A stale Worker may have committed. Settle that identity before reporting a reload.
       const current = await status();
       if (current.submission.state === "published") return current;
       throw new ApiClientError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
     };
-    let canceling: Promise<CommentSubmissionStatus> | undefined;
-    const cancel = () => {
-      if (account !== realtimeAccessAccount())
-        return Promise.reject(new Error("This comment belongs to a retired account."));
-      return (canceling ??= api<Result>(`${root}/${operationId}/cancel`, { method: "POST", headers, readOnly: true })
-        .then((value) => remember(value).submission)
-        .catch((error) => {
-          canceling = undefined;
-          throw error;
-        }));
+    const cancellations = new Map<string, Promise<CommentSubmissionStatus>>();
+    const cancelOperation = async (id: string, requestHeaders: typeof headers) => {
+      assertAccount();
+      let canceling = cancellations.get(id);
+      if (!canceling) {
+        canceling = api<Result>(`${root}/${id}/cancel`, { method: "POST", headers: requestHeaders, readOnly: true })
+          .then((value) => remember(value, id).submission)
+          .catch((error) => {
+            cancellations.delete(id);
+            throw error;
+          });
+        cancellations.set(id, canceling);
+      }
+      return canceling;
     };
-    if (this.draftScope) {
-      const registration = registerCommentPublication(this.draftScope, operationId, cancel);
-      finish = registration.finish;
-      if (!registration.durable) warnCommentDraftPersistence(this.draftScope);
-    }
-    const release = () => {
-      if (terminal) finish();
+    const rotate = () => {
+      if (rotated)
+        throw new Error("This preparation was canceled or expired again. Your draft is preserved; retry deliberately.");
+      const draft = this.draftScope ? readCommentDraft(this.draftScope, "new") : null;
+      if (draft && draft.operationId !== operationId)
+        throw new Error("Your draft changed while posting. Review the newer text before posting again.");
+      const next = crypto.randomUUID();
+      this.pendingOperations.set("new", { body: json(body), id: next });
+      if (this.draftScope) replaceCommentDraftOperation(this.draftScope, operationId, next);
+      headers = this.operationHeaders("new", body);
+      operationId = next;
+      if (this.draftScope) markLocalCommentOperation(this.draftScope, operationId);
+      terminal = false;
+      protocolConfirmed = false;
+      rotated = true;
+      finish = () => (this.draftScope ? forgetCommentPublication(this.draftScope, operationId) : true);
     };
     return {
       prepare: async () => {
         assertAccount();
-        if (!this.ready()) throw new Error("Connect and sync the document before posting. Your draft is preserved.");
-        if (previous === operationId) {
-          try {
-            const current = await status();
-            if (current.submission.state !== "prepared") return current;
-          } catch (error) {
-            if (!(error instanceof ApiClientError) || error.status !== 404) throw error;
+        while (true) {
+          if (this.terminalPreparations.has(operationId)) {
+            if (!canContinue()) throw new Error("The comment composer was closed. Your draft is preserved.");
+            rotate();
           }
+          if (!local()) {
+            try {
+              const current = await status();
+              if (current.submission.state === "published") return current;
+              if (current.submission.state !== "prepared") {
+                if (!canContinue()) return current;
+                rotate();
+                continue;
+              }
+            } catch (error) {
+              if (!(error instanceof ApiClientError) || error.status !== 404) throw error;
+            }
+          }
+          if (!canContinue() || !this.ready())
+            throw new Error("Connect and sync the document before posting. Your draft is preserved.");
+          const id = operationId,
+            requestHeaders = headers;
+          const registration = this.draftScope
+            ? registerCommentPublication(this.draftScope, id, () => cancelOperation(id, requestHeaders))
+            : undefined;
+          if (registration) finish = registration.finish;
+          let response: Result;
+          try {
+            response = await api<Result>(root, {
+              method: "POST",
+              headers: { ...headers, [COMMENT_PROTOCOL_HEADER]: String(COMMENT_PROTOCOL_VERSION) },
+              body: json({ initialComment: { body } }),
+            });
+          } catch (error) {
+            if (error instanceof ApiClientError && (error.notSent || error.code === "comment_client_reload_required"))
+              registration?.rejectedBeforeSend();
+            throw error;
+          }
+          const result = await confirmProtocol(response);
+          if (result.submission.state === "canceled" || result.submission.state === "expired") {
+            if (!canContinue()) return result;
+            rotate();
+            continue;
+          }
+          return result;
         }
-        return confirmProtocol(
-          await api<Result>(root, {
-            method: "POST",
-            headers: protocolHeaders,
-            body: json({ initialComment: { body } }),
-          }),
-        );
       },
       publish: async (editor: BlockNoteEditor<any, any, any>, selection: { head: number; anchor: number }) => {
         assertAccount();
-        if (!this.ready()) throw new Error("Connect and sync the document before posting. Your draft is preserved.");
+        if (!canContinue() || !this.ready())
+          throw new Error("Connect and sync the document before posting. Your draft is preserved.");
         if (!protocolConfirmed) throw new ApiClientError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
         const binding = ySyncPluginKey.getState(editor.prosemirrorState)?.binding;
         if (!binding) throw new Error("The original comment selection is unavailable.");
@@ -339,7 +376,7 @@ export class ServerThreadStore extends ThreadStore {
         return confirmProtocol(
           await api<Result>(`${root}/${operationId}/publish`, {
             method: "POST",
-            headers: protocolHeaders,
+            headers: { ...headers, [COMMENT_PROTOCOL_HEADER]: String(COMMENT_PROTOCOL_VERSION) },
             body: json({ selection: { yjs } }),
           }),
         );
@@ -351,8 +388,10 @@ export class ServerThreadStore extends ThreadStore {
         this.posted("new", operationId);
         this.upsert(result.thread);
       },
-      cancel,
-      release,
+      cancel: () => cancelOperation(operationId, headers),
+      release: () => {
+        if (terminal) finish();
+      },
     };
   }
 

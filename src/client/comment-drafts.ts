@@ -1,4 +1,8 @@
-import { purgeCommentPublications, setCommentPublicationStorageErrorHandler } from "./comment-publication";
+import {
+  purgeCommentPublications,
+  markLocalCommentOperation,
+  forgetLocalCommentOperation,
+} from "./comment-publication";
 import type { CommentBody } from "@blocknote/core/comments";
 export type CommentDraftScope = { account: string; pageId: string; epoch: number };
 export type CommentDraftAnchor = { head: unknown; anchor: unknown };
@@ -63,6 +67,10 @@ export function writeCommentDraft(
     const name = key(scope, id);
     clearedOperations.delete(name);
     memory.set(name, record);
+    if (id === "new" && record.operationId !== previous?.operationId) {
+      if (previous) forgetLocalCommentOperation(scope, previous.operationId);
+      markLocalCommentOperation(scope, record.operationId);
+    }
     let saved = true;
     try {
       localStorage.setItem(name, value);
@@ -82,6 +90,7 @@ export function clearCommentDraft(scope: CommentDraftScope, id: string, operatio
   if (operationId && current !== operationId) return;
   clearedOperations.set(name, current);
   memory.set(name, null);
+  if (id === "new" && current) forgetLocalCommentOperation(scope, current);
   notify(name);
   // A subscriber may synchronously start a newer draft while observing the
   // tombstone. Its persisted copy belongs to that newer version.
@@ -153,6 +162,8 @@ export function replaceCommentDraftOperation(scope: CommentDraftScope, expected:
   const name = key(scope, "new"),
     next = { ...current, operationId };
   memory.set(name, next);
+  forgetLocalCommentOperation(scope, expected);
+  markLocalCommentOperation(scope, operationId);
   try {
     localStorage.setItem(name, JSON.stringify(next));
   } catch {
@@ -160,13 +171,3 @@ export function replaceCommentDraftOperation(scope: CommentDraftScope, expected:
   }
   notify(name);
 }
-
-export function warnCommentDraftPersistence(scope: CommentDraftScope) {
-  const current = readCommentDraft(scope, "new");
-  if (current) {
-    memory.set(key(scope, "new"), { ...current, storageFailed: true });
-    notify(key(scope, "new"));
-  }
-}
-
-setCommentPublicationStorageErrorHandler(warnCommentDraftPersistence);

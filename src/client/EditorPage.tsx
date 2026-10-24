@@ -1651,6 +1651,7 @@ function MountedCollaborativeEditor({
     [member.user.id, commentAccount, pageId, bundle, contentEpoch],
   );
   useEffect(() => {
+    threadStore.initialize();
     void threadStore.refresh(commentsRevision);
   }, [commentsRevision, threadStore]);
   useEffect(() => {
