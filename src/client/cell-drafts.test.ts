@@ -338,7 +338,7 @@ it("adopts a metadata-only rewrite of the stored predecessor when discarding a f
   });
   map.set(key, edit("Failed successor"));
   write.mockRestore();
-  const replacement = { ...old, operationId: "other-tab-submission", submissionRevision: 15 };
+  const replacement = { ...old, durable: false, operationId: "other-tab-submission", submissionRevision: 15 };
   localStorage.setItem(name, JSON.stringify(replacement));
   discardCellDraft(accountCellDrafts(scope.account)[0]!);
   expect(map.get(key)).toMatchObject({
