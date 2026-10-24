@@ -62,7 +62,9 @@ function parse(name: string, raw: string | null, includeCleared = false) {
   try {
     const draft: unknown = JSON.parse(raw ?? "null");
     if (!valid(draft) || name !== nameOf(draft.scope, cellDraftKey(draft.rowId, draft.columnId))) return null;
-    return !includeCleared && clearedVersions.get(name)?.has(draft.version) ? null : { ...draft, durable: true };
+    return !includeCleared && (clearedVersions.get(name)?.has(draft.version) || cleanupTargets.get(name)?.raw === raw)
+      ? null
+      : { ...draft, durable: true };
   } catch {
     return null;
   }
@@ -162,12 +164,15 @@ export function useCellDraft(map: CellDraftMap, key: string) {
     () => map.get(key),
   );
 }
-function tombstone(name: string, version?: string) {
+function clearVersion(name: string, version?: string) {
   if (version) {
     const set = clearedVersions.get(name) ?? new Set<string>();
     set.add(version);
     clearedVersions.set(name, set);
   }
+}
+function tombstone(name: string, version?: string) {
+  clearVersion(name, version);
   records.set(name, null);
 }
 function sameDraft(left: StoredCellDraft | null | undefined, right: StoredCellDraft | null) {
@@ -206,9 +211,7 @@ export function discardCellDraft(draft: StoredCellDraft) {
   refresh(name, draft.scope.account);
   if (records.get(name)?.version !== draft.version) return;
   const predecessor = persistedSnapshots.get(name);
-  const storedVersion = parse(name, predecessor ?? null, true)?.version;
   tombstone(name, draft.version);
-  if (storedVersion) clearedVersions.get(name)!.add(storedVersion);
   if (predecessor !== undefined && predecessor !== null)
     cleanupTargets.set(name, { account: draft.scope.account, raw: predecessor });
   notify(draft.scope.account, name);
@@ -228,6 +231,9 @@ function cleanupStoredDraft(name: string, account: string) {
   const raw = localStorage.getItem(name),
     target = cleanupTargets.get(name);
   if (raw !== null && raw === target?.raw) {
+    // Only the observed predecessor is cleared. A same-version metadata rewrite
+    // that arrived before this comparison belongs to the other tab.
+    clearVersion(name, parse(name, raw, true)?.version);
     localStorage.removeItem(name);
     persistedSnapshots.set(name, null);
   } else {

@@ -327,3 +327,27 @@ it("isolates corrupt values, caches initialization, and purges corruption withou
   expect(localStorage.getItem(name)).toBeNull();
   for (let index = 0; index < 500; index++) localStorage.removeItem(`unrelated-${index}`);
 });
+it("adopts a metadata-only rewrite of the stored predecessor when discarding a failed successor", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("Stored predecessor"));
+  const old = accountCellDrafts(scope.account)[0]!;
+  const name = Object.keys(localStorage).find((storedName) => localStorage.getItem(storedName)?.includes(old.version))!;
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.set(key, edit("Failed successor"));
+  write.mockRestore();
+  const replacement = { ...old, operationId: "other-tab-submission", submissionRevision: 15 };
+  localStorage.setItem(name, JSON.stringify(replacement));
+  discardCellDraft(accountCellDrafts(scope.account)[0]!);
+  expect(map.get(key)).toMatchObject({
+    text: old.text,
+    version: old.version,
+    operationId: "other-tab-submission",
+    submissionRevision: 15,
+    durable: true,
+  });
+  expect(map.current(key, old.version)).toBe(true);
+  expect(JSON.parse(localStorage.getItem(name)!)).toMatchObject(replacement);
+});
