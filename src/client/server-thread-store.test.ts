@@ -184,7 +184,7 @@ it("requires collaboration readiness at preparation and publication but can ackn
   await expect(submission.prepare()).rejects.toThrow("Connect and sync");
   expect(mockedApi).not.toHaveBeenCalled();
   ready = true;
-  mockedApi.mockResolvedValueOnce({ submission: { state: "prepared", operationId: "op" } });
+  mockedApi.mockResolvedValueOnce({ protocolVersion: 3, submission: { state: "prepared", operationId: "op" } });
   await submission.prepare();
   ready = false;
   await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow("Connect and sync");
@@ -195,4 +195,37 @@ it("requires collaboration readiness at preparation and publication but can ackn
       thread: thread({ anchored: true }),
     } as never),
   ).not.toThrow();
+});
+
+it("sends protocol 3 and refuses publication after an unconfirmed preparation response", async () => {
+  mockedApi.mockReset();
+  const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true);
+  const submission = store.anchoredSubmission(thread().comments[0]!.body as never);
+  const prepared = { submission: { state: "prepared", operationId: "op" } };
+  mockedApi.mockResolvedValueOnce(prepared).mockResolvedValueOnce(prepared);
+  await expect(submission.prepare()).rejects.toThrow("Reload NoteFlare");
+  expect(mockedApi.mock.calls[0]![1]?.headers).toMatchObject({ "X-Notes-Comment-Protocol": "3" });
+  expect(mockedApi.mock.calls[1]![0]).toMatch(/comment-submissions\/[^/]+$/);
+  await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow("Reload NoteFlare");
+  expect(mockedApi).toHaveBeenCalledTimes(2);
+});
+it("reconciles a recovered identity before preparing and acknowledges an already published outcome", async () => {
+  mockedApi.mockReset();
+  const scope = { account: "protocol-recovery", pageId: "page-1", epoch: 1 };
+  const body = thread().comments[0]!.body as never;
+  writeCommentDraft(scope, "new", body);
+  const operationId = readCommentDraft(scope, "new")!.operationId;
+  const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true, scope);
+  const submission = store.anchoredSubmission(body);
+  mockedApi.mockResolvedValueOnce({
+    submission: { operationId, state: "published" },
+    thread: thread({ anchored: true }),
+  });
+  const result = await submission.prepare();
+  expect(mockedApi).toHaveBeenCalledExactlyOnceWith(
+    `/api/pages/page-1/comment-submissions/${operationId}`,
+    expect.objectContaining({ headers: expect.objectContaining({ "x-notes-operation-id": operationId }) }),
+  );
+  submission.acknowledge(result);
+  expect(readCommentDraft(scope, "new")).toBeNull();
 });

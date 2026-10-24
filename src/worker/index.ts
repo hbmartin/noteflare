@@ -5,6 +5,11 @@ import {
   commentSubmissionStatus,
   expireCommentSubmissions,
 } from "./comment-submissions";
+import {
+  COMMENT_PROTOCOL_HEADER,
+  COMMENT_PROTOCOL_VERSION,
+  COMMENT_RELOAD_MESSAGE,
+} from "../shared/comment-submissions";
 import { previewSlackLink } from "./slack-link-preview";
 import { TableAuthority } from "./table-authority";
 import {
@@ -3726,6 +3731,8 @@ app.post("/api/slack/link-preview", async (c) => {
 });
 
 app.post("/api/pages/:id/comment-submissions", async (c) => {
+  if (c.req.header(COMMENT_PROTOCOL_HEADER) !== String(COMMENT_PROTOCOL_VERSION))
+    throw new HttpError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
   if (page.kind !== "document")
@@ -3740,7 +3747,7 @@ app.post("/api/pages/:id/comment-submissions", async (c) => {
     object(body.initialComment).body,
   );
   c.header("Cache-Control", "private, no-store");
-  return c.json(result, 201);
+  return c.json({ ...result, protocolVersion: COMMENT_PROTOCOL_VERSION }, 201);
 });
 app.get("/api/pages/:id/comment-submissions/:operationId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
@@ -3754,6 +3761,8 @@ app.post("/api/pages/:id/comment-submissions/:operationId/cancel", async (c) => 
   return c.json(await cancelCommentSubmission(c.env, member, commentPage(page), c.req.param("operationId")));
 });
 app.post("/api/pages/:id/comment-submissions/:operationId/publish", async (c) => {
+  if (c.req.header(COMMENT_PROTOCOL_HEADER) !== String(COMMENT_PROTOCOL_VERSION))
+    throw new HttpError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
   const body = await jsonBody(c.req.raw),
@@ -3776,7 +3785,7 @@ app.post("/api/pages/:id/comment-submissions/:operationId/publish", async (c) =>
     },
   );
   sendCommentMutationEvents(c, member.workspace.id, page.id);
-  return c.json(result);
+  return c.json({ ...result, protocolVersion: COMMENT_PROTOCOL_VERSION });
 });
 
 app.get("/api/pages/:id/comments", async (c) => {

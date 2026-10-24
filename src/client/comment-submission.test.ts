@@ -113,6 +113,7 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
     updatedAt: 1,
   };
   const spy = vi.spyOn(apiModule, "api").mockImplementation(async (path, init) => {
+    if (!init?.method) throw new apiModule.ApiClientError(404, "comment_submission_not_found", "Not prepared");
     if (path.endsWith("/comment-submissions")) {
       identities.add(new Headers(init?.headers).get("x-notes-operation-id")!);
       if (identities.size === 1 && !finishCreation)
@@ -120,6 +121,7 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
           finishCreation = resolve;
         });
       return {
+        protocolVersion: 3,
         submission: {
           operationId: new Headers(init?.headers).get("x-notes-operation-id"),
           state: "prepared",
@@ -137,6 +139,7 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
       finishAnchor = resolve;
     });
     return {
+      protocolVersion: 3,
       submission: {
         operationId: new Headers(init?.headers).get("x-notes-operation-id"),
         state: "published",
@@ -159,6 +162,7 @@ it("persists the current anchor, reuses a failed submission's thread, and retain
     const first = submitAnchoredComment(editor, anchor, body, store, () => true);
     const rejected = first.catch((error: Error) => error);
     editor.transact((tr) => tr.insertText("Concurrent ", start));
+    await vi.waitFor(() => expect(finishCreation).toBeTypeOf("function"));
     finishCreation();
     expect(await rejected).toMatchObject({ message: "anchor transport interrupted" });
     expect(readCommentDraft(scope, "new")!.operationId).toBe(identity);

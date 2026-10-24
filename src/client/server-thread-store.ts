@@ -1,6 +1,15 @@
 import { realtimeAccessAccount } from "./realtime-access-status";
-import type { CommentSubmissionStatus } from "../shared/comment-submissions";
-import { registerCommentPublication, forgetCommentPublication } from "./comment-publication";
+import {
+  COMMENT_PROTOCOL_HEADER,
+  COMMENT_PROTOCOL_VERSION,
+  COMMENT_RELOAD_MESSAGE,
+  type CommentSubmissionStatus,
+} from "../shared/comment-submissions";
+import {
+  registerCommentPublication,
+  forgetCommentPublication,
+  initializeCommentPublications,
+} from "./comment-publication";
 import {
   readCommentDraft,
   clearCommentDraft,
@@ -19,7 +28,7 @@ import type { BlockNoteEditor } from "@blocknote/core";
 import { absolutePositionToRelativePosition, ySyncPluginKey } from "y-prosemirror";
 import * as Y from "yjs";
 import type { CommentThread, SessionUser } from "../shared/types";
-import { api, apiErrorMessage, json } from "./api";
+import { api, ApiClientError, apiErrorMessage, json } from "./api";
 
 const finishedWithoutStorage = () => true;
 type NotesThreadMetadata = {
@@ -120,6 +129,7 @@ export class ServerThreadStore extends ThreadStore {
     private readonly draftScope?: CommentDraftScope,
   ) {
     super(new ServerThreadStoreAuth(userId, ready));
+    if (draftScope) initializeCommentPublications(draftScope);
   }
 
   private async mutate<T>(path: string, init: RequestInit): Promise<T> {
@@ -242,7 +252,9 @@ export class ServerThreadStore extends ThreadStore {
     const headers = this.operationHeaders("new", body),
       operationId = headers["x-notes-operation-id"];
     const root = `/api/pages/${encodeURIComponent(this.pageId)}/comment-submissions`;
-    type Result = { submission: CommentSubmissionStatus; thread?: CommentThread };
+    type Result = { submission: CommentSubmissionStatus; thread?: CommentThread; protocolVersion?: number };
+    const protocolHeaders = { ...headers, [COMMENT_PROTOCOL_HEADER]: String(COMMENT_PROTOCOL_VERSION) };
+    let protocolConfirmed = false;
     let terminal = false;
     let finish = finishedWithoutStorage;
     const remember = (result: Result) => {
@@ -254,6 +266,22 @@ export class ServerThreadStore extends ThreadStore {
       if (result.submission.state === "canceled" || result.submission.state === "expired")
         this.terminalPreparations.add(operationId);
       return result;
+    };
+    const status = async () => {
+      const result = await api<Result>(`${root}/${operationId}`, { headers });
+      assertAccount();
+      return remember(result);
+    };
+    const confirmProtocol = async (result: Result) => {
+      assertAccount();
+      if (result.protocolVersion === COMMENT_PROTOCOL_VERSION) {
+        protocolConfirmed = true;
+        return remember(result);
+      }
+      // A stale Worker may have committed. Settle that identity before reporting a reload.
+      const current = await status();
+      if (current.submission.state === "published") return current;
+      throw new Error(COMMENT_RELOAD_MESSAGE);
     };
     let canceling: Promise<CommentSubmissionStatus> | undefined;
     const cancel = () => {
@@ -278,11 +306,26 @@ export class ServerThreadStore extends ThreadStore {
       prepare: async () => {
         assertAccount();
         if (!this.ready()) throw new Error("Connect and sync the document before posting. Your draft is preserved.");
-        return remember(await api<Result>(root, { method: "POST", headers, body: json({ initialComment: { body } }) }));
+        if (previous === operationId) {
+          try {
+            const current = await status();
+            if (current.submission.state !== "prepared") return current;
+          } catch (error) {
+            if (!(error instanceof ApiClientError) || error.status !== 404) throw error;
+          }
+        }
+        return confirmProtocol(
+          await api<Result>(root, {
+            method: "POST",
+            headers: protocolHeaders,
+            body: json({ initialComment: { body } }),
+          }),
+        );
       },
       publish: async (editor: BlockNoteEditor<any, any, any>, selection: { head: number; anchor: number }) => {
         assertAccount();
         if (!this.ready()) throw new Error("Connect and sync the document before posting. Your draft is preserved.");
+        if (!protocolConfirmed) throw new Error(COMMENT_RELOAD_MESSAGE);
         const binding = ySyncPluginKey.getState(editor.prosemirrorState)?.binding;
         if (!binding) throw new Error("The original comment selection is unavailable.");
         const yjs = {
@@ -293,10 +336,10 @@ export class ServerThreadStore extends ThreadStore {
             absolutePositionToRelativePosition(selection.anchor, binding.type, binding.mapping),
           ),
         };
-        return remember(
+        return confirmProtocol(
           await api<Result>(`${root}/${operationId}/publish`, {
             method: "POST",
-            headers,
+            headers: protocolHeaders,
             body: json({ selection: { yjs } }),
           }),
         );

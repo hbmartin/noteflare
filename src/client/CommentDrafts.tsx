@@ -329,6 +329,7 @@ export function DraftCommentsControllers() {
           ? activeCommentCancellation(
               scope,
               store.cancelAnchoredDraft ? (operationId) => store.cancelAnchoredDraft!(operationId) : undefined,
+              draft.operationId,
             )
           : undefined;
       if (cancel) {
@@ -342,7 +343,7 @@ export function DraftCommentsControllers() {
             }
             try {
               clearCommentDraft(scope, id, draft.operationId);
-              setDiscardError(result.state === "published" ? "Comment posted before cancellation completed." : "");
+              setDiscardError(result?.state === "published" ? "Comment posted before cancellation completed." : "");
               if (afterCancellation) afterCancellation();
               else comments.stopPendingComment();
             } catch {
