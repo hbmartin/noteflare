@@ -189,7 +189,9 @@ describe("durable cell draft ownership", () => {
     expect(remove).toHaveBeenCalled();
     vi.restoreAllMocks();
     map.set(cellDraftKey("row:a", "b"), edit("Again"));
-    window.dispatchEvent(new StorageEvent("storage", { key: "notes:local-signout", newValue: scope.account }));
+    window.dispatchEvent(
+      new StorageEvent("storage", { storageArea: localStorage, key: "notes:local-signout", newValue: scope.account }),
+    );
     expect(accountCellDrafts(scope.account)).toHaveLength(0);
   });
 });
@@ -207,12 +209,16 @@ it("keeps failed-delete tombstones through focus and accepts a distinct cross-ta
   map.set(key, { ...edit("server"), changed: false });
   expect(accountCellDrafts(scope.account)).toHaveLength(0);
   expect(map.get(key)?.changed).toBe(false);
-  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: localStorage.getItem(name) }));
+  window.dispatchEvent(
+    new StorageEvent("storage", { storageArea: localStorage, key: name, newValue: localStorage.getItem(name) }),
+  );
   expect(accountCellDrafts(scope.account)).toHaveLength(0);
   remove.mockRestore();
   const next = { ...old, version: "other-tab", operationId: "other-operation", text: "Other tab text" };
   localStorage.setItem(name, JSON.stringify(next));
-  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(next) }));
+  window.dispatchEvent(
+    new StorageEvent("storage", { storageArea: localStorage, key: name, newValue: JSON.stringify(next) }),
+  );
   expect(map.get(key)?.text).toBe("Other tab text");
   discardCellDraft(old);
   expect(map.get(key)?.text).toBe("Other tab text");
@@ -227,7 +233,9 @@ it("rejects delayed events, wrong keys and stale submissions without scanning st
   )!;
   const newer = { ...first, scope, version: "newer-tab", text: "Newest" };
   localStorage.setItem(name, JSON.stringify(newer));
-  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(first) }));
+  window.dispatchEvent(
+    new StorageEvent("storage", { storageArea: localStorage, key: name, newValue: JSON.stringify(first) }),
+  );
   expect(map.submission(key, 11, first.version)).toBeUndefined();
   expect(map.get(key)?.text).toBe("Newest");
   const length = vi.spyOn(Storage.prototype, "length", "get");
@@ -257,7 +265,9 @@ it("adopts another tab's submission and definite-rejection reset without changin
   });
   // Definite rejection clears metadata while retaining the original text version.
   localStorage.setItem(name, JSON.stringify(draft));
-  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(draft) }));
+  window.dispatchEvent(
+    new StorageEvent("storage", { storageArea: localStorage, key: name, newValue: JSON.stringify(draft) }),
+  );
   expect(map.get(key)?.operationId).toBeUndefined();
   const retry = map.submission(key, 12, draft.version)!;
   expect(retry.operationId).not.toBe("other-attempt");
@@ -341,4 +351,104 @@ it("adopts a metadata-only rewrite of the stored predecessor when discarding a f
   });
   expect(map.current(key, old.version)).toBe(true);
   expect(JSON.parse(localStorage.getItem(name)!)).toMatchObject(replacement);
+});
+
+it.each(["malformed", "mismatched"] as const)(
+  "preserves loaded text and identity after %s storage corruption",
+  (kind) => {
+    const map = new CellDraftMap(scope),
+      key = cellDraftKey("row:a", "b");
+    map.set(key, edit("Budget note"));
+    const submitted = map.submission(key, 20)!;
+    const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+    localStorage.setItem(
+      name,
+      kind === "malformed" ? "{broken" : JSON.stringify({ ...submitted, scope: { ...scope, host: "wrong" } }),
+    );
+    expect(map.current(key, submitted.version)).toBe(true);
+    expect(map.get(key)).toMatchObject({
+      text: "Budget note",
+      version: submitted.version,
+      baseRevision: 7,
+      operationId: submitted.operationId,
+      submissionRevision: 20,
+      durable: false,
+    });
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+  },
+);
+it("adopts a same-version predecessor metadata update after removal failed", () => {
+  const { map, key, old, name } = failedSuccessor();
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  map.delete(key);
+  remove.mockRestore();
+  const replacement = JSON.stringify({ ...old, operationId: "other-tab", submissionRevision: 20 });
+  localStorage.setItem(name, replacement);
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: replacement, storageArea: localStorage }));
+  retryCellDraftCleanup(scope.account);
+  expect(map.get(key)).toMatchObject({
+    text: old.text,
+    version: old.version,
+    operationId: "other-tab",
+    submissionRevision: 20,
+  });
+  expect(localStorage.getItem(name)).toBe(replacement);
+});
+it("never replaces a newer memory-only edit with its persisted predecessor during cleanup Retry", () => {
+  const { map, key, name } = failedSuccessor();
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  map.delete(key);
+  remove.mockRestore();
+  map.set(key, edit("B"));
+  const stored = localStorage.getItem(name);
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.set(key, edit("C"));
+  const pending = map.submission(key, 22)!;
+  write.mockRestore();
+  retryCellDraftCleanup(scope.account);
+  expect(map.get(key)).toMatchObject({
+    text: "C",
+    version: pending.version,
+    operationId: pending.operationId,
+    submissionRevision: 22,
+    durable: false,
+  });
+  expect(localStorage.getItem(name)).toBe(stored);
+  expect(cellDraftCleanupError(scope.account)).toBe("");
+});
+it("ignores session storage clear and preserves memory-only edits through localStorage clear", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b"),
+    other = cellDraftKey("other", "b");
+  map.set(key, edit("Durable"));
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.set(other, { ...edit("Memory"), rowId: "other" });
+  write.mockRestore();
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: sessionStorage }));
+  expect(accountCellDrafts(scope.account)).toHaveLength(2);
+  localStorage.clear();
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  expect(map.get(key)).toBeUndefined();
+  expect(map.get(other)).toMatchObject({ text: "Memory", durable: false });
+});
+it("reads current keys on a delayed clear event instead of erasing a replacement", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  const replacement = { ...map.get(key), scope, version: "later", text: "Later tab" };
+  localStorage.clear();
+  localStorage.setItem(name, JSON.stringify(replacement));
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  expect(map.get(key)).toMatchObject({ text: "Later tab", version: "later", durable: true });
 });
