@@ -755,7 +755,7 @@ it("keeps anchored preparations private, cancels them terminally, and expires un
     );
   const first = await prepare();
   expect(first.status).toBe(201);
-  expect(await first.json()).toMatchObject({ submission: { operationId, state: "prepared" } });
+  expect(await first.json()).toMatchObject({ protocolVersion: 3, submission: { operationId, state: "prepared" } });
   expect(
     (
       await (
@@ -1449,7 +1449,10 @@ it.each(["viewer", "private-viewer", "old-totp", "passkey", "trust"] as const)(
       f.authorization,
       f.authorize,
     );
-    expect(result).toMatchObject({ submission: { state: "published" }, thread: { anchored: true } });
+    expect(result).toMatchObject({
+      submission: { state: "published" },
+      thread: { anchored: true },
+    });
     expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(1);
   },
 );
@@ -1492,7 +1495,7 @@ it("publishes a durable anchor exactly once and reports publication winning canc
   const first = await publish();
   expect(first.status).toBe(200);
   const result = await first.json<{ submission: { state: string }; thread: CommentThread }>();
-  expect(result).toMatchObject({ submission: { state: "published" }, thread: { anchored: true } });
+  expect(result).toMatchObject({ protocolVersion: 3, submission: { state: "published" }, thread: { anchored: true } });
   expect((await (await publish()).json<{ thread: CommentThread }>()).thread.id).toBe(result.thread.id);
   expect(await env.DB.prepare("SELECT count(*) n FROM comment_threads").first<number>("n")).toBe(1);
   expect(await env.DB.prepare("SELECT count(*) n FROM comments").first<number>("n")).toBe(1);
