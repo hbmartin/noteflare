@@ -2261,9 +2261,9 @@ it.each(["release-failure", "replacement-token", "canceled"] as const)(
           .bind(f.operationId)
           .first<{ state: string; anchor_token: string | null; anchor_expires_at: number }>();
         expect(current!.anchor_token).not.toBeNull();
-        if (mode === "replacement-token") expect(current!.anchor_token).toBe("replacement");
-        if (mode === "canceled") expect(current!.state).toBe("canceled");
-        if (mode === "release-failure") expect(current!.anchor_expires_at).toBeGreaterThan(Date.now());
+        expect(current!.anchor_token).toEqual(mode === "replacement-token" ? "replacement" : expect.any(String));
+        expect(current!.state).toBe(mode === "canceled" ? "canceled" : "prepared");
+        expect(current!.anchor_expires_at).toBeGreaterThan(Date.now());
         expect(state.storage.sql.exec("SELECT * FROM provisional_comment_anchors").toArray()).toHaveLength(1);
         expect(stateFromDocument(room.document)).not.toContain(f.submission.threadId);
       } finally {
