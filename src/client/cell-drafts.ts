@@ -209,6 +209,12 @@ function observeStoredDraft(name: string, raw: string | null, account: string) {
     return;
   }
   if (result.state === "suppressed") return;
+  if (current && !current.durable && result.state === "valid" && sameDraft(current, result.draft)) {
+    records.set(name, result.draft);
+    persistedSnapshots.set(name, raw);
+    notify(account, name);
+    return;
+  }
   if (current && !current.durable && (raw === persistedSnapshots.get(name) || result.state === "missing")) {
     if (result.state === "missing") persistedSnapshots.set(name, null);
     return;

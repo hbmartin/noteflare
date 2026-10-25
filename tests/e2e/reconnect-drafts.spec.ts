@@ -110,6 +110,48 @@ test("canonical cell drafts survive offline blur and resume normal saving after 
     })
     .toBe("Preserved browser draft");
 });
+test("restoring a corrupt cell draft clears its storage warning without submitting it", async ({ page, context }) => {
+  await signInOwner(page);
+  const { table, rowId, columnId } = await textTableFixture(page, "Restored draft storage", "Restored title");
+  const storageTab = await context.newPage();
+  await storageTab.goto("/api/health");
+  await page.goto(`/?page=${table.id}`);
+  const cell = page.getByLabel("Restored title", { exact: true });
+  await expect(cell).toBeEnabled();
+  await cell.fill("Budget note");
+  await context.setOffline(true);
+  try {
+    await expect(cell).toBeDisabled();
+    const stored = await storageTab.evaluate((id) => {
+      const name = Object.keys(localStorage).find((key) => key.startsWith("notes:cell-draft:v1:") && key.includes(id))!;
+      const raw = localStorage.getItem(name)!;
+      localStorage.setItem(name, "{broken");
+      return { name, raw };
+    }, table.id);
+    await expect(
+      page.getByText("Draft storage is unavailable. Keep this tab open; these edits exist only in memory."),
+    ).toBeVisible();
+    await expect(page.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue("Budget note");
+    await storageTab.evaluate(({ name, raw }) => localStorage.setItem(name, raw), stored);
+    await expect(
+      page.getByText("Draft storage is unavailable. Keep this tab open; these edits exist only in memory."),
+    ).toHaveCount(0);
+    await expect(page.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue("Budget note");
+    expect(
+      await page.evaluate(() => {
+        const event = new Event("beforeunload", { cancelable: true });
+        window.dispatchEvent(event);
+        return event.defaultPrevented;
+      }),
+    ).toBe(false);
+  } finally {
+    await context.setOffline(false);
+    await storageTab.close();
+  }
+  await expect(cell).toBeEnabled({ timeout: 20_000 });
+  const query = await (await page.request.get(`/api/tables/${table.id}/query`)).json();
+  expect(query.rows.find((row: { id: string }) => row.id === rowId).cells[columnId]).toBe("Original");
+});
 test("table renewal preserves focused text and caret without submitting a partial value", async ({ page }) => {
   await signInOwner(page);
   const { table, columnId, rowId } = await textTableFixture(page, "Renewal table", "Renewal title");
@@ -376,8 +418,18 @@ test("diagram access refresh after actual sign-out reaches sign-in", async ({ pa
   await expect(page.getByRole("heading", { name: "Page unavailable", exact: true })).toHaveCount(0);
 });
 
-for (const outcome of ["cancellation-wins", "publication-wins"] as const) {
-  test(`closing an in-flight anchored comment reports ${outcome}`, async ({ page }) => {
+for (const { outcome, cleanup, newer } of [
+  { outcome: "cancellation-wins", cleanup: "none", newer: false },
+  { outcome: "publication-wins", cleanup: "none", newer: false },
+  { outcome: "cancellation-wins", cleanup: "receipt", newer: false },
+  { outcome: "publication-wins", cleanup: "receipt", newer: false },
+  { outcome: "cancellation-wins", cleanup: "draft", newer: false },
+  { outcome: "cancellation-wins", cleanup: "none", newer: true },
+  { outcome: "cancellation-wins", cleanup: "receipt", newer: true },
+] as const) {
+  test(`closing an in-flight anchored comment reports ${outcome}${cleanup !== "none" ? ` with failed ${cleanup} cleanup` : ""}${newer ? " and preserves newer text" : ""}`, async ({
+    page,
+  }) => {
     await signInOwner(page);
     const document = await create(page, "document", `Comment publication ${outcome}`);
     await page.goto(`/?page=${document.id}`);
@@ -396,6 +448,18 @@ for (const outcome of ["cancellation-wins", "publication-wins"] as const) {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    let releaseCancellation!: () => void,
+      cancellationIntercepted = false;
+    const cancellationGate = new Promise<void>((resolve) => {
+      releaseCancellation = resolve;
+    });
+    if (newer)
+      await page.route(`**/api/pages/${document.id}/comment-submissions/*/cancel`, async (route) => {
+        const response = await route.fetch();
+        cancellationIntercepted = true;
+        await cancellationGate;
+        await route.fulfill({ response });
+      });
     await page.route(`**/api/pages/${document.id}/comment-submissions/*/publish`, async (route) => {
       const response = outcome === "publication-wins" ? await route.fetch() : undefined;
       intercepted = true;
@@ -406,11 +470,59 @@ for (const outcome of ["cancellation-wins", "publication-wins"] as const) {
     try {
       await composer.press("Enter");
       await expect.poll(() => intercepted).toBe(true);
+      if (cleanup !== "none")
+        await page.evaluate((kind) => {
+          const remove = Storage.prototype.removeItem;
+          Storage.prototype.removeItem = function (key) {
+            if (key.startsWith(kind === "receipt" ? "notes:comment-publication:v3:" : "notes:comment-draft:"))
+              throw new DOMException("Cleanup blocked by test", "SecurityError");
+            return remove.call(this, key);
+          };
+          (window as typeof window & { restoreCommentStorage?: () => void }).restoreCommentStorage = () => {
+            Storage.prototype.removeItem = remove;
+          };
+        }, cleanup);
       page.once("dialog", (dialog) => dialog.accept());
       await composer.press("Escape");
-      await expect(composer).toHaveCount(0);
-      if (outcome === "publication-wins")
-        await expect(page.getByText("Comment posted before cancellation completed.")).toBeVisible();
+      if (newer) {
+        await expect.poll(() => cancellationIntercepted).toBe(true);
+        await composer.fill("Newer text remains mine");
+        releaseCancellation();
+        await expect(page.getByText("Newer draft edits are preserved. Review them before closing.")).toBeVisible();
+        await expect(composer).toContainText("Newer text remains mine");
+      } else if (cleanup === "draft") {
+        await expect(page.getByRole("button", { name: "Retry comment draft cleanup" })).toBeVisible();
+        await expect(composer).not.toContainText(`Private comment ${outcome}`);
+      } else {
+        await expect(composer).toHaveCount(0);
+        if (outcome === "publication-wins")
+          await expect(
+            page.getByText(
+              cleanup === "receipt"
+                ? "Comment posted before cancellation completed. Local cleanup is still pending."
+                : "Comment posted before cancellation completed.",
+              { exact: true },
+            ),
+          ).toBeVisible();
+      }
+      if (cleanup !== "none") {
+        await page.evaluate(() =>
+          (window as typeof window & { restoreCommentStorage?: () => void }).restoreCommentStorage?.(),
+        );
+        const retry = page.getByRole("button", {
+          name: cleanup === "receipt" ? "Retry comment storage cleanup" : "Retry comment draft cleanup",
+        });
+        await expect(retry).toBeVisible();
+        if (newer) await expect(composer).toContainText("Newer text remains mine");
+        else {
+          if (cleanup === "draft") {
+            await composer.press("Escape");
+            await expect(composer).toHaveCount(0);
+          }
+          await retry.click();
+          await expect(retry).toHaveCount(0);
+        }
+      }
       const settled = page.waitForResponse(
         (response) => response.url().endsWith("/publish") && response.request().method() === "POST",
       );
@@ -421,6 +533,10 @@ for (const outcome of ["cancellation-wins", "publication-wins"] as const) {
       expect(threads.every((thread: { anchored: boolean }) => thread.anchored)).toBe(true);
     } finally {
       release();
+      releaseCancellation();
+      await page.evaluate(() =>
+        (window as typeof window & { restoreCommentStorage?: () => void }).restoreCommentStorage?.(),
+      );
     }
   });
 }
@@ -651,6 +767,54 @@ test("never-submitted anchored text can be discarded offline without a cancellat
     ).toBe(0);
   } finally {
     await context.setOffline(false);
+  }
+});
+test("comment storage Retry recovers a failed receipt event without posting or losing draft text", async ({ page }) => {
+  await signInOwner(page);
+  const { document, composer } = await anchoredComposer(page, "Receipt discovery Retry", "Receipt original anchor");
+  await composer.fill("Keep my unposted text");
+  await page.reload();
+  await editableDocument(page, document.id);
+  await expect(page.getByRole("button", { name: "Resume saved comment" })).toBeVisible();
+  let requests = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith(`/api/pages/${document.id}/comment-submissions`)) requests++;
+  });
+  const saved = await page.evaluate((id) => {
+    const prefix = "notes:comment-draft:",
+      name = Object.keys(localStorage).find((key) => key.startsWith(prefix) && key.includes(id))!,
+      parts = JSON.parse(name.slice(prefix.length)),
+      raw = localStorage.getItem(name)!;
+    const receipt = "notes:comment-publication:v3:" + JSON.stringify([...parts.slice(0, 3), "event-only"]);
+    localStorage.setItem(receipt, "1");
+    const get = Storage.prototype.getItem;
+    Storage.prototype.getItem = function (key) {
+      if (key === receipt) throw new DOMException("Read blocked by test", "SecurityError");
+      return get.call(this, key);
+    };
+    (window as typeof window & { restoreReceiptRead?: () => void }).restoreReceiptRead = () => {
+      Storage.prototype.getItem = get;
+    };
+    window.dispatchEvent(new StorageEvent("storage", { key: receipt, newValue: "1", storageArea: localStorage }));
+    return { name, raw, receipt };
+  }, document.id);
+  try {
+    const retry = page.getByRole("button", { name: "Retry comment storage cleanup" });
+    await expect(retry).toBeVisible();
+    await retry.click();
+    await expect(retry).toBeVisible();
+    await page.evaluate(() => (window as typeof window & { restoreReceiptRead?: () => void }).restoreReceiptRead?.());
+    await retry.click();
+    await expect(retry).toHaveCount(0);
+    expect(await page.evaluate((name) => localStorage.getItem(name), saved.name)).toBe(saved.raw);
+    expect(requests).toBe(0);
+    await page.getByRole("button", { name: "Resume saved comment" }).click();
+    await expect(composer).toContainText("Keep my unposted text");
+  } finally {
+    await page.evaluate(({ receipt }) => {
+      (window as typeof window & { restoreReceiptRead?: () => void }).restoreReceiptRead?.();
+      localStorage.removeItem(receipt);
+    }, saved);
   }
 });
 test("a recovered canceled preparation posts in one deliberate action with a new identity", async ({ page }) => {

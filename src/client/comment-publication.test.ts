@@ -7,6 +7,7 @@ import {
   registerCommentPublication,
   initializeCommentPublications,
   commentPublicationWarning,
+  retryCommentPublicationStorage,
 } from "./comment-publication";
 import { realtimeAccessAccount, setRealtimeAccessAccount } from "./realtime-access-status";
 const scope = { account: "publication-test\0wiki", pageId: "page", epoch: 1 };
@@ -241,4 +242,73 @@ it("enumerates once and does not rescan while registering or resolving receipts"
   }
   expect(length).not.toHaveBeenCalled();
   expect(key).not.toHaveBeenCalled();
+});
+it("retries event discovery failures without losing pending work or unrelated warnings", async () => {
+  setRealtimeAccessAccount(scope.account);
+  initializeCommentPublications(scope);
+  const receipt =
+    "notes:comment-publication:v3:" + JSON.stringify([scope.account, scope.pageId, scope.epoch, "other-tab"]);
+  localStorage.setItem(receipt, "1");
+  const setItem = Storage.prototype.setItem;
+  const failed = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key, value) {
+    if (key.startsWith("notes:comment-publication:v3:")) throw new Error("quota");
+    return setItem.call(this, key, value);
+  });
+  const cancel = vi.fn(async () => ({
+    operationId: "memory-only",
+    threadId: "t",
+    state: "canceled" as const,
+    expiresAt: 1,
+  }));
+  registerCommentPublication(scope, "memory-only", cancel);
+  const read = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+    throw new Error("SecurityError");
+  });
+  window.dispatchEvent(new StorageEvent("storage", { key: receipt, newValue: "1", storageArea: localStorage }));
+  expect(commentPublicationWarning(scope)).toContain("could not be checked");
+  retryCommentPublicationStorage(scope);
+  expect(commentPublicationWarning(scope)).toContain("could not be checked");
+  read.mockRestore();
+  const legacy = "notes:comment-publication:" + JSON.stringify([scope.account, scope.pageId, scope.epoch]);
+  localStorage.setItem(legacy, "[]");
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked cleanup");
+  });
+  const length = vi.spyOn(Storage.prototype, "length", "get"),
+    keys = vi.spyOn(Storage.prototype, "key");
+  retryCommentPublicationStorage(scope);
+  expect(length).toHaveBeenCalled();
+  expect(keys).toHaveBeenCalled();
+  expect(commentPublicationWarning(scope)).not.toContain("could not be checked");
+  expect(commentPublicationWarning(scope)).toContain("Older comment data");
+  expect(commentPublicationWarning(scope)).toContain("unfinished comment cannot be saved");
+  length.mockClear();
+  keys.mockClear();
+  retryCommentPublicationStorage(scope);
+  failed.mockRestore();
+  expect(length).not.toHaveBeenCalled();
+  expect(keys).not.toHaveBeenCalled();
+  remove.mockRestore();
+  const recover = vi.fn(async (operationId: string) => ({
+    operationId,
+    threadId: "t",
+    state: "canceled" as const,
+    expiresAt: 1,
+  }));
+  await activeCommentCancellation(scope, recover)!();
+  expect(cancel).toHaveBeenCalledOnce();
+  expect(recover).toHaveBeenCalledExactlyOnceWith("other-tab");
+});
+it("ignores unrelated account, sessionStorage and delayed receipt events without invalidating discovery", () => {
+  setRealtimeAccessAccount(scope.account);
+  initializeCommentPublications(scope);
+  const length = vi.spyOn(Storage.prototype, "length", "get"),
+    receipt = "notes:comment-publication:v3:" + JSON.stringify([scope.account, scope.pageId, scope.epoch, "delayed"]),
+    other = "notes:comment-publication:v3:" + JSON.stringify(["another-account", scope.pageId, scope.epoch, "other"]);
+  window.dispatchEvent(new StorageEvent("storage", { key: receipt, newValue: "1", storageArea: sessionStorage }));
+  window.dispatchEvent(new StorageEvent("storage", { key: other, newValue: "1", storageArea: localStorage }));
+  window.dispatchEvent(new StorageEvent("storage", { key: receipt, newValue: "1", storageArea: localStorage }));
+  retryCommentPublicationStorage(scope);
+  expect(length).not.toHaveBeenCalled();
+  expect(commentPublicationWarning(scope)).toBe("");
 });
