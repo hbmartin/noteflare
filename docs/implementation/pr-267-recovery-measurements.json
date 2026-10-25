@@ -1,0 +1,258 @@
+{
+  "baselineRevision": "37b5b08",
+  "updatedRevision": "69c99f2ea06484a09d3ef36a0fa1301b3b303902",
+  "harnessRevision": "69c99f2ea06484a09d3ef36a0fa1301b3b303902",
+  "command": "NOTES_BENCH_TYPING_EDITS=200 NOTES_BENCH_READ_RECOVERY=1 node scripts/measure-collaboration-recovery.mjs 37b5b08 docs/implementation/pr-267-recovery-measurements.json",
+  "fixture": {
+    "readRecoverySamplesPerVersion": 3,
+    "corruptAccountDraft": false,
+    "rows": 100,
+    "columns": 3,
+    "accountDrafts": 500,
+    "unrelatedStorageKeys": 5000,
+    "typingEditsPerContext": 200,
+    "contextsPerVersion": 3,
+    "reconnectingClients": 20
+  },
+  "limits": "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
+  "runs": {
+    "baseline": [
+      {
+        "typing": {
+          "samples": 200,
+          "firstEditMs": 0.6000000238418579,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.19999992847442627,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 200,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 303
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 1.4000000953674316,
+          "p95Ms": 1.5,
+          "counts": {
+            "length": 110020,
+            "key": 110000,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1569.8999999761581,
+          "p95Ms": 1870.8999999761581,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "readRecovery": {
+          "latencyMs": 14999.699999928474,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 200,
+          "firstEditMs": 0.6000000238418579,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 200,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 303
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 1.5,
+          "p95Ms": 1.600000023841858,
+          "counts": {
+            "length": 110020,
+            "key": 110000,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1436.4000000953674,
+          "p95Ms": 1741.4000000953674,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "readRecovery": {
+          "latencyMs": 14998.700000047684,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 200,
+          "firstEditMs": 0.6000000238418579,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 200,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 303
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 1.5,
+          "p95Ms": 1.8000000715255737,
+          "counts": {
+            "length": 110020,
+            "key": 110000,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1416.8000000715256,
+          "p95Ms": 1886.9000000953674,
+          "maximumReadyIn100ms": 3,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "readRecovery": {
+          "latencyMs": 14998.200000047684,
+          "queries": 3
+        }
+      }
+    ],
+    "updated": [
+      {
+        "typing": {
+          "samples": 200,
+          "firstEditMs": 0.7000000476837158,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 200,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000002384185791,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1483.7999999523163,
+          "p95Ms": 1961.1999999284744,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "readRecovery": {
+          "latencyMs": 1698.6999999284744,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 200,
+          "firstEditMs": 0.7999999523162842,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.19999992847442627,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 200,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000002384185791,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1587.1999999284744,
+          "p95Ms": 1844.3999999761581,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "readRecovery": {
+          "latencyMs": 1515,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 200,
+          "firstEditMs": 0.6000000238418579,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 200,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000002384185791,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1510.7999999523163,
+          "p95Ms": 1851.3999999761581,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "readRecovery": {
+          "latencyMs": 1516.8999999761581,
+          "queries": 3
+        }
+      }
+    ]
+  }
+}

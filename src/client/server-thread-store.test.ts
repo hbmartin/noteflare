@@ -1,9 +1,11 @@
-import { writeCommentDraft, readCommentDraft } from "./comment-drafts";
+import { activeCommentCancellation, commentPublicationWarning, purgeCommentPublications } from "./comment-publication";
+import { setRealtimeAccessAccount } from "./realtime-access-status";
+import { writeCommentDraft, readCommentDraft, subscribeCommentDraft } from "./comment-drafts";
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommentThread } from "../shared/types";
-import { api } from "./api";
+import { api, ApiClientError } from "./api";
 import { ServerThreadStore } from "./server-thread-store";
 
 vi.mock("./api", async (importOriginal) => ({
@@ -155,7 +157,6 @@ describe("ServerThreadStore", () => {
 });
 
 it("retires prepared comment operations without sending cancellation or publication as another account", async () => {
-  const { setRealtimeAccessAccount } = await import("./realtime-access-status");
   setRealtimeAccessAccount("first\0wiki");
   const store = new ServerThreadStore("page", "first", vi.fn(), () => true, {
     account: "first\0wiki",
@@ -218,6 +219,9 @@ it("reconciles a recovered identity before preparing and acknowledges an already
   const body = thread().comments[0]!.body as never;
   writeCommentDraft(scope, "new", body);
   const operationId = readCommentDraft(scope, "new")!.operationId;
+  // Returning to this account gives recovered text an unknown submission history.
+  setRealtimeAccessAccount("");
+  setRealtimeAccessAccount(scope.account);
   const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true, scope);
   const submission = store.anchoredSubmission(body);
   mockedApi.mockResolvedValueOnce({
@@ -231,4 +235,127 @@ it("reconciles a recovered identity before preparing and acknowledges an already
   );
   submission.acknowledge(result);
   expect(readCommentDraft(scope, "new")).toBeNull();
+});
+
+function localAnchoredDraft() {
+  const scope = { account: crypto.randomUUID(), pageId: "page-1", epoch: 1 };
+  setRealtimeAccessAccount(scope.account);
+  const body = thread().comments[0]!.body as never;
+  writeCommentDraft(scope, "new", body);
+  const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true, scope);
+  return { scope, body, store, operationId: readCommentDraft(scope, "new")!.operationId };
+}
+it("keeps construction free of storage side effects and initializes outside render", () => {
+  const { scope } = localAnchoredDraft();
+  const legacy = "notes:comment-publication:" + JSON.stringify([scope.account, scope.pageId, scope.epoch]);
+  localStorage.setItem(legacy, "[]");
+  const listener = vi.fn(),
+    stop = subscribeCommentDraft(scope, "new", listener);
+  const length = vi.spyOn(Storage.prototype, "length", "get"),
+    remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+  const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true, scope);
+  expect(length).not.toHaveBeenCalled();
+  expect(remove).not.toHaveBeenCalled();
+  expect(listener).not.toHaveBeenCalled();
+  store.initialize();
+  expect(commentPublicationWarning(scope)).toContain("Older comment data");
+  expect(readCommentDraft(scope, "new")!.storageFailed).toBe(false);
+  stop();
+  vi.restoreAllMocks();
+  purgeCommentPublications(scope.account);
+});
+it("starts a fresh local preparation without a preliminary status request", async () => {
+  mockedApi.mockReset();
+  const { scope, store, body, operationId } = localAnchoredDraft();
+  mockedApi.mockResolvedValueOnce({ protocolVersion: 3, submission: { state: "prepared", operationId } });
+  expect((await store.anchoredSubmission(body).prepare()).submission.state).toBe("prepared");
+  expect(mockedApi).toHaveBeenCalledExactlyOnceWith(
+    "/api/pages/page-1/comment-submissions",
+    expect.objectContaining({ method: "POST" }),
+  );
+  purgeCommentPublications(scope.account);
+});
+it("leaves a known protocol rejection local, and resumes its same identity after reload", async () => {
+  mockedApi.mockReset();
+  const { scope, store, body, operationId } = localAnchoredDraft();
+  mockedApi.mockRejectedValueOnce(new ApiClientError(409, "comment_client_reload_required", "Reload NoteFlare"));
+  await expect(store.anchoredSubmission(body).prepare()).rejects.toThrow("Reload NoteFlare");
+  expect(activeCommentCancellation(scope)).toBeUndefined();
+  expect(
+    Object.keys(localStorage).filter(
+      (name) => name.startsWith("notes:comment-publication:v3:") && name.includes(scope.account),
+    ),
+  ).toEqual([]);
+  setRealtimeAccessAccount("");
+  setRealtimeAccessAccount(scope.account);
+  const recovered = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true, scope);
+  mockedApi
+    .mockRejectedValueOnce(new ApiClientError(404, "comment_submission_not_found", "Missing"))
+    .mockResolvedValueOnce({ protocolVersion: 3, submission: { state: "prepared", operationId } });
+  await recovered.anchoredSubmission(body).prepare();
+  expect(readCommentDraft(scope, "new")!.operationId).toBe(operationId);
+  expect(mockedApi.mock.calls).toHaveLength(3);
+  purgeCommentPublications(scope.account);
+});
+it.each(["canceled", "expired"])(
+  "continues a deliberate Post after confirmed %s status with one new identity",
+  async (state) => {
+    mockedApi.mockReset();
+    const { scope, body, operationId } = localAnchoredDraft();
+    setRealtimeAccessAccount("");
+    setRealtimeAccessAccount(scope.account);
+    const recovered = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true, scope);
+    mockedApi
+      .mockResolvedValueOnce({ submission: { state, operationId } })
+      .mockImplementationOnce(async (_path, init) => ({
+        protocolVersion: 3,
+        submission: {
+          state: "prepared",
+          operationId: new Headers(init?.headers).get("x-notes-operation-id"),
+        },
+      }));
+    const result = await recovered.anchoredSubmission(body).prepare();
+    expect(result.submission.state).toBe("prepared");
+    expect(result.submission.operationId).not.toBe(operationId);
+    expect(mockedApi.mock.calls.map(([path]) => path)).toEqual([
+      `/api/pages/page-1/comment-submissions/${operationId}`,
+      "/api/pages/page-1/comment-submissions",
+    ]);
+    expect(readCommentDraft(scope, "new")).toMatchObject({ body, operationId: result.submission.operationId });
+    purgeCommentPublications(scope.account);
+  },
+);
+it("does not loop if the one replacement identity is also canceled", async () => {
+  mockedApi.mockReset();
+  const { scope, body, store } = localAnchoredDraft();
+  mockedApi.mockImplementation(async (_path, init) => ({
+    protocolVersion: 3,
+    submission: { state: "canceled", operationId: new Headers(init?.headers).get("x-notes-operation-id") },
+  }));
+  await expect(store.anchoredSubmission(body).prepare()).rejects.toThrow("canceled or expired again");
+  expect(mockedApi).toHaveBeenCalledTimes(2);
+  expect(readCommentDraft(scope, "new")!.body).toEqual(body);
+  purgeCommentPublications(scope.account);
+});
+
+it("treats a freshly minted fallback identity as local when no saved draft matches", async () => {
+  mockedApi.mockReset();
+  const scope = { account: crypto.randomUUID(), pageId: "page-1", epoch: 1 };
+  setRealtimeAccessAccount(scope.account);
+  const store = new ServerThreadStore("page-1", "user-1", vi.fn(), () => true, scope);
+  mockedApi.mockImplementation(async (_path, init) => {
+    if (init?.method !== "POST") throw new ApiClientError(404, "comment_submission_not_found", "Missing");
+    return {
+      protocolVersion: 3,
+      submission: { state: "prepared", operationId: new Headers(init.headers).get("x-notes-operation-id") },
+    };
+  });
+  await store.anchoredSubmission(thread().comments[0]!.body as never).prepare();
+  expect(mockedApi).toHaveBeenCalledExactlyOnceWith(
+    "/api/pages/page-1/comment-submissions",
+    expect.objectContaining({ method: "POST" }),
+  );
+  purgeCommentPublications(scope.account);
 });

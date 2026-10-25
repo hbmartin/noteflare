@@ -58,15 +58,20 @@ function valid(value: unknown): value is StoredCellDraft {
     Number.isSafeInteger(draft.scope.generation),
   );
 }
-function parse(name: string, raw: string | null, includeCleared = false) {
+type StoredRead =
+  | { state: "missing" | "invalid" | "suppressed"; draft?: never }
+  | { state: "valid"; draft: StoredCellDraft };
+function parse(name: string, raw: string | null, includeCleared = false): StoredRead {
+  if (raw === null) return { state: "missing" };
   try {
-    const draft: unknown = JSON.parse(raw ?? "null");
-    if (!valid(draft) || name !== nameOf(draft.scope, cellDraftKey(draft.rowId, draft.columnId))) return null;
-    return !includeCleared && (clearedVersions.get(name)?.has(draft.version) || cleanupTargets.get(name)?.raw === raw)
-      ? null
-      : { ...draft, durable: true };
+    const draft: unknown = JSON.parse(raw);
+    if (!valid(draft) || name !== nameOf(draft.scope, cellDraftKey(draft.rowId, draft.columnId)))
+      return { state: "invalid" };
+    if (!includeCleared && (clearedVersions.get(name)?.has(draft.version) || cleanupTargets.get(name)?.raw === raw))
+      return { state: "suppressed" };
+    return { state: "valid", draft: { ...draft, durable: true } };
   } catch {
-    return null;
+    return { state: "invalid" };
   }
 }
 function loadCellDrafts(account: string) {
@@ -78,7 +83,7 @@ function loadCellDrafts(account: string) {
         const name = localStorage.key(index);
         if (!name?.startsWith(prefix) || records.has(name)) continue;
         const raw = localStorage.getItem(name),
-          draft = parse(name, raw);
+          draft = parse(name, raw).draft;
         if (draft?.scope.account === account) {
           records.set(name, draft);
           persistedSnapshots.set(name, raw);
@@ -177,6 +182,7 @@ function tombstone(name: string, version?: string) {
 }
 function sameDraft(left: StoredCellDraft | null | undefined, right: StoredCellDraft | null) {
   return (
+    (!left && !right) ||
     left === right ||
     Boolean(
       left &&
@@ -190,18 +196,37 @@ function sameDraft(left: StoredCellDraft | null | undefined, right: StoredCellDr
     )
   );
 }
+function retainInvalidDraft(name: string, current: StoredCellDraft | null | undefined) {
+  if (!current?.durable) return;
+  records.set(name, { ...current, durable: false });
+  notify(current.scope.account, name);
+}
+function observeStoredDraft(name: string, raw: string | null, account: string) {
+  const current = records.get(name),
+    result = parse(name, raw);
+  if (result.state === "invalid") {
+    retainInvalidDraft(name, current);
+    return;
+  }
+  if (result.state === "suppressed") return;
+  if (current && !current.durable && (raw === persistedSnapshots.get(name) || result.state === "missing")) {
+    if (result.state === "missing") persistedSnapshots.set(name, null);
+    return;
+  }
+  const next = result.draft ?? null;
+  if (sameDraft(current, next)) {
+    if (next || persistedSnapshots.has(name)) persistedSnapshots.set(name, raw);
+    return;
+  }
+  persistedSnapshots.set(name, raw);
+  if (!next && current) tombstone(name, current.version);
+  else records.set(name, next);
+  notify(account, name);
+}
 /** Read the actual latest write before a save or discard, without enumerating storage. */
 function refresh(name: string, account: string) {
   try {
-    const current = records.get(name);
-    if (current && !current.durable) return;
-    const raw = localStorage.getItem(name),
-      next = parse(name, raw);
-    persistedSnapshots.set(name, raw);
-    if (sameDraft(current, next)) return;
-    if (!next && current) tombstone(name, current.version);
-    else records.set(name, next);
-    notify(account, name);
+    observeStoredDraft(name, localStorage.getItem(name), account);
   } catch {
     /* In-memory text remains available when storage cannot be read. */
   }
@@ -231,23 +256,39 @@ function cleanupStoredDraft(name: string, account: string) {
   const raw = localStorage.getItem(name),
     target = cleanupTargets.get(name);
   if (raw !== null && raw === target?.raw) {
-    // Only the observed predecessor is cleared. A same-version metadata rewrite
-    // that arrived before this comparison belongs to the other tab.
-    clearVersion(name, parse(name, raw, true)?.version);
+    // A failed removal suppresses exactly this snapshot, never all later
+    // metadata writes carrying its text version.
     localStorage.removeItem(name);
+    clearVersion(name, parse(name, raw, true).draft?.version);
     persistedSnapshots.set(name, null);
   } else {
-    const replacement = parse(name, raw);
-    persistedSnapshots.set(name, raw);
-    if (replacement) {
-      records.set(name, replacement);
-      notify(account, name);
+    const replacement = parse(name, raw),
+      current = records.get(name);
+    if (replacement.state === "invalid") retainInvalidDraft(name, current);
+    else {
+      const isOwnPredecessor = current && !current.durable && raw === persistedSnapshots.get(name);
+      if (replacement.draft && !isOwnPredecessor && !sameDraft(current, replacement.draft)) {
+        records.set(name, replacement.draft);
+        notify(account, name);
+      }
+      persistedSnapshots.set(name, raw);
     }
   }
   cleanupTargets.delete(name);
+  if (![...cleanupTargets.values()].some((entry) => entry.account === account) && cleanupErrors.delete(account))
+    notify(account);
 }
 export function retryCellDraftCleanup(account: string) {
-  for (const [name, target] of cleanupTargets) if (target.account === account) cleanupStoredDraft(name, account);
+  const errors: unknown[] = [];
+  for (const [name, target] of cleanupTargets)
+    if (target.account === account) {
+      try {
+        cleanupStoredDraft(name, account);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+  if (errors.length) throw new AggregateError(errors, "Stored draft cleanup is still pending.");
   cleanupErrors.delete(account);
   notify(account);
 }
@@ -263,9 +304,13 @@ export class CellDraftMap extends Map<string, CellDraft> {
   override has(key: string) {
     return this.get(key) !== undefined;
   }
+  subscribe(key: string, listener: () => void) {
+    return subscribe(cellListeners, nameOf(this.scope, key), listener);
+  }
   focus(key: string, value: boolean) {
     const name = nameOf(this.scope, key),
       set = focused.get(name) ?? new Set<CellDraftMap>();
+    if (set.has(this) === value) return;
     if (value) {
       set.add(this);
       focused.set(name, set);
@@ -384,7 +429,7 @@ export function purgeCellDrafts(account: string) {
     }
     const ownVersion = records.get(name)?.version;
     try {
-      const persisted = parse(name, localStorage.getItem(name));
+      const persisted = parse(name, localStorage.getItem(name)).draft;
       if (persisted) tombstone(name, persisted.version);
     } catch (error) {
       errors.push(error);
@@ -412,6 +457,11 @@ if (typeof window !== "undefined") {
     }
   });
   window.addEventListener("storage", (event) => {
+    try {
+      if (event.storageArea !== localStorage) return;
+    } catch {
+      return;
+    }
     if (event.key === "notes:local-signout" && event.newValue) {
       try {
         purgeCellDrafts(event.newValue);
@@ -419,27 +469,15 @@ if (typeof window !== "undefined") {
         /* Signing-out tab reports cleanup failures. */
       }
     } else if (event.key === null) {
-      for (const [name, draft] of records) {
-        if (draft) {
-          tombstone(name, draft.version);
-          notify(draft.scope.account, name);
-        }
-      }
-      initialized.clear();
+      // clear() may be delivered after another write. Inspect known keys and
+      // keep memory-only edits whose failed writes never belonged to storage.
+      for (const [name, draft] of records) if (draft) refresh(name, draft.scope.account);
     } else if (event.key.startsWith(prefix)) {
       try {
-        // Events may be queued behind a newer write. The serialized storage value wins.
         const raw = localStorage.getItem(event.key);
         if (raw !== event.newValue) return;
-        const next = parse(event.key, raw),
-          previous = records.get(event.key);
-        if (raw !== null && !next) return;
-        persistedSnapshots.set(event.key, raw);
-        const account = next?.scope.account ?? (JSON.parse(event.key.slice(prefix.length)) as string[])[0];
-        if (!account || sameDraft(previous, next)) return;
-        if (!next) tombstone(event.key, previous?.version);
-        else records.set(event.key, next);
-        notify(account, event.key);
+        const account = (JSON.parse(event.key.slice(prefix.length)) as unknown[])[0];
+        if (typeof account === "string") observeStoredDraft(event.key, raw, account);
       } catch {
         /* Keep the last valid local copy. */
       }

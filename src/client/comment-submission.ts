@@ -74,7 +74,7 @@ export async function submitAnchoredComment(
 ) {
   if (!isCurrent()) return false;
   if ("anchoredSubmission" in store && typeof store.anchoredSubmission === "function") {
-    const submission = (store as ServerThreadStore).anchoredSubmission(body);
+    const submission = (store as ServerThreadStore).anchoredSubmission(body, isCurrent);
     try {
       let result = await submission.prepare();
       if (!isCurrent()) {

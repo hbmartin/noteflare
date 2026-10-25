@@ -10,10 +10,20 @@ import {
   type CommentPage,
 } from "./comments";
 import { correlationHeaders, logger } from "./observability";
-import type { CommentSubmissionStatus } from "../shared/comment-submissions";
+import {
+  COMMENT_PROTOCOL_HEADER,
+  COMMENT_PROTOCOL_VERSION,
+  COMMENT_RELOAD_MESSAGE,
+  type CommentSubmissionStatus,
+} from "../shared/comment-submissions";
 import { protectedSessionGuard } from "./security";
 import { SQL_NOW_MS } from "./sql-clock";
 import { pageReadableSql, spaceVisibleSql } from "./page-access";
+
+export function requireCommentProtocol(request: Request) {
+  if (request.headers.get(COMMENT_PROTOCOL_HEADER) !== String(COMMENT_PROTOCOL_VERSION))
+    throw new HttpError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
+}
 
 export type CommentPublicationAuthorization = { userId: string; sessionId: string; workspaceId: string };
 
@@ -204,7 +214,9 @@ export async function publishCommentSubmission(
     );
   let token: string | undefined;
   let mayHaveCommitted = false;
+  let anchorAttempted = false;
   try {
+    anchorAttempted = true;
     const response = await room(env, page, member, operationId, { operation: "prepare", selection });
     if (!response.ok) {
       if (response.status === 410) await authorize();
@@ -273,18 +285,26 @@ export async function publishCommentSubmission(
     return await commentSubmissionStatus(env, member, page, operationId);
   } catch (error) {
     // A lost response never turns a committed publication into a duplicate.
-    const committed = mayHaveCommitted
-      ? await commentSubmissionStatus(env, member, page, operationId).catch((cause: unknown) => {
-          logger.error(
-            "comment.publication.reconciliation_failed",
-            "comments",
-            "Publication status could not be reconciled.",
-            { pageId: page.id, operationId },
-            cause,
-          );
-          return undefined;
-        })
-      : undefined;
+    if (
+      error instanceof HttpError &&
+      ([401, 403, 404].includes(error.status) || error.code === "comment_epoch_changed")
+    )
+      throw error;
+    let reconciliationFailed = false;
+    const committed =
+      mayHaveCommitted || anchorAttempted
+        ? await commentSubmissionStatus(env, member, page, operationId).catch((cause: unknown) => {
+            reconciliationFailed = true;
+            logger.error(
+              "comment.publication.reconciliation_failed",
+              "comments",
+              "Publication status could not be reconciled.",
+              { pageId: page.id, operationId },
+              cause,
+            );
+            return undefined;
+          })
+        : undefined;
     const guardRejected = error instanceof Error && error.message.includes("anchored_comment_publication_conflict");
     if (!(error instanceof HttpError) && !guardRejected) {
       logger.error(
@@ -295,7 +315,32 @@ export async function publishCommentSubmission(
         error,
       );
     }
-    if (committed?.submission.state === "published") return committed;
+    if (committed?.submission.state === "published") {
+      try {
+        await authorize();
+      } catch (denial) {
+        if (denial instanceof HttpError) throw denial;
+        logger.error(
+          "comment.publication.authorization_failed",
+          "comments",
+          "Publication access could not be reconciled.",
+          { pageId: page.id, operationId },
+          denial,
+        );
+        throw new HttpError(
+          503,
+          "comment_publication_unavailable",
+          "Comment access could not be confirmed. Your draft is preserved.",
+        );
+      }
+      return committed;
+    }
+    if (reconciliationFailed)
+      throw new HttpError(
+        503,
+        "comment_publication_unavailable",
+        "Comment publication could not be confirmed. Your draft is preserved.",
+      );
     if (committed && committed.submission.state !== "prepared")
       throw new HttpError(
         409,

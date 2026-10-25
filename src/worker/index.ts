@@ -4,12 +4,10 @@ import {
   cancelCommentSubmission,
   commentSubmissionStatus,
   expireCommentSubmissions,
+  requireCommentProtocol,
 } from "./comment-submissions";
-import {
-  COMMENT_PROTOCOL_HEADER,
-  COMMENT_PROTOCOL_VERSION,
-  COMMENT_RELOAD_MESSAGE,
-} from "../shared/comment-submissions";
+import { COMMENT_PROTOCOL_VERSION } from "../shared/comment-submissions";
+import { runMaintenance } from "./maintenance";
 import { previewSlackLink } from "./slack-link-preview";
 import { TableAuthority } from "./table-authority";
 import {
@@ -144,7 +142,7 @@ import {
   TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
 import { PAGE_KINDS } from "../shared/page-kind";
-import { boundedLogString, prefixedErrorLogFields, rawSafeErrorMessage, safeInstanceOf } from "../shared/error-log";
+import { prefixedErrorLogFields, safeInstanceOf } from "../shared/error-log";
 import {
   PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
   PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
@@ -3731,8 +3729,7 @@ app.post("/api/slack/link-preview", async (c) => {
 });
 
 app.post("/api/pages/:id/comment-submissions", async (c) => {
-  if (c.req.header(COMMENT_PROTOCOL_HEADER) !== String(COMMENT_PROTOCOL_VERSION))
-    throw new HttpError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
+  requireCommentProtocol(c.req.raw);
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
   if (page.kind !== "document")
@@ -3761,8 +3758,7 @@ app.post("/api/pages/:id/comment-submissions/:operationId/cancel", async (c) => 
   return c.json(await cancelCommentSubmission(c.env, member, commentPage(page), c.req.param("operationId")));
 });
 app.post("/api/pages/:id/comment-submissions/:operationId/publish", async (c) => {
-  if (c.req.header(COMMENT_PROTOCOL_HEADER) !== String(COMMENT_PROTOCOL_VERSION))
-    throw new HttpError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
+  requireCommentProtocol(c.req.raw);
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
   const body = await jsonBody(c.req.raw),
@@ -7471,32 +7467,15 @@ export async function backfillTableSearchValues(env: Env) {
 }
 
 export async function runSlackMaintenance(env: Env) {
-  const operations = ["redrive", "file_cleanup", "mapping_validation"] as const;
-  const results = await Promise.allSettled([
-    redriveStaleSlackOutbox(env),
-    processDueSlackFileCleanup(env),
-    revalidateMappings(env),
+  await runMaintenance("Slack", "scheduled.slack_maintenance.failed", [
+    ["redrive", () => redriveStaleSlackOutbox(env)],
+    ["file_cleanup", () => processDueSlackFileCleanup(env)],
+    ["mapping_validation", () => revalidateMappings(env)],
   ]);
-  const failures: unknown[] = [];
-  const summaries: string[] = [];
-  for (const [index, result] of results.entries()) {
-    if (result.status !== "rejected") continue;
-    const operation = operations[index]!;
-    logger.error(
-      "scheduled.slack_maintenance.failed",
-      "scheduler",
-      "Slack maintenance operation failed",
-      { operation },
-      result.reason,
-    );
-    failures.push(result.reason);
-    summaries.push(`${operation}: ${boundedLogString(rawSafeErrorMessage(result.reason, "Unknown failure"), 180)}`);
-  }
-  if (failures.length) throw new AggregateError(failures, `Slack maintenance failed; ${summaries.join("; ")}`);
 }
 
 export async function runSecurityMaintenance(env: Env) {
-  const operations = [
+  await runMaintenance("Security", "scheduled.security_maintenance.failed", [
     ["comment_expiry", () => expireCommentSubmissions(env)],
     ["security_pruning", () => pruneSecurityState(env)],
     [
@@ -7505,24 +7484,7 @@ export async function runSecurityMaintenance(env: Env) {
         if (!(await drainRealtimeRevocationsBatch(env))) throw new Error("Live access revocation is still pending.");
       },
     ],
-  ] as const;
-  const results = await Promise.allSettled(operations.map(([, run]) => Promise.resolve().then(run)));
-  const failures: unknown[] = [];
-  const labels: string[] = [];
-  for (const [index, result] of results.entries()) {
-    if (result.status !== "rejected") continue;
-    const operation = operations[index]![0];
-    logger.error(
-      "scheduled.security_maintenance.failed",
-      "scheduler",
-      "Security maintenance operation failed",
-      { operation },
-      result.reason,
-    );
-    failures.push(result.reason);
-    labels.push(operation);
-  }
-  if (failures.length) throw new AggregateError(failures, `Security maintenance failed: ${labels.join(", ")}`);
+  ]);
 }
 
 export default {

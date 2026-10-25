@@ -1182,3 +1182,56 @@ it("shows an active unsaved indicator without duplicate recovery controls", asyn
   expect(await screen.findByLabelText("Recovered cell draft")).toHaveValue("Active text");
   expect(writes).toHaveLength(0);
 });
+
+it("retires the saved-operation Retry when another edit supersedes its draft", async () => {
+  show();
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Earlier" } });
+  failure = new ApiClientError(503, "busy", "Uncertain update");
+  fireEvent.blur(input);
+  await screen.findByRole("button", { name: "Retry saved operation" });
+  const drafts = new CellDraftMap({ account: "owner\0workspace", host: "/linked", tableId: "table", generation: 1 });
+  const key = cellDraftKey("row", "Title");
+  act(() => {
+    drafts.set(key, { ...drafts.get(key)!, text: "Newer text" });
+  });
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Retry saved operation" })).toBeNull());
+  expect(screen.getByLabelText("Recovered cell draft")).toHaveValue("Newer text");
+  expect(writes).toHaveLength(1);
+});
+it("reveals a focused draft when a remote column type replaces its input", async () => {
+  show();
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Recover this text" } });
+  data = {
+    ...data,
+    revision: 2,
+    columns: data.columns.map((property) => (property.id === "Title" ? { ...property, type: "formula" } : property)),
+  };
+  await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+  expect(screen.queryByLabelText("Title")).toBeNull();
+  expect(screen.getByLabelText("Recovered cell draft")).toHaveValue("Recover this text");
+  expect(screen.getByText("Incompatible column. Text recovery only.")).toBeInTheDocument();
+  expect(writes).toHaveLength(0);
+});
+it("automatically verifies a transiently failed linked read without replaying its draft", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  show();
+  await act(async () => {});
+  const input = screen.getByLabelText("Title");
+  expect(input).toBeEnabled();
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Unsaved" } });
+  vi.mocked(api).mockRejectedValueOnce(new TypeError("read failed"));
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh" })));
+  expect(input).toBeDisabled();
+  expect(screen.getByLabelText("Recovered cell draft")).toHaveValue("Unsaved");
+  await act(async () => vi.advanceTimersByTimeAsync(1000));
+  expect(input).toBeEnabled();
+  expect(writes).toHaveLength(0);
+});

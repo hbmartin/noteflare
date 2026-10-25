@@ -1,4 +1,11 @@
-import { activeCommentCancellation, CommentCancellationUncertainError } from "./comment-publication";
+import {
+  activeCommentCancellation,
+  CommentCancellationUncertainError,
+  CommentPublicationCleanupError,
+  useCommentPublicationWarning,
+  retryCommentPublicationStorage,
+  hasVolatileCommentReceipt,
+} from "./comment-publication";
 import {
   createContext,
   memo,
@@ -41,6 +48,23 @@ import {
   type CommentDraftScope,
 } from "./comment-drafts";
 export const CommentDraftContext = createContext<(CommentDraftScope & { ready: boolean }) | null>(null);
+function PublicationStorageNotice({ scope }: { scope: CommentDraftScope }) {
+  const warning = useCommentPublicationWarning(scope);
+  useEffect(() => {
+    if (!warning || !hasVolatileCommentReceipt(scope)) return undefined;
+    const protect = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", protect);
+    return () => window.removeEventListener("beforeunload", protect);
+  }, [scope, warning]);
+  return warning ? (
+    <p role="alert">
+      {warning} <button onClick={() => retryCommentPublicationStorage(scope)}>Retry comment storage cleanup</button>
+    </p>
+  ) : null;
+}
 function setCommentEditing(editor: BlockNoteEditor<any, any, any>, ready: boolean) {
   editor.isEditable = ready;
 }
@@ -353,13 +377,35 @@ export function DraftCommentsControllers() {
               );
             }
           })
-          .catch((error) =>
-            setDiscardError(
-              error instanceof CommentCancellationUncertainError
-                ? error.message
-                : "Cancellation could not be confirmed. Your draft is preserved; retry before discarding it.",
-            ),
-          );
+          .catch((error) => {
+            if (error instanceof CommentPublicationCleanupError) {
+              const latest = readCommentDraft(scope, id);
+              if (latest && latest.operationId !== draft.operationId) {
+                setDiscardError("Newer draft edits are preserved. Review them before closing.");
+                return;
+              }
+              try {
+                clearCommentDraft(scope, id, draft.operationId);
+                setDiscardError(
+                  error.posted
+                    ? "Comment posted before cancellation completed. Local cleanup is still pending."
+                    : error.message,
+                );
+                if (afterCancellation) afterCancellation();
+                else comments.stopPendingComment();
+              } catch {
+                setCleanup({ id, operationId: draft.operationId });
+                setDiscardError(
+                  "The draft was cleared from this tab, but its stored copy could not be removed. Retry cleanup before leaving.",
+                );
+              }
+            } else
+              setDiscardError(
+                error instanceof CommentCancellationUncertainError
+                  ? error.message
+                  : "Cancellation could not be confirmed. Your draft is preserved; retry before discarding it.",
+              );
+          });
         return false;
       }
       try {
@@ -424,6 +470,7 @@ export function DraftCommentsControllers() {
   const thread = state.selectedThreadId ? threads.get(state.selectedThreadId) : undefined;
   return (
     <>
+      <PublicationStorageNotice scope={scope} />
       {discardError && <p role="alert">{discardError}</p>}
       {cleanup && (
         <button

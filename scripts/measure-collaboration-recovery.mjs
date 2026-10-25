@@ -8,17 +8,20 @@ import { relative, resolve as resolvePath } from "node:path";
 const baseline = process.argv[2] ?? "ac826e9";
 const output = process.argv[3];
 const corruptStorage = process.argv[4] === "--corrupt-storage";
+const measureReadRecovery = process.env.NOTES_BENCH_READ_RECOVERY === "1";
 const typingEdits = Number(process.env.NOTES_BENCH_TYPING_EDITS ?? 20);
 if (!Number.isSafeInteger(typingEdits) || typingEdits < 20 || typingEdits > 10000)
   throw new Error("Invalid typing sample count");
 const root = process.cwd();
-const controlled = /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection)\.(ts|tsx)$/;
+const controlled =
+  /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection|comment-publication)\.(ts|tsx)$/;
 const entry = `
 import {createElement} from 'react';
 import {createRoot} from 'react-dom/client';
 import {flushSync} from 'react-dom';
 import {CollaborativeTablePage} from './src/client/CollaborativeTablePage';
 import {tableConnection} from './src/client/table-connection';
+import {registerCommentPublication,initializeCommentPublications} from './src/client/comment-publication';
 const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
 const percentile=(values,q)=>[...values].sort((a,b)=>a-b)[Math.ceil(values.length*q)-1];
 const column=(id,type)=>({id,name:id,type,position:0,revision:1,generation:1,options:[]});
@@ -53,8 +56,43 @@ globalThis.measureTyping=async()=>{
  try{
   for(let i=0;i<${typingEdits};i++){const started=performance.now();edit('Measured draft '+i);durations.push(performance.now()-started);}
   if(![...Object.keys(localStorage)].some(key=>localStorage.getItem(key)?.includes('Measured draft ${typingEdits - 1}')))throw Error('No actual persisted input events');
-  return {samples:durations.length,firstEditMs:durations[0],p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),counts:{...count,wholeTableRenders:globalThis.__wholeTableRenders},requests:globalThis.__requests};
+  const result={samples:durations.length,firstEditMs:durations[0],p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),counts:{...count,wholeTableRenders:globalThis.__wholeTableRenders},requests:globalThis.__requests};
+  globalThis.__draftNotifications=0;
+  input.blur();
+  for(let i=0;i<100;i++){await frame();if(globalThis.__requests>=3&&!input.disabled)break;}
+  result.saveFocusNotifications=globalThis.__draftNotifications;
+  return result;
  }finally{Object.defineProperty(Storage.prototype,'length',descriptor);Storage.prototype.key=key;Storage.prototype.setItem=set;tree.unmount();host.remove();}
+};
+globalThis.measureReceipts=async()=>{
+ const scope={account:'receipt-bench',pageId:'page',epoch:1};initializeCommentPublications(scope);
+ const count={length:0,key:0,writes:0,removes:0},durations=[];
+ const descriptor=Object.getOwnPropertyDescriptor(Storage.prototype,'length'),key=Storage.prototype.key,set=Storage.prototype.setItem,remove=Storage.prototype.removeItem;
+ Object.defineProperty(Storage.prototype,'length',{configurable:true,get(){count.length++;return descriptor.get.call(this)}});
+ Storage.prototype.key=function(...args){count.key++;return key.apply(this,args)};
+ Storage.prototype.setItem=function(...args){count.writes++;return set.apply(this,args)};
+ Storage.prototype.removeItem=function(...args){count.removes++;return remove.apply(this,args)};
+ try{
+  for(let i=0;i<20;i++){const start=performance.now();registerCommentPublication(scope,'operation-'+i,async()=>{}).finish();durations.push(performance.now()-start);}
+  return {samples:durations.length,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),counts:count};
+ }finally{Object.defineProperty(Storage.prototype,'length',descriptor);Storage.prototype.key=key;Storage.prototype.setItem=set;Storage.prototype.removeItem=remove;}
+};
+globalThis.measureReadRecovery=async()=>{
+ const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
+ globalThis.__requests=0;
+ flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'Read measurement'},member:{role:'editor',user:{id:'read-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
+ try{
+  let input;
+  for(let i=0;i<100;i++){await frame();input=host.querySelector('input[aria-label="Title"]');if(input&&!input.disabled)break;}
+  if(!input||input.disabled)throw Error('Read fixture never became editable');
+  globalThis.__failNextRead=true;const start=performance.now();
+  [...host.querySelectorAll('button')].find(button=>button.textContent==='Refresh').click();
+  const deadline=start+20000;
+  let interrupted=false;
+  while(performance.now()<deadline){await frame();if(input.disabled)interrupted=true;if(interrupted&&!input.disabled)break;}
+  if(!interrupted||input.disabled)throw Error('Read recovery did not complete');
+  return {latencyMs:performance.now()-start,queries:globalThis.__requests};
+ }finally{tree.unmount();host.remove();}
 };
 globalThis.measureReconnect=async()=>{
  const Native=globalThis.WebSocket,times=[],starts=new Map();let queries=0,created=0;
@@ -94,11 +132,11 @@ async function bundle(before) {
         name: "controlled-collaboration-fixture",
         setup(builder) {
           builder.onLoad({ filter: /src\/client\/api\.ts$/ }, () => ({
-            contents: `export class ApiClientError extends Error{}; export const json=JSON.stringify; export const apiErrorMessage=(e,f)=>f; export async function api(){globalThis.__requests++;return globalThis.__data;}`,
+            contents: `export class ApiClientError extends Error{}; export const json=JSON.stringify; export const apiErrorMessage=(e,f)=>f; export async function api(path,init){globalThis.__requests++;if(globalThis.__failNextRead&&!init?.method){globalThis.__failNextRead=false;throw Error('Controlled read failure')}return path?.endsWith('/commands')?{revision:1,result:{},projectionPending:false}:globalThis.__data;}`,
             loader: "ts",
           }));
           builder.onLoad({ filter: /src\/client\/realtime-access-status\.ts$/ }, () => ({
-            contents: `export const useRealtimeAccessStatus=()=>({account:null});export const useRealtimeAccessAccount=()=>null;`,
+            contents: `export const useRealtimeAccessStatus=()=>({account:null});export const useRealtimeAccessAccount=()=>null;export const realtimeAccessAccount=()=>null;export const subscribeRealtimeAccess=()=>()=>{};`,
             loader: "ts",
           }));
           builder.onLoad({ filter: /\.css$/ }, () => ({ contents: "", loader: "js" }));
@@ -110,6 +148,11 @@ async function bundle(before) {
               contents = contents.replace(
                 "  const base = queryBase",
                 "  globalThis.__wholeTableRenders=(globalThis.__wholeTableRenders??0)+1;\n  const base = queryBase",
+              );
+            if (path.endsWith("cell-drafts.ts"))
+              contents = contents.replace(
+                "function notify(account: string, name?: string) {",
+                "function notify(account: string, name?: string) { globalThis.__draftNotifications=(globalThis.__draftNotifications??0)+1;",
               );
             return { contents, loader: path.endsWith("tsx") ? "tsx" : "ts", resolveDir: resolvePath(path, "..") };
           });
@@ -134,7 +177,10 @@ const browser = await chromium.launch({ headless: true });
 const results = {
   baselineRevision: baseline,
   updatedRevision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+  harnessRevision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+  command: `NOTES_BENCH_TYPING_EDITS=${typingEdits} NOTES_BENCH_READ_RECOVERY=${measureReadRecovery ? "1" : "0"} node scripts/measure-collaboration-recovery.mjs ${baseline}${output ? ` ${output}` : ""}${corruptStorage ? " --corrupt-storage" : ""}`,
   fixture: {
+    readRecoverySamplesPerVersion: measureReadRecovery ? 3 : 0,
     corruptAccountDraft: corruptStorage,
     rows: 100,
     columns: 3,
@@ -158,7 +204,9 @@ try {
       await page.waitForFunction(() => typeof globalThis.measureTyping === "function");
       results.runs[mode].push({
         typing: await page.evaluate(() => globalThis.measureTyping()),
+        receipts: await page.evaluate(() => globalThis.measureReceipts()),
         reconnect: await page.evaluate(() => globalThis.measureReconnect()),
+        ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });
       await context.close();
     }
