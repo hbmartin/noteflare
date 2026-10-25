@@ -1651,9 +1651,9 @@ function MountedCollaborativeEditor({
     [member.user.id, commentAccount, pageId, bundle, contentEpoch],
   );
   useEffect(() => {
-    threadStore.initialize();
     void threadStore.refresh(commentsRevision);
   }, [commentsRevision, threadStore]);
+  useEffect(() => threadStore.initialize(), [threadStore]);
   useEffect(() => {
     const panel = commentsPanel.current;
     if (!commentsOpen || !panelTarget || !panel) return undefined;

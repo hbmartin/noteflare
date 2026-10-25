@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import type { CommentDraftScope } from "./comment-drafts";
 import type { CommentSubmissionStatus } from "../shared/comment-submissions";
 import { realtimeAccessAccount, subscribeRealtimeAccess } from "./realtime-access-status";
@@ -11,7 +11,12 @@ const operationKey = (name: string, operationId: string) =>
   v3 + JSON.stringify([...(JSON.parse(name.slice(prefix.length)) as unknown[]), operationId]);
 const pending = new Map<string, Set<string>>();
 const indexed = new Map<string, Set<string>>();
-const initialized = new Set<string>();
+type Discovery = {
+  state: "running" | "ready" | "failed" | "dirty";
+  incarnation: ReturnType<typeof realtimeAccessAccount>;
+};
+const discovery = new Map<string, Discovery>();
+const discoveryWarning = "Comment status could not be checked on this device. Retry cleanup.";
 const retiredKeys = new Map<string, Set<string>>();
 const cleanupOnly = new Map<string, Set<string>>();
 const active = new Map<string, Map<string, { cancel: () => Promise<CommentSubmissionStatus>; detach: () => void }>>();
@@ -78,15 +83,18 @@ export function commentPublicationWarning(scope: CommentDraftScope) {
 }
 export function useCommentPublicationWarning(scope: CommentDraftScope) {
   return useSyncExternalStore(
-    (listener) => {
-      const set = listeners.get(scope.account) ?? new Set();
-      listeners.set(scope.account, set);
-      set.add(listener);
-      return () => {
-        set.delete(listener);
-        if (!set.size) listeners.delete(scope.account);
-      };
-    },
+    useCallback(
+      (listener: () => void) => {
+        const set = listeners.get(scope.account) ?? new Set();
+        listeners.set(scope.account, set);
+        set.add(listener);
+        return () => {
+          set.delete(listener);
+          if (!set.size) listeners.delete(scope.account);
+        };
+      },
+      [scope.account],
+    ),
     () => commentPublicationWarning(scope),
     () => "",
   );
@@ -103,10 +111,15 @@ export function isLocalCommentOperation(scope: CommentDraftScope, operationId: s
   return phase?.state === "local" && phase.account === realtimeAccessAccount();
 }
 /** Beta cutover: enumerate once; older formats are erased, never imported. */
-export function initializeCommentPublications(scope: CommentDraftScope) {
+export function initializeCommentPublications(scope: CommentDraftScope, retry = false) {
   const { account } = scope;
-  let complete = true;
-  if (!initialized.has(account)) {
+  const incarnation = realtimeAccessAccount();
+  const previous = discovery.get(account);
+  const reactivated = incarnation?.key === account && previous?.incarnation !== incarnation;
+  let complete = previous?.state === "ready";
+  if (!previous || reactivated || (retry && previous.state !== "ready" && previous.state !== "running")) {
+    complete = true;
+    discovery.set(account, { state: "running", incarnation });
     try {
       const entries: string[] = [];
       for (let index = 0; index < localStorage.length; index++) {
@@ -126,8 +139,7 @@ export function initializeCommentPublications(scope: CommentDraftScope) {
         }
         if (parts.length !== 4 || typeof parts[3] !== "string") continue;
         try {
-          if (localStorage.getItem(entry) === "1")
-            changeSet(indexed, prefix + JSON.stringify(parts.slice(0, 3)), parts[3], true);
+          observeReceipt(entry, parts, localStorage.getItem(entry) === "1");
         } catch {
           complete = false;
         }
@@ -135,14 +147,8 @@ export function initializeCommentPublications(scope: CommentDraftScope) {
     } catch {
       complete = false;
     }
-    if (complete) initialized.add(account);
-    warn(
-      account,
-      "discovery",
-      complete
-        ? undefined
-        : "Unfinished comments could not be checked on this device. You can still retry known attempts.",
-    );
+    discovery.set(account, { state: complete ? "ready" : "failed", incarnation });
+    warn(account, "discovery", complete ? undefined : discoveryWarning);
   }
   let cleaned = true;
   for (const entry of retiredKeys.get(account) ?? []) {
@@ -200,7 +206,15 @@ export function registerCommentPublication(
   const name = key(scope),
     operationName = operationKey(name, operationId),
     account = realtimeAccessAccount();
-  const wasLocal = isLocalCommentOperation(scope, operationId);
+  let wasLocal =
+    isLocalCommentOperation(scope, operationId) &&
+    !pending.get(name)?.has(operationId) &&
+    !indexed.get(name)?.has(operationId);
+  try {
+    if (localStorage.getItem(operationName) === "1") wasLocal = false;
+  } catch {
+    wasLocal = false;
+  }
   const attempt = { account, state: "possibly-sent" as const };
   phases.set(operationName, attempt);
   changeSet(cleanupOnly, name, operationId, false);
@@ -248,26 +262,48 @@ export function registerCommentPublication(
     },
   };
 }
+/** Local recovery covers every page/epoch in this workspace account. */
 export function retryCommentPublicationStorage(scope: CommentDraftScope) {
-  initializeCommentPublications(scope);
-  const name = key(scope);
-  for (const id of pending.get(name) ?? []) {
-    if (cleanupOnly.get(name)?.has(id)) forgetCommentPublication(scope, id);
-    else {
-      try {
-        localStorage.setItem(operationKey(name, id), "1");
-        changeSet(indexed, name, id, true);
-        changeSet(pending, name, id, false);
-      } catch {
-        /* Preserve this operation's fallback and warning. */
+  initializeCommentPublications(scope, true);
+  for (const [name, operations] of pending) {
+    if (accountOf(name) !== scope.account) continue;
+    const parts = JSON.parse(name.slice(prefix.length)) as [string, string, number];
+    const operationScope = { account: parts[0], pageId: parts[1], epoch: parts[2] };
+    for (const id of operations) {
+      if (cleanupOnly.get(name)?.has(id)) forgetCommentPublication(operationScope, id);
+      else {
+        try {
+          localStorage.setItem(operationKey(name, id), "1");
+          changeSet(indexed, name, id, true);
+          changeSet(pending, name, id, false);
+        } catch {
+          /* Preserve this operation's fallback and warning. */
+        }
       }
     }
   }
   updateReceiptWarnings(scope.account);
 }
-export function hasVolatileCommentReceipt(scope: CommentDraftScope) {
-  const name = key(scope);
-  return [...(pending.get(name) ?? [])].some((id) => !cleanupOnly.get(name)?.has(id));
+export function hasVolatileCommentReceipt(scope?: CommentDraftScope) {
+  return [...pending].some(
+    ([name, operations]) =>
+      (!scope || accountOf(name) === scope.account) && [...operations].some((id) => !cleanupOnly.get(name)?.has(id)),
+  );
+}
+function observeReceipt(entry: string, parts: unknown[], present: boolean) {
+  if (
+    parts.length !== 4 ||
+    typeof parts[1] !== "string" ||
+    !Number.isSafeInteger(parts[2]) ||
+    typeof parts[3] !== "string"
+  )
+    return;
+  changeSet(indexed, prefix + JSON.stringify(parts.slice(0, 3)), parts[3], present);
+  // Discovery and events have the same conservative provenance policy.
+  if (present) phases.delete(entry);
+}
+function invalidateDiscovery(account: string) {
+  discovery.set(account, { state: "dirty", incarnation: realtimeAccessAccount() });
 }
 export class CommentCancellationUncertainError extends Error {}
 export class CommentPublicationCleanupError extends Error {
@@ -370,12 +406,18 @@ export function purgeCommentPublications(account: string) {
       failures.push(error);
     }
   }
-  initialized.delete(account);
+  discovery.delete(account);
   warnings.delete(account);
   if (failures.length)
     throw new AggregateError(failures, "Unfinished comment publication receipts could not be removed.");
 }
-if (typeof window !== "undefined")
+if (typeof window !== "undefined") {
+  window.addEventListener("beforeunload", (event) => {
+    if (hasVolatileCommentReceipt()) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
   window.addEventListener("storage", (event) => {
     try {
       if (event.storageArea !== localStorage) return;
@@ -384,7 +426,7 @@ if (typeof window !== "undefined")
     }
     if (event.key === null) {
       const account = realtimeAccessAccount()?.key;
-      if (account) initialized.delete(account);
+      if (account) invalidateDiscovery(account);
       return;
     }
     if (!event.key.startsWith(prefix)) return;
@@ -397,11 +439,11 @@ if (typeof window !== "undefined")
         changeSet(retiredKeys, account, event.key, true);
         initializeCommentPublications({ account, pageId: String(parts[1]), epoch: Number(parts[2]) });
       } else if (parts.length === 4 && typeof parts[3] === "string") {
-        changeSet(indexed, prefix + JSON.stringify(parts.slice(0, 3)), parts[3], event.newValue === "1");
-        if (event.newValue === "1") phases.delete(event.key);
+        observeReceipt(event.key, parts, event.newValue === "1");
       }
     } catch {
-      initialized.delete(account);
-      warn(account, "discovery", "Comment status could not be checked on this device. Retry cleanup.");
+      invalidateDiscovery(account);
+      warn(account, "discovery", discoveryWarning);
     }
   });
+}

@@ -150,10 +150,10 @@ export class ServerThreadStore extends ThreadStore {
       previous = this.pendingOperations.get(key),
       draft = this.draftScope ? readCommentDraft(this.draftScope, key) : null;
     const id =
-      previous?.body === serialized
-        ? previous.id
-        : draft && json(draft.body) === serialized
-          ? draft.operationId
+      draft && json(draft.body) === serialized
+        ? draft.operationId
+        : !draft && previous?.body === serialized
+          ? previous.id
           : crypto.randomUUID();
     this.pendingOperations.set(key, { body: serialized, id });
     return {
@@ -246,6 +246,14 @@ export class ServerThreadStore extends ThreadStore {
       operationId = headers["x-notes-operation-id"];
     if (this.draftScope && operationId !== previous && operationId !== saved)
       markLocalCommentOperation(this.draftScope, operationId);
+    const assertDraft = () => {
+      assertAccount();
+      const draft = this.draftScope ? readCommentDraft(this.draftScope, "new") : null;
+      if ((saved && !draft) || (draft && (draft.operationId !== operationId || json(draft.body) !== json(body)))) {
+        if (this.pendingOperations.get("new")?.id === operationId) this.pendingOperations.delete("new");
+        throw new Error("Your draft changed while posting. Review the newer text before posting again.");
+      }
+    };
     const root = `/api/pages/${encodeURIComponent(this.pageId)}/comment-submissions`;
     type Result = { submission: CommentSubmissionStatus; thread?: CommentThread; protocolVersion?: number };
     let protocolConfirmed = false,
@@ -298,9 +306,7 @@ export class ServerThreadStore extends ThreadStore {
     const rotate = () => {
       if (rotated)
         throw new Error("This preparation was canceled or expired again. Your draft is preserved; retry deliberately.");
-      const draft = this.draftScope ? readCommentDraft(this.draftScope, "new") : null;
-      if (draft && draft.operationId !== operationId)
-        throw new Error("Your draft changed while posting. Review the newer text before posting again.");
+      assertDraft();
       const next = crypto.randomUUID();
       this.pendingOperations.set("new", { body: json(body), id: next });
       if (this.draftScope) replaceCommentDraftOperation(this.draftScope, operationId, next);
@@ -316,6 +322,7 @@ export class ServerThreadStore extends ThreadStore {
       prepare: async () => {
         assertAccount();
         while (true) {
+          assertDraft();
           if (this.terminalPreparations.has(operationId)) {
             if (!canContinue()) throw new Error("The comment composer was closed. Your draft is preserved.");
             rotate();
@@ -333,6 +340,7 @@ export class ServerThreadStore extends ThreadStore {
               if (!(error instanceof ApiClientError) || error.status !== 404) throw error;
             }
           }
+          assertDraft();
           if (!canContinue() || !this.ready())
             throw new Error("Connect and sync the document before posting. Your draft is preserved.");
           const id = operationId,
@@ -363,7 +371,7 @@ export class ServerThreadStore extends ThreadStore {
         }
       },
       publish: async (editor: BlockNoteEditor<any, any, any>, selection: { head: number; anchor: number }) => {
-        assertAccount();
+        assertDraft();
         if (!canContinue() || !this.ready())
           throw new Error("Connect and sync the document before posting. Your draft is preserved.");
         if (!protocolConfirmed) throw new ApiClientError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);

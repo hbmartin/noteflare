@@ -359,3 +359,22 @@ it("treats a freshly minted fallback identity as local when no saved draft match
   );
   purgeCommentPublications(scope.account);
 });
+
+it("uses the current shared identity after a same-text operation is replaced and canceled", async () => {
+  mockedApi.mockReset();
+  const { scope, store, body, operationId } = localAnchoredDraft();
+  mockedApi.mockResolvedValueOnce({ protocolVersion: 3, submission: { state: "prepared", operationId } });
+  await store.anchoredSubmission(body).prepare();
+  const { replaceCommentDraftOperation } = await import("./comment-drafts");
+  replaceCommentDraftOperation(scope, operationId, "replacement-identity");
+  mockedApi.mockResolvedValueOnce({ submission: { state: "canceled", operationId } });
+  await store.cancelAnchoredDraft(operationId);
+  mockedApi.mockImplementation(async (_path, init) => ({
+    protocolVersion: 3,
+    submission: { state: "prepared", operationId: new Headers(init?.headers).get("x-notes-operation-id") },
+  }));
+  const result = await store.anchoredSubmission(body).prepare();
+  expect(result.submission).toMatchObject({ state: "prepared", operationId: "replacement-identity" });
+  expect(readCommentDraft(scope, "new")!.operationId).toBe("replacement-identity");
+  purgeCommentPublications(scope.account);
+});

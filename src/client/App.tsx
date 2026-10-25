@@ -1,3 +1,4 @@
+import { CommentPublicationNotice } from "./CommentPublicationNotice";
 import { purgeCommentDrafts } from "./comment-drafts";
 import { DiagramRestoreOwner } from "./diagram-restore-owner";
 import { useRealtimeAccessCoordinator } from "./RealtimeAccessCoordinator";
@@ -4288,6 +4289,7 @@ function Workspace({
         inert={activitiesOpen || notificationsOpen || exportOpen || importOpen ? true : undefined}
         aria-hidden={activitiesOpen || notificationsOpen || exportOpen || importOpen || undefined}
       >
+        <CommentPublicationNotice account={`${member.user.id}\0${member.workspace.id}`} />
         {workspaceError && (
           <div className="form-error workspace-error" role="alert">
             <span>{workspaceError}</span>

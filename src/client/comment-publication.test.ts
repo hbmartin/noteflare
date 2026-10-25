@@ -8,6 +8,8 @@ import {
   initializeCommentPublications,
   commentPublicationWarning,
   retryCommentPublicationStorage,
+  markLocalCommentOperation,
+  isLocalCommentOperation,
 } from "./comment-publication";
 import { realtimeAccessAccount, setRealtimeAccessAccount } from "./realtime-access-status";
 const scope = { account: "publication-test\0wiki", pageId: "page", epoch: 1 };
@@ -311,4 +313,60 @@ it("ignores unrelated account, sessionStorage and delayed receipt events without
   retryCommentPublicationStorage(scope);
   expect(length).not.toHaveBeenCalled();
   expect(commentPublicationWarning(scope)).toBe("");
+});
+
+it("rediscovery retires local provenance before a not-sent attempt can remove shared work", async () => {
+  setRealtimeAccessAccount(scope.account);
+  initializeCommentPublications(scope);
+  markLocalCommentOperation(scope, "shared-operation");
+  const name =
+    "notes:comment-publication:v3:" + JSON.stringify([scope.account, scope.pageId, scope.epoch, "shared-operation"]);
+  localStorage.setItem(name, "1");
+  const read = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: "1", storageArea: localStorage }));
+  read.mockRestore();
+  retryCommentPublicationStorage(scope);
+  expect(isLocalCommentOperation(scope, "shared-operation")).toBe(false);
+  expect(registerCommentPublication(scope, "shared-operation", vi.fn()).rejectedBeforeSend()).toBe(false);
+  expect(localStorage.getItem(name)).toBe("1");
+});
+it("rediscovers receipts written while another workspace was active", () => {
+  setRealtimeAccessAccount(scope.account);
+  initializeCommentPublications(scope);
+  setRealtimeAccessAccount("elsewhere\0workspace");
+  const name = "notes:comment-publication:v3:" + JSON.stringify([scope.account, scope.pageId, scope.epoch, "missed"]);
+  localStorage.setItem(name, "1");
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: "1", storageArea: localStorage }));
+  setRealtimeAccessAccount(scope.account);
+  initializeCommentPublications(scope);
+  expect(activeCommentCancellation(scope, vi.fn())).toBeDefined();
+});
+it("retries volatile receipts for other pages in the same account", () => {
+  setRealtimeAccessAccount(scope.account);
+  const failed = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  registerCommentPublication(scope, "other-page", vi.fn());
+  failed.mockRestore();
+  retryCommentPublicationStorage({ ...scope, pageId: "another-page" });
+  expect(commentPublicationWarning(scope)).toBe("");
+  expect(
+    localStorage.getItem(
+      "notes:comment-publication:v3:" + JSON.stringify([scope.account, scope.pageId, scope.epoch, "other-page"]),
+    ),
+  ).toBe("1");
+});
+it("does not repeat failed discovery from routine initialization", () => {
+  setRealtimeAccessAccount(scope.account);
+  const length = vi.spyOn(Storage.prototype, "length", "get").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  initializeCommentPublications(scope);
+  expect(length).toHaveBeenCalledOnce();
+  for (let i = 0; i < 4; i++) initializeCommentPublications(scope);
+  expect(length).toHaveBeenCalledOnce();
+  retryCommentPublicationStorage(scope);
+  expect(length).toHaveBeenCalledTimes(2);
 });
