@@ -21,7 +21,7 @@ import {createRoot} from 'react-dom/client';
 import {flushSync} from 'react-dom';
 import {CollaborativeTablePage} from './src/client/CollaborativeTablePage';
 import {tableConnection} from './src/client/table-connection';
-import {registerCommentPublication,initializeCommentPublications} from './src/client/comment-publication';
+import {registerCommentPublication,initializeCommentPublications,useCommentPublicationWarning} from './src/client/comment-publication';
 const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
 const percentile=(values,q)=>[...values].sort((a,b)=>a-b)[Math.ceil(values.length*q)-1];
 const column=(id,type)=>({id,name:id,type,position:0,revision:1,generation:1,options:[]});
@@ -76,6 +76,17 @@ globalThis.measureReceipts=async()=>{
   for(let i=0;i<20;i++){const start=performance.now();registerCommentPublication(scope,'operation-'+i,async()=>{}).finish();durations.push(performance.now()-start);}
   return {samples:durations.length,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),counts:count};
  }finally{Object.defineProperty(Storage.prototype,'length',descriptor);Storage.prototype.key=key;Storage.prototype.setItem=set;Storage.prototype.removeItem=remove;}
+};
+globalThis.measureReceiptSubscriptions=async()=>{
+ const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
+ const scope={account:'subscription-bench',pageId:'page',epoch:1};
+ function Notice({sequence}){return createElement('span',null,useCommentPublicationWarning(scope),sequence);}
+ flushSync(()=>tree.render(createElement(Notice,{sequence:0})));await frame();
+ globalThis.__receiptSubscriptions=0;globalThis.__receiptUnsubscriptions=0;
+ try{
+  for(let sequence=1;sequence<=20;sequence++)flushSync(()=>tree.render(createElement(Notice,{sequence})));
+  return {renders:20,subscriptions:globalThis.__receiptSubscriptions,unsubscriptions:globalThis.__receiptUnsubscriptions};
+ }finally{tree.unmount();host.remove();}
 };
 globalThis.measureReadRecovery=async()=>{
  const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
@@ -149,6 +160,16 @@ async function bundle(before) {
                 "  const base = queryBase",
                 "  globalThis.__wholeTableRenders=(globalThis.__wholeTableRenders??0)+1;\n  const base = queryBase",
               );
+            if (path.endsWith("comment-publication.ts"))
+              contents = contents
+                .replace(
+                  "set.add(listener);",
+                  "globalThis.__receiptSubscriptions=(globalThis.__receiptSubscriptions??0)+1; set.add(listener);",
+                )
+                .replace(
+                  "set.delete(listener);",
+                  "globalThis.__receiptUnsubscriptions=(globalThis.__receiptUnsubscriptions??0)+1; set.delete(listener);",
+                );
             if (path.endsWith("cell-drafts.ts"))
               contents = contents.replace(
                 "function notify(account: string, name?: string) {",
@@ -205,6 +226,7 @@ try {
       results.runs[mode].push({
         typing: await page.evaluate(() => globalThis.measureTyping()),
         receipts: await page.evaluate(() => globalThis.measureReceipts()),
+        receiptSubscriptions: await page.evaluate(() => globalThis.measureReceiptSubscriptions()),
         reconnect: await page.evaluate(() => globalThis.measureReconnect()),
         ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });
