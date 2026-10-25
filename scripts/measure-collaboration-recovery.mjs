@@ -89,6 +89,8 @@ globalThis.measureReceiptSubscriptions=async()=>{
  }finally{tree.unmount();host.remove();}
 };
 globalThis.measureReadRecovery=async()=>{
+ // Compare scheduler work with the same equal-jitter draw in both versions.
+ const originalRandom=Math.random;Math.random=()=>0.5;
  const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
  globalThis.__requests=0;
  flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'Read measurement'},member:{role:'editor',user:{id:'read-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
@@ -103,7 +105,7 @@ globalThis.measureReadRecovery=async()=>{
   while(performance.now()<deadline){await frame();if(input.disabled)interrupted=true;if(interrupted&&!input.disabled)break;}
   if(!interrupted||input.disabled)throw Error('Read recovery did not complete');
   return {latencyMs:performance.now()-start,queries:globalThis.__requests};
- }finally{tree.unmount();host.remove();}
+ }finally{Math.random=originalRandom;tree.unmount();host.remove();}
 };
 globalThis.measureReconnect=async()=>{
  const Native=globalThis.WebSocket,times=[],starts=new Map();let queries=0,created=0;
@@ -210,6 +212,7 @@ const results = {
     typingEditsPerContext: typingEdits,
     contextsPerVersion: 3,
     reconnectingClients: 20,
+    readRecoveryRandomDraw: measureReadRecovery ? 0.5 : null,
   },
   limits:
     "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
