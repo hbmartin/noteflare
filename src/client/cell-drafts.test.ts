@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
+import { CellDraftRecovery } from "./CellDraftRecovery";
 import {
   accountCellDrafts,
   CellDraftMap,
@@ -378,6 +379,84 @@ it.each(["malformed", "mismatched"] as const)(
     const event = new Event("beforeunload", { cancelable: true });
     window.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(true);
+  },
+);
+it.each(["corruption", "failed write"] as const)(
+  "recognizes complete persisted restoration after %s and clears only its storage warning",
+  (cause) => {
+    const map = new CellDraftMap(scope),
+      key = cellDraftKey("row:a", "b"),
+      name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+    const failure =
+      cause === "failed write"
+        ? vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+            throw new Error("quota");
+          })
+        : undefined;
+    map.set(key, edit("Budget note"));
+    const submitted = map.submission(key, 20)!;
+    const raw = cause === "corruption" ? localStorage.getItem(name)! : JSON.stringify(submitted);
+    failure?.mockRestore();
+    if (cause === "corruption") {
+      localStorage.setItem(name, "{broken");
+      map.current(key, submitted.version);
+    }
+    render(createElement(CellDraftRecovery, { account: scope.account }));
+    expect(screen.getByRole("alert")).toHaveTextContent("these edits exist only in memory");
+    const before = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(before);
+    expect(before.defaultPrevented).toBe(true);
+    localStorage.setItem(name, raw);
+    const writes = vi.spyOn(Storage.prototype, "setItem"),
+      notify = vi.fn(),
+      stop = map.subscribe(key, notify);
+    act(() => {
+      if (cause === "corruption")
+        window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: raw, storageArea: localStorage }));
+      else map.current(key, submitted.version);
+    });
+    expect(map.get(key)).toMatchObject({ ...submitted, durable: true });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue("Budget note");
+    const after = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(after);
+    expect(after.defaultPrevented).toBe(false);
+    expect(notify).toHaveBeenCalledOnce();
+    act(() => {
+      map.current(key, submitted.version);
+      window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: raw, storageArea: localStorage }));
+    });
+    expect(notify).toHaveBeenCalledOnce();
+    expect(writes).not.toHaveBeenCalled();
+    stop();
+  },
+);
+it.each(["text", "type", "baseRevision", "submission metadata"] as const)(
+  "does not establish durability from a persisted predecessor with different %s",
+  (field) => {
+    const map = new CellDraftMap(scope),
+      key = cellDraftKey("row:a", "b");
+    map.set(key, edit("Budget note"));
+    const original = map.submission(key, 20)!,
+      name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]),
+      raw = localStorage.getItem(name)!;
+    const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    if (field === "submission metadata") {
+      map.resetRejectedSubmission(key, original.version, original.operationId!);
+      map.submission(key, 21);
+    } else
+      map.set(key, {
+        ...original,
+        [field]: field === "baseRevision" ? original.baseRevision + 1 : `new-${original[field]}`,
+      });
+    write.mockRestore();
+    const current = { ...map.get(key) };
+    expect(current.durable).toBe(false);
+    expect(map.current(key, current.version)).toBe(true);
+    window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: raw, storageArea: localStorage }));
+    expect(map.get(key)).toEqual(current);
   },
 );
 it("adopts a same-version predecessor metadata update after removal failed", () => {
