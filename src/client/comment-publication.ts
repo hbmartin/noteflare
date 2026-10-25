@@ -286,7 +286,7 @@ export function activeCommentCancellation(
   const name = key(scope),
     entries = active.get(name),
     account = realtimeAccessAccount();
-  const operations = new Set(recover ? ids(scope) : entries?.keys());
+  const operations = recover ? ids(scope) : new Set(entries?.keys());
   if (recover && draftOperationId && !isLocalCommentOperation(scope, draftOperationId))
     operations.add(draftOperationId);
   if (!operations.size && !published.has(name)) return undefined;
@@ -401,6 +401,7 @@ if (typeof window !== "undefined")
         if (event.newValue === "1") phases.delete(event.key);
       }
     } catch {
+      initialized.delete(account);
       warn(account, "discovery", "Comment status could not be checked on this device. Retry cleanup.");
     }
   });
