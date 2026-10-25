@@ -14,7 +14,7 @@ if (!Number.isSafeInteger(typingEdits) || typingEdits < 20 || typingEdits > 1000
   throw new Error("Invalid typing sample count");
 const root = process.cwd();
 const controlled =
-  /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection|comment-publication)\.(ts|tsx)$/;
+  /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection|comment-publication|linked-table-reads|linked-table-query)\.(ts|tsx)$/;
 const entry = `
 import {createElement} from 'react';
 import {createRoot} from 'react-dom/client';

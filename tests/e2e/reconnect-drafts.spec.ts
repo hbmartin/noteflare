@@ -118,7 +118,22 @@ test("restoring a corrupt cell draft clears its storage warning without submitti
   await page.goto(`/?page=${table.id}`);
   const cell = page.getByLabel("Restored title", { exact: true });
   await expect(cell).toBeEnabled();
+  let mutations = 0;
+  page.on("request", (request) => {
+    if (request.method() !== "GET" && request.url().includes(`/api/tables/${table.id}/commands`)) mutations++;
+  });
   await cell.fill("Budget note");
+  await page.evaluate(() => {
+    const original = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (name, value) {
+      if (name.startsWith("notes:cell-draft:v1:"))
+        throw new DOMException("Repair blocked by test", "QuotaExceededError");
+      return original.call(this, name, value);
+    };
+    (window as typeof window & { restoreCellStorage?: () => void }).restoreCellStorage = () => {
+      Storage.prototype.setItem = original;
+    };
+  });
   await context.setOffline(true);
   try {
     await expect(cell).toBeDisabled();
@@ -147,8 +162,14 @@ test("restoring a corrupt cell draft clears its storage warning without submitti
   } finally {
     await context.setOffline(false);
     await storageTab.close();
+    await page.evaluate(() => (window as typeof window & { restoreCellStorage?: () => void }).restoreCellStorage?.());
   }
   await expect(cell).toBeEnabled({ timeout: 20_000 });
+  // Retire the recovered connection and its timers, then verify reload recovery.
+  await page.reload();
+  await expect(cell).toBeEnabled();
+  await expect(cell).toHaveValue("Budget note");
+  expect(mutations).toBe(0);
   const query = await (await page.request.get(`/api/tables/${table.id}/query`)).json();
   expect(query.rows.find((row: { id: string }) => row.id === rowId).cells[columnId]).toBe("Original");
 });
@@ -426,6 +447,9 @@ for (const { outcome, cleanup, newer } of [
   { outcome: "cancellation-wins", cleanup: "draft", newer: false },
   { outcome: "cancellation-wins", cleanup: "none", newer: true },
   { outcome: "cancellation-wins", cleanup: "receipt", newer: true },
+  { outcome: "publication-wins", cleanup: "none", newer: true },
+  { outcome: "publication-wins", cleanup: "receipt", newer: true },
+  { outcome: "publication-wins", cleanup: "draft", newer: false },
 ] as const) {
   test(`closing an in-flight anchored comment reports ${outcome}${cleanup !== "none" ? ` with failed ${cleanup} cleanup` : ""}${newer ? " and preserves newer text" : ""}`, async ({
     page,
@@ -490,9 +514,13 @@ for (const { outcome, cleanup, newer } of [
         releaseCancellation();
         await expect(page.getByText("Newer draft edits are preserved. Review them before closing.")).toBeVisible();
         await expect(composer).toContainText("Newer text remains mine");
+        if (outcome === "publication-wins")
+          await expect(page.getByText("Comment posted before cancellation completed.", { exact: false })).toBeVisible();
       } else if (cleanup === "draft") {
         await expect(page.getByRole("button", { name: "Retry comment draft cleanup" })).toBeVisible();
         await expect(composer).not.toContainText(`Private comment ${outcome}`);
+        if (outcome === "publication-wins")
+          await expect(page.getByText("Comment posted before cancellation completed.", { exact: false })).toBeVisible();
       } else {
         await expect(composer).toHaveCount(0);
         if (outcome === "publication-wins")
@@ -889,4 +917,50 @@ test("uncertain preparation and navigation cancellation retain the original publ
   await expect(composer).toHaveCount(0);
   expect((await (await page.request.get(`${root}/${operationId}`)).json()).submission.state).toBe("published");
   expect((await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads).toHaveLength(1);
+});
+
+test("corrupt cell storage is repaired automatically and survives reload without posting", async ({
+  page,
+  context,
+}) => {
+  await signInOwner(page);
+  const { table, columnId, rowId } = await textTableFixture(page, "Automatic local repair", "Repair title");
+  await page.goto(`/?page=${table.id}`);
+  const cell = page.getByLabel("Repair title", { exact: true });
+  await expect(cell).toBeEnabled();
+  let mutations = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().includes(`/api/tables/${table.id}/commands`)) mutations++;
+  });
+  await cell.fill("Automatically preserved");
+  const storageTab = await context.newPage();
+  await storageTab.goto("/api/health");
+  try {
+    const name = await storageTab.evaluate((id) => {
+      const key = Object.keys(localStorage).find(
+        (candidate) => candidate.startsWith("notes:cell-draft:v1:") && candidate.includes(id),
+      )!;
+      localStorage.setItem(key, "{broken");
+      return key;
+    }, table.id);
+    await expect
+      .poll(() =>
+        storageTab.evaluate((key) => {
+          try {
+            return JSON.parse(localStorage.getItem(key)!).text;
+          } catch {
+            return null;
+          }
+        }, name),
+      )
+      .toBe("Automatically preserved");
+    await page.reload();
+    await expect(cell).toBeEnabled();
+    await expect(cell).toHaveValue("Automatically preserved");
+    const result = await (await page.request.get(`/api/tables/${table.id}/query`)).json();
+    expect(result.rows.find((row: { id: string }) => row.id === rowId).cells[columnId]).toBe("Original");
+    expect(mutations).toBe(0);
+  } finally {
+    await storageTab.close();
+  }
 });
