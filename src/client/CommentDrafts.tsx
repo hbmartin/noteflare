@@ -358,48 +358,36 @@ export function DraftCommentsControllers() {
           : undefined;
       if (cancel) {
         setDiscardError("Canceling unpublished comment…");
+        const settle = (message: string) => {
+          const latest = readCommentDraft(scope, id);
+          if (latest && latest.operationId !== draft.operationId) {
+            setDiscardError("Newer draft edits are preserved. Review them before closing.");
+            return;
+          }
+          try {
+            clearCommentDraft(scope, id, draft.operationId);
+            setDiscardError(message);
+            if (afterCancellation) afterCancellation();
+            else comments.stopPendingComment();
+          } catch {
+            setCleanup({ id, operationId: draft.operationId });
+            setDiscardError(
+              "The draft was cleared from this tab, but its stored copy could not be removed. Retry cleanup before leaving.",
+            );
+          }
+        };
         void cancel()
-          .then((result) => {
-            const latest = readCommentDraft(scope, id);
-            if (latest && latest.operationId !== draft.operationId) {
-              setDiscardError("Newer draft edits are preserved. Review them before closing.");
-              return;
-            }
-            try {
-              clearCommentDraft(scope, id, draft.operationId);
-              setDiscardError(result?.state === "published" ? "Comment posted before cancellation completed." : "");
-              if (afterCancellation) afterCancellation();
-              else comments.stopPendingComment();
-            } catch {
-              setCleanup({ id, operationId: draft.operationId });
-              setDiscardError(
-                "The draft was cleared from this tab, but its stored copy could not be removed. Retry cleanup before leaving.",
-              );
-            }
-          })
+          .then((result) =>
+            settle(result?.state === "published" ? "Comment posted before cancellation completed." : ""),
+          )
           .catch((error) => {
-            if (error instanceof CommentPublicationCleanupError) {
-              const latest = readCommentDraft(scope, id);
-              if (latest && latest.operationId !== draft.operationId) {
-                setDiscardError("Newer draft edits are preserved. Review them before closing.");
-                return;
-              }
-              try {
-                clearCommentDraft(scope, id, draft.operationId);
-                setDiscardError(
-                  error.posted
-                    ? "Comment posted before cancellation completed. Local cleanup is still pending."
-                    : error.message,
-                );
-                if (afterCancellation) afterCancellation();
-                else comments.stopPendingComment();
-              } catch {
-                setCleanup({ id, operationId: draft.operationId });
-                setDiscardError(
-                  "The draft was cleared from this tab, but its stored copy could not be removed. Retry cleanup before leaving.",
-                );
-              }
-            } else
+            if (error instanceof CommentPublicationCleanupError)
+              settle(
+                error.posted
+                  ? "Comment posted before cancellation completed. Local cleanup is still pending."
+                  : error.message,
+              );
+            else
               setDiscardError(
                 error instanceof CommentCancellationUncertainError
                   ? error.message
