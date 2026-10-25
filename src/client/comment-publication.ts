@@ -284,11 +284,8 @@ export function retryCommentPublicationStorage(scope: CommentDraftScope) {
   }
   updateReceiptWarnings(scope.account);
 }
-export function hasVolatileCommentReceipt(scope?: CommentDraftScope) {
-  return [...pending].some(
-    ([name, operations]) =>
-      (!scope || accountOf(name) === scope.account) && [...operations].some((id) => !cleanupOnly.get(name)?.has(id)),
-  );
+function hasVolatileCommentReceipt() {
+  return [...pending].some(([name, operations]) => [...operations].some((id) => !cleanupOnly.get(name)?.has(id)));
 }
 function observeReceipt(entry: string, parts: unknown[], present: boolean) {
   if (

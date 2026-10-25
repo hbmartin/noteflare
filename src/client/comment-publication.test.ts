@@ -370,3 +370,21 @@ it("does not repeat failed discovery from routine initialization", () => {
   retryCommentPublicationStorage(scope);
   expect(length).toHaveBeenCalledTimes(2);
 });
+
+it("protects volatile receipts after page and workspace retirement until local recovery succeeds", () => {
+  setRealtimeAccessAccount(scope.account);
+  const failed = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  registerCommentPublication(scope, "volatile", vi.fn());
+  failed.mockRestore();
+  setRealtimeAccessAccount("other\0workspace");
+  const protectedEvent = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(protectedEvent);
+  expect(protectedEvent.defaultPrevented).toBe(true);
+  setRealtimeAccessAccount(scope.account);
+  retryCommentPublicationStorage({ ...scope, pageId: "elsewhere" });
+  const durableEvent = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(durableEvent);
+  expect(durableEvent.defaultPrevented).toBe(false);
+});

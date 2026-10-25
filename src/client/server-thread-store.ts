@@ -215,7 +215,6 @@ export class ServerThreadStore extends ThreadStore {
     });
   }
 
-  // fallow-ignore-next-line unused-class-member -- Called through the optional first-party BlockNote ThreadStore extension in DraftCommentsControllers; covered by reload cancellation tests.
   async cancelAnchoredDraft(operationId: string) {
     const account = realtimeAccessAccount();
     const result = await api<{ submission: CommentSubmissionStatus }>(

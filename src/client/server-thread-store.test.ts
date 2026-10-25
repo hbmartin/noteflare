@@ -378,3 +378,25 @@ it("uses the current shared identity after a same-text operation is replaced and
   expect(readCommentDraft(scope, "new")!.operationId).toBe("replacement-identity");
   purgeCommentPublications(scope.account);
 });
+
+it("does not publish a prepared operation after its captured draft changes", async () => {
+  mockedApi.mockReset();
+  const { scope, body, store, operationId } = localAnchoredDraft();
+  let finish!: (value: unknown) => void;
+  mockedApi.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const submission = store.anchoredSubmission(body),
+    preparing = submission.prepare();
+  writeCommentDraft(scope, "new", [{ type: "paragraph", content: [{ type: "text", text: "Newer" }] }] as never);
+  const newer = readCommentDraft(scope, "new")!;
+  finish({ protocolVersion: 3, submission: { state: "prepared", operationId } });
+  await preparing;
+  await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow("Your draft changed");
+  expect(mockedApi).toHaveBeenCalledOnce();
+  expect(readCommentDraft(scope, "new")).toEqual(newer);
+  purgeCommentPublications(scope.account);
+});
