@@ -936,24 +936,27 @@ test("corrupt cell storage is repaired automatically and survives reload without
   const storageTab = await context.newPage();
   await storageTab.goto("/api/health");
   try {
-    const name = await storageTab.evaluate((id) => {
-      const key = Object.keys(localStorage).find(
-        (candidate) => candidate.startsWith("notes:cell-draft:v1:") && candidate.includes(id),
-      )!;
-      localStorage.setItem(key, "{broken");
-      return key;
-    }, table.id);
-    await expect
-      .poll(() =>
-        storageTab.evaluate((key) => {
-          try {
-            return JSON.parse(localStorage.getItem(key)!).text;
-          } catch {
-            return null;
-          }
-        }, name),
-      )
-      .toBe("Automatically preserved");
+    const name = await storageTab.evaluate(
+      (id) =>
+        Object.keys(localStorage).find(
+          (candidate) => candidate.startsWith("notes:cell-draft:v1:") && candidate.includes(id),
+        )!,
+      table.id,
+    );
+    for (let incident = 0; incident < 2; incident++) {
+      await storageTab.evaluate((key) => localStorage.setItem(key, "{broken"), name);
+      await expect
+        .poll(() =>
+          storageTab.evaluate((key) => {
+            try {
+              return JSON.parse(localStorage.getItem(key)!).text;
+            } catch {
+              return null;
+            }
+          }, name),
+        )
+        .toBe("Automatically preserved");
+    }
     await page.reload();
     await expect(cell).toBeEnabled();
     await expect(cell).toHaveValue("Automatically preserved");

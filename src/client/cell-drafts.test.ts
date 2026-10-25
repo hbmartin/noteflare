@@ -711,3 +711,18 @@ it("cannot acknowledge another operation with the same draft version", () => {
   map.acknowledge(key, sent.version, "independent-drag");
   expect(map.get(key)).toMatchObject(sent);
 });
+
+it("repairs a later corruption incident after a successful repair of the same text", async () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("Repeated repair"));
+  const sent = map.submission(key, 20)!,
+    name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  for (let incident = 0; incident < 2; incident++) {
+    localStorage.setItem(name, "{broken");
+    map.current(key, sent.version);
+    await Promise.resolve();
+    expect(map.get(key)).toMatchObject({ ...sent, durable: true });
+    expect(JSON.parse(localStorage.getItem(name)!)).toMatchObject({ ...sent, durable: true });
+  }
+});

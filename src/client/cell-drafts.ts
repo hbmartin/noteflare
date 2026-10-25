@@ -178,6 +178,7 @@ function clearVersion(name: string, version?: string) {
   }
 }
 function tombstone(name: string, version?: string) {
+  repairAttempts.delete(name);
   clearVersion(name, version);
   records.set(name, null);
 }
@@ -279,6 +280,7 @@ function observeStoredDraft(name: string, raw: string | null, account: string) {
   persistedSnapshots.set(name, raw);
   if (!next && current) tombstone(name, current.version);
   else records.set(name, next);
+  if (next) repairAttempts.delete(name);
   notify(account, name);
 }
 /** Read the actual latest write before a save or discard, without enumerating storage. */
