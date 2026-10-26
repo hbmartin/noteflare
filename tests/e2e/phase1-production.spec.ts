@@ -165,7 +165,6 @@ test("renders math, Mermaid, and highlighted code with the built policy", async 
   const documentUrl = page.url();
   await page.reload();
   await expect(page).toHaveURL(documentUrl);
-  await editableDocument(page, new URL(documentUrl).searchParams.get("page")!);
   await expect(code).toHaveText(editedCode);
   await expect(block.locator("select")).toHaveValue("javascript");
   await expect.poll(() => code.locator("span").count()).toBeGreaterThan(0);
