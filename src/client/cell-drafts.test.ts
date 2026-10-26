@@ -804,7 +804,8 @@ it("ordinary replacement retires only its verified obsolete cleanup target", () 
   const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
     throw new Error("blocked");
   });
-  for (const draft of accountCellDrafts(scope.account)) expect(() => discardCellDraft(draft)).toThrow();
+  for (const draft of accountCellDrafts(scope.account))
+    expect(() => discardCellDraft(draft)).toThrow("stored copy could not be removed");
   remove.mockRestore();
   map.set(key, edit("Replacement B"));
   expect(cellDraftCleanupError(scope.account)).toContain("Retry cleanup");
@@ -824,7 +825,7 @@ it("an unrelated automatic repair cannot clear another draft's cleanup warning",
   const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
     throw new Error("blocked");
   });
-  expect(() => discardCellDraft(accountCellDrafts(scope.account)[0]!)).toThrow();
+  expect(() => discardCellDraft(accountCellDrafts(scope.account)[0]!)).toThrow("stored copy could not be removed");
   remove.mockRestore();
   map.set(other, { ...edit("Repair"), rowId: "other" });
   const draft = map.get(other)!;
@@ -846,7 +847,7 @@ it("an unverified ordinary replacement retains its cleanup target", () => {
   const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
     throw new Error("blocked");
   });
-  expect(() => discardCellDraft(accountCellDrafts(scope.account)[0]!)).toThrow();
+  expect(() => discardCellDraft(accountCellDrafts(scope.account)[0]!)).toThrow("stored copy could not be removed");
   remove.mockRestore();
   const get = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
     throw new Error("read blocked");
