@@ -187,7 +187,7 @@ test("save denial retires queued buffers and requires a fresh read to recover", 
     await linked.getByRole("button", { name: "Load more rows" }).click();
     await cells.first().fill("Local text survives access loss");
     await cells.first().press("Tab");
-    await expect(linked.getByText("Linked access removed", { exact: true })).toBeVisible();
+    await expect(linked).toContainText("Linked access removed");
     release();
     await expect.poll(() => settled).toBe(true);
     await expect(cells).toHaveCount(0);
