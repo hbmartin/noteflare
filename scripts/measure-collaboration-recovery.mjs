@@ -107,6 +107,31 @@ globalThis.measureReadRecovery=async()=>{
   return {latencyMs:performance.now()-start,queries:globalThis.__requests};
  }finally{Math.random=originalRandom;tree.unmount();host.remove();}
 };
+globalThis.measurePagination=async()=>{
+ const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
+ globalThis.__pagedRows=Array.from({length:1200},(_,index)=>({...globalThis.__data.rows[0],id:'paged'+index,position:index,cells:{Title:'Paged '+index,Amount:index,Done:false}}));
+ globalThis.__pageQueries=[];
+ flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'Pagination measurement'},member:{role:'editor',user:{id:'page-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
+ const count=()=>host.querySelectorAll('input[aria-label="Title"]').length;
+ const button=text=>[...host.querySelectorAll('button')].find(item=>item.textContent.trim()===text);
+ const rows=async expected=>{for(let i=0;i<300;i++){await frame();if(count()===expected)return;}throw Error('Unexpected visible extent '+count()+' expected '+expected)};
+ try{
+  await rows(100);
+  for(const expected of [200,300,400,500]){button('Load more rows').click();await rows(expected);}
+  const durations=[],queryCounts=[];
+  for(let sample=0;sample<5;sample++){
+   const before=globalThis.__pageQueries.length,renders=globalThis.__wholeTableRenders,start=performance.now();
+   button('Refresh').click();
+   for(let i=0;i<300;i++){await frame();if(globalThis.__wholeTableRenders>renders)break;}
+   await rows(500);
+   durations.push(performance.now()-start);queryCounts.push(globalThis.__pageQueries.length-before);
+  }
+  const before=globalThis.__pageQueries.length;button('Load more rows').click();await rows(600);
+  const firstContinuationQueries=globalThis.__pageQueries.length-before;
+  const bufferedBefore=globalThis.__pageQueries.length;button('Load more rows').click();await rows(700);
+  return {refreshSamples:durations.length,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),refreshQueries:queryCounts,firstContinuationQueries,bufferedContinuationQueries:globalThis.__pageQueries.length-bufferedBefore,visibleRows:count(),requests:globalThis.__pageQueries};
+ }finally{globalThis.__pagedRows=null;tree.unmount();host.remove();}
+};
 globalThis.measureReconnect=async()=>{
  const Native=globalThis.WebSocket,times=[],starts=new Map();let queries=0,created=0;
  class Socket extends EventTarget{
@@ -145,7 +170,19 @@ async function bundle(before) {
         name: "controlled-collaboration-fixture",
         setup(builder) {
           builder.onLoad({ filter: /src\/client\/api\.ts$/ }, () => ({
-            contents: `export class ApiClientError extends Error{}; export const json=JSON.stringify; export const apiErrorMessage=(e,f)=>f; export async function api(path,init){globalThis.__requests++;if(globalThis.__failNextRead&&!init?.method){globalThis.__failNextRead=false;throw Error('Controlled read failure')}return path?.endsWith('/commands')?{revision:1,result:{},projectionPending:false}:globalThis.__data;}`,
+            contents: `export class ApiClientError extends Error{}; export const json=JSON.stringify; export const apiErrorMessage=(e,f)=>f; export async function api(path,init){
+              globalThis.__requests++;
+              if(globalThis.__failNextRead&&!init?.method){globalThis.__failNextRead=false;throw Error('Controlled read failure')}
+              if(globalThis.__pagedRows&&!init?.method){
+                const params=new URL(path,'http://fixture').searchParams,limit=Number(params.get('limit')??100),cursor=params.get('cursor');
+                const decoded=cursor?JSON.parse(cursor):{offset:0,limit};
+                if(decoded.limit!==limit){const error=new ApiClientError('Changed cursor page size');error.code='table_cursor_stale';throw error;}
+                globalThis.__pageQueries.push({limit,cursor});
+                const end=decoded.offset+limit;
+                return {...globalThis.__data,rows:globalThis.__pagedRows.slice(decoded.offset,end),rowCount:globalThis.__pagedRows.length,nextCursor:end<globalThis.__pagedRows.length?JSON.stringify({offset:end,limit}):null};
+              }
+              return path?.endsWith('/commands')?{revision:1,result:{},projectionPending:false}:globalThis.__data;
+            }`,
             loader: "ts",
           }));
           builder.onLoad({ filter: /src\/client\/realtime-access-status\.ts$/ }, () => ({
@@ -213,6 +250,9 @@ const results = {
     contextsPerVersion: 3,
     reconnectingClients: 20,
     readRecoveryRandomDraw: measureReadRecovery ? 0.5 : null,
+    paginationRows: 1200,
+    paginationVisibleRowsBeforeRefresh: 500,
+    paginationRefreshSamplesPerContext: 5,
   },
   limits:
     "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
@@ -231,6 +271,7 @@ try {
         receipts: await page.evaluate(() => globalThis.measureReceipts()),
         receiptSubscriptions: await page.evaluate(() => globalThis.measureReceiptSubscriptions()),
         reconnect: await page.evaluate(() => globalThis.measureReconnect()),
+        pagination: await page.evaluate(() => globalThis.measurePagination()),
         ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });
       await context.close();
