@@ -76,7 +76,7 @@ function serverRows(count: number) {
     } as TableQueryResult;
   });
 }
-it("refreshes500 rows in one request and exposes buffered results in100-row increments", async () => {
+it("refreshes 500 rows in one request and exposes buffered results in 100-row increments", async () => {
   const read = serverRows(1200);
   const current = loaded(
     page(
