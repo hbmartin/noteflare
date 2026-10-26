@@ -10,7 +10,7 @@ export type CommentDraft = {
   body: CommentBody;
   operationId: string;
   anchor?: CommentDraftAnchor;
-  storageFailed?: boolean;
+  storageFailed: boolean;
 };
 const listeners = new Map<string, Set<() => void>>();
 const memory = new Map<string, CommentDraft | null>();
@@ -39,7 +39,7 @@ function storedDraft(raw: string | null): CommentDraft | null {
     body: value.body,
     operationId: value.operationId,
     ...(value.anchor ? { anchor: value.anchor } : {}),
-    ...(value.storageFailed === undefined ? {} : { storageFailed: false }),
+    storageFailed: false,
   };
 }
 function serializeDraft(draft: CommentDraft) {
@@ -70,6 +70,7 @@ export function writeCommentDraft(
     const previous = readCommentDraft(scope, id);
     const record: CommentDraft = {
       body,
+      storageFailed: false,
       ...(anchor ? { anchor } : previous?.anchor ? { anchor: previous.anchor } : {}),
       operationId:
         previous &&

@@ -227,14 +227,15 @@ function persistRecoveredDraft(name: string, current: StoredCellDraft, expectedR
   if (records.get(name) !== current || clearedVersions.get(name)?.has(current.version)) return false;
   if (expectedRaw !== undefined && localStorage.getItem(name) !== expectedRaw) {
     refresh(name, current.scope.account);
-    return records.get(name) === current && current.durable;
+    return records.get(name)?.durable === true && sameDraft(records.get(name), current);
   }
   const raw = JSON.stringify({ ...current, durable: true });
   localStorage.setItem(name, raw);
   const stored = localStorage.getItem(name);
   observeStoredDraft(name, stored, current.scope.account);
   const durable = records.get(name)?.durable === true && sameDraft(records.get(name), current);
-  if (durable && cleanupTargets.get(name)?.raw === expectedRaw) completeCleanup(name, current.scope.account);
+  const target = cleanupTargets.get(name);
+  if (durable && target && target.raw === expectedRaw) completeCleanup(name, current.scope.account);
   return durable;
 }
 /** Local persistence only; a valid newer shared value always keeps ownership. */
@@ -247,7 +248,7 @@ export function retryCellDraftPersistence(draft: StoredCellDraft) {
       result = parse(name, raw);
     if (result.state === "valid" && (sameDraft(current, result.draft) || raw !== persistedSnapshots.get(name))) {
       observeStoredDraft(name, raw, draft.scope.account);
-      return Boolean(records.get(name)?.durable);
+      return records.get(name)?.durable === true && sameDraft(records.get(name), current);
     }
     if (
       (result.state === "suppressed" && cleanupTargets.get(name)?.raw !== raw) ||
@@ -383,6 +384,7 @@ export class CellDraftMap extends Map<string, CellDraft> {
   }
   private persist(key: string, record: StoredCellDraft) {
     const name = nameOf(this.scope, key);
+    const cleanup = cleanupTargets.get(name);
     records.set(name, record);
     super.delete(key);
     try {
@@ -391,6 +393,8 @@ export class CellDraftMap extends Map<string, CellDraft> {
       persistedSnapshots.set(name, raw);
       record.durable = true;
       repairAttempts.delete(name);
+      if (cleanup && cleanup.raw !== raw && localStorage.getItem(name) === raw && cleanupTargets.get(name) === cleanup)
+        completeCleanup(name, this.scope.account);
     } catch {
       /* Keep every character in memory. */
     }

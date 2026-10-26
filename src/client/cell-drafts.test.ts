@@ -767,3 +767,94 @@ it("clears a failed repair guard after ordinary persistence before identical lat
   expect(map.get(key)).toMatchObject({ ...original, durable: true });
   expect(JSON.parse(localStorage.getItem(name)!).text).toBe(original.text);
 });
+
+it.each(["exact", "different"] as const)(
+  "reports persistence Retry accurately when a %s stored draft arrives between checks",
+  (replacement) => {
+    const { map, key, name } = failedSuccessor();
+    const current = accountCellDrafts(scope.account)[0]!;
+    const stored = JSON.stringify({
+      ...current,
+      ...(replacement === "different" ? { operationId: "other-operation", submissionRevision: 30 } : {}),
+      durable: true,
+    });
+    const get = Storage.prototype.getItem;
+    let checks = 0;
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(function (this: Storage, nameToRead) {
+      if (nameToRead === name && ++checks === 2) localStorage.setItem(name, stored);
+      return get.call(this, nameToRead);
+    });
+    expect(retryCellDraftPersistence(current)).toBe(replacement === "exact");
+    expect(map.get(key)).toMatchObject({ text: current.text, durable: true });
+    expect(map.get(key)?.operationId).toBe(replacement === "exact" ? current.operationId : "other-operation");
+    const listener = vi.fn();
+    const stop = map.subscribe(key, listener);
+    map.current(key, current.version);
+    expect(listener).not.toHaveBeenCalled();
+    stop();
+  },
+);
+
+it("ordinary replacement retires only its verified obsolete cleanup target", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b"),
+    other = cellDraftKey("other", "b");
+  map.set(key, edit("A"));
+  map.set(other, { ...edit("Other"), rowId: "other" });
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  for (const draft of accountCellDrafts(scope.account)) expect(() => discardCellDraft(draft)).toThrow();
+  remove.mockRestore();
+  map.set(key, edit("Replacement B"));
+  expect(cellDraftCleanupError(scope.account)).toContain("Retry cleanup");
+  const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  expect(JSON.parse(localStorage.getItem(name)!).text).toBe("Replacement B");
+  const reads = vi.spyOn(Storage.prototype, "getItem");
+  retryCellDraftCleanup(scope.account);
+  expect(reads.mock.calls.some(([value]) => value === name)).toBe(false);
+  expect(cellDraftCleanupError(scope.account)).toBe("");
+});
+
+it("an unrelated automatic repair cannot clear another draft's cleanup warning", async () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b"),
+    other = cellDraftKey("other", "b");
+  map.set(key, edit("Discarded"));
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  expect(() => discardCellDraft(accountCellDrafts(scope.account)[0]!)).toThrow();
+  remove.mockRestore();
+  map.set(other, { ...edit("Repair"), rowId: "other" });
+  const draft = map.get(other)!;
+  const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, other]);
+  localStorage.setItem(name, "{broken");
+  map.current(other, draft.version);
+  await Promise.resolve();
+  expect(map.get(other)).toMatchObject({ text: "Repair", durable: true });
+  expect(cellDraftCleanupError(scope.account)).toContain("Retry cleanup");
+  expect(
+    localStorage.getItem("notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key])),
+  ).not.toBeNull();
+});
+
+it("an unverified ordinary replacement retains its cleanup target", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("A"));
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  expect(() => discardCellDraft(accountCellDrafts(scope.account)[0]!)).toThrow();
+  remove.mockRestore();
+  const get = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+    throw new Error("read blocked");
+  });
+  map.set(key, edit("B"));
+  get.mockRestore();
+  expect(cellDraftCleanupError(scope.account)).toContain("Retry cleanup");
+  retryCellDraftCleanup(scope.account);
+  expect(map.get(key)).toMatchObject({ text: "B", durable: true });
+  expect(cellDraftCleanupError(scope.account)).toBe("");
+});
