@@ -228,7 +228,7 @@ test("writing streams into a read-only preview, applies with undo, preserves con
     .filter({ hasText: "Collaborator changed this source." })
     .first()
     .evaluate((element) => {
-      const range = document.createRange();
+      const range = window.document.createRange();
       range.selectNodeContents(element);
       const selection = window.getSelection()!;
       selection.removeAllRanges();
