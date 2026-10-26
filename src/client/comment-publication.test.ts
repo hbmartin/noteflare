@@ -388,3 +388,74 @@ it("protects volatile receipts after page and workspace retirement until local r
   window.dispatchEvent(durableEvent);
   expect(durableEvent.defaultPrevented).toBe(false);
 });
+
+it("coalesces clear recovery, preserves missing active receipts, and discovers current replacements", async () => {
+  setRealtimeAccessAccount(scope.account);
+  initializeCommentPublications(scope);
+  const cancel = vi.fn();
+  registerCommentPublication(scope, "lost-marker", cancel);
+  localStorage.clear();
+  const replacement =
+    "notes:comment-publication:v3:" + JSON.stringify([scope.account, scope.pageId, scope.epoch, "replacement"]);
+  localStorage.setItem(replacement, "1");
+  const keys = vi.spyOn(Storage.prototype, "key");
+  for (let i = 0; i < 3; i++)
+    window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  expect(keys).not.toHaveBeenCalled();
+  await Promise.resolve();
+  expect(keys).toHaveBeenCalledTimes(1);
+  expect(commentPublicationWarning(scope)).toContain("unfinished comment cannot be saved");
+  const unload = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(unload);
+  expect(unload.defaultPrevented).toBe(true);
+  retryCommentPublicationStorage(scope);
+  expect(commentPublicationWarning(scope)).toBe("");
+  expect(
+    localStorage.getItem(
+      "notes:comment-publication:v3:" + JSON.stringify([scope.account, scope.pageId, scope.epoch, "lost-marker"]),
+    ),
+  ).toBe("1");
+  expect(localStorage.getItem(replacement)).toBe("1");
+  expect(cancel).not.toHaveBeenCalled();
+});
+it("retains clear recovery after blocked reads and protects inactive-account receipts", async () => {
+  setRealtimeAccessAccount(scope.account);
+  initializeCommentPublications(scope);
+  registerCommentPublication(scope, "inactive", vi.fn());
+  setRealtimeAccessAccount("other-clear-account");
+  localStorage.clear();
+  const read = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  await Promise.resolve();
+  expect(commentPublicationWarning(scope)).toContain("could not be checked");
+  const unload = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(unload);
+  expect(unload.defaultPrevented).toBe(true);
+  read.mockRestore();
+  setRealtimeAccessAccount(scope.account);
+  retryCommentPublicationStorage(scope);
+  expect(commentPublicationWarning(scope)).toBe("");
+});
+
+it("clear recovery completes absent settled receipts and keeps present cleanup retryable", async () => {
+  setRealtimeAccessAccount(scope.account);
+  initializeCommentPublications(scope);
+  const gone = registerCommentPublication(scope, "gone-cleanup", vi.fn());
+  const remains = registerCommentPublication(scope, "remaining-cleanup", vi.fn());
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  expect(gone.finish()).toBe(false);
+  expect(remains.finish()).toBe(false);
+  remove.mockRestore();
+  localStorage.removeItem(
+    "notes:comment-publication:v3:" + JSON.stringify([scope.account, scope.pageId, scope.epoch, "gone-cleanup"]),
+  );
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  await Promise.resolve();
+  expect(commentPublicationWarning(scope)).toContain("settled comment");
+  retryCommentPublicationStorage(scope);
+  expect(commentPublicationWarning(scope)).toBe("");
+});

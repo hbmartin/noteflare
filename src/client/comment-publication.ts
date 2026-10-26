@@ -302,6 +302,59 @@ function observeReceipt(entry: string, parts: unknown[], present: boolean) {
 function invalidateDiscovery(account: string) {
   discovery.set(account, { state: "dirty", incarnation: realtimeAccessAccount() });
 }
+let clearQueued = false;
+function recoverClearedReceipts() {
+  if (clearQueued) return;
+  clearQueued = true;
+  queueMicrotask(() => {
+    clearQueued = false;
+    const names = new Set([...indexed.keys(), ...pending.keys(), ...active.keys(), ...cleanupOnly.keys()]);
+    const accounts = new Set<string>(),
+      failed = new Set<string>();
+    for (const name of names) {
+      const account = accountOf(name);
+      accounts.add(account);
+      const operations = new Set([
+        ...(indexed.get(name) ?? []),
+        ...(pending.get(name) ?? []),
+        ...(active.get(name)?.keys() ?? []),
+        ...(cleanupOnly.get(name) ?? []),
+      ]);
+      for (const id of operations) {
+        const entry = operationKey(name, id);
+        try {
+          const raw = localStorage.getItem(entry);
+          if (raw === null && cleanupOnly.get(name)?.has(id)) {
+            active.get(name)?.get(id)?.detach();
+            phases.delete(entry);
+            changeSet(cleanupOnly, name, id, false);
+            changeSet(indexed, name, id, false);
+            changeSet(pending, name, id, false);
+          } else if (raw === "1") {
+            observeReceipt(entry, receiptParts(entry)!, true);
+            changeSet(pending, name, id, Boolean(cleanupOnly.get(name)?.has(id)));
+          } else {
+            changeSet(indexed, name, id, false);
+            changeSet(pending, name, id, true);
+          }
+        } catch {
+          failed.add(account);
+          changeSet(pending, name, id, true);
+          warn(account, "discovery", discoveryWarning);
+        }
+      }
+      updateReceiptWarnings(account);
+    }
+    const current = realtimeAccessAccount()?.key;
+    if (current) accounts.add(current);
+    for (const account of accounts) invalidateDiscovery(account);
+    if (current) initializeCommentPublications({ account: current, pageId: "", epoch: 0 }, true);
+    for (const account of failed) {
+      discovery.set(account, { state: "failed", incarnation: realtimeAccessAccount() });
+      warn(account, "discovery", discoveryWarning);
+    }
+  });
+}
 export class CommentCancellationUncertainError extends Error {}
 export class CommentPublicationCleanupError extends Error {
   constructor(
@@ -422,8 +475,7 @@ if (typeof window !== "undefined") {
       return;
     }
     if (event.key === null) {
-      const account = realtimeAccessAccount()?.key;
-      if (account) invalidateDiscovery(account);
+      recoverClearedReceipts();
       return;
     }
     if (!event.key.startsWith(prefix)) return;

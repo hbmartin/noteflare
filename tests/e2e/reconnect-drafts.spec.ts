@@ -967,3 +967,73 @@ test("corrupt cell storage is repaired automatically and survives reload without
     await storageTab.close();
   }
 });
+
+test("changing a comment during preparation cancels only the abandoned operation", async ({ page, context }) => {
+  await signInOwner(page);
+  const { document, composer } = await anchoredComposer(page, "Abandoned preparation", "Stable original anchor");
+  await composer.fill("Original prepared text");
+  let release!: () => void,
+    held = false,
+    operationId = "";
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const root = `/api/pages/${document.id}/comment-submissions`;
+  await page.route(`**${root}`, async (route) => {
+    const response = await route.fetch();
+    operationId = (await response.json()).submission.operationId;
+    held = true;
+    await gate;
+    await route.fulfill({ response });
+  });
+  let cancellations = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === `${root}/${operationId}/cancel`) cancellations++;
+  });
+  try {
+    await composer.press("Enter");
+    await expect.poll(() => held).toBe(true);
+    await composer.fill("Newer text stays mine");
+    release();
+    await expect(page.getByText("Your draft changed while posting.", { exact: false })).toBeVisible();
+    await expect(composer).toContainText("Newer text stays mine");
+    const status = await page.request.get(`${root}/${operationId}`);
+    expect((await status.json()).submission.state).toBe("canceled");
+    expect((await (await page.request.get(`/api/pages/${document.id}/comments`)).json()).threads).toHaveLength(0);
+    expect(cancellations).toBe(1);
+    await context.setOffline(true);
+    page.once("dialog", (dialog) => dialog.accept());
+    await composer.press("Escape");
+    await expect(composer).toHaveCount(0);
+    expect(cancellations).toBe(1);
+  } finally {
+    release();
+    await context.setOffline(false);
+  }
+});
+
+test("cleared receipt storage exposes local Retry without replaying a comment", async ({ page }) => {
+  await signInOwner(page);
+  const document = await create(page, "document", "Cleared receipts");
+  await page.goto(`/?page=${document.id}`);
+  await editableDocument(page, document.id);
+  const member = await (await page.request.get("/api/me")).json();
+  const name =
+    "notes:comment-publication:v3:" +
+    JSON.stringify([`${member.user.id}\0${member.workspace.id}`, document.id, document.contentEpoch, "clear-recovery"]);
+  let mutations = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().includes("comment-submissions")) mutations++;
+  });
+  await page.evaluate((key) => {
+    localStorage.setItem(key, "1");
+    window.dispatchEvent(new StorageEvent("storage", { key, newValue: "1", storageArea: localStorage }));
+    localStorage.removeItem(key);
+    window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  }, name);
+  await expect(page.getByText("The status of an unfinished comment cannot be saved", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "Retry comment storage cleanup" }).click();
+  await expect(page.getByText("The status of an unfinished comment cannot be saved", { exact: false })).toHaveCount(0);
+  expect(await page.evaluate((key) => localStorage.getItem(key), name)).toBe("1");
+  expect(mutations).toBe(0);
+});
