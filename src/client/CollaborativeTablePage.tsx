@@ -303,7 +303,10 @@ export function CollaborativeTablePage({
       },
     });
     linkedReads.current = reads;
+    const permit = () => linkedWindow.current?.verified === true;
+    connectionPermit.current = permit;
     return () => {
+      if (connectionPermit.current === permit) connectionPermit.current = () => false;
       linkedReads.current = null;
       invalidateVerification();
       publishLinkedWindow(null);
@@ -370,7 +373,7 @@ export function CollaborativeTablePage({
     });
     connectionPermit.current = connection.authorized;
     return () => {
-      connectionPermit.current = () => false;
+      if (connectionPermit.current === connection.authorized) connectionPermit.current = () => false;
       connection();
     };
   }, [page.id, queryBase, account, incarnation]);
