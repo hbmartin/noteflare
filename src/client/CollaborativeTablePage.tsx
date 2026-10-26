@@ -416,8 +416,12 @@ export function CollaborativeTablePage({
           message: apiErrorMessage(cause, "The table update could not be saved."),
         });
       else if (cause.status === 409) {
-        await load();
-        setError("The table changed. Review the latest value before saving again.");
+        if (queryBase) {
+          invalidateVerification();
+          setConnectionReady(false);
+        }
+        const refreshed = await load();
+        if (refreshed) setError("The table changed. Review the latest value before saving again.");
       }
       return false;
     } finally {

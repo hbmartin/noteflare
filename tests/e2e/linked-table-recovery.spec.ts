@@ -1,10 +1,10 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { signInOwner, editableDocument } from "./security-helpers";
 
 test.setTimeout(60_000);
 test.use({ serviceWorkers: "block" });
 
-test("linked reads retain failed continuation after refresh and buffer 100-row increments", async ({ page }) => {
+async function linkedFixture(page: Page) {
   // Creation controls are enabled only in this client fixture; deployment flags stay unchanged.
   await page.context().route("**/api/me", async (route) => {
     const response = await route.fetch();
@@ -74,6 +74,11 @@ test("linked reads retain failed continuation after refresh and buffer 100-row i
     await expect(cells).toHaveCount(count);
   }
   const path = `/api/pages/${host.id}/linked-tables/${source.id}`;
+  return { source, path, linked, cells };
+}
+
+test("linked reads retain failed continuation after refresh and buffer 100-row increments", async ({ page }) => {
+  const { source, path, linked, cells } = await linkedFixture(page);
   const reads: URL[] = [];
   let mutations = 0;
   page.on("request", (request) => {
@@ -139,5 +144,122 @@ test("linked reads retain failed continuation after refresh and buffer 100-row i
   } finally {
     releaseContinuation();
     releaseRefresh();
+  }
+});
+
+async function bufferedFixture(page: Page) {
+  const fixture = await linkedFixture(page);
+  const refresh = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === fixture.path && url.searchParams.get("limit") === "500" && !url.searchParams.has("cursor");
+  });
+  await fixture.linked.getByRole("button", { name: "Refresh", exact: true }).click();
+  expect((await (await refresh).json()).rows).toHaveLength(500);
+  await fixture.linked.getByRole("button", { name: "Load more rows" }).click();
+  await expect(fixture.cells).toHaveCount(600);
+  return fixture;
+}
+
+test("save denial retires queued buffers and requires a fresh read to recover", async ({ page }) => {
+  const { path, linked, cells } = await bufferedFixture(page);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let held = false,
+    settled = false,
+    mutations = 0;
+  await page.route(`**${path}/commands`, async (route) => {
+    mutations++;
+    await route.fulfill({ status: 403, json: { error: { code: "forbidden", message: "Linked access removed" } } });
+  });
+  await page.route(`**${path}?**`, async (route) => {
+    if (!held) {
+      held = true;
+      await gate;
+      await route.continue();
+      settled = true;
+    } else await route.continue();
+  });
+  try {
+    await linked.getByRole("button", { name: "Refresh", exact: true }).click();
+    await expect.poll(() => held).toBe(true);
+    await linked.getByRole("button", { name: "Load more rows" }).click();
+    await cells.first().fill("Local text survives access loss");
+    await cells.first().press("Tab");
+    await expect(linked.getByText("Linked access removed", { exact: true })).toBeVisible();
+    release();
+    await expect.poll(() => settled).toBe(true);
+    await expect(cells).toHaveCount(0);
+    await expect(linked.getByRole("button", { name: "Load more rows" })).toHaveCount(0);
+    await expect(linked.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue(
+      "Local text survives access loss",
+    );
+    const fresh = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === "GET" && url.pathname === path && !url.searchParams.has("cursor");
+    });
+    await linked.getByRole("button", { name: "Reload", exact: true }).click();
+    await fresh;
+    await expect(cells).toHaveCount(100);
+    await expect(cells.first()).toBeEnabled();
+    expect(mutations).toBe(1);
+  } finally {
+    release();
+  }
+});
+
+test("failed conflict verification retains cached drafts and requires network recovery", async ({ page }) => {
+  const { path, linked, cells } = await bufferedFixture(page);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let held = false,
+    failReads = true,
+    mutations = 0;
+  await page.route(`**${path}/commands`, async (route) => {
+    mutations++;
+    await route.fulfill({
+      status: 409,
+      json: { error: { code: "table_revision_conflict", message: "Table changed" } },
+    });
+  });
+  await page.route(`**${path}?**`, async (route) => {
+    if (!held) {
+      held = true;
+      await gate;
+    }
+    if (failReads)
+      await route.fulfill({
+        status: 503,
+        json: { error: { code: "unavailable", message: "Fresh verification failed" } },
+      });
+    else await route.continue();
+  });
+  try {
+    await cells.first().fill("Deliberate draft remains unsaved");
+    await cells.first().press("Tab");
+    await expect.poll(() => held).toBe(true);
+    await expect(cells.first()).toBeDisabled();
+    await expect(linked.getByRole("button", { name: "Refresh", exact: true })).toBeDisabled();
+    release();
+    await expect(linked.getByText("Fresh verification failed", { exact: true })).toBeVisible();
+    await expect(linked.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
+    await expect(cells.first()).toBeDisabled();
+    await expect(cells).toHaveCount(600);
+    failReads = false;
+    const fresh = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === "GET" && url.pathname === path && !url.searchParams.has("cursor");
+    });
+    await linked.getByRole("button", { name: "Load more rows" }).click();
+    await fresh;
+    await expect(cells).toHaveCount(700);
+    await expect(cells.first()).toBeEnabled();
+    await expect(cells.first()).toHaveValue("Deliberate draft remains unsaved");
+    expect(mutations).toBe(1);
+  } finally {
+    release();
   }
 });
