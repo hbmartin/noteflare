@@ -35,6 +35,29 @@ test("linked reads retain failed continuation after refresh and buffer 100-row i
       })),
     });
   const host = await create("document", "Linked paging host");
+  // Host-document projection is unrelated to this static source. Keep source,
+  // unknown, restore, and access invalidations observable in this read fixture.
+  await page.addInitScript(
+    ({ hostId }) => {
+      window.addEventListener(
+        "notes:workspace-event",
+        (event) => {
+          const detail = (event as CustomEvent).detail;
+          if (
+            (detail?.type === "projection-updated" && detail.pageId === hostId) ||
+            (detail?.type === "pages-upserted" &&
+              !detail.restored &&
+              Array.isArray(detail.pages) &&
+              detail.pages.length > 0 &&
+              detail.pages.every((item: { id: string }) => item.id === hostId))
+          )
+            event.stopImmediatePropagation();
+        },
+        true,
+      );
+    },
+    { hostId: host.id },
+  );
   await page.goto(`/?page=${host.id}`);
   const editor = await editableDocument(page, host.id);
   await editor.click();
@@ -62,7 +85,15 @@ test("linked reads retain failed continuation after refresh and buffer 100-row i
     const url = new URL(response.url());
     return url.pathname === path && url.searchParams.get("limit") === "500" && !url.searchParams.has("cursor");
   });
-  await linked.getByRole("button", { name: "Refresh", exact: true }).click();
+  await page.evaluate(
+    (pageId) =>
+      window.dispatchEvent(
+        new CustomEvent("notes:workspace-event", {
+          detail: { type: "projection-updated", pageId, backlinkTargetIds: [], mentionTargetUserIds: [] },
+        }),
+      ),
+    source.id,
+  );
   expect((await (await refresh).json()).rows).toHaveLength(500);
   await expect(cells).toHaveCount(500);
 
