@@ -1,0 +1,874 @@
+{
+  "baselineRevision": "07195eb",
+  "updatedRevision": "1b94059ead01d5b3806d94d4c7506b97a5475f9d",
+  "harnessRevision": "1b94059ead01d5b3806d94d4c7506b97a5475f9d",
+  "command": "NOTES_BENCH_TYPING_EDITS=300 NOTES_BENCH_READ_RECOVERY=1 node scripts/measure-collaboration-recovery.mjs 07195eb docs/implementation/pr-270-durability-read-measurements.json",
+  "fixture": {
+    "readRecoverySamplesPerVersion": 3,
+    "corruptAccountDraft": false,
+    "rows": 100,
+    "columns": 3,
+    "accountDrafts": 500,
+    "unrelatedStorageKeys": 5000,
+    "typingEditsPerContext": 300,
+    "contextsPerVersion": 3,
+    "reconnectingClients": 20,
+    "readRecoveryRandomDraw": 0.5,
+    "paginationRows": 1200,
+    "paginationVisibleRowsBeforeRefresh": 500,
+    "paginationRefreshSamplesPerContext": 5
+  },
+  "limits": "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
+  "runs": {
+    "baseline": [
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 1,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000002384185791,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1550.1000000238419,
+          "p95Ms": 1987.2000000476837,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.299999952316284,
+          "p95Ms": 33.300000071525574,
+          "refreshQueries": [5, 5, 5, 5, 5],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 1,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":500,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":600,\"limit\":100}"
+            }
+          ]
+        },
+        "readRecovery": {
+          "latencyMs": 1515.5,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 1,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000002384185791,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1302.7000000476837,
+          "p95Ms": 1908.2999999523163,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.300000071525574,
+          "p95Ms": 33.39999997615814,
+          "refreshQueries": [5, 5, 5, 5, 5],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 1,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":500,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":600,\"limit\":100}"
+            }
+          ]
+        },
+        "readRecovery": {
+          "latencyMs": 1515.2000000476837,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.7000000476837158,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000002384185791,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1516.8999999761581,
+          "p95Ms": 1923.1999999284744,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.200000047683716,
+          "p95Ms": 33.40000009536743,
+          "refreshQueries": [5, 5, 5, 5, 5],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 1,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":500,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":600,\"limit\":100}"
+            }
+          ]
+        },
+        "readRecovery": {
+          "latencyMs": 1515.2999999523163,
+          "queries": 3
+        }
+      }
+    ],
+    "updated": [
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.7999999523162842,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000002384185791,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1452.2999999523163,
+          "p95Ms": 1866.1999999284744,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.09999990463257,
+          "p95Ms": 34.700000047683716,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "readRecovery": {
+          "latencyMs": 1515.5,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.7999999523162842,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000002384185791,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1396.7000000476837,
+          "p95Ms": 1960.1000000238419,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.200000047683716,
+          "p95Ms": 34.10000002384186,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "readRecovery": {
+          "latencyMs": 1514.7000000476837,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.7000000476837158,
+          "p50Ms": 0.10000002384185791,
+          "p95Ms": 0.19999992847442627,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000002384185791,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1513.1999999284744,
+          "p95Ms": 1961.2999999523163,
+          "maximumReadyIn100ms": 7,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.299999952316284,
+          "p95Ms": 33.39999997615814,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "readRecovery": {
+          "latencyMs": 1515.1000000238419,
+          "queries": 3
+        }
+      }
+    ]
+  }
+}
