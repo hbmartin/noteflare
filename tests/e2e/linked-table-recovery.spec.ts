@@ -35,28 +35,32 @@ async function linkedFixture(page: Page) {
       })),
     });
   const host = await create("document", "Linked paging host");
-  // Host-document projection is unrelated to this static source. Keep source,
+  // Other pages' projection is unrelated to this static source. Keep source,
   // unknown, restore, and access invalidations observable in this read fixture.
   await page.addInitScript(
-    ({ hostId }) => {
+    ({ sourceId }) => {
       window.addEventListener(
         "notes:workspace-event",
         (event) => {
           const detail = (event as CustomEvent).detail;
           if (
-            (detail?.type === "projection-updated" && detail.pageId === hostId) ||
+            (detail?.type === "projection-updated" &&
+              typeof detail.pageId === "string" &&
+              detail.pageId !== sourceId) ||
             (detail?.type === "pages-upserted" &&
               !detail.restored &&
               Array.isArray(detail.pages) &&
               detail.pages.length > 0 &&
-              detail.pages.every((item: { id: string }) => item.id === hostId))
+              detail.pages.every(
+                (item: { id?: unknown } | null) => typeof item?.id === "string" && item.id !== sourceId,
+              ))
           )
             event.stopImmediatePropagation();
         },
         true,
       );
     },
-    { hostId: host.id },
+    { sourceId: source.id },
   );
   await page.goto(`/?page=${host.id}`);
   const editor = await editableDocument(page, host.id);
