@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, expect, it, vi } from "vitest";
 import { CollaborativeTablePage, type CollaborativeTableProps } from "./CollaborativeTablePage";
 import { api, ApiClientError } from "./api";
-import { accountCellDrafts, purgeCellDrafts } from "./cell-drafts";
+import { accountCellDrafts, purgeCellDrafts, CellDraftMap } from "./cell-drafts";
 import { taskColumns } from "../shared/tasks";
 import type { CollaborativeColumn, TableQueryResult } from "../shared/table-protocol";
 vi.mock("./api", async (importOriginal) => ({ ...(await importOriginal<typeof import("./api")>()), api: vi.fn() }));
@@ -142,4 +142,30 @@ it("retires local focus through column replacement without saving the draft", as
   expect(screen.queryByText("Unsaved edit")).not.toBeInTheDocument();
   expect(accountCellDrafts(account)[0]!.columnId).toBe(ids.title);
   expect(vi.mocked(api).mock.calls.every(([, init]) => !init?.method)).toBe(true);
+});
+
+it("rejects an explicit task operation replaced after submission capture", async () => {
+  const { month } = fixture(true);
+  const input = await screen.findByLabelText("Due");
+  await waitFor(() => expect(input).toBeEnabled());
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: `${month}-05` } });
+  const original = CellDraftMap.prototype.submission;
+  let changed = false;
+  vi.spyOn(CellDraftMap.prototype, "submission").mockImplementation(function (
+    this: CellDraftMap,
+    key,
+    revision,
+    version,
+  ) {
+    const captured = original.call(this, key, revision, version);
+    if (captured && !changed) {
+      changed = true;
+      this.set(key, { ...captured, text: `${month}-09` });
+    }
+    return captured;
+  });
+  await act(async () => fireEvent.blur(input));
+  expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(0);
+  expect(accountCellDrafts(account)[0]!.text).toBe(`${month}-09`);
 });

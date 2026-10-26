@@ -1,3 +1,4 @@
+import { CellDraftPersistenceRetry } from "./CellDraftPersistenceRetry";
 import { useOnlineStatus } from "./online-status";
 import { RelationPanel } from "./RelationPanel";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -27,12 +28,11 @@ import {
   cellDraftKey as draftKey,
   useMissingCellDraftRowIds,
   useCellDraft,
-  retryCellDraftPersistence,
   type StoredCellDraft,
 } from "./cell-drafts";
 import { CellDraftRecovery } from "./CellDraftRecovery";
 import { linkedTableReads, type LinkedTableReadIntent } from "./linked-table-reads";
-import { readLinkedTable } from "./linked-table-query";
+import { readLinkedTable, type LinkedTableWindow } from "./linked-table-query";
 import { tableConnection } from "./table-connection";
 import { useRealtimeAccessAccount } from "./realtime-access-status";
 import type { TableDraftRows } from "../shared/table-protocol";
@@ -72,6 +72,8 @@ export function CollaborativeTablePage({
   const [connectionReady, setConnectionReady] = useState(false);
   const [authorizedGeneration, setAuthorizedGeneration] = useState<number | null>(null);
   const [data, setData] = useState<TableQueryResult | null>(null);
+  const linkedWindow = useRef<LinkedTableWindow | null>(null);
+  const [linkedHasMore, setLinkedHasMore] = useState(false);
   const account = `${member.user.id}\0${member.workspace?.id ?? "workspace"}`;
   const incarnation = useRealtimeAccessAccount();
   const host = queryBase ?? page.id;
@@ -126,7 +128,6 @@ export function CollaborativeTablePage({
   const [newTitle, setNewTitle] = useState("");
   const epoch = useRef(0),
     dataRef = useRef(data),
-    dataQuery = useRef(""),
     active = useRef(true);
   useEffect(() => {
     dataRef.current = data;
@@ -180,28 +181,29 @@ export function CollaborativeTablePage({
       params.set("timeZone", Intl.DateTimeFormat().resolvedOptions().timeZone);
       if (cursor) params.set("cursor", cursor);
       try {
-        const readPage = (nextCursor?: string) => {
+        const readPage = (nextCursor?: string, limit = 100) => {
           const pageParams = new URLSearchParams(params);
           pageParams.delete("cursor");
+          pageParams.set("limit", String(limit));
           if (nextCursor) pageParams.set("cursor", nextCursor);
           return api<TableQueryResult>(`${base}?${pageParams}`, {
             signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
           });
         };
-        const result = queryBase
-          ? await readLinkedTable(
-              intent ?? { kind: "refresh" },
-              dataQuery.current === queryIdentity ? dataRef.current : null,
-              readPage,
-              signal,
-            )
-          : await readPage(cursor);
+        const window = queryBase
+          ? await readLinkedTable(intent ?? { kind: "refresh" }, linkedWindow.current, readPage, signal, queryIdentity)
+          : null;
+        const result = window ? window.data : await readPage(cursor);
         if (!active.current || signal?.aborted) return null;
         // Superseded view data must not replace newer rows, but the fresh
         // authorization result still belongs to its live connection attempt.
         if (owner !== epoch.current) return queryBase ? null : result;
         dataRef.current = result;
-        dataQuery.current = queryIdentity;
+        if (window) {
+          window.verified = navigator.onLine && !document.hidden;
+          linkedWindow.current = window;
+          setLinkedHasMore(window.hasMore);
+        }
         taskRefreshRequiredRef.current = false;
         setTaskRefreshRequired(false);
         setData((current) =>
@@ -216,6 +218,7 @@ export function CollaborativeTablePage({
         if (signal?.aborted) return null;
         if (owner === epoch.current && active.current) {
           if (queryBase) {
+            if (linkedWindow.current) linkedWindow.current.verified = false;
             writeReady.current = false;
             setConnectionReady(false);
           }
@@ -243,6 +246,7 @@ export function CollaborativeTablePage({
     const reads = linkedTableReads({
       read: (intent, signal) => fetchRef.current(undefined, signal, intent),
       unavailable: () => {
+        if (linkedWindow.current) linkedWindow.current.verified = false;
         writeReady.current = false;
         setConnectionReady(false);
       },
@@ -250,6 +254,7 @@ export function CollaborativeTablePage({
     linkedReads.current = reads;
     return () => {
       linkedReads.current = null;
+      linkedWindow.current = null;
       reads.dispose();
     };
   }, [queryBase, page.id, account, incarnation]);
@@ -316,10 +321,13 @@ export function CollaborativeTablePage({
     };
   }, [page.id, queryBase, account, incarnation]);
   useEffect(() => {
-    const invalidate = () => void load();
+    const invalidate = () => {
+      if (queryBase) void linkedReads.current?.invalidate();
+      else void load();
+    };
     window.addEventListener("notes:workspace-event", invalidate);
     return () => window.removeEventListener("notes:workspace-event", invalidate);
-  }, [load]);
+  }, [load, queryBase]);
   const send = async (command: TableCommand, submission?: TaskDraftSubmission) => {
     if (
       submission &&
@@ -460,9 +468,7 @@ export function CollaborativeTablePage({
                   : value,
           },
           row.id,
-          submitted?.changed && operationId && submitted.operationId === operationId
-            ? { map: drafts, key, version: submitted.version, operationId: op }
-            : undefined,
+          operationId ? { map: drafts, key, version: submitted?.version, operationId: op } : undefined,
         );
         return result.state === "saved";
       }
@@ -895,8 +901,11 @@ export function CollaborativeTablePage({
           </table>
         </div>
       )}
-      {data.nextCursor && (
-        <button disabled={busy} onClick={() => void load(data.nextCursor!)}>
+      {(queryBase ? linkedHasMore : data.nextCursor) && (
+        <button
+          disabled={busy}
+          onClick={() => void load(queryBase ? (linkedWindow.current?.continuation ?? undefined) : data.nextCursor!)}
+        >
           Load more rows
         </button>
       )}
@@ -1144,12 +1153,7 @@ function Cell({
       {pendingDraft?.changed && !pendingDraft.durable && (
         <small role="alert">
           Draft storage is unavailable. Keep this tab open; this edit exists only in memory.{" "}
-          <button
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => retryCellDraftPersistence(pendingDraft as StoredCellDraft)}
-          >
-            Retry saving locally
-          </button>
+          <CellDraftPersistenceRetry draft={pendingDraft as StoredCellDraft} />
         </small>
       )}
       {focused && pendingDraft?.changed && displayedVersion !== pendingDraft.version && (
