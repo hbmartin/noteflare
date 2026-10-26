@@ -32,12 +32,28 @@ const prefix = "notes:comment-draft:";
 function key(scope: CommentDraftScope, id: string) {
   return `${prefix}${JSON.stringify([scope.account, scope.pageId, scope.epoch, id])}`;
 }
+function storedDraft(raw: string | null): CommentDraft | null {
+  const value = JSON.parse(raw ?? "null") as CommentDraft | null;
+  if (!value || !Array.isArray(value.body) || typeof value.operationId !== "string") return null;
+  return {
+    body: value.body,
+    operationId: value.operationId,
+    ...(value.anchor ? { anchor: value.anchor } : {}),
+    ...(value.storageFailed === undefined ? {} : { storageFailed: false }),
+  };
+}
+function serializeDraft(draft: CommentDraft) {
+  return JSON.stringify({
+    body: draft.body,
+    operationId: draft.operationId,
+    ...(draft.anchor ? { anchor: draft.anchor } : {}),
+  });
+}
 export function readCommentDraft(scope: CommentDraftScope, id: string): CommentDraft | null {
   try {
     const name = key(scope, id);
     if (memory.has(name)) return memory.get(name) ?? null;
-    const value = JSON.parse(localStorage.getItem(name) ?? "null") as CommentDraft | null;
-    const result = value && Array.isArray(value.body) && typeof value.operationId === "string" ? value : null;
+    const result = storedDraft(localStorage.getItem(name));
     memory.set(name, result);
     return result;
   } catch {
@@ -62,7 +78,7 @@ export function writeCommentDraft(
           ? previous.operationId
           : crypto.randomUUID(),
     };
-    const value = JSON.stringify(record);
+    const value = serializeDraft(record);
     if (value.length > 128_000) return false;
     const name = key(scope, id);
     clearedOperations.delete(name);
@@ -152,8 +168,8 @@ function observeDraft(name: string, raw: string | null) {
       clearedOperations.set(name, current.operationId);
       memory.set(name, null);
     } else {
-      const next = JSON.parse(raw) as CommentDraft | null;
-      if (!next || !Array.isArray(next.body) || typeof next.operationId !== "string") return;
+      const next = storedDraft(raw);
+      if (!next) return;
       const cleared = clearedOperations.get(name);
       if (cleared !== undefined && cleared === next.operationId) return;
       if (
@@ -192,12 +208,12 @@ export function replaceCommentDraftOperation(scope: CommentDraftScope, expected:
   const current = readCommentDraft(scope, "new");
   if (!current || current.operationId !== expected) return;
   const name = key(scope, "new"),
-    next = { ...current, operationId };
+    next = { ...current, operationId, storageFailed: false };
   memory.set(name, next);
   forgetLocalCommentOperation(scope, expected);
   markLocalCommentOperation(scope, operationId);
   try {
-    localStorage.setItem(name, JSON.stringify(next));
+    localStorage.setItem(name, serializeDraft(next));
   } catch {
     next.storageFailed = true;
   }

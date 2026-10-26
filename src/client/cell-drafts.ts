@@ -223,13 +223,19 @@ function retainInvalidDraft(name: string, current: StoredCellDraft | null | unde
     }
   });
 }
-function persistRecoveredDraft(name: string, current: StoredCellDraft) {
+function persistRecoveredDraft(name: string, current: StoredCellDraft, expectedRaw?: string | null) {
   if (records.get(name) !== current || clearedVersions.get(name)?.has(current.version)) return false;
+  if (expectedRaw !== undefined && localStorage.getItem(name) !== expectedRaw) {
+    refresh(name, current.scope.account);
+    return records.get(name) === current && current.durable;
+  }
   const raw = JSON.stringify({ ...current, durable: true });
   localStorage.setItem(name, raw);
   const stored = localStorage.getItem(name);
   observeStoredDraft(name, stored, current.scope.account);
-  return records.get(name)?.durable === true;
+  const durable = records.get(name)?.durable === true && sameDraft(records.get(name), current);
+  if (durable && cleanupTargets.get(name)?.raw === expectedRaw) completeCleanup(name, current.scope.account);
+  return durable;
 }
 /** Local persistence only; a valid newer shared value always keeps ownership. */
 export function retryCellDraftPersistence(draft: StoredCellDraft) {
@@ -244,11 +250,11 @@ export function retryCellDraftPersistence(draft: StoredCellDraft) {
       return Boolean(records.get(name)?.durable);
     }
     if (
-      result.state === "suppressed" ||
+      (result.state === "suppressed" && cleanupTargets.get(name)?.raw !== raw) ||
       (raw === null && persistedSnapshots.get(name) !== null && persistedSnapshots.get(name) !== undefined)
     )
       return false;
-    return persistRecoveredDraft(name, current);
+    return persistRecoveredDraft(name, current, raw);
   } catch {
     return false;
   }
@@ -322,6 +328,9 @@ function cleanupStoredDraft(name: string, account: string) {
     clearVersion(name, parse(name, raw, true).draft?.version);
     persistedSnapshots.set(name, null);
   } else observeStoredDraft(name, raw, account);
+  completeCleanup(name, account);
+}
+function completeCleanup(name: string, account: string) {
   cleanupTargets.delete(name);
   if (![...cleanupTargets.values()].some((entry) => entry.account === account) && cleanupErrors.delete(account))
     notify(account);
@@ -381,6 +390,7 @@ export class CellDraftMap extends Map<string, CellDraft> {
       localStorage.setItem(name, raw);
       persistedSnapshots.set(name, raw);
       record.durable = true;
+      repairAttempts.delete(name);
     } catch {
       /* Keep every character in memory. */
     }
