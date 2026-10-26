@@ -1,7 +1,7 @@
 import { ApiClientError } from "./api";
 import { TABLE_PAGE_MAX } from "../shared/table-limits";
 import type { TableQueryResult } from "../shared/table-protocol";
-import type { LinkedTableReadIntent } from "./linked-table-reads";
+import type { LinkedTableContinuation, LinkedTableReadIntent } from "./linked-table-reads";
 export type LinkedTableWindow = {
   data: TableQueryResult;
   buffered: TableQueryResult["rows"];
@@ -10,8 +10,9 @@ export type LinkedTableWindow = {
   queryIdentity: string;
   verified: boolean;
   hasMore: boolean;
-  continuation: string | null;
+  continuation: LinkedTableContinuation | null;
 };
+export type LinkedTableReadResult = { window: LinkedTableWindow; verification: "network" | "buffer" };
 class CursorChanged extends Error {
   constructor() {
     super("The table changed during pagination.");
@@ -27,16 +28,22 @@ export async function readLinkedTable(
   read: (cursor?: string, limit?: number) => Promise<TableQueryResult>,
   signal?: AbortSignal,
   queryIdentity = "",
-): Promise<LinkedTableWindow> {
+): Promise<LinkedTableReadResult> {
+  signal?.throwIfAborted();
   const current = previous?.queryIdentity === queryIdentity ? previous : null;
-  const target = current
+  const applicable =
+    intent.kind === "refresh" ||
+    (intent.queryIdentity === queryIdentity && (!current || intent.generation === current.data.generation));
+  if (!applicable && current) return { window: current, verification: "buffer" };
+  let target = current
     ? intent.kind === "append"
-      ? current.data.rows.length + 100
+      ? Math.max(current.data.rows.length, intent.target)
       : current.data.rows.length || 100
     : 100;
   for (let attempt = 0; ; attempt++) {
     try {
       signal?.throwIfAborted();
+      let network = false;
       let data: TableQueryResult, rows: TableQueryResult["rows"], cursor: string | null, pageSize: number;
       if (attempt === 0 && intent.kind === "append" && current?.verified) {
         data = current.data;
@@ -46,6 +53,8 @@ export async function readLinkedTable(
       } else {
         pageSize = Math.min(TABLE_PAGE_MAX, Math.max(100, target));
         data = await read(undefined, pageSize);
+        network = true;
+        if (intent.kind === "append" && data.generation !== intent.generation) target = 100;
         rows = mergeRows([], data.rows);
         cursor = data.nextCursor;
       }
@@ -55,6 +64,7 @@ export async function readLinkedTable(
         if (cursors.has(cursor)) throw new CursorChanged();
         cursors.add(cursor);
         const page = await read(cursor, pageSize);
+        network = true;
         if (page.revision !== data.revision || page.generation !== data.generation) throw new CursorChanged();
         rows = mergeRows(rows, page.rows);
         data = page;
@@ -65,14 +75,17 @@ export async function readLinkedTable(
         buffered = rows.slice(target);
       const hasMore = buffered.length > 0 || cursor !== null;
       return {
-        data: { ...data, rows: visible },
-        buffered,
-        serverCursor: cursor,
-        pageSize,
-        queryIdentity,
-        verified: true,
-        hasMore,
-        continuation: hasMore ? JSON.stringify([queryIdentity, data.generation, data.revision, visible.length]) : null,
+        window: {
+          data: { ...data, rows: visible },
+          buffered,
+          serverCursor: cursor,
+          pageSize,
+          queryIdentity,
+          verified: network || current?.verified === true,
+          hasMore,
+          continuation: hasMore ? { queryIdentity, generation: data.generation, target: visible.length + 100 } : null,
+        },
+        verification: network ? "network" : "buffer",
       };
     } catch (error) {
       if (
