@@ -394,9 +394,65 @@ it("does not publish a prepared operation after its captured draft changes", asy
   writeCommentDraft(scope, "new", [{ type: "paragraph", content: [{ type: "text", text: "Newer" }] }] as never);
   const newer = readCommentDraft(scope, "new")!;
   finish({ protocolVersion: 3, submission: { state: "prepared", operationId } });
-  await preparing;
-  await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow("Your draft changed");
-  expect(mockedApi).toHaveBeenCalledOnce();
+  mockedApi.mockResolvedValueOnce({ submission: { state: "canceled", operationId } });
+  await expect(preparing).rejects.toThrow("Your draft changed");
+  expect(mockedApi).toHaveBeenCalledTimes(2);
+  expect(mockedApi.mock.calls[1]![0]).toContain(`/${operationId}/cancel`);
   expect(readCommentDraft(scope, "new")).toEqual(newer);
+  purgeCommentPublications(scope.account);
+});
+
+it.each(["canceled", "published", "uncertain"])(
+  "settles only an abandoned preparation with %s cancellation",
+  async (state) => {
+    mockedApi.mockReset();
+    const { scope, store, body, operationId } = localAnchoredDraft();
+    mockedApi.mockResolvedValueOnce({ protocolVersion: 3, submission: { state: "prepared", operationId } });
+    const submission = store.anchoredSubmission(body);
+    await submission.prepare();
+    writeCommentDraft(scope, "new", [{ type: "paragraph", content: [{ type: "text", text: "Newer" }] }] as never);
+    const newer = readCommentDraft(scope, "new")!;
+    if (state === "uncertain") mockedApi.mockRejectedValueOnce(new Error("offline"));
+    else mockedApi.mockResolvedValueOnce({ submission: { state, operationId } });
+    await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow(
+      state === "published"
+        ? "Comment posted before cancellation completed."
+        : state === "uncertain"
+          ? "Cancellation could not be confirmed"
+          : "Your draft changed",
+    );
+    expect(readCommentDraft(scope, "new")).toEqual(newer);
+    expect(mockedApi.mock.calls.map(([path]) => path)).toEqual([
+      "/api/pages/page-1/comment-submissions",
+      `/api/pages/page-1/comment-submissions/${operationId}/cancel`,
+    ]);
+    submission.release();
+    expect(Boolean(activeCommentCancellation(scope))).toBe(state === "uncertain");
+    purgeCommentPublications(scope.account);
+  },
+);
+
+it("cancels a changed draft after protocol reconciliation confirms its preparation", async () => {
+  mockedApi.mockReset();
+  const { scope, store, body, operationId } = localAnchoredDraft();
+  let finish!: (value: unknown) => void;
+  mockedApi.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  mockedApi.mockResolvedValueOnce({ submission: { state: "prepared", operationId } });
+  mockedApi.mockResolvedValueOnce({ submission: { state: "canceled", operationId } });
+  const pending = store.anchoredSubmission(body).prepare();
+  writeCommentDraft(scope, "new", [
+    { type: "paragraph", content: [{ type: "text", text: "Newer protocol draft" }] },
+  ] as never);
+  const newer = readCommentDraft(scope, "new")!;
+  finish({ submission: { state: "prepared", operationId } });
+  await expect(pending).rejects.toThrow("Your draft changed while posting");
+  expect(mockedApi.mock.calls[2]![0]).toBe(`/api/pages/page-1/comment-submissions/${operationId}/cancel`);
+  expect(readCommentDraft(scope, "new")).toEqual(newer);
+  expect(activeCommentCancellation(scope)).toBeUndefined();
   purgeCommentPublications(scope.account);
 });

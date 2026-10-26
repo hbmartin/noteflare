@@ -250,14 +250,19 @@ export class ServerThreadStore extends ThreadStore {
       const draft = this.draftScope ? readCommentDraft(this.draftScope, "new") : null;
       if ((saved && !draft) || (draft && (draft.operationId !== operationId || json(draft.body) !== json(body)))) {
         if (this.pendingOperations.get("new")?.id === operationId) this.pendingOperations.delete("new");
-        throw new Error("Your draft changed while posting. Review the newer text before posting again.");
+        throw new ApiClientError(
+          409,
+          "comment_draft_changed",
+          "Your draft changed while posting. Review the newer text before posting again.",
+        );
       }
     };
     const root = `/api/pages/${encodeURIComponent(this.pageId)}/comment-submissions`;
     type Result = { submission: CommentSubmissionStatus; thread?: CommentThread; protocolVersion?: number };
     let protocolConfirmed = false,
       terminal = false,
-      rotated = false;
+      rotated = false,
+      prepared = false;
     let finish = () =>
       this.draftScope ? forgetCommentPublication(this.draftScope, operationId) : finishedWithoutStorage();
     const local = () =>
@@ -266,6 +271,7 @@ export class ServerThreadStore extends ThreadStore {
         : !this.terminalPreparations.has(operationId);
     const remember = (result: Result, id = operationId) => {
       assertAccount();
+      if (id === operationId) prepared = result.submission.state === "prepared";
       if (result.submission.state !== "prepared") {
         if (id === operationId) {
           terminal = true;
@@ -285,6 +291,8 @@ export class ServerThreadStore extends ThreadStore {
       }
       const current = await status();
       if (current.submission.state === "published") return current;
+      const abandoned = checkPreparedOwner();
+      if (abandoned) await abandoned;
       throw new ApiClientError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
     };
     const cancellations = new Map<string, Promise<CommentSubmissionStatus>>();
@@ -302,6 +310,34 @@ export class ServerThreadStore extends ThreadStore {
       }
       return canceling;
     };
+    const checkPreparedOwner = () => {
+      try {
+        assertDraft();
+      } catch (error) {
+        if (!prepared || !(error instanceof ApiClientError) || error.code !== "comment_draft_changed") throw error;
+        return (async () => {
+          let outcome: string;
+          try {
+            const result = await cancelOperation(operationId, headers);
+            outcome =
+              result.state === "prepared"
+                ? "Cancellation could not be confirmed. The earlier operation is preserved for recovery. "
+                : result.state === "published"
+                  ? "Comment posted before cancellation completed. "
+                  : "";
+          } catch {
+            assertAccount();
+            outcome = "Cancellation could not be confirmed. The earlier operation is preserved for recovery. ";
+          }
+          throw new ApiClientError(
+            409,
+            "comment_draft_changed",
+            outcome + "Your draft changed while posting. Review the newer text before posting again.",
+          );
+        })();
+      }
+      return undefined;
+    };
     const rotate = () => {
       if (rotated)
         throw new Error("This preparation was canceled or expired again. Your draft is preserved; retry deliberately.");
@@ -314,6 +350,7 @@ export class ServerThreadStore extends ThreadStore {
       if (this.draftScope) markLocalCommentOperation(this.draftScope, operationId);
       terminal = false;
       protocolConfirmed = false;
+      prepared = false;
       rotated = true;
       finish = () => (this.draftScope ? forgetCommentPublication(this.draftScope, operationId) : true);
     };
@@ -339,7 +376,8 @@ export class ServerThreadStore extends ThreadStore {
               if (!(error instanceof ApiClientError) || error.status !== 404) throw error;
             }
           }
-          assertDraft();
+          const abandoned = checkPreparedOwner();
+          if (abandoned) await abandoned;
           if (!canContinue() || !this.ready())
             throw new Error("Connect and sync the document before posting. Your draft is preserved.");
           const id = operationId,
@@ -366,11 +404,16 @@ export class ServerThreadStore extends ThreadStore {
             rotate();
             continue;
           }
+          if (result.submission.state === "prepared") {
+            const changedAfterPrepare = checkPreparedOwner();
+            if (changedAfterPrepare) await changedAfterPrepare;
+          }
           return result;
         }
       },
       publish: async (editor: BlockNoteEditor<any, any, any>, selection: { head: number; anchor: number }) => {
-        assertDraft();
+        const abandoned = checkPreparedOwner();
+        if (abandoned) return abandoned;
         if (!canContinue() || !this.ready())
           throw new Error("Connect and sync the document before posting. Your draft is preserved.");
         if (!protocolConfirmed) throw new ApiClientError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);

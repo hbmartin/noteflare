@@ -124,3 +124,58 @@ it("aborts active work and releases queued callers on disposal", async () => {
   expect(await second).toBeNull();
   expect(read).toHaveBeenCalledOnce();
 });
+
+it("retries a failed append even after a queued refresh succeeds", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let finish!: (value: number | null) => void;
+  const read = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise<number | null>((resolve) => {
+          finish = resolve;
+        }),
+    )
+    .mockResolvedValue(2);
+  const controller = setup(read);
+  const append = controller.request("cursor"),
+    refresh = controller.request();
+  finish(null);
+  expect(await append).toBeNull();
+  await refresh;
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(read.mock.calls.map((call) => call[0].kind)).toEqual(["append", "refresh", "append"]);
+});
+it("serves an eligible append after at most one queued refresh", async () => {
+  const finishes: Array<(value: number) => void> = [];
+  const read = vi.fn(() => new Promise<number>((resolve) => finishes.push(resolve)));
+  const controller = setup(read);
+  void controller.request();
+  void controller.request("cursor");
+  void controller.request();
+  finishes.shift()!(1);
+  await Promise.resolve();
+  await Promise.resolve();
+  void controller.request();
+  finishes.shift()!(1);
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(read.mock.calls.map((call: unknown[]) => (call[0] as LinkedTableReadIntent).kind)).toEqual([
+    "refresh",
+    "refresh",
+    "append",
+  ]);
+});
+it("resets retry progression for a new query while preserving separate failed intents", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const read = vi.fn().mockResolvedValue(null),
+    controller = setup(read);
+  for (let i = 0; i < 6; i++) await controller.request();
+  controller.reset();
+  const before = read.mock.calls.length;
+  await controller.request();
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(read).toHaveBeenCalledTimes(before + 2);
+});

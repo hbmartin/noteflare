@@ -1564,10 +1564,11 @@ function Workspace({
   onSignOut: () => void;
   onMemberChanged: (member: ClientMemberContext) => void;
 }) {
+  const workspaceAccountKey = offlineAccountKey(member);
   useLayoutEffect(() => {
-    setRealtimeAccessAccount(`${member.user.id}\0${member.workspace.id}`);
+    setRealtimeAccessAccount(workspaceAccountKey);
     return () => setRealtimeAccessAccount("");
-  }, [member.user.id, member.workspace.id]);
+  }, [workspaceAccountKey]);
   const refreshOwnerRole = useCallback(
     async (signal: AbortSignal) => {
       const account = realtimeAccessAccount();
@@ -4289,7 +4290,7 @@ function Workspace({
         inert={activitiesOpen || notificationsOpen || exportOpen || importOpen ? true : undefined}
         aria-hidden={activitiesOpen || notificationsOpen || exportOpen || importOpen || undefined}
       >
-        <CommentPublicationNotice account={`${member.user.id}\0${member.workspace.id}`} />
+        <CommentPublicationNotice account={workspaceAccountKey} />
         {workspaceError && (
           <div className="form-error workspace-error" role="alert">
             <span>{workspaceError}</span>

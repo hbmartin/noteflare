@@ -220,10 +220,23 @@ test("writing streams into a read-only preview, applies with undo, preserves con
   await expect(editor).toContainText("Clear writing result.");
   await expect(writing).not.toBeVisible();
   expect(explicitOpens).toBe(1);
+  // Establish a text range after remount: Select All did not reliably create
+  // the selection required by this toolbar in this scenario.
   await editor.click();
-  await page.keyboard.press(
-    await page.evaluate(() => (/Mac|iPhone|iPad/.test(navigator.platform) ? "Meta+a" : "Control+a")),
-  );
+  await editor
+    .locator(".bn-inline-content")
+    .filter({ hasText: "Collaborator changed this source." })
+    .first()
+    .evaluate((element) => {
+      const range = window.document.createRange();
+      range.selectNodeContents(element);
+      const selection = window.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+    });
+  await expect
+    .poll(() => page.evaluate(() => window.getSelection()?.toString()))
+    .toBe("Collaborator changed this source.");
   await page.getByRole("button", { name: "Writing with selection", exact: true }).press("Enter");
   await expect(writing.getByText("Selected text", { exact: true })).toBeVisible();
   expect(explicitOpens).toBe(1);

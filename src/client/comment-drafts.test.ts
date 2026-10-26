@@ -185,3 +185,30 @@ it("ignores sessionStorage and delayed clears while preserving memory-only text"
   expect(readCommentDraft(isolated, "new")).toMatchObject(replacement);
   purgeCommentDrafts(isolated.account);
 });
+
+it("does not persist runtime failure state when a failed draft rotates successfully", async () => {
+  const { replaceCommentDraftOperation } = await import("./comment-drafts");
+  const isolated = { ...scope, account: crypto.randomUUID() };
+  const fail = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  writeCommentDraft(isolated, "new", body("Keep text"));
+  const original = readCommentDraft(isolated, "new")!;
+  fail.mockRestore();
+  replaceCommentDraftOperation(isolated, original.operationId, "rotated");
+  const name = `notes:comment-draft:${JSON.stringify([isolated.account, isolated.pageId, isolated.epoch, "new"])}`;
+  expect(JSON.parse(localStorage.getItem(name)!)).not.toHaveProperty("storageFailed");
+  expect(readCommentDraft(isolated, "new")!.storageFailed).toBe(false);
+  localStorage.removeItem(name);
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: null, storageArea: localStorage }));
+  expect(readCommentDraft(isolated, "new")).toBeNull();
+});
+it("ignores legacy failure metadata in verified stored drafts and accepts later removal", () => {
+  const isolated = { ...scope, account: crypto.randomUUID() };
+  const name = `notes:comment-draft:${JSON.stringify([isolated.account, isolated.pageId, isolated.epoch, "new"])}`;
+  localStorage.setItem(name, JSON.stringify({ body: body("Legacy"), operationId: "legacy", storageFailed: true }));
+  expect(readCommentDraft(isolated, "new")!.storageFailed).toBe(false);
+  localStorage.removeItem(name);
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: null, storageArea: localStorage }));
+  expect(readCommentDraft(isolated, "new")).toBeNull();
+});

@@ -1,6 +1,17 @@
 import { ApiClientError } from "./api";
+import { TABLE_PAGE_MAX } from "../shared/table-limits";
 import type { TableQueryResult } from "../shared/table-protocol";
 import type { LinkedTableReadIntent } from "./linked-table-reads";
+export type LinkedTableWindow = {
+  data: TableQueryResult;
+  buffered: TableQueryResult["rows"];
+  serverCursor: string | null;
+  pageSize: number;
+  queryIdentity: string;
+  verified: boolean;
+  hasMore: boolean;
+  continuation: string | null;
+};
 class CursorChanged extends Error {
   constructor() {
     super("The table changed during pagination.");
@@ -9,37 +20,60 @@ class CursorChanged extends Error {
 const mergeRows = (left: TableQueryResult["rows"], right: TableQueryResult["rows"]) => [
   ...new Map([...left, ...right].map((row) => [row.id, row])).values(),
 ];
-/** Assemble a consistent expanded result before exposing data or readiness. */
+/** Keep visible continuation intent separate from opaque, page-size-bound server cursors. */
 export async function readLinkedTable(
   intent: LinkedTableReadIntent,
-  current: TableQueryResult | null,
-  read: (cursor?: string) => Promise<TableQueryResult>,
+  previous: LinkedTableWindow | null,
+  read: (cursor?: string, limit?: number) => Promise<TableQueryResult>,
   signal?: AbortSignal,
-) {
-  const target = Math.max(1, (current?.rows.length ?? 0) + (intent.kind === "append" ? 1 : 0));
+  queryIdentity = "",
+): Promise<LinkedTableWindow> {
+  const current = previous?.queryIdentity === queryIdentity ? previous : null;
+  const target = current
+    ? intent.kind === "append"
+      ? current.data.rows.length + 100
+      : current.data.rows.length || 100
+    : 100;
   for (let attempt = 0; ; attempt++) {
     try {
       signal?.throwIfAborted();
-      let result: TableQueryResult;
-      if (attempt === 0 && intent.kind === "append" && current?.nextCursor) {
-        const page = await read(current.nextCursor);
-        signal?.throwIfAborted();
-        if (page.revision !== current.revision || page.generation !== current.generation) throw new CursorChanged();
-        return { ...page, rows: mergeRows(current.rows, page.rows) };
+      let data: TableQueryResult, rows: TableQueryResult["rows"], cursor: string | null, pageSize: number;
+      if (attempt === 0 && intent.kind === "append" && current?.verified) {
+        data = current.data;
+        rows = mergeRows(data.rows, current.buffered);
+        cursor = current.serverCursor;
+        pageSize = current.pageSize;
+      } else {
+        pageSize = Math.min(TABLE_PAGE_MAX, Math.max(100, target));
+        data = await read(undefined, pageSize);
+        rows = mergeRows([], data.rows);
+        cursor = data.nextCursor;
       }
-      result = await read();
       const cursors = new Set<string>();
-      while (result.rows.length < target && result.nextCursor) {
+      while (rows.length < target && cursor) {
         signal?.throwIfAborted();
-        const cursor = result.nextCursor;
         if (cursors.has(cursor)) throw new CursorChanged();
         cursors.add(cursor);
-        const page = await read(cursor);
-        if (page.revision !== result.revision || page.generation !== result.generation) throw new CursorChanged();
-        result = { ...page, rows: mergeRows(result.rows, page.rows) };
+        const page = await read(cursor, pageSize);
+        if (page.revision !== data.revision || page.generation !== data.generation) throw new CursorChanged();
+        rows = mergeRows(rows, page.rows);
+        data = page;
+        cursor = page.nextCursor;
       }
       signal?.throwIfAborted();
-      return result;
+      const visible = rows.slice(0, target),
+        buffered = rows.slice(target);
+      const hasMore = buffered.length > 0 || cursor !== null;
+      return {
+        data: { ...data, rows: visible },
+        buffered,
+        serverCursor: cursor,
+        pageSize,
+        queryIdentity,
+        verified: true,
+        hasMore,
+        continuation: hasMore ? JSON.stringify([queryIdentity, data.generation, data.revision, visible.length]) : null,
+      };
     } catch (error) {
       if (
         signal?.aborted ||

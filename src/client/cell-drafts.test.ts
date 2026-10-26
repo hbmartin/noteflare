@@ -726,3 +726,44 @@ it("repairs a later corruption incident after a successful repair of the same te
     expect(JSON.parse(localStorage.getItem(name)!)).toMatchObject({ ...sent, durable: true });
   }
 });
+
+it("replaces only its obsolete cleanup snapshot when retrying a newer memory-only edit", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("A"));
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  expect(() => discardCellDraft(accountCellDrafts(scope.account)[0]!)).toThrow("stored copy could not be removed");
+  remove.mockRestore();
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.set(key, edit("B"));
+  const sent = map.submission(key, 22)!;
+  write.mockRestore();
+  expect(retryCellDraftPersistence(accountCellDrafts(scope.account)[0]!)).toBe(true);
+  expect(map.get(key)).toMatchObject({ ...sent, durable: true });
+  expect(cellDraftCleanupError(scope.account)).toBe("");
+});
+it("clears a failed repair guard after ordinary persistence before identical later corruption", async () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const original = map.submission(key, 20)!;
+  const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  localStorage.setItem(name, "{broken");
+  const fail = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.current(key, original.version);
+  await Promise.resolve();
+  fail.mockRestore();
+  map.set(key, { ...map.get(key)! });
+  expect(map.get(key)!.durable).toBe(true);
+  localStorage.setItem(name, "{broken");
+  map.current(key, original.version);
+  await Promise.resolve();
+  expect(map.get(key)).toMatchObject({ ...original, durable: true });
+  expect(JSON.parse(localStorage.getItem(name)!).text).toBe(original.text);
+});
