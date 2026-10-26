@@ -453,6 +453,7 @@ for (const { outcome, cleanup, newer } of [
 ] as const) {
   test(`closing an in-flight anchored comment reports ${outcome}${cleanup !== "none" ? ` with failed ${cleanup} cleanup` : ""}${newer ? " and preserves newer text" : ""}`, async ({
     page,
+    isMobile,
   }) => {
     await signInOwner(page);
     const document = await create(page, "document", `Comment publication ${outcome}`);
@@ -464,7 +465,14 @@ for (const { outcome, cleanup, newer } of [
     await page.keyboard.down("Shift");
     for (let index = 0; index < "Original publication anchor".length; index++) await page.keyboard.press("ArrowLeft");
     await page.keyboard.up("Shift");
-    await page.getByRole("button", { name: /add comment/i }).click();
+    const addComment = page.getByRole("button", { name: /add comment/i });
+    if (isMobile) {
+      // This lifecycle case does not depend on the narrow toolbar's pointer
+      // geometry. Keyboard activation preserves the selected text while opening.
+      await expect(addComment).toBeVisible();
+      await expect(addComment).toBeEnabled();
+      await addComment.press("Enter");
+    } else await addComment.click();
     const composer = page.locator(".bn-thread .bn-editor");
     await composer.fill(`Private comment ${outcome}`);
     let release!: () => void,
