@@ -4,6 +4,7 @@ import {
   useCellDrafts,
   cellDraftCleanupError,
   retryCellDraftCleanup,
+  retryCellDraftPersistence,
   type StoredCellDraft,
   type CellDraftSelection,
 } from "./cell-drafts";
@@ -66,6 +67,18 @@ export function CellDraftRecovery({
           <div key={JSON.stringify([draft.scope, draft.rowId, draft.columnId])}>
             <p>{state}</p>
             <textarea aria-label="Recovered cell draft" readOnly value={draft.text} />
+            {!draft.durable && (
+              <button
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  if (!retryCellDraftPersistence(draft))
+                    setError("Draft storage is still unavailable. Keep this tab open or copy your text.");
+                  else setError("");
+                }}
+              >
+                Retry saving locally
+              </button>
+            )}
             {!save && <a href={`/?page=${encodeURIComponent(originalContext(draft))}`}>Open original table context</a>}
             {save && ["Ready to save", "Outside the loaded view"].includes(state) && (
               <button

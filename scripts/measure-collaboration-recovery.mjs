@@ -14,14 +14,14 @@ if (!Number.isSafeInteger(typingEdits) || typingEdits < 20 || typingEdits > 1000
   throw new Error("Invalid typing sample count");
 const root = process.cwd();
 const controlled =
-  /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection|comment-publication)\.(ts|tsx)$/;
+  /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection|comment-publication|linked-table-reads|linked-table-query)\.(ts|tsx)$/;
 const entry = `
 import {createElement} from 'react';
 import {createRoot} from 'react-dom/client';
 import {flushSync} from 'react-dom';
 import {CollaborativeTablePage} from './src/client/CollaborativeTablePage';
 import {tableConnection} from './src/client/table-connection';
-import {registerCommentPublication,initializeCommentPublications} from './src/client/comment-publication';
+import {registerCommentPublication,initializeCommentPublications,useCommentPublicationWarning} from './src/client/comment-publication';
 const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
 const percentile=(values,q)=>[...values].sort((a,b)=>a-b)[Math.ceil(values.length*q)-1];
 const column=(id,type)=>({id,name:id,type,position:0,revision:1,generation:1,options:[]});
@@ -77,7 +77,20 @@ globalThis.measureReceipts=async()=>{
   return {samples:durations.length,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),counts:count};
  }finally{Object.defineProperty(Storage.prototype,'length',descriptor);Storage.prototype.key=key;Storage.prototype.setItem=set;Storage.prototype.removeItem=remove;}
 };
+globalThis.measureReceiptSubscriptions=async()=>{
+ const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
+ const scope={account:'subscription-bench',pageId:'page',epoch:1};
+ function Notice({sequence}){return createElement('span',null,useCommentPublicationWarning(scope),sequence);}
+ flushSync(()=>tree.render(createElement(Notice,{sequence:0})));await frame();
+ globalThis.__receiptSubscriptions=0;globalThis.__receiptUnsubscriptions=0;
+ try{
+  for(let sequence=1;sequence<=20;sequence++)flushSync(()=>tree.render(createElement(Notice,{sequence})));
+  return {renders:20,subscriptions:globalThis.__receiptSubscriptions,unsubscriptions:globalThis.__receiptUnsubscriptions};
+ }finally{tree.unmount();host.remove();}
+};
 globalThis.measureReadRecovery=async()=>{
+ // Compare scheduler work with the same equal-jitter draw in both versions.
+ const originalRandom=Math.random;Math.random=()=>0.5;
  const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
  globalThis.__requests=0;
  flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'Read measurement'},member:{role:'editor',user:{id:'read-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
@@ -92,7 +105,7 @@ globalThis.measureReadRecovery=async()=>{
   while(performance.now()<deadline){await frame();if(input.disabled)interrupted=true;if(interrupted&&!input.disabled)break;}
   if(!interrupted||input.disabled)throw Error('Read recovery did not complete');
   return {latencyMs:performance.now()-start,queries:globalThis.__requests};
- }finally{tree.unmount();host.remove();}
+ }finally{Math.random=originalRandom;tree.unmount();host.remove();}
 };
 globalThis.measureReconnect=async()=>{
  const Native=globalThis.WebSocket,times=[],starts=new Map();let queries=0,created=0;
@@ -149,6 +162,16 @@ async function bundle(before) {
                 "  const base = queryBase",
                 "  globalThis.__wholeTableRenders=(globalThis.__wholeTableRenders??0)+1;\n  const base = queryBase",
               );
+            if (path.endsWith("comment-publication.ts"))
+              contents = contents
+                .replace(
+                  "set.add(listener);",
+                  "globalThis.__receiptSubscriptions=(globalThis.__receiptSubscriptions??0)+1; set.add(listener);",
+                )
+                .replace(
+                  "set.delete(listener);",
+                  "globalThis.__receiptUnsubscriptions=(globalThis.__receiptUnsubscriptions??0)+1; set.delete(listener);",
+                );
             if (path.endsWith("cell-drafts.ts"))
               contents = contents.replace(
                 "function notify(account: string, name?: string) {",
@@ -189,6 +212,7 @@ const results = {
     typingEditsPerContext: typingEdits,
     contextsPerVersion: 3,
     reconnectingClients: 20,
+    readRecoveryRandomDraw: measureReadRecovery ? 0.5 : null,
   },
   limits:
     "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
@@ -205,6 +229,7 @@ try {
       results.runs[mode].push({
         typing: await page.evaluate(() => globalThis.measureTyping()),
         receipts: await page.evaluate(() => globalThis.measureReceipts()),
+        receiptSubscriptions: await page.evaluate(() => globalThis.measureReceiptSubscriptions()),
         reconnect: await page.evaluate(() => globalThis.measureReconnect()),
         ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });

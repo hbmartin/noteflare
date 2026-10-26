@@ -359,3 +359,44 @@ it("treats a freshly minted fallback identity as local when no saved draft match
   );
   purgeCommentPublications(scope.account);
 });
+
+it("uses the current shared identity after a same-text operation is replaced and canceled", async () => {
+  mockedApi.mockReset();
+  const { scope, store, body, operationId } = localAnchoredDraft();
+  mockedApi.mockResolvedValueOnce({ protocolVersion: 3, submission: { state: "prepared", operationId } });
+  await store.anchoredSubmission(body).prepare();
+  const { replaceCommentDraftOperation } = await import("./comment-drafts");
+  replaceCommentDraftOperation(scope, operationId, "replacement-identity");
+  mockedApi.mockResolvedValueOnce({ submission: { state: "canceled", operationId } });
+  await store.cancelAnchoredDraft(operationId);
+  mockedApi.mockImplementation(async (_path, init) => ({
+    protocolVersion: 3,
+    submission: { state: "prepared", operationId: new Headers(init?.headers).get("x-notes-operation-id") },
+  }));
+  const result = await store.anchoredSubmission(body).prepare();
+  expect(result.submission).toMatchObject({ state: "prepared", operationId: "replacement-identity" });
+  expect(readCommentDraft(scope, "new")!.operationId).toBe("replacement-identity");
+  purgeCommentPublications(scope.account);
+});
+
+it("does not publish a prepared operation after its captured draft changes", async () => {
+  mockedApi.mockReset();
+  const { scope, body, store, operationId } = localAnchoredDraft();
+  let finish!: (value: unknown) => void;
+  mockedApi.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const submission = store.anchoredSubmission(body),
+    preparing = submission.prepare();
+  writeCommentDraft(scope, "new", [{ type: "paragraph", content: [{ type: "text", text: "Newer" }] }] as never);
+  const newer = readCommentDraft(scope, "new")!;
+  finish({ protocolVersion: 3, submission: { state: "prepared", operationId } });
+  await preparing;
+  await expect(submission.publish({} as never, { head: 1, anchor: 2 })).rejects.toThrow("Your draft changed");
+  expect(mockedApi).toHaveBeenCalledOnce();
+  expect(readCommentDraft(scope, "new")).toEqual(newer);
+  purgeCommentPublications(scope.account);
+});

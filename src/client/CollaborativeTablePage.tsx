@@ -27,10 +27,12 @@ import {
   cellDraftKey as draftKey,
   useMissingCellDraftRowIds,
   useCellDraft,
+  retryCellDraftPersistence,
   type StoredCellDraft,
 } from "./cell-drafts";
 import { CellDraftRecovery } from "./CellDraftRecovery";
-import { linkedTableReads } from "./linked-table-reads";
+import { linkedTableReads, type LinkedTableReadIntent } from "./linked-table-reads";
+import { readLinkedTable } from "./linked-table-query";
 import { tableConnection } from "./table-connection";
 import { useRealtimeAccessAccount } from "./realtime-access-status";
 import type { TableDraftRows } from "../shared/table-protocol";
@@ -124,6 +126,7 @@ export function CollaborativeTablePage({
   const [newTitle, setNewTitle] = useState("");
   const epoch = useRef(0),
     dataRef = useRef(data),
+    dataQuery = useRef(""),
     active = useRef(true);
   useEffect(() => {
     dataRef.current = data;
@@ -161,8 +164,13 @@ export function CollaborativeTablePage({
     return true;
   }, []);
   const fetchTable = useCallback(
-    async function fetchTable(cursor?: string, signal?: AbortSignal) {
+    async function fetchTable(
+      cursor?: string,
+      signal?: AbortSignal,
+      intent?: LinkedTableReadIntent,
+    ): Promise<TableQueryResult | null> {
       const owner = ++epoch.current;
+      const queryIdentity = JSON.stringify([base, viewId, query, month]);
       const params = new URLSearchParams({ limit: "100" });
       if (viewId) params.set("viewId", viewId);
       if (query) params.set("q", query);
@@ -172,18 +180,32 @@ export function CollaborativeTablePage({
       params.set("timeZone", Intl.DateTimeFormat().resolvedOptions().timeZone);
       if (cursor) params.set("cursor", cursor);
       try {
-        const result = await api<TableQueryResult>(`${base}?${params}`, {
-          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
-        });
+        const readPage = (nextCursor?: string) => {
+          const pageParams = new URLSearchParams(params);
+          pageParams.delete("cursor");
+          if (nextCursor) pageParams.set("cursor", nextCursor);
+          return api<TableQueryResult>(`${base}?${pageParams}`, {
+            signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+          });
+        };
+        const result = queryBase
+          ? await readLinkedTable(
+              intent ?? { kind: "refresh" },
+              dataQuery.current === queryIdentity ? dataRef.current : null,
+              readPage,
+              signal,
+            )
+          : await readPage(cursor);
         if (!active.current || signal?.aborted) return null;
         // Superseded view data must not replace newer rows, but the fresh
         // authorization result still belongs to its live connection attempt.
         if (owner !== epoch.current) return queryBase ? null : result;
         dataRef.current = result;
+        dataQuery.current = queryIdentity;
         taskRefreshRequiredRef.current = false;
         setTaskRefreshRequired(false);
         setData((current) =>
-          cursor && current?.revision === result.revision
+          !queryBase && cursor && current?.revision === result.revision
             ? { ...result, rows: [...current.rows, ...result.rows] }
             : result,
         );
@@ -203,7 +225,7 @@ export function CollaborativeTablePage({
           }
           setError(apiErrorMessage(cause, "The table could not be loaded."));
           if (cause instanceof ApiClientError && cause.code === "table_cursor_stale" && cursor)
-            return fetchTable(undefined, signal);
+            return queryBase ? null : fetchTable(undefined, signal);
         }
       }
       return null;
@@ -219,7 +241,7 @@ export function CollaborativeTablePage({
     if (!queryBase || !page.id || (incarnation && incarnation.key !== account)) return undefined;
     writeReady.current = false;
     const reads = linkedTableReads({
-      read: (cursor, signal) => fetchRef.current(cursor, signal),
+      read: (intent, signal) => fetchRef.current(undefined, signal, intent),
       unavailable: () => {
         writeReady.current = false;
         setConnectionReady(false);
@@ -260,13 +282,14 @@ export function CollaborativeTablePage({
   useEffect(() => {
     if (incarnation && incarnation.key !== account) return undefined;
     active.current = true;
+    if (queryBase) linkedReads.current?.reset();
     void Promise.resolve().then(() => load());
     const requestEpoch = epoch;
     return () => {
       active.current = false;
       requestEpoch.current++;
     };
-  }, [load, account, incarnation]);
+  }, [load, account, incarnation, queryBase]);
   const loadRef = useRef(load);
   useLayoutEffect(() => {
     loadRef.current = load;
@@ -298,7 +321,12 @@ export function CollaborativeTablePage({
     return () => window.removeEventListener("notes:workspace-event", invalidate);
   }, [load]);
   const send = async (command: TableCommand, submission?: TaskDraftSubmission) => {
-    if (submission && !submission.map.current(submission.key, submission.version)) return false;
+    if (
+      submission &&
+      (!submission.map.current(submission.key, submission.version) ||
+        submission.map.get(submission.key)?.operationId !== submission.operationId)
+    )
+      return false;
     if (!canCommit()) return false;
     busyRef.current = true;
     setBusy(true);
@@ -310,7 +338,7 @@ export function CollaborativeTablePage({
         body: json(command),
         signal: AbortSignal.timeout(30000),
       });
-      if (submission) submission.map.acknowledge(submission.key, submission.version);
+      if (submission) submission.map.acknowledge(submission.key, submission.version, submission.operationId);
       await load();
       if (result.projectionPending) setError("Saved. Search and task lists are catching up.");
       if (result.result.visibleInView === false)
@@ -347,7 +375,11 @@ export function CollaborativeTablePage({
     rowId?: string,
     submission?: TaskDraftSubmission,
   ): Promise<TaskSaveResult> => {
-    if (submission && !submission.map.current(submission.key, submission.version))
+    if (
+      submission &&
+      (!submission.map.current(submission.key, submission.version) ||
+        submission.map.get(submission.key)?.operationId !== submission.operationId)
+    )
       return { state: "rejected", code: "draft_changed" };
     if (!canCommit()) return { state: "rejected", code: "not_ready" };
     busyRef.current = true;
@@ -361,7 +393,7 @@ export function CollaborativeTablePage({
         signal: AbortSignal.timeout(30000),
       });
       if (!rowId) setNewTitle("");
-      if (submission) submission.map.acknowledge(submission.key, submission.version);
+      if (submission) submission.map.acknowledge(submission.key, submission.version, submission.operationId);
       await load();
       if (result?.visibleInView === false)
         setError("Saved. Current filters hide this task. Choose All rows to see it.");
@@ -428,7 +460,9 @@ export function CollaborativeTablePage({
                   : value,
           },
           row.id,
-          submitted?.changed ? { map: drafts, key, version: submitted.version, operationId: op } : undefined,
+          submitted?.changed && operationId && submitted.operationId === operationId
+            ? { map: drafts, key, version: submitted.version, operationId: op }
+            : undefined,
         );
         return result.state === "saved";
       }
@@ -527,7 +561,6 @@ export function CollaborativeTablePage({
           pending.operationId,
           pending.submissionRevision,
         );
-        if (saved) drafts.acknowledge(key, pending.version);
         return saved;
       }}
     />
@@ -925,7 +958,16 @@ function Cell({
     [drafts, key],
   );
   useLayoutEffect(() => {
-    if (disabled || (pendingDraft?.changed && pendingDraft.type !== column.type)) drafts.focus(key, false);
+    if (
+      disabled ||
+      metadataColumns.has(column.type) ||
+      column.type === "formula" ||
+      (pendingDraft?.changed && pendingDraft.type !== column.type)
+    ) {
+      drafts.focus(key, false);
+      // eslint-disable-next-line react/set-state-in-effect -- Input removal must retire local focus without submitting a blur save.
+      setFocused(false);
+    }
   }, [disabled, drafts, key, pendingDraft?.changed, pendingDraft?.type, column.type]);
   if (pendingDraft?.changed && pendingDraft.type !== column.type) return <output>{String(value ?? "—")}</output>;
   if (column.type === "formula") {
@@ -1090,10 +1132,7 @@ function Cell({
           if (!canCommit() || disabled || pending.baseRevision !== (row.cellRevisions[column.id] ?? 0)) return;
           if (JSON.stringify(next) !== JSON.stringify(value)) {
             void onChange(next, pending?.baseRevision, pending.version).then((saved) => {
-              if (saved && drafts.get(key)?.version === pending.version) {
-                drafts.delete(key);
-                invalidateDraft((version) => version + 1);
-              }
+              if (saved) invalidateDraft((version) => version + 1);
             });
           } else drafts.delete(key);
         }}
@@ -1103,7 +1142,15 @@ function Cell({
       />
       {focused && !disabled && pendingDraft?.changed && <small aria-live="polite">Unsaved edit</small>}
       {pendingDraft?.changed && !pendingDraft.durable && (
-        <small role="alert">Draft storage is unavailable. Keep this tab open; this edit exists only in memory.</small>
+        <small role="alert">
+          Draft storage is unavailable. Keep this tab open; this edit exists only in memory.{" "}
+          <button
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => retryCellDraftPersistence(pendingDraft as StoredCellDraft)}
+          >
+            Retry saving locally
+          </button>
+        </small>
       )}
       {focused && pendingDraft?.changed && displayedVersion !== pendingDraft.version && (
         <output>Draft updated in another tab. Review it before saving.</output>
@@ -1120,8 +1167,7 @@ function Cell({
               const reviewed = drafts.get(key)!;
               const next =
                 column.type === "number" ? (pending.text === "" ? null : Number(pending.text)) : pending.text || null;
-              void onChange(next, row.cellRevisions[column.id] ?? 0, reviewed.version).then((saved) => {
-                if (saved) drafts.acknowledge(key, reviewed.version);
+              void onChange(next, row.cellRevisions[column.id] ?? 0, reviewed.version).then(() => {
                 invalidateDraft((version) => version + 1);
               });
             }}

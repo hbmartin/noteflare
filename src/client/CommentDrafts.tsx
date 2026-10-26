@@ -2,9 +2,6 @@ import {
   activeCommentCancellation,
   CommentCancellationUncertainError,
   CommentPublicationCleanupError,
-  useCommentPublicationWarning,
-  retryCommentPublicationStorage,
-  hasVolatileCommentReceipt,
 } from "./comment-publication";
 import {
   createContext,
@@ -34,6 +31,7 @@ import {
   useThreads,
   useBlockNoteEditor,
 } from "@blocknote/react";
+import { settleCommentDiscard } from "./comment-discard";
 import { apiErrorMessage } from "./api";
 import { submitAnchoredComment, CommentSubmissionOwner, CommentAnchorUnavailableError } from "./comment-submission";
 import { TextSelection } from "prosemirror-state";
@@ -48,23 +46,6 @@ import {
   type CommentDraftScope,
 } from "./comment-drafts";
 export const CommentDraftContext = createContext<(CommentDraftScope & { ready: boolean }) | null>(null);
-function PublicationStorageNotice({ scope }: { scope: CommentDraftScope }) {
-  const warning = useCommentPublicationWarning(scope);
-  useEffect(() => {
-    if (!warning || !hasVolatileCommentReceipt(scope)) return undefined;
-    const protect = (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", protect);
-    return () => window.removeEventListener("beforeunload", protect);
-  }, [scope, warning]);
-  return warning ? (
-    <p role="alert">
-      {warning} <button onClick={() => retryCommentPublicationStorage(scope)}>Retry comment storage cleanup</button>
-    </p>
-  ) : null;
-}
 function setCommentEditing(editor: BlockNoteEditor<any, any, any>, ready: boolean) {
   editor.isEditable = ready;
 }
@@ -356,31 +337,18 @@ export function DraftCommentsControllers() {
               draft.operationId,
             )
           : undefined;
+      const clear = (outcome = "", complete?: () => void) => {
+        const result = settleCommentDiscard(scope, id, draft.operationId, outcome, complete);
+        if (result.draft === "cleanup-pending") setCleanup({ id, operationId: draft.operationId });
+        setDiscardError(result.message);
+        return result.draft === "cleared";
+      };
       if (cancel) {
         setDiscardError("Canceling unpublished comment…");
-        const settle = (message: string) => {
-          const latest = readCommentDraft(scope, id);
-          if (latest && latest.operationId !== draft.operationId) {
-            setDiscardError("Newer draft edits are preserved. Review them before closing.");
-            return;
-          }
-          try {
-            clearCommentDraft(scope, id, draft.operationId);
-            setDiscardError(message);
-            if (afterCancellation) afterCancellation();
-            else comments.stopPendingComment();
-          } catch {
-            setCleanup({ id, operationId: draft.operationId });
-            setDiscardError(
-              "The draft was cleared from this tab, but its stored copy could not be removed. Retry cleanup before leaving.",
-            );
-          }
-        };
-        void cancel()
-          .then((result) =>
-            settle(result?.state === "published" ? "Comment posted before cancellation completed." : ""),
-          )
-          .catch((error) => {
+        const settle = (outcome: string) => clear(outcome, afterCancellation ?? (() => comments.stopPendingComment()));
+        void cancel().then(
+          (result) => settle(result?.state === "published" ? "Comment posted before cancellation completed." : ""),
+          (error) => {
             if (error instanceof CommentPublicationCleanupError)
               settle(
                 error.posted
@@ -393,20 +361,11 @@ export function DraftCommentsControllers() {
                   ? error.message
                   : "Cancellation could not be confirmed. Your draft is preserved; retry before discarding it.",
               );
-          });
-        return false;
-      }
-      try {
-        clearCommentDraft(scope, id);
-        setDiscardError("");
-        return true;
-      } catch {
-        setCleanup({ id, operationId: draft.operationId });
-        setDiscardError(
-          "The draft was cleared from this tab, but its stored copy could not be removed. Retry cleanup before leaving.",
+          },
         );
         return false;
       }
+      return clear();
     },
     [scope, comments],
   );
@@ -458,7 +417,6 @@ export function DraftCommentsControllers() {
   const thread = state.selectedThreadId ? threads.get(state.selectedThreadId) : undefined;
   return (
     <>
-      <PublicationStorageNotice scope={scope} />
       {discardError && <p role="alert">{discardError}</p>}
       {cleanup && (
         <button

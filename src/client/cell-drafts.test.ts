@@ -10,6 +10,7 @@ import {
   discardCellDraft,
   purgeCellDrafts,
   retryCellDraftCleanup,
+  retryCellDraftPersistence,
   cellDraftCleanupError,
   useMissingCellDraftRowIds,
   useCellDrafts,
@@ -619,4 +620,109 @@ it("checks a newer shared draft before submitting memory-only text even before i
   localStorage.setItem(name, JSON.stringify({ ...prior, scope, text: "New tab D", version: "new-tab-d" }));
   expect(map.submission(key, 30, version)).toBeUndefined();
   expect(map.get(key)).toMatchObject({ text: "New tab D", version: "new-tab-d", durable: true });
+});
+
+it("automatically repairs corruption once without changing text or submission identity", async () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("Budget note"));
+  const sent = map.submission(key, 20)!;
+  const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  localStorage.setItem(name, "{broken");
+  const write = vi.spyOn(Storage.prototype, "setItem"),
+    listener = vi.fn(),
+    stop = map.subscribe(key, listener);
+  expect(map.current(key, sent.version)).toBe(true);
+  expect(map.get(key)?.durable).toBe(false);
+  await Promise.resolve();
+  expect(map.get(key)).toMatchObject({ ...sent, durable: true });
+  expect(JSON.parse(localStorage.getItem(name)!)).toMatchObject({ ...sent, durable: true });
+  expect(write).toHaveBeenCalledOnce();
+  expect(listener).toHaveBeenCalledTimes(2);
+  map.current(key, sent.version);
+  await Promise.resolve();
+  expect(listener).toHaveBeenCalledTimes(2);
+  expect(write).toHaveBeenCalledOnce();
+  stop();
+});
+it.each(["replacement", "discard"])("does not repair over a %s arriving before the queued repair", async (kind) => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const original = accountCellDrafts(scope.account)[0]!,
+    name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  localStorage.setItem(name, "{broken");
+  map.current(key, original.version);
+  if (kind === "replacement")
+    localStorage.setItem(name, JSON.stringify({ ...original, text: "Another tab", version: "other" }));
+  else discardCellDraft(accountCellDrafts(scope.account)[0]!);
+  const write = vi.spyOn(Storage.prototype, "setItem");
+  await Promise.resolve();
+  expect(write).not.toHaveBeenCalled();
+  expect(map.get(key)?.text).toBe(kind === "replacement" ? "Another tab" : undefined);
+});
+it("offers explicit local Retry after repair fails without looping or creating a mutation", async () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const sent = map.submission(key, 20)!,
+    name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  localStorage.setItem(name, "{broken");
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.current(key, sent.version);
+  await Promise.resolve();
+  map.current(key, sent.version);
+  await Promise.resolve();
+  expect(write).toHaveBeenCalledOnce();
+  const protect = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(protect);
+  expect(protect.defaultPrevented).toBe(true);
+  write.mockRestore();
+  expect(retryCellDraftPersistence(accountCellDrafts(scope.account)[0]!)).toBe(true);
+  expect(map.get(key)).toMatchObject({ ...sent, durable: true });
+});
+it("cleanup Retry recognizes an exactly restored memory-only current draft", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("A"));
+  const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("blocked");
+  });
+  map.delete(key);
+  remove.mockRestore();
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  map.set(key, edit("C"));
+  const sent = map.submission(key, 20)!;
+  write.mockRestore();
+  const name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  localStorage.setItem(name, JSON.stringify(sent));
+  retryCellDraftCleanup(scope.account);
+  expect(map.get(key)).toMatchObject({ ...sent, durable: true });
+});
+it("cannot acknowledge another operation with the same draft version", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const sent = map.submission(key, 20)!;
+  map.acknowledge(key, sent.version, "independent-drag");
+  expect(map.get(key)).toMatchObject(sent);
+});
+
+it("repairs a later corruption incident after a successful repair of the same text", async () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit("Repeated repair"));
+  const sent = map.submission(key, 20)!,
+    name = "notes:cell-draft:v1:" + JSON.stringify([scope.account, scope.host, scope.tableId, 1, key]);
+  for (let incident = 0; incident < 2; incident++) {
+    localStorage.setItem(name, "{broken");
+    map.current(key, sent.version);
+    await Promise.resolve();
+    expect(map.get(key)).toMatchObject({ ...sent, durable: true });
+    expect(JSON.parse(localStorage.getItem(name)!)).toMatchObject({ ...sent, durable: true });
+  }
 });

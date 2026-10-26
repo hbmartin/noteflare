@@ -134,24 +134,56 @@ export function purgeCommentDrafts(account: string) {
   }
   if (failures.length) throw new AggregateError(failures, "Comment drafts could not be removed from this device.");
 }
+function observeDraft(name: string, raw: string | null) {
+  try {
+    const parts: unknown = JSON.parse(name.slice(prefix.length));
+    if (
+      !Array.isArray(parts) ||
+      parts.length !== 4 ||
+      typeof parts[0] !== "string" ||
+      typeof parts[1] !== "string" ||
+      !Number.isSafeInteger(parts[2]) ||
+      typeof parts[3] !== "string"
+    )
+      return;
+    const current = memory.get(name);
+    if (raw === null) {
+      if (!current || current.storageFailed) return;
+      clearedOperations.set(name, current.operationId);
+      memory.set(name, null);
+    } else {
+      const next = JSON.parse(raw) as CommentDraft | null;
+      if (!next || !Array.isArray(next.body) || typeof next.operationId !== "string") return;
+      const cleared = clearedOperations.get(name);
+      if (cleared !== undefined && cleared === next.operationId) return;
+      if (
+        current &&
+        !current.storageFailed &&
+        current.operationId === next.operationId &&
+        JSON.stringify(current.body) === JSON.stringify(next.body) &&
+        JSON.stringify(current.anchor) === JSON.stringify(next.anchor)
+      )
+        return;
+      clearedOperations.delete(name);
+      memory.set(name, next);
+    }
+    notify(name);
+  } catch {
+    // Invalid records and failed reads cannot take ownership of valid local text.
+  }
+}
 if (typeof window !== "undefined")
   window.addEventListener("storage", (event) => {
-    if (event.key === null) {
-      const names = [...memory.keys()];
-      for (const name of names) memory.set(name, null);
-      for (const name of names) notify(name);
-    } else if (event.key.startsWith(prefix)) {
-      if (event.newValue && clearedOperations.has(event.key)) {
-        try {
-          const cleared = clearedOperations.get(event.key);
-          if (cleared !== undefined && JSON.parse(event.newValue).operationId === cleared) return;
-        } catch {
-          return;
-        }
+    try {
+      if (event.storageArea !== localStorage) return;
+      if (event.key === null) {
+        for (const name of memory.keys()) observeDraft(name, localStorage.getItem(name));
+      } else if (event.key.startsWith(prefix)) {
+        const raw = localStorage.getItem(event.key);
+        if (raw === event.newValue) observeDraft(event.key, raw);
       }
-      clearedOperations.delete(event.key);
-      memory.delete(event.key);
-      notify(event.key);
+    } catch {
+      // Keep in-memory drafts when storage itself is unavailable.
     }
   });
 

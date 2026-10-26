@@ -213,7 +213,6 @@ export async function publishCommentSubmission(
       "This unpublished comment was canceled or expired. Your local draft is preserved.",
     );
   let token: string | undefined;
-  let mayHaveCommitted = false;
   let anchorAttempted = false;
   try {
     anchorAttempted = true;
@@ -263,7 +262,6 @@ export async function publishCommentSubmission(
         page.content_epoch,
         ...session.binds,
       );
-    mayHaveCommitted = true;
     await createCommentThread(env, member, page, JSON.parse(row.body_json!), null, null, {
       threadId: row.thread_id,
       commentId: row.comment_id,
@@ -291,20 +289,19 @@ export async function publishCommentSubmission(
     )
       throw error;
     let reconciliationFailed = false;
-    const committed =
-      mayHaveCommitted || anchorAttempted
-        ? await commentSubmissionStatus(env, member, page, operationId).catch((cause: unknown) => {
-            reconciliationFailed = true;
-            logger.error(
-              "comment.publication.reconciliation_failed",
-              "comments",
-              "Publication status could not be reconciled.",
-              { pageId: page.id, operationId },
-              cause,
-            );
-            return undefined;
-          })
-        : undefined;
+    const committed = anchorAttempted
+      ? await commentSubmissionStatus(env, member, page, operationId).catch((cause: unknown) => {
+          reconciliationFailed = true;
+          logger.error(
+            "comment.publication.reconciliation_failed",
+            "comments",
+            "Publication status could not be reconciled.",
+            { pageId: page.id, operationId },
+            cause,
+          );
+          return undefined;
+        })
+      : undefined;
     const guardRejected = error instanceof Error && error.message.includes("anchored_comment_publication_conflict");
     if (!(error instanceof HttpError) && !guardRejected) {
       logger.error(

@@ -104,7 +104,9 @@ it.each(["clear", "purge"])("accepts a new cross-tab operation after an empty %s
     stop = subscribeCommentDraft(isolated, "new", update);
   try {
     localStorage.setItem(name, JSON.stringify(next));
-    window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: JSON.stringify(next) }));
+    window.dispatchEvent(
+      new StorageEvent("storage", { storageArea: localStorage, key: name, newValue: JSON.stringify(next) }),
+    );
     expect(update).toHaveBeenCalledOnce();
     expect(readCommentDraft(isolated, "new")).toEqual(next);
     // An older completion must not discard the operation accepted from the other tab.
@@ -159,4 +161,27 @@ it("purges known memory despite failed enumeration and continues after per-key f
     length.mockRestore();
     remove.mockRestore();
   }
+});
+
+it("ignores sessionStorage and delayed clears while preserving memory-only text", () => {
+  const isolated = { ...scope, account: crypto.randomUUID() };
+  const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  writeCommentDraft(isolated, "new", body("Memory only"));
+  const saved = readCommentDraft(isolated, "new")!;
+  write.mockRestore();
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: sessionStorage }));
+  expect(readCommentDraft(isolated, "new")).toEqual(saved);
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  expect(readCommentDraft(isolated, "new")).toEqual(saved);
+  const name = "notes:comment-draft:" + JSON.stringify([isolated.account, isolated.pageId, isolated.epoch, "new"]);
+  const replacement = { body: body("Another tab"), operationId: "newer" };
+  localStorage.setItem(name, JSON.stringify(replacement));
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  expect(readCommentDraft(isolated, "new")).toMatchObject(replacement);
+  localStorage.setItem(name, "{broken");
+  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: "{broken", storageArea: localStorage }));
+  expect(readCommentDraft(isolated, "new")).toMatchObject(replacement);
+  purgeCommentDrafts(isolated.account);
 });

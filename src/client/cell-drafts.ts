@@ -25,6 +25,7 @@ const listeners = new Map<string, Set<() => void>>();
 const cellListeners = new Map<string, Set<() => void>>();
 const focused = new Map<string, Set<CellDraftMap>>();
 const cleanupErrors = new Map<string, string>();
+const repairAttempts = new Map<string, { draft: StoredCellDraft; raw: string | null }>();
 const nameOf = (scope: CellDraftScope, key: string) =>
   prefix + JSON.stringify([scope.account, scope.host, scope.tableId, scope.generation, key]);
 function subscribe(map: Map<string, Set<() => void>>, key: string, listener: () => void) {
@@ -177,6 +178,7 @@ function clearVersion(name: string, version?: string) {
   }
 }
 function tombstone(name: string, version?: string) {
+  repairAttempts.delete(name);
   clearVersion(name, version);
   records.set(name, null);
 }
@@ -196,37 +198,89 @@ function sameDraft(left: StoredCellDraft | null | undefined, right: StoredCellDr
     )
   );
 }
-function retainInvalidDraft(name: string, current: StoredCellDraft | null | undefined) {
-  if (!current?.durable) return;
-  records.set(name, { ...current, durable: false });
-  notify(current.scope.account, name);
+function retainInvalidDraft(name: string, current: StoredCellDraft | null | undefined, raw: string | null) {
+  if (!current) return;
+  let candidate = current;
+  if (current.durable) {
+    candidate = { ...current, durable: false };
+    records.set(name, candidate);
+    notify(current.scope.account, name);
+  }
+  const attempted = repairAttempts.get(name);
+  if (attempted?.raw === raw && sameDraft(attempted.draft, candidate)) return;
+  repairAttempts.set(name, { draft: candidate, raw });
+  queueMicrotask(() => {
+    if (records.get(name) !== candidate || clearedVersions.get(name)?.has(candidate.version)) return;
+    try {
+      const latest = localStorage.getItem(name);
+      if (latest !== raw) {
+        observeStoredDraft(name, latest, candidate.scope.account);
+        return;
+      }
+      persistRecoveredDraft(name, candidate);
+    } catch {
+      // One attempt per corrupt snapshot; explicit Retry can try again.
+    }
+  });
+}
+function persistRecoveredDraft(name: string, current: StoredCellDraft) {
+  if (records.get(name) !== current || clearedVersions.get(name)?.has(current.version)) return false;
+  const raw = JSON.stringify({ ...current, durable: true });
+  localStorage.setItem(name, raw);
+  const stored = localStorage.getItem(name);
+  observeStoredDraft(name, stored, current.scope.account);
+  return records.get(name)?.durable === true;
+}
+/** Local persistence only; a valid newer shared value always keeps ownership. */
+export function retryCellDraftPersistence(draft: StoredCellDraft) {
+  const name = nameOf(draft.scope, cellDraftKey(draft.rowId, draft.columnId));
+  const current = records.get(name);
+  if (!sameDraft(current, draft) || !current || clearedVersions.get(name)?.has(current.version)) return false;
+  try {
+    const raw = localStorage.getItem(name),
+      result = parse(name, raw);
+    if (result.state === "valid" && (sameDraft(current, result.draft) || raw !== persistedSnapshots.get(name))) {
+      observeStoredDraft(name, raw, draft.scope.account);
+      return Boolean(records.get(name)?.durable);
+    }
+    if (
+      result.state === "suppressed" ||
+      (raw === null && persistedSnapshots.get(name) !== null && persistedSnapshots.get(name) !== undefined)
+    )
+      return false;
+    return persistRecoveredDraft(name, current);
+  } catch {
+    return false;
+  }
 }
 function observeStoredDraft(name: string, raw: string | null, account: string) {
   const current = records.get(name),
     result = parse(name, raw);
   if (result.state === "invalid") {
-    retainInvalidDraft(name, current);
+    retainInvalidDraft(name, current, raw);
     return;
   }
   if (result.state === "suppressed") return;
-  if (current && !current.durable && result.state === "valid" && sameDraft(current, result.draft)) {
-    records.set(name, result.draft);
-    persistedSnapshots.set(name, raw);
-    notify(account, name);
-    return;
-  }
-  if (current && !current.durable && (raw === persistedSnapshots.get(name) || result.state === "missing")) {
+  const next = result.draft ?? null;
+  const matches = sameDraft(current, next);
+  const restored = Boolean(current && !current.durable && next && matches);
+  if (
+    !restored &&
+    current &&
+    !current.durable &&
+    (raw === persistedSnapshots.get(name) || result.state === "missing")
+  ) {
     if (result.state === "missing") persistedSnapshots.set(name, null);
     return;
   }
-  const next = result.draft ?? null;
-  if (sameDraft(current, next)) {
+  if (matches && !restored) {
     if (next || persistedSnapshots.has(name)) persistedSnapshots.set(name, raw);
     return;
   }
   persistedSnapshots.set(name, raw);
   if (!next && current) tombstone(name, current.version);
   else records.set(name, next);
+  if (next) repairAttempts.delete(name);
   notify(account, name);
 }
 /** Read the actual latest write before a save or discard, without enumerating storage. */
@@ -267,19 +321,7 @@ function cleanupStoredDraft(name: string, account: string) {
     localStorage.removeItem(name);
     clearVersion(name, parse(name, raw, true).draft?.version);
     persistedSnapshots.set(name, null);
-  } else {
-    const replacement = parse(name, raw),
-      current = records.get(name);
-    if (replacement.state === "invalid") retainInvalidDraft(name, current);
-    else {
-      const isOwnPredecessor = current && !current.durable && raw === persistedSnapshots.get(name);
-      if (replacement.draft && !isOwnPredecessor && !sameDraft(current, replacement.draft)) {
-        records.set(name, replacement.draft);
-        notify(account, name);
-      }
-      persistedSnapshots.set(name, raw);
-    }
-  }
+  } else observeStoredDraft(name, raw, account);
   cleanupTargets.delete(name);
   if (![...cleanupTargets.values()].some((entry) => entry.account === account) && cleanupErrors.delete(account))
     notify(account);
@@ -385,8 +427,8 @@ export class CellDraftMap extends Map<string, CellDraft> {
     }
     return Boolean(draft);
   }
-  acknowledge(key: string, version: string | undefined) {
-    if (this.current(key, version)) this.delete(key);
+  acknowledge(key: string, version: string | undefined, operationId?: string) {
+    if (this.current(key, version) && (!operationId || this.get(key)?.operationId === operationId)) this.delete(key);
   }
   submission(key: string, tableRevision: number, version = this.get(key)?.version) {
     if (!this.current(key, version)) return undefined;
@@ -441,6 +483,7 @@ export function purgeCellDrafts(account: string) {
       errors.push(error);
     }
     tombstone(name, ownVersion);
+    repairAttempts.delete(name);
     try {
       localStorage.removeItem(name);
       persistedSnapshots.delete(name);
