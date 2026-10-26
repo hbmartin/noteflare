@@ -291,6 +291,8 @@ export class ServerThreadStore extends ThreadStore {
       }
       const current = await status();
       if (current.submission.state === "published") return current;
+      const abandoned = checkPreparedOwner();
+      if (abandoned) await abandoned;
       throw new ApiClientError(409, "comment_client_reload_required", COMMENT_RELOAD_MESSAGE);
     };
     const cancellations = new Map<string, Promise<CommentSubmissionStatus>>();

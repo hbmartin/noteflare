@@ -431,3 +431,28 @@ it.each(["canceled", "published", "uncertain"])(
     purgeCommentPublications(scope.account);
   },
 );
+
+it("cancels a changed draft after protocol reconciliation confirms its preparation", async () => {
+  mockedApi.mockReset();
+  const { scope, store, body, operationId } = localAnchoredDraft();
+  let finish!: (value: unknown) => void;
+  mockedApi.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  mockedApi.mockResolvedValueOnce({ submission: { state: "prepared", operationId } });
+  mockedApi.mockResolvedValueOnce({ submission: { state: "canceled", operationId } });
+  const pending = store.anchoredSubmission(body).prepare();
+  writeCommentDraft(scope, "new", [
+    { type: "paragraph", content: [{ type: "text", text: "Newer protocol draft" }] },
+  ] as never);
+  const newer = readCommentDraft(scope, "new")!;
+  finish({ submission: { state: "prepared", operationId } });
+  await expect(pending).rejects.toThrow("Your draft changed while posting");
+  expect(mockedApi.mock.calls[2]![0]).toBe(`/api/pages/page-1/comment-submissions/${operationId}/cancel`);
+  expect(readCommentDraft(scope, "new")).toEqual(newer);
+  expect(activeCommentCancellation(scope)).toBeUndefined();
+  purgeCommentPublications(scope.account);
+});
