@@ -21,6 +21,7 @@ import {createRoot} from 'react-dom/client';
 import {flushSync} from 'react-dom';
 import {CollaborativeTablePage} from './src/client/CollaborativeTablePage';
 import {tableConnection} from './src/client/table-connection';
+import {readLinkedTable} from './src/client/linked-table-query';
 import {registerCommentPublication,initializeCommentPublications,useCommentPublicationWarning} from './src/client/comment-publication';
 const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
 const percentile=(values,q)=>[...values].sort((a,b)=>a-b)[Math.ceil(values.length*q)-1];
@@ -132,6 +133,38 @@ globalThis.measurePagination=async()=>{
   return {refreshSamples:durations.length,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),refreshQueries:queryCounts,firstContinuationQueries,bufferedContinuationQueries:globalThis.__pageQueries.length-bufferedBefore,visibleRows:count(),requests:globalThis.__pageQueries};
  }finally{globalThis.__pagedRows=null;tree.unmount();host.remove();}
 };
+globalThis.measureQueryVerification=async()=>{
+ const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
+ flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'Query measurement'},member:{role:'editor',user:{id:'query-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
+ const button=text=>[...host.querySelectorAll('button')].find(item=>item.textContent.trim()===text);
+ const ready=()=>host.querySelector('input[aria-label="Title"]')&&!host.querySelector('input[aria-label="Title"]').disabled;
+ for(let i=0;i<100&&!ready();i++)await frame();
+ if(!ready())throw Error('Query fixture not ready');
+ const durations=[],renderCounts=[],queries=[];let toolbarReplacements=0,controlsMissingDuringVerification=0;
+ try{
+  for(let sample=0;sample<20;sample++){
+   const views=button('Views'),properties=button('Properties'),before=globalThis.__requests,renders=globalThis.__wholeTableRenders,start=performance.now();
+   const input=host.querySelector('input[aria-label="Search table"]');
+   flushSync(()=>{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'Query '+sample);input.dispatchEvent(new Event('input',{bubbles:true}));});
+   if(!button('Views')||!button('Properties'))controlsMissingDuringVerification++;
+   for(let i=0;i<100;i++){await frame();if(ready()&&globalThis.__requests>before)break;}
+   if(!ready()||globalThis.__requests===before)throw Error('Query verification did not complete');
+   toolbarReplacements+=Number(button('Views')!==views)+Number(button('Properties')!==properties);
+   durations.push(performance.now()-start);renderCounts.push(globalThis.__wholeTableRenders-renders);queries.push(globalThis.__requests-before);
+  }
+  return {samples:20,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),toolbarReplacements,controlsMissingDuringVerification,renderCounts,queries};
+ }finally{tree.unmount();host.remove();}
+};
+globalThis.measureFulfilledContinuations=async()=>{
+ const current={data:globalThis.__data,buffered:[],serverCursor:null,pageSize:100,queryIdentity:'noop',verified:true,hasMore:false,continuation:null};
+ const durations=[];let requests=0,sameWindows=0,sameData=0,sameRows=0;
+ const read=async()=>{requests++;return globalThis.__data};
+ for(let sample=0;sample<1000;sample++){
+  const start=performance.now();const result=await readLinkedTable({kind:'append',queryIdentity:'noop',generation:1,target:100},current,read,undefined,'noop');
+  durations.push(performance.now()-start);sameWindows+=Number(result.window===current);sameData+=Number(result.window.data===current.data);sameRows+=Number(result.window.data.rows===current.data.rows);
+ }
+ return {samples:1000,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),requests,sameWindows,sameData,sameRows};
+};
 globalThis.measureReconnect=async()=>{
  const Native=globalThis.WebSocket,times=[],starts=new Map();let queries=0,created=0;
  class Socket extends EventTarget{
@@ -170,7 +203,7 @@ async function bundle(before) {
         name: "controlled-collaboration-fixture",
         setup(builder) {
           builder.onLoad({ filter: /src\/client\/api\.ts$/ }, () => ({
-            contents: `export class ApiClientError extends Error{}; export const json=JSON.stringify; export const apiErrorMessage=(e,f)=>f; export async function api(path,init){
+            contents: `export class ApiClientError extends Error{}; export const isPageNotFoundError=e=>e instanceof ApiClientError&&e.code==='page_not_found'&&(e.status===404||e.status===410); export const json=JSON.stringify; export const apiErrorMessage=(e,f)=>f; export async function api(path,init){
               globalThis.__requests++;
               if(globalThis.__failNextRead&&!init?.method){globalThis.__failNextRead=false;throw Error('Controlled read failure')}
               if(globalThis.__pagedRows&&!init?.method){
@@ -253,6 +286,8 @@ const results = {
     paginationRows: 1200,
     paginationVisibleRowsBeforeRefresh: 500,
     paginationRefreshSamplesPerContext: 5,
+    queryVerificationSamplesPerContext: 20,
+    fulfilledContinuationSamplesPerContext: 1000,
   },
   limits:
     "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
@@ -272,6 +307,8 @@ try {
         receiptSubscriptions: await page.evaluate(() => globalThis.measureReceiptSubscriptions()),
         reconnect: await page.evaluate(() => globalThis.measureReconnect()),
         pagination: await page.evaluate(() => globalThis.measurePagination()),
+        queryVerification: await page.evaluate(() => globalThis.measureQueryVerification()),
+        fulfilledContinuations: await page.evaluate(() => globalThis.measureFulfilledContinuations()),
         ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });
       await context.close();

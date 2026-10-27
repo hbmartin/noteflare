@@ -859,3 +859,21 @@ it("an unverified ordinary replacement retains its cleanup target", () => {
   expect(map.get(key)).toMatchObject({ text: "B", durable: true });
   expect(cellDraftCleanupError(scope.account)).toBe("");
 });
+
+it("checks captured ownership against current shared storage before acknowledging", () => {
+  const map = new CellDraftMap(scope),
+    key = cellDraftKey("row:a", "b");
+  map.set(key, edit());
+  const submitted = map.submission(key, 10)!;
+  expect(map.owns(key, submitted.version, submitted.operationId)).toBe(true);
+  const name = Object.keys(localStorage).find(
+    (storedKey) => storedKey.startsWith("notes:cell-draft:") && storedKey.includes(scope.account),
+  )!;
+  const replacement = { ...submitted, text: "Other tab", version: "new-version", operationId: "other-op" };
+  localStorage.setItem(name, JSON.stringify(replacement));
+  expect(map.owns(key, submitted.version, submitted.operationId)).toBe(false);
+  map.acknowledge(key, submitted.version, submitted.operationId);
+  expect(map.get(key)?.text).toBe("Other tab");
+  map.delete(key);
+  expect(map.owns(key, replacement.version, replacement.operationId)).toBe(false);
+});

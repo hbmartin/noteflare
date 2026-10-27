@@ -18,7 +18,7 @@ import {
 } from "../shared/table-protocol";
 import { type CalculationKind } from "../shared/table-computed";
 import { isErrorCell, format, type FormulaTypeOptions } from "../shared/formula";
-import { api, apiErrorMessage, ApiClientError, json } from "./api";
+import { api, apiErrorMessage, ApiClientError, isPageNotFoundError, json } from "./api";
 import { taskColumns } from "../shared/tasks";
 import { calendarDay } from "../shared/table-calendar";
 import "./collaborative-table.css";
@@ -32,7 +32,12 @@ import {
   type StoredCellDraft,
 } from "./cell-drafts";
 import { CellDraftRecovery } from "./CellDraftRecovery";
-import { linkedTableReads, type LinkedTableContinuation, type LinkedTableReadIntent } from "./linked-table-reads";
+import {
+  linkedTableReads,
+  type LinkedTableContinuation,
+  type LinkedTableReadIntent,
+  type LinkedTableReadOutcome,
+} from "./linked-table-reads";
 import { readLinkedTable, type LinkedTableWindow } from "./linked-table-query";
 import { tableConnection } from "./table-connection";
 import { useRealtimeAccessAccount } from "./realtime-access-status";
@@ -85,7 +90,18 @@ export function CollaborativeTablePage({
   const base = queryBase ?? `/api/tables/${page.id}/query`;
   const commandsPath = queryBase ? `${queryBase}/commands` : `/api/tables/${page.id}/commands`;
   const online = useOnlineStatus();
-  const writeReady = useRef(false);
+  const ownership = useRef({
+    request: 0,
+    verification: 0,
+    ready: false,
+    generation: 0,
+    authorizedGeneration: null as number | null,
+    canEdit: false,
+    role: member.role,
+  });
+  useLayoutEffect(() => {
+    ownership.current.role = member.role;
+  }, [member.role]);
   const connectionPermit = useRef<() => boolean>(() => true);
   const busyRef = useRef(false);
   const taskRefreshRequiredRef = useRef(false);
@@ -93,19 +109,42 @@ export function CollaborativeTablePage({
   const [connectionReady, setConnectionReady] = useState(false);
   const [authorizedGeneration, setAuthorizedGeneration] = useState<number | null>(null);
   const [data, setData] = useState<TableQueryResult | null>(null);
+  const [panel, setPanel] = useState<"view" | "properties" | null>(null);
+  const [retry, setRetry] = useState<SavedRetry | null>(null);
   const linkedWindow = useRef<LinkedTableWindow | null>(null);
   const [linkedSnapshot, setLinkedSnapshot] = useState<LinkedTableWindow | null>(null);
-  const verificationGeneration = useRef(0);
   const linkedReads = useRef<ReturnType<typeof linkedTableReads<TableQueryResult>> | null>(null);
   const publishLinkedWindow = useCallback((value: LinkedTableWindow | null) => {
     linkedWindow.current = value;
     setLinkedSnapshot(value);
   }, []);
-  const invalidateVerification = useCallback(() => {
-    verificationGeneration.current++;
-    if (linkedWindow.current) linkedWindow.current.verified = false;
-    writeReady.current = false;
+  const publishReadiness = useCallback((value: boolean, generation?: number) => {
+    ownership.current.ready = value;
+    if (generation !== undefined) {
+      ownership.current.authorizedGeneration = generation;
+      setAuthorizedGeneration(generation);
+    }
+    setConnectionReady(value);
   }, []);
+  const retireVerification = useCallback(
+    (mode: "invalidate" | "suspend" | "denied" | "retire") => {
+      if (mode !== "suspend") ownership.current.verification++;
+      publishReadiness(false);
+      if (mode === "denied" || mode === "retire") {
+        ownership.current.request++;
+        publishLinkedWindow(null);
+        if (mode === "denied") {
+          ownership.current.canEdit = false;
+          setData(null);
+          setRetry(null);
+          setPanel(null);
+        }
+      } else if (linkedWindow.current?.verified) {
+        publishLinkedWindow({ ...linkedWindow.current, verified: false });
+      }
+    },
+    [publishLinkedWindow, publishReadiness],
+  );
   const account = `${member.user.id}\0${member.workspace?.id ?? "workspace"}`;
   const incarnation = useRealtimeAccessAccount();
   const host = queryBase ?? page.id;
@@ -157,11 +196,8 @@ export function CollaborativeTablePage({
   const queryOwner = useRef({ queryIdentity, account, incarnation });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [retry, setRetry] = useState<SavedRetry | null>(null);
-  const [panel, setPanel] = useState<"view" | "properties" | null>(null);
   const [newTitle, setNewTitle] = useState("");
-  const epoch = useRef(0),
-    active = useRef(true);
+  const active = useRef(true);
   const editable = Boolean(
     online &&
     !taskRefreshRequired &&
@@ -170,43 +206,46 @@ export function CollaborativeTablePage({
     member.role !== "viewer" &&
     data?.canEdit !== false,
   );
-  useLayoutEffect(() => {
-    writeReady.current = Boolean(editable);
-  });
   const canCommit = useCallback(
     () =>
-      writeReady.current &&
+      active.current &&
       navigator.onLine &&
+      !document.hidden &&
+      ownership.current.ready &&
+      ownership.current.canEdit &&
+      ownership.current.role !== "viewer" &&
       !busyRef.current &&
       !taskRefreshRequiredRef.current &&
-      connectionPermit.current(),
-    [],
+      connectionPermit.current() &&
+      queryOwner.current.account === account &&
+      queryOwner.current.incarnation === incarnation &&
+      (queryBase
+        ? queryOwner.current.queryIdentity === queryIdentity &&
+          queryOwner.current.account === account &&
+          queryOwner.current.incarnation === incarnation
+        : ownership.current.authorizedGeneration === ownership.current.generation),
+    [account, incarnation, queryBase, queryIdentity],
   );
   const taskList = Boolean(page.taskList || data?.taskList);
   const tasksPath = queryBase ? `${queryBase}/tasks` : `/api/task-lists/${page.id}/tasks`;
   const discardDenied = useCallback(
-    (cause: unknown) => {
-      if (!(cause instanceof ApiClientError) || ![401, 403, 404].includes(cause.status)) return false;
-      invalidateVerification();
-      epoch.current++;
-      publishLinkedWindow(null);
-      linkedReads.current?.reset();
-      setConnectionReady(false);
-      setData(null);
-      setRetry(null);
-      setPanel(null);
+    (cause: unknown, fromRead = false) => {
+      if (!(cause instanceof ApiClientError) || (![401, 403].includes(cause.status) && !isPageNotFoundError(cause)))
+        return false;
+      retireVerification("denied");
+      if (!fromRead) linkedReads.current?.recoverDenied();
       return true;
     },
-    [invalidateVerification, publishLinkedWindow],
+    [retireVerification],
   );
   const fetchTable = useCallback(
     async function fetchTable(
       cursor?: string,
       signal?: AbortSignal,
       intent?: LinkedTableReadIntent,
-    ): Promise<TableQueryResult | null> {
-      const owner = ++epoch.current;
-      const verification = verificationGeneration.current;
+    ): Promise<LinkedTableReadOutcome<TableQueryResult>> {
+      const owner = ++ownership.current.request;
+      const verification = ownership.current.verification;
       const params = new URLSearchParams({ limit: "100" });
       if (viewId) params.set("viewId", viewId);
       if (query) params.set("q", query);
@@ -229,17 +268,18 @@ export function CollaborativeTablePage({
           ? await readLinkedTable(intent ?? { kind: "refresh" }, linkedWindow.current, readPage, signal, queryIdentity)
           : null;
         const result = linked ? linked.window.data : await readPage(cursor);
-        if (!active.current || signal?.aborted) return null;
-        // Superseded view data must not replace newer rows, but the fresh
-        // authorization result still belongs to its live connection attempt.
-        if (owner !== epoch.current) return queryBase ? null : result;
-        if (queryBase && verification !== verificationGeneration.current) return null;
+        if (!active.current || signal?.aborted) return { state: "superseded" };
+        // Canonical transport queries retain their authorization result when only view data is superseded.
+        if (owner !== ownership.current.request)
+          return queryBase ? { state: "superseded" } : { state: "success", value: result, verification: "network" };
+        if (queryBase && verification !== ownership.current.verification) return { state: "superseded" };
         const fresh = !linked || linked.verification === "network";
         if (linked) {
-          linked.window.verified =
-            navigator.onLine && !document.hidden && (fresh || linkedWindow.current?.verified === true);
-          publishLinkedWindow(linked.window);
+          const verified = navigator.onLine && !document.hidden && (fresh || linkedWindow.current?.verified === true);
+          publishLinkedWindow(linked.window.verified === verified ? linked.window : { ...linked.window, verified });
         }
+        ownership.current.generation = result.generation;
+        ownership.current.canEdit = result.canEdit !== false;
         if (fresh) {
           taskRefreshRequiredRef.current = false;
           setTaskRefreshRequired(false);
@@ -250,34 +290,57 @@ export function CollaborativeTablePage({
             : result,
         );
         if (fresh) setError("");
-        if (queryBase && fresh && navigator.onLine && !document.hidden) setConnectionReady(true);
-        return result;
+        if (fresh)
+          publishReadiness(
+            navigator.onLine &&
+              !document.hidden &&
+              Boolean(
+                queryBase ||
+                (connectionPermit.current() && ownership.current.authorizedGeneration === result.generation),
+              ),
+          );
+        return { state: "success", value: result, verification: fresh ? "network" : "buffer" };
       } catch (cause) {
-        if (signal?.aborted) return null;
-        if (owner === epoch.current && active.current) {
-          if (queryBase) {
-            invalidateVerification();
-            setConnectionReady(false);
-          }
-          if (discardDenied(cause)) {
-            writeReady.current = false;
-            setConnectionReady(false);
-          }
-          setError(apiErrorMessage(cause, "The table could not be loaded."));
-          if (cause instanceof ApiClientError && cause.code === "table_cursor_stale" && cursor)
-            return queryBase ? null : fetchTable(undefined, signal);
+        if (
+          signal?.aborted ||
+          owner !== ownership.current.request ||
+          !active.current ||
+          (queryBase && verification !== ownership.current.verification)
+        )
+          return { state: "superseded" };
+        if (discardDenied(cause, true)) {
+          setError(apiErrorMessage(cause, "The table is unavailable."));
+          return { state: "denied" };
         }
+        if (!navigator.onLine && !(cause instanceof ApiClientError)) {
+          retireVerification("suspend");
+          return { state: "suspended" };
+        }
+        retireVerification("invalidate");
+        setError(apiErrorMessage(cause, "The table could not be loaded."));
+        if (cause instanceof ApiClientError && cause.code === "table_cursor_stale" && cursor && !queryBase)
+          return fetchTable(undefined, signal);
+        return { state: "failure" };
       }
-      return null;
     },
-    [base, viewId, query, month, queryIdentity, discardDenied, queryBase, invalidateVerification, publishLinkedWindow],
+    [
+      base,
+      viewId,
+      query,
+      month,
+      queryIdentity,
+      discardDenied,
+      queryBase,
+      retireVerification,
+      publishLinkedWindow,
+      publishReadiness,
+    ],
   );
   const fetchRef = useRef(fetchTable);
   useLayoutEffect(() => {
     fetchRef.current = fetchTable;
   }, [fetchTable]);
   useLayoutEffect(() => {
-    if (!queryBase) return;
     const previous = queryOwner.current;
     if (
       previous.queryIdentity === queryIdentity &&
@@ -286,21 +349,16 @@ export function CollaborativeTablePage({
     )
       return;
     queryOwner.current = { queryIdentity, account, incarnation };
-    epoch.current++;
-    invalidateVerification();
-    publishLinkedWindow(null);
-    setConnectionReady(false);
+    if (!queryBase) return;
+    // eslint-disable-next-line react/set-state-in-effect -- Synchronize the external query/account authorization boundary before events can submit writes.
+    retireVerification("retire");
     linkedReads.current?.reset();
-  }, [queryIdentity, queryBase, account, incarnation, invalidateVerification, publishLinkedWindow]);
+  }, [queryIdentity, queryBase, account, incarnation, retireVerification]);
   useLayoutEffect(() => {
     if (!queryBase || !page.id || (incarnation && incarnation.key !== account)) return undefined;
-    writeReady.current = false;
     const reads = linkedTableReads({
       read: (intent, signal) => fetchRef.current(undefined, signal, intent),
-      unavailable: () => {
-        invalidateVerification();
-        setConnectionReady(false);
-      },
+      unavailable: (reason) => retireVerification(reason === "suspended" ? "suspend" : "invalidate"),
     });
     linkedReads.current = reads;
     const permit = () => linkedWindow.current?.verified === true;
@@ -308,33 +366,33 @@ export function CollaborativeTablePage({
     return () => {
       if (connectionPermit.current === permit) connectionPermit.current = () => false;
       linkedReads.current = null;
-      invalidateVerification();
-      publishLinkedWindow(null);
+      retireVerification("retire");
       reads.dispose();
     };
-  }, [queryBase, page.id, account, incarnation, invalidateVerification, publishLinkedWindow]);
+  }, [queryBase, page.id, account, incarnation, retireVerification]);
   const load = useCallback(
     (continuation?: string | LinkedTableContinuation) =>
       queryBase
         ? (linkedReads.current?.request(typeof continuation === "object" ? continuation : undefined) ??
           Promise.resolve(null))
-        : fetchTable(typeof continuation === "string" ? continuation : undefined),
+        : fetchTable(typeof continuation === "string" ? continuation : undefined).then((outcome) =>
+            outcome.state === "success" ? outcome.value : null,
+          ),
     [queryBase, fetchTable],
   );
   useEffect(() => {
     const offline = () => {
-      invalidateVerification();
-      setConnectionReady(false);
+      retireVerification("suspend");
     };
     window.addEventListener("offline", offline);
     return () => window.removeEventListener("offline", offline);
-  }, [invalidateVerification]);
+  }, [retireVerification]);
   useEffect(() => {
     if (!retry?.submission) return undefined;
     const { map, key, version, operationId } = retry.submission;
     const retire = () => {
       const current = map.get(key);
-      if (current && current.version === version && current.operationId === operationId) return;
+      if (current && map.owns(key, version, operationId)) return;
       setRetry((value) => (value === retry ? null : value));
       setError((value) => (value === retry.message ? "" : value));
     };
@@ -346,10 +404,10 @@ export function CollaborativeTablePage({
     if (incarnation && incarnation.key !== account) return undefined;
     active.current = true;
     void Promise.resolve().then(() => load());
-    const requestEpoch = epoch;
+    const requestOwnership = ownership;
     return () => {
       active.current = false;
-      requestEpoch.current++;
+      requestOwnership.current.request++;
     };
   }, [load, account, incarnation]);
   const loadRef = useRef(load);
@@ -365,18 +423,14 @@ export function CollaborativeTablePage({
     const connection = tableConnection({
       url: url.href,
       query: () => loadRef.current(),
-      ready: (value, generation) => {
-        if (!value) writeReady.current = false;
-        if (value && generation !== undefined) setAuthorizedGeneration(generation);
-        setConnectionReady(value);
-      },
+      ready: publishReadiness,
     });
     connectionPermit.current = connection.authorized;
     return () => {
       if (connectionPermit.current === connection.authorized) connectionPermit.current = () => false;
       connection();
     };
-  }, [page.id, queryBase, account, incarnation]);
+  }, [page.id, queryBase, account, incarnation, publishReadiness]);
   useEffect(() => {
     const invalidate = () => {
       if (queryBase) void linkedReads.current?.invalidate();
@@ -386,12 +440,7 @@ export function CollaborativeTablePage({
     return () => window.removeEventListener("notes:workspace-event", invalidate);
   }, [load, queryBase]);
   const send = async (command: TableCommand, submission?: CellDraftSubmission) => {
-    if (
-      submission &&
-      (!submission.map.current(submission.key, submission.version) ||
-        submission.map.get(submission.key)?.operationId !== submission.operationId)
-    )
-      return false;
+    if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId)) return false;
     if (!canCommit()) return false;
     busyRef.current = true;
     setBusy(true);
@@ -418,13 +467,17 @@ export function CollaborativeTablePage({
           submission,
           message: apiErrorMessage(cause, "The table update could not be saved."),
         });
-      else if (cause.status === 409) {
-        if (queryBase) {
-          invalidateVerification();
-          setConnectionReady(false);
-        }
+      else if (cause.status === 409 || cause.status === 404) {
+        taskRefreshRequiredRef.current = true;
+        setTaskRefreshRequired(true);
+        retireVerification("invalidate");
         const refreshed = await load();
-        if (refreshed) setError("The table changed. Review the latest value before saving again.");
+        if (refreshed)
+          setError(
+            cause.status === 404
+              ? apiErrorMessage(cause, "The table item no longer exists.")
+              : "The table changed. Review the latest value before saving again.",
+          );
       }
       return false;
     } finally {
@@ -444,11 +497,7 @@ export function CollaborativeTablePage({
     rowId?: string,
     submission?: CellDraftSubmission,
   ): Promise<TaskSaveResult> => {
-    if (
-      submission &&
-      (!submission.map.current(submission.key, submission.version) ||
-        submission.map.get(submission.key)?.operationId !== submission.operationId)
-    )
+    if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId))
       return { state: "rejected", code: "draft_changed" };
     if (!canCommit()) return { state: "rejected", code: "not_ready" };
     busyRef.current = true;
@@ -478,18 +527,21 @@ export function CollaborativeTablePage({
         });
         return { state: "uncertain" };
       }
-      if (cause.status === 409) {
-        if (cause.code === "table_revision_conflict") {
+      if (cause.status === 409 || cause.status === 404) {
+        if (cause.code === "table_revision_conflict" || cause.status === 404) {
           if (submission)
             submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
           taskRefreshRequiredRef.current = true;
           setTaskRefreshRequired(true);
-          invalidateVerification();
-          if (queryBase) setConnectionReady(false);
+          retireVerification("invalidate");
         }
         const refreshed = await load();
         if (refreshed && !taskRefreshRequiredRef.current)
-          setError("The task list changed. Review the latest value before saving again.");
+          setError(
+            cause.status === 404
+              ? apiErrorMessage(cause, "The task no longer exists.")
+              : "The task list changed. Review the latest value before saving again.",
+          );
       }
       return { state: "rejected", code: cause.code };
     } finally {
@@ -639,6 +691,14 @@ export function CollaborativeTablePage({
   const textColumn = data.columns.find((column) => column.type === "text");
   const rowLabel = (row: CollaborativeRow) =>
     String(textColumn ? (row.cells[textColumn.id] ?? "Untitled") : "Untitled");
+  const submitCell =
+    (row: CollaborativeRow, column: CollaborativeColumn) =>
+    (value: TableValue, revision?: number, version?: string) => {
+      const key = draftKey(row.id, column.id);
+      const submission = captureSubmission(drafts, key, drafts.submission(key, data.revision, version));
+      if (version && !submission) return Promise.resolve(false);
+      return changeCell(row, column, value, revision, submission);
+    };
   const card = (row: CollaborativeRow) => (
     <div
       className="table-card"
@@ -666,12 +726,7 @@ export function CollaborativeTablePage({
               disabled={!editable || busy}
               drafts={drafts}
               canCommit={canCommit}
-              onChange={(value, revision, version) => {
-                const key = draftKey(row.id, column.id);
-                const submission = captureSubmission(drafts, key, drafts.submission(key, data.revision, version));
-                if (version && !submission) return Promise.resolve(false);
-                return changeCell(row, column, value, revision, submission);
-              }}
+              onChange={submitCell(row, column)}
             />
           </label>
         ))}
@@ -736,12 +791,12 @@ export function CollaborativeTablePage({
           />
         )}
         <span>{data.rowCount} rows</span>
-        {editable && (
+        {member.role !== "viewer" && data.canEdit !== false && (
           <>
-            <button disabled={busy} onClick={() => setPanel(panel === "view" ? null : "view")}>
+            <button disabled={busy || !editable} onClick={() => setPanel(panel === "view" ? null : "view")}>
               Views
             </button>
-            <button disabled={busy} onClick={() => setPanel(panel === "properties" ? null : "properties")}>
+            <button disabled={busy || !editable} onClick={() => setPanel(panel === "properties" ? null : "properties")}>
               Properties
             </button>
           </>
@@ -906,16 +961,7 @@ export function CollaborativeTablePage({
                         disabled={!editable || busy}
                         drafts={drafts}
                         canCommit={canCommit}
-                        onChange={(value, revision, version) => {
-                          const key = draftKey(row.id, column.id);
-                          const submission = captureSubmission(
-                            drafts,
-                            key,
-                            drafts.submission(key, data.revision, version),
-                          );
-                          if (version && !submission) return Promise.resolve(false);
-                          return changeCell(row, column, value, revision, submission);
-                        }}
+                        onChange={submitCell(row, column)}
                       />
                     </td>
                   ))}

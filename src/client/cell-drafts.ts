@@ -441,8 +441,15 @@ export class CellDraftMap extends Map<string, CellDraft> {
     }
     return Boolean(draft);
   }
+  owns(key: string, version: string | undefined, operationId?: string) {
+    return (
+      this.current(key, version) &&
+      Boolean(this.get(key)) &&
+      (!operationId || this.get(key)?.operationId === operationId)
+    );
+  }
   acknowledge(key: string, version: string | undefined, operationId?: string) {
-    if (this.current(key, version) && (!operationId || this.get(key)?.operationId === operationId)) this.delete(key);
+    if (this.owns(key, version, operationId)) this.delete(key);
   }
   submission(key: string, tableRevision: number, version = this.get(key)?.version) {
     if (!this.current(key, version)) return undefined;

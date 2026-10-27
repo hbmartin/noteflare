@@ -156,6 +156,8 @@ it("fulfills an extent once across revision changes and repeated old continuatio
   }));
   const before = read.mock.calls.length;
   const replayed = await query(pending, current, read);
+  expect(replayed.window).toBe(current);
+  expect(replayed.window.data.rows).toBe(current.data.rows);
   expect(replayed.window.data.rows).toHaveLength(200);
   expect(replayed.verification).toBe("buffer");
   expect(read).toHaveBeenCalledTimes(before);
@@ -232,7 +234,8 @@ it("completes exhausted continuations without issuing reads or inventing rows", 
   const current = loaded(page(["last"], null));
   const read = vi.fn();
   const result = await query({ kind: "append", queryIdentity: "", generation: 1, target: 200 }, current, read);
-  expect(result.window.data.rows).toEqual(current.data.rows);
+  expect(result.window).toBe(current);
+  expect(result.window.data.rows).toBe(current.data.rows);
   expect(result.window.hasMore).toBe(false);
   expect(result.window.continuation).toBeNull();
   expect(read).not.toHaveBeenCalled();
