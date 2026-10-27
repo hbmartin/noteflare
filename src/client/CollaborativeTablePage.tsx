@@ -174,7 +174,6 @@ export function CollaborativeTablePage({
     )
       return;
     retryLifetime.current = { account, incarnation, host, tableId: page.id };
-    // eslint-disable-next-line react/set-state-in-effect -- Retire saved mutations at the external account/table boundary before events can replay them.
     setRetry(null);
   }, [account, incarnation, host, page.id]);
   const retry =
@@ -230,7 +229,6 @@ export function CollaborativeTablePage({
   useLayoutEffect(() => {
     if (previousInitialView.current === initialViewId) return;
     previousInitialView.current = initialViewId;
-    // eslint-disable-next-line react/set-state-in-effect -- Adopt a changed linked-host view without remounting and losing saved operations.
     setViewId(initialViewId ?? "");
   }, [initialViewId]);
   const [query, setQuery] = useState("");
