@@ -1235,3 +1235,37 @@ it("automatically verifies a transiently failed linked read without replaying it
   expect(input).toBeEnabled();
   expect(writes).toHaveLength(0);
 });
+
+it("pauses a canonical background read failure and automatically verifies before resuming", async () => {
+  render(<CollaborativeTablePage page={{ id: "table", title: "Roadmap" }} member={member} onSelectPage={vi.fn()} />);
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const read = vi.mocked(api).getMockImplementation()!;
+  let attempts = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (!init?.method && ++attempts === 1) throw new ApiClientError(503, "temporary", "Background reload unavailable");
+    return read(path, init);
+  });
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Unsaved local text" } });
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent("notes:workspace-event"));
+  });
+  expect(input).toBeDisabled();
+  expect(input).toHaveValue("Unsaved local text");
+  expect(screen.getByText("Background reload unavailable")).toBeInTheDocument();
+  expect(AuthorizedTableSocket.instances).toHaveLength(1);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(999);
+  });
+  expect(attempts).toBe(1);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+  });
+  expect(input).toBeEnabled();
+  expect(input).toHaveValue("Unsaved local text");
+  expect(writes).toHaveLength(0);
+  expect(attempts).toBe(2);
+});

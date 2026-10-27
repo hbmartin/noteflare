@@ -2,22 +2,28 @@ import { jitteredBackoff } from "../shared/retry";
 
 export type LinkedTableContinuation = { queryIdentity: string; generation: number; target: number };
 export type LinkedTableReadIntent = { kind: "refresh" } | ({ kind: "append" } & LinkedTableContinuation);
+export type TableReadIntent = LinkedTableReadIntent | { kind: "page"; cursor: string };
 export type LinkedTableReadOutcome<T> =
   | { state: "success"; value: T; verification: "network" | "buffer" }
   | { state: "failure" | "denied" | "suspended" | "superseded" };
 type Batch<T> = {
-  intent: LinkedTableReadIntent;
+  intent: TableReadIntent;
   resolve: Array<(value: T | null) => void>;
   attempt: number;
   retryAt: number;
   manual: boolean;
 };
-const intentKey = (intent: LinkedTableReadIntent) =>
-  intent.kind === "refresh" ? "refresh" : JSON.stringify([intent.queryIdentity, intent.generation, intent.target]);
+const intentKey = (intent: TableReadIntent) =>
+  intent.kind === "refresh"
+    ? "refresh"
+    : intent.kind === "page"
+      ? `page:${intent.cursor}`
+      : JSON.stringify([intent.queryIdentity, intent.generation, intent.target]);
 /** One active logical read. Retry ownership and deadlines belong to each intent. */
 export function linkedTableReads<T>(options: {
-  read: (intent: LinkedTableReadIntent, signal: AbortSignal) => Promise<LinkedTableReadOutcome<T>>;
+  read: (intent: TableReadIntent, signal: AbortSignal) => Promise<LinkedTableReadOutcome<T>>;
   unavailable: (reason: "failure" | "suspended") => void;
+  poll?: boolean;
 }) {
   options.unavailable("failure");
   let stopped = false,
@@ -40,7 +46,7 @@ export function linkedTableReads<T>(options: {
   function next() {
     if (!available() || active) return;
     const eligible = [...queued.values()].filter((batch) => batch.retryAt <= Date.now());
-    const append = eligible.find((batch) => batch.intent.kind === "append");
+    const append = eligible.find((batch) => batch.intent.kind !== "refresh");
     const refresh = eligible.find((batch) => batch.intent.kind === "refresh");
     const batch = append && (!refresh || refreshAhead) ? append : refresh;
     if (!batch) {
@@ -53,7 +59,7 @@ export function linkedTableReads<T>(options: {
   }
   function retireAppends() {
     for (const [name, batch] of queued) {
-      if (batch.intent.kind !== "append") continue;
+      if (batch.intent.kind === "refresh") continue;
       queued.delete(name);
       for (const resolve of batch.resolve.splice(0)) resolve(null);
     }
@@ -65,6 +71,34 @@ export function linkedTableReads<T>(options: {
       trailing.attempt = Math.max(trailing.attempt, batch.attempt);
       if (!trailing.manual) trailing.retryAt = Math.max(trailing.retryAt, batch.retryAt);
     } else queued.set(name, batch);
+  }
+  function abortActive() {
+    const previous = active;
+    active = undefined;
+    if (previous) {
+      previous.controller.abort();
+      for (const resolve of previous.batch.resolve.splice(0)) resolve(null);
+    }
+  }
+  function scheduleFailure(batch: Batch<T>) {
+    batch.retryAt = Date.now() + jitteredBackoff(batch.attempt++, 2000, 30_000);
+    enqueueRetry(batch);
+  }
+  function scheduleDenied(batch?: Batch<T>) {
+    retireAppends();
+    // Denial progression belongs to access recovery, never to a failed continuation.
+    const recovery: Batch<T> = batch ?? {
+      intent: { kind: "refresh" },
+      resolve: [],
+      attempt: 0,
+      retryAt: 0,
+      manual: false,
+    };
+    recovery.intent = { kind: "refresh" };
+    recovery.attempt = denialAttempt;
+    recovery.manual = false;
+    scheduleFailure(recovery);
+    denialAttempt = recovery.attempt;
   }
   async function run(batch: Batch<T>) {
     batch.manual = false;
@@ -80,16 +114,10 @@ export function linkedTableReads<T>(options: {
     if (active !== owner || stopped) return;
     active = undefined;
     const value = outcome.state === "success" ? outcome.value : null;
-    if (outcome.state === "denied") {
-      retireAppends();
-      batch.intent = { kind: "refresh" };
-      batch.attempt = Math.max(batch.attempt, denialAttempt);
-    }
     if (outcome.state === "failure" || outcome.state === "denied") {
       options.unavailable("failure");
-      batch.retryAt = Date.now() + jitteredBackoff(batch.attempt++, 2000, 30_000);
-      if (outcome.state === "denied") denialAttempt = batch.attempt;
-      enqueueRetry(batch);
+      if (outcome.state === "denied") scheduleDenied(batch);
+      else scheduleFailure(batch);
     } else if (outcome.state === "suspended") {
       options.unavailable("suspended");
       enqueueRetry(batch);
@@ -100,10 +128,10 @@ export function linkedTableReads<T>(options: {
     for (const resolve of waiting) resolve(value);
     next();
   }
-  function requestIntent(intent: LinkedTableReadIntent, manual = true): Promise<T | null> {
+  function requestIntent(intent: TableReadIntent, manual = true, joinActive = false): Promise<T | null> {
     if (stopped) return Promise.resolve(null);
     const name = intentKey(intent);
-    if (intent.kind === "append" && active && intentKey(active.batch.intent) === name)
+    if ((intent.kind !== "refresh" || joinActive) && active && intentKey(active.batch.intent) === name)
       return new Promise((resolve) => active!.batch.resolve.push(resolve));
     const batch = queued.get(name) ?? { intent, resolve: [], attempt: 0, retryAt: 0, manual: false };
     if (manual) {
@@ -123,49 +151,31 @@ export function linkedTableReads<T>(options: {
       options.unavailable("suspended");
       return;
     }
-    if (queued.size) next();
-    else void requestIntent({ kind: "refresh" }, false);
+    // A continuation's deadline must not block the distinct foreground verification.
+    // Existing refresh/denial deadlines are retained by requestIntent.
+    void requestIntent({ kind: "refresh" }, false, true);
   };
-  const poll = setInterval(() => {
-    if (!available() || active) return;
-    if (queued.size) next();
-    else void requestIntent({ kind: "refresh" }, false);
-  }, 15000);
-  const reset = () => {
+  const poll =
+    options.poll === false
+      ? undefined
+      : setInterval(() => {
+          if (!available() || active) return;
+          if (queued.size) next();
+          else void requestIntent({ kind: "refresh" }, false);
+        }, 15000);
+  const reset = (preserveActive = false) => {
     clear();
     refreshAhead = false;
     denialAttempt = 0;
-    if (active) {
-      const previous = active;
-      active = undefined;
-      previous.controller.abort();
-      for (const resolve of previous.batch.resolve.splice(0)) resolve(null);
-    }
+    if (!preserveActive) abortActive();
     for (const batch of queued.values()) for (const resolve of batch.resolve.splice(0)) resolve(null);
     queued.clear();
   };
   const recoverDenied = () => {
     if (stopped) return;
     clear();
-    const previous = active;
-    active = undefined;
-    if (previous) {
-      previous.controller.abort();
-      for (const resolve of previous.batch.resolve.splice(0)) resolve(null);
-    }
-    retireAppends();
-    const batch = queued.get("refresh") ?? {
-      intent: { kind: "refresh" } as const,
-      resolve: [],
-      attempt: denialAttempt,
-      retryAt: 0,
-      manual: false,
-    };
-    batch.attempt = Math.max(batch.attempt, denialAttempt, previous?.batch.attempt ?? 0);
-    batch.retryAt = Math.max(batch.retryAt, Date.now() + jitteredBackoff(batch.attempt++, 2000, 30_000));
-    batch.manual = false;
-    denialAttempt = batch.attempt;
-    queued.set("refresh", batch);
+    abortActive();
+    scheduleDenied();
     schedule();
   };
   window.addEventListener("online", wake);
@@ -174,6 +184,8 @@ export function linkedTableReads<T>(options: {
   return {
     request: (continuation?: LinkedTableContinuation) =>
       requestIntent(continuation ? { kind: "append", ...continuation } : { kind: "refresh" }),
+    page: (cursor: string) => requestIntent({ kind: "page", cursor }),
+    verify: () => requestIntent({ kind: "refresh" }, false, true),
     invalidate: () => requestIntent({ kind: "refresh" }, false),
     reset,
     recoverDenied,

@@ -18,7 +18,8 @@ const available = () => navigator.onLine && !document.hidden;
 export function tableConnection(options: {
   url: string;
   query: () => Promise<TableQueryResult | null>;
-  ready: (value: boolean, generation?: number) => void;
+  ready: (value: boolean) => void;
+  verified?: (generation: number) => void;
 }) {
   let active: Slot | null = null,
     replacement: Slot | null = null,
@@ -97,7 +98,8 @@ export function tableConnection(options: {
       }
       if (active === slot) {
         slot.generation ??= result.generation;
-        options.ready(Boolean(available() && valid()), slot.generation);
+        options.verified?.(slot.generation);
+        options.ready(Boolean(available() && valid()));
         schedule();
       }
     } catch {

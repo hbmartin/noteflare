@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from "vitest";
-import { linkedTableReads, type LinkedTableReadIntent } from "./linked-table-reads";
+import { linkedTableReads, type TableReadIntent } from "./linked-table-reads";
 const continuation = (target = 200) => ({ queryIdentity: "query", generation: 1, target });
 const controllers: ReturnType<typeof linkedTableReads>[] = [];
 afterEach(() => {
@@ -8,7 +8,7 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
-function setup(read: (intent: LinkedTableReadIntent, signal: AbortSignal) => Promise<number | null>) {
+function setup(read: (intent: TableReadIntent, signal: AbortSignal) => Promise<number | null>) {
   const unavailable = vi.fn(),
     controller = linkedTableReads({
       read: async (...args) => {
@@ -170,7 +170,7 @@ it("serves an eligible append after at most one queued refresh", async () => {
   finishes.shift()!(1);
   await Promise.resolve();
   await Promise.resolve();
-  expect(read.mock.calls.map((call: unknown[]) => (call[0] as LinkedTableReadIntent).kind)).toEqual([
+  expect(read.mock.calls.map((call: unknown[]) => (call[0] as TableReadIntent).kind)).toEqual([
     "refresh",
     "refresh",
     "append",
@@ -295,4 +295,74 @@ it("retires denied appends without abandoning or resetting refresh recovery", as
   expect(read).toHaveBeenCalledTimes(3);
   await controller.request();
   expect(read).toHaveBeenCalledTimes(4);
+});
+
+it("verifies on foreground independently of an append deadline without replaying it", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let hidden = false;
+  vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce({ state: "failure" })
+    .mockResolvedValue({ state: "success", value: 1, verification: "network" });
+  const controller = linkedTableReads<number>({ read, unavailable: vi.fn() });
+  controllers.push(controller);
+  await controller.request(continuation());
+  hidden = true;
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.advanceTimersByTimeAsync(100);
+  hidden = false;
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["append", "refresh"]);
+  await vi.advanceTimersByTimeAsync(899);
+  expect(read).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read.mock.calls[2]![0].kind).toBe("append");
+});
+
+it.each(["read", "mutation"])("starts %s denial recovery independently of repeated append failures", async (source) => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const read = vi.fn().mockResolvedValue({ state: "failure" });
+  const controller = linkedTableReads<number>({ read, unavailable: vi.fn() });
+  controllers.push(controller);
+  for (let count = 0; count < 5; count++) await controller.request(continuation());
+  if (source === "read") {
+    read.mockResolvedValueOnce({ state: "denied" });
+    await controller.request(continuation());
+  } else {
+    read.mockImplementationOnce(() => new Promise(() => {}));
+    void controller.request(continuation());
+    controller.recoverDenied();
+  }
+  const before = read.mock.calls.length;
+  read.mockResolvedValue({ state: "denied" });
+  await vi.advanceTimersByTimeAsync(999);
+  expect(read).toHaveBeenCalledTimes(before);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(before + 1);
+  expect(read.mock.calls.at(-1)![0]).toEqual({ kind: "refresh" });
+  await vi.advanceTimersByTimeAsync(1999);
+  expect(read).toHaveBeenCalledTimes(before + 1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(before + 2);
+});
+
+it("coalesces canonical verification with an equivalent active read", async () => {
+  let release!: (value: number) => void;
+  const read = vi.fn(
+    () =>
+      new Promise<number>((resolve) => {
+        release = resolve;
+      }),
+  );
+  const controller = setup(read);
+  const first = controller.request(),
+    second = controller.verify();
+  release(1);
+  expect(await first).toBe(1);
+  expect(await second).toBe(1);
+  expect(read).toHaveBeenCalledOnce();
 });
