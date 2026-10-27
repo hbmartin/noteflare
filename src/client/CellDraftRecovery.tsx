@@ -22,12 +22,14 @@ export function CellDraftRecovery({
   scope,
   classify,
   save,
+  disabled = false,
 }: {
   account: string;
   filter?: (draft: StoredCellDraft) => boolean;
   scope?: CellDraftSelection;
   classify?: (draft: StoredCellDraft) => string;
   save?: (draft: StoredCellDraft, reviewed?: boolean) => Promise<boolean>;
+  disabled?: boolean;
 }) {
   const drafts = useCellDrafts(account, scope, Boolean(scope)).filter(filter ?? (() => true));
   const [error, setError] = useState(""),
@@ -72,8 +74,9 @@ export function CellDraftRecovery({
             {save && ["Ready to save", "Outside the loaded view"].includes(state) && (
               <button
                 onMouseDown={(event) => event.preventDefault()}
-                disabled={saving !== null}
+                disabled={disabled || saving !== null}
                 onClick={() => {
+                  if (disabled) return;
                   setSaving(draft.version);
                   void save(draft)
                     .catch(() => setError("The draft could not be saved. Your text is preserved."))
@@ -86,8 +89,9 @@ export function CellDraftRecovery({
             {save && state.startsWith("Server value changed:") && (
               <button
                 onMouseDown={(event) => event.preventDefault()}
-                disabled={saving !== null}
+                disabled={disabled || saving !== null}
                 onClick={() => {
+                  if (disabled) return;
                   setSaving(draft.version);
                   void save(draft, true)
                     .catch(() => setError("The draft could not be saved. Your text is preserved."))

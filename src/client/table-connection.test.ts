@@ -193,3 +193,28 @@ it("jitters fenced reconnects and does not bypass the pending delay on visibilit
   await vi.advanceTimersByTimeAsync(1);
   expect(Socket.all).toHaveLength(3);
 });
+
+it("records verified generation independently of hidden readiness and never from a failed query", async () => {
+  stop();
+  const verified = vi.fn();
+  let release!: (value: TableQueryResult | null) => void;
+  query.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+  );
+  stop = tableConnection({ url: "ws://example.test/table", query, ready, verified });
+  Socket.all.at(-1)!.ready();
+  vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+  release(result);
+  await settle();
+  expect(verified).toHaveBeenCalledExactlyOnceWith(1);
+  expect(ready).toHaveBeenLastCalledWith(false);
+  vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+  query.mockResolvedValueOnce(null);
+  document.dispatchEvent(new Event("visibilitychange"));
+  await settle();
+  expect(verified).toHaveBeenCalledTimes(1);
+  expect(stop.authorized()).toBe(false);
+});

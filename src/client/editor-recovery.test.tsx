@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { useState } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { RenderBoundary } from "./RenderBoundary";
@@ -12,11 +13,21 @@ const mocks = vi.hoisted(() => ({ api: vi.fn(), report: vi.fn() }));
 vi.mock("./api", async (original) => ({ ...(await original<typeof import("./api")>()), api: mocks.api }));
 vi.mock("./telemetry", () => ({ reportClientError: mocks.report }));
 vi.mock("./CollaborativeTablePage", () => ({
-  CollaborativeTablePage: ({ onViewChanged }: { onViewChanged: (id: string) => void }) => (
-    <button type="button" onClick={() => onViewChanged("different-view")}>
-      Switch saved view
-    </button>
-  ),
+  CollaborativeTablePage: ({ onViewChanged }: { onViewChanged: (id: string) => void }) => {
+    const [pending, setPending] = useState("");
+    return (
+      <>
+        <input
+          aria-label="Saved table operation"
+          value={pending}
+          onChange={(event) => setPending(event.target.value)}
+        />
+        <button type="button" onClick={() => onViewChanged("different-view")}>
+          Switch saved view
+        </button>
+      </>
+    );
+  },
 }));
 function Bomb({ fail }: { fail: boolean }) {
   if (fail) throw new Error("broken renderer");
@@ -177,4 +188,27 @@ describe("editor containment and disposable previews", () => {
       vi.unstubAllGlobals();
     }
   });
+});
+
+it("keeps linked operation state across host view changes and retires it on source change", () => {
+  vi.stubGlobal("IntersectionObserver", undefined);
+  const context = { hostId: "host", member: { role: "editor" } as never, onSelectPage: vi.fn() };
+  const content = (tablePageId: string, viewId: string) => (
+    <EditorFeatureContext.Provider value={context}>
+      <LinkedTableView tablePageId={tablePageId} viewId={viewId} title="Source" editable update={vi.fn()} />
+    </EditorFeatureContext.Provider>
+  );
+  try {
+    const rendered = render(content("source", "grid"));
+    const pending = screen.getByLabelText("Saved table operation");
+    fireEvent.change(pending, { target: { value: "operation identity" } });
+    rendered.rerender(content("source", "calendar"));
+    expect(screen.getByLabelText("Saved table operation")).toBe(pending);
+    expect(pending).toHaveValue("operation identity");
+    rendered.rerender(content("other-source", "calendar"));
+    expect(screen.getByLabelText("Saved table operation")).not.toBe(pending);
+    expect(screen.getByLabelText("Saved table operation")).toHaveValue("");
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

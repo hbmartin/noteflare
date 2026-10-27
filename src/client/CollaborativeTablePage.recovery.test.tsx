@@ -571,3 +571,96 @@ it("retains real server failure backoff when the response arrives while hidden",
   expect(reads).toBe(2);
   expect(screen.getByLabelText("Title")).toBeEnabled();
 });
+
+it.each([false, true])("retries the captured %s task operation through a current query guard", async (taskList) => {
+  const { ids } = fixture(taskList, 2);
+  const input = (await screen.findAllByLabelText("Title"))[0]!;
+  await waitFor(() => expect(input).toBeEnabled());
+  const read = vi.mocked(api).getMockImplementation()!;
+  const submissions: Record<string, unknown>[] = [];
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if ((init?.method === "POST" && path.endsWith("/commands")) || init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      submissions.push(body);
+      if (submissions.length === 1) throw new ApiClientError(503, "temporary", "Save uncertain");
+      return { result: {} };
+    }
+    return read(path, init);
+  });
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Captured edit" } });
+  fireEvent.blur(input);
+  await screen.findByRole("button", { name: "Retry saved operation" });
+  fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Original" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Retry saved operation" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Retry saved operation" }));
+  await waitFor(() => expect(submissions).toHaveLength(2));
+  expect(submissions[1]).toEqual(submissions[0]);
+  expect(String(submissions[1]!.operationId)).not.toBe("");
+  expect(accountCellDrafts(account).some((draft) => draft.columnId === ids.title)).toBe(false);
+});
+
+it.each(["relation_target_unavailable", "feature_disabled", "read_only", "owner_required", "unknown_operation_denial"])(
+  "preserves authorized rows after operation 403 %s",
+  async (code) => {
+    fixture();
+    const input = await screen.findByLabelText("Title");
+    await waitFor(() => expect(input).toBeEnabled());
+    const read = vi.mocked(api).getMockImplementation()!;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let verify = false;
+    const writes: string[] = [];
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (init?.method === "POST" && path.endsWith("/commands")) {
+        writes.push(String(init.body));
+        verify = true;
+        throw new ApiClientError(403, code, "Operation rejected");
+      }
+      if (verify && !init?.method) await held;
+      return read(path, init);
+    });
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "Preserved draft" } });
+    fireEvent.blur(input);
+    await screen.findByText("Operation rejected");
+    expect(screen.getByLabelText("Search table")).toBeInTheDocument();
+    expect(input).toBeDisabled();
+    await act(async () => {
+      release();
+    });
+    await waitFor(() => expect(input).toBeEnabled());
+    expect(writes).toHaveLength(1);
+    expect(screen.getByText("Operation rejected")).toBeInTheDocument();
+    expect(accountCellDrafts(account).some((draft) => draft.text === "Preserved draft")).toBe(true);
+  },
+);
+
+it.each(["Views", "Properties"])("retains the open %s form while verification blocks mutations", async (panel) => {
+  fixture();
+  await waitFor(() => expect(screen.getByRole("button", { name: panel })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: panel }));
+  const input = screen.getByLabelText(panel === "Views" ? "View name" : "New property name");
+  fireEvent.change(input, { target: { value: "Unsubmitted settings" } });
+  const read = vi.mocked(api).getMockImplementation()!;
+  let blocked = true;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (!init?.method && blocked) throw new ApiClientError(503, "temporary", "Reload unavailable");
+    return read(path, init);
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await screen.findByText("Reload unavailable");
+  expect(input).toBeDisabled();
+  expect(input).toHaveValue("Unsubmitted settings");
+  const writes = () => vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "POST" && !init.readOnly);
+  expect(writes()).toHaveLength(0);
+  // A synthetic submit cannot bypass the synchronous permit either.
+  fireEvent.submit(input.closest("form")!);
+  expect(writes()).toHaveLength(0);
+  blocked = false;
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await waitFor(() => expect(input).toBeEnabled());
+  expect(input).toHaveValue("Unsubmitted settings");
+});

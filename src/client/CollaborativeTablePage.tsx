@@ -18,7 +18,7 @@ import {
 } from "../shared/table-protocol";
 import { type CalculationKind } from "../shared/table-computed";
 import { isErrorCell, format, type FormulaTypeOptions } from "../shared/formula";
-import { api, apiErrorMessage, ApiClientError, isPageNotFoundError, json } from "./api";
+import { api, apiErrorMessage, ApiClientError, json } from "./api";
 import { taskColumns } from "../shared/tasks";
 import { calendarDay } from "../shared/table-calendar";
 import "./collaborative-table.css";
@@ -35,7 +35,7 @@ import { CellDraftRecovery } from "./CellDraftRecovery";
 import {
   linkedTableReads,
   type LinkedTableContinuation,
-  type LinkedTableReadIntent,
+  type TableReadIntent,
   type LinkedTableReadOutcome,
 } from "./linked-table-reads";
 import { readLinkedTable, type LinkedTableWindow } from "./linked-table-query";
@@ -53,7 +53,22 @@ export type CollaborativeTableProps = {
   embedded?: boolean;
 };
 type TaskSaveResult = { state: "saved" } | { state: "rejected"; code?: string } | { state: "uncertain" };
-type SavedRetry = { run: () => Promise<unknown>; submission?: CellDraftSubmission; message: string };
+type SavedRetry = {
+  owner: { account: string; incarnation: unknown; host: string; tableId: string };
+  submission?: CellDraftSubmission;
+  message: string;
+} & ({ kind: "command"; command: TableCommand } | { kind: "task"; body: Record<string, unknown>; rowId?: string });
+const readinessMessage =
+  "Editing is temporarily unavailable. Your changes are preserved. Wait for verification or refresh the table.";
+function accessFailure(cause: unknown, fromRead: boolean): "denied" | "verify" | "other" {
+  if (!(cause instanceof ApiClientError)) return "other";
+  if (cause.status === 401 || (cause.code === "page_not_found" && [404, 410].includes(cause.status))) return "denied";
+  if (cause.status !== 403) return "other";
+  if (["table_forbidden", "forbidden"].includes(cause.code)) return "denied";
+  if (["relation_target_unavailable", "feature_disabled", "read_only", "owner_required"].includes(cause.code))
+    return "verify";
+  return fromRead ? "denied" : "verify";
+}
 type CellDraftSubmission = {
   kind: "draft";
   map: CellDraftMap;
@@ -104,13 +119,14 @@ export function CollaborativeTablePage({
   }, [member.role]);
   const connectionPermit = useRef<() => boolean>(() => true);
   const busyRef = useRef(false);
+  const mutationNotice = useRef("");
   const taskRefreshRequiredRef = useRef(false);
   const [taskRefreshRequired, setTaskRefreshRequired] = useState(false);
   const [connectionReady, setConnectionReady] = useState(false);
   const [authorizedGeneration, setAuthorizedGeneration] = useState<number | null>(null);
   const [data, setData] = useState<TableQueryResult | null>(null);
   const [panel, setPanel] = useState<"view" | "properties" | null>(null);
-  const [retry, setRetry] = useState<SavedRetry | null>(null);
+  const [savedRetry, setRetry] = useState<SavedRetry | null>(null);
   const linkedWindow = useRef<LinkedTableWindow | null>(null);
   const [linkedSnapshot, setLinkedSnapshot] = useState<LinkedTableWindow | null>(null);
   const linkedReads = useRef<ReturnType<typeof linkedTableReads<TableQueryResult>> | null>(null);
@@ -118,13 +134,13 @@ export function CollaborativeTablePage({
     linkedWindow.current = value;
     setLinkedSnapshot(value);
   }, []);
-  const publishReadiness = useCallback((value: boolean, generation?: number) => {
+  const publishReadiness = useCallback((value: boolean) => {
     ownership.current.ready = value;
-    if (generation !== undefined) {
-      ownership.current.authorizedGeneration = generation;
-      setAuthorizedGeneration(generation);
-    }
     setConnectionReady(value);
+  }, []);
+  const recordAuthorization = useCallback((generation: number) => {
+    ownership.current.authorizedGeneration = generation;
+    setAuthorizedGeneration(generation);
   }, []);
   const retireVerification = useCallback(
     (mode: "invalidate" | "suspend" | "denied" | "retire") => {
@@ -148,6 +164,27 @@ export function CollaborativeTablePage({
   const account = `${member.user.id}\0${member.workspace?.id ?? "workspace"}`;
   const incarnation = useRealtimeAccessAccount();
   const host = queryBase ?? page.id;
+  const retryLifetime = useRef({ account, incarnation, host, tableId: page.id });
+  useLayoutEffect(() => {
+    const previous = retryLifetime.current;
+    if (
+      previous.account === account &&
+      previous.incarnation === incarnation &&
+      previous.host === host &&
+      previous.tableId === page.id
+    )
+      return;
+    retryLifetime.current = { account, incarnation, host, tableId: page.id };
+    mutationNotice.current = "";
+    setRetry(null);
+  }, [account, incarnation, host, page.id]);
+  const retry =
+    savedRetry?.owner.account === account &&
+    savedRetry.owner.incarnation === incarnation &&
+    savedRetry.owner.host === host &&
+    savedRetry.owner.tableId === page.id
+      ? savedRetry
+      : null;
   const drafts = useMemo(
     () => new CellDraftMap({ account, host, tableId: page.id, generation: data?.generation ?? 0 }),
     [account, host, page.id, data?.generation],
@@ -190,12 +227,22 @@ export function CollaborativeTablePage({
   }, [draftGeneration, draftRevision, missingDraftIds, online, page.id, queryBase]);
 
   const [viewId, setViewId] = useState(initialViewId ?? "");
+  const previousInitialView = useRef(initialViewId);
+  useLayoutEffect(() => {
+    if (previousInitialView.current === initialViewId) return;
+    previousInitialView.current = initialViewId;
+    setViewId(initialViewId ?? "");
+  }, [initialViewId]);
   const [query, setQuery] = useState("");
   const [month, setMonth] = useState(() => new Date().toISOString().slice(0, 7));
   const queryIdentity = JSON.stringify([base, viewId, query, month]);
   const queryOwner = useRef({ queryIdentity, account, incarnation });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const reportMutation = useCallback((message: string) => {
+    mutationNotice.current = message;
+    setError(message);
+  }, []);
   const [newTitle, setNewTitle] = useState("");
   const active = useRef(true);
   const editable = Boolean(
@@ -220,9 +267,7 @@ export function CollaborativeTablePage({
       queryOwner.current.account === account &&
       queryOwner.current.incarnation === incarnation &&
       (queryBase
-        ? queryOwner.current.queryIdentity === queryIdentity &&
-          queryOwner.current.account === account &&
-          queryOwner.current.incarnation === incarnation
+        ? queryOwner.current.queryIdentity === queryIdentity
         : ownership.current.authorizedGeneration === ownership.current.generation),
     [account, incarnation, queryBase, queryIdentity],
   );
@@ -230,8 +275,7 @@ export function CollaborativeTablePage({
   const tasksPath = queryBase ? `${queryBase}/tasks` : `/api/task-lists/${page.id}/tasks`;
   const discardDenied = useCallback(
     (cause: unknown, fromRead = false) => {
-      if (!(cause instanceof ApiClientError) || (![401, 403].includes(cause.status) && !isPageNotFoundError(cause)))
-        return false;
+      if (accessFailure(cause, fromRead) !== "denied") return false;
       retireVerification("denied");
       if (!fromRead) linkedReads.current?.recoverDenied();
       return true;
@@ -242,8 +286,9 @@ export function CollaborativeTablePage({
     async function fetchTable(
       cursor?: string,
       signal?: AbortSignal,
-      intent?: LinkedTableReadIntent,
+      intent?: TableReadIntent,
     ): Promise<LinkedTableReadOutcome<TableQueryResult>> {
+      if (intent?.kind === "page") cursor = intent.cursor;
       const owner = ++ownership.current.request;
       const verification = ownership.current.verification;
       const params = new URLSearchParams({ limit: "100" });
@@ -265,7 +310,13 @@ export function CollaborativeTablePage({
           });
         };
         const linked = queryBase
-          ? await readLinkedTable(intent ?? { kind: "refresh" }, linkedWindow.current, readPage, signal, queryIdentity)
+          ? await readLinkedTable(
+              intent?.kind === "page" ? { kind: "refresh" } : (intent ?? { kind: "refresh" }),
+              linkedWindow.current,
+              readPage,
+              signal,
+              queryIdentity,
+            )
           : null;
         const result = linked ? linked.window.data : await readPage(cursor);
         if (!active.current || signal?.aborted) return { state: "superseded" };
@@ -289,7 +340,7 @@ export function CollaborativeTablePage({
             ? { ...result, rows: [...current.rows, ...result.rows] }
             : result,
         );
-        if (fresh) setError("");
+        if (fresh) setError(mutationNotice.current);
         if (fresh)
           publishReadiness(
             navigator.onLine &&
@@ -313,28 +364,15 @@ export function CollaborativeTablePage({
           return { state: "denied" };
         }
         if (!navigator.onLine && !(cause instanceof ApiClientError)) {
-          retireVerification("suspend");
           return { state: "suspended" };
         }
-        retireVerification("invalidate");
         setError(apiErrorMessage(cause, "The table could not be loaded."));
         if (cause instanceof ApiClientError && cause.code === "table_cursor_stale" && cursor && !queryBase)
           return fetchTable(undefined, signal);
         return { state: "failure" };
       }
     },
-    [
-      base,
-      viewId,
-      query,
-      month,
-      queryIdentity,
-      discardDenied,
-      queryBase,
-      retireVerification,
-      publishLinkedWindow,
-      publishReadiness,
-    ],
+    [base, viewId, query, month, queryIdentity, discardDenied, queryBase, publishLinkedWindow, publishReadiness],
   );
   const fetchRef = useRef(fetchTable);
   useLayoutEffect(() => {
@@ -349,20 +387,20 @@ export function CollaborativeTablePage({
     )
       return;
     queryOwner.current = { queryIdentity, account, incarnation };
-    if (!queryBase) return;
-    // eslint-disable-next-line react/set-state-in-effect -- Synchronize the external query/account authorization boundary before events can submit writes.
     retireVerification("retire");
-    linkedReads.current?.reset();
+    linkedReads.current?.reset(!queryBase && previous.account === account && previous.incarnation === incarnation);
   }, [queryIdentity, queryBase, account, incarnation, retireVerification]);
   useLayoutEffect(() => {
-    if (!queryBase || !page.id || (incarnation && incarnation.key !== account)) return undefined;
+    if (!page.id || (incarnation && incarnation.key !== account)) return undefined;
     const reads = linkedTableReads({
+      // Canonical polling is driven by its authorized socket heartbeat.
+      poll: Boolean(queryBase),
       read: (intent, signal) => fetchRef.current(undefined, signal, intent),
       unavailable: (reason) => retireVerification(reason === "suspended" ? "suspend" : "invalidate"),
     });
     linkedReads.current = reads;
     const permit = () => linkedWindow.current?.verified === true;
-    connectionPermit.current = permit;
+    if (queryBase) connectionPermit.current = permit;
     return () => {
       if (connectionPermit.current === permit) connectionPermit.current = () => false;
       linkedReads.current = null;
@@ -370,29 +408,16 @@ export function CollaborativeTablePage({
       reads.dispose();
     };
   }, [queryBase, page.id, account, incarnation, retireVerification]);
-  const load = useCallback(
-    (continuation?: string | LinkedTableContinuation) =>
-      queryBase
-        ? (linkedReads.current?.request(typeof continuation === "object" ? continuation : undefined) ??
-          Promise.resolve(null))
-        : fetchTable(typeof continuation === "string" ? continuation : undefined).then((outcome) =>
-            outcome.state === "success" ? outcome.value : null,
-          ),
-    [queryBase, fetchTable],
-  );
-  useEffect(() => {
-    const offline = () => {
-      retireVerification("suspend");
-    };
-    window.addEventListener("offline", offline);
-    return () => window.removeEventListener("offline", offline);
-  }, [retireVerification]);
+  const load = useCallback((continuation?: string | LinkedTableContinuation) => {
+    const reads = linkedReads.current;
+    if (!reads) return Promise.resolve(null);
+    return typeof continuation === "string" ? reads.page(continuation) : reads.request(continuation);
+  }, []);
   useEffect(() => {
     if (!retry?.submission) return undefined;
     const { map, key, version, operationId } = retry.submission;
     const retire = () => {
-      const current = map.get(key);
-      if (current && map.owns(key, version, operationId)) return;
+      if (map.owns(key, version, operationId)) return;
       setRetry((value) => (value === retry ? null : value));
       setError((value) => (value === retry.message ? "" : value));
     };
@@ -401,7 +426,8 @@ export function CollaborativeTablePage({
     return unsubscribe;
   }, [retry]);
   useEffect(() => {
-    if (incarnation && incarnation.key !== account) return undefined;
+    if ((incarnation && incarnation.key !== account) || queryOwner.current.queryIdentity !== queryIdentity)
+      return undefined;
     active.current = true;
     void Promise.resolve().then(() => load());
     const requestOwnership = ownership;
@@ -409,11 +435,7 @@ export function CollaborativeTablePage({
       active.current = false;
       requestOwnership.current.request++;
     };
-  }, [load, account, incarnation]);
-  const loadRef = useRef(load);
-  useLayoutEffect(() => {
-    loadRef.current = load;
-  }, [load]);
+  }, [load, queryIdentity, account, incarnation]);
   useEffect(() => {
     if (queryBase) return undefined;
     // The incarnation is an ownership boundary even when the account key is unchanged.
@@ -422,29 +444,33 @@ export function CollaborativeTablePage({
     url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const connection = tableConnection({
       url: url.href,
-      query: () => loadRef.current(),
+      query: () => linkedReads.current?.verify() ?? Promise.resolve(null),
       ready: publishReadiness,
+      verified: recordAuthorization,
     });
     connectionPermit.current = connection.authorized;
     return () => {
       if (connectionPermit.current === connection.authorized) connectionPermit.current = () => false;
       connection();
     };
-  }, [page.id, queryBase, account, incarnation, publishReadiness]);
+  }, [page.id, queryBase, account, incarnation, publishReadiness, recordAuthorization]);
   useEffect(() => {
     const invalidate = () => {
-      if (queryBase) void linkedReads.current?.invalidate();
-      else void load();
+      void linkedReads.current?.invalidate();
     };
     window.addEventListener("notes:workspace-event", invalidate);
     return () => window.removeEventListener("notes:workspace-event", invalidate);
-  }, [load, queryBase]);
+  }, []);
+  const retryOwner = { account, incarnation, host, tableId: page.id };
   const send = async (command: TableCommand, submission?: CellDraftSubmission) => {
     if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId)) return false;
-    if (!canCommit()) return false;
+    if (!canCommit()) {
+      setError(readinessMessage);
+      return false;
+    }
     busyRef.current = true;
     setBusy(true);
-    setError("");
+    reportMutation("");
     setRetry(null);
     try {
       const result = await api<TableCommandResult>(commandsPath, {
@@ -463,19 +489,21 @@ export function CollaborativeTablePage({
       if (discardDenied(cause)) return false;
       if (!(cause instanceof ApiClientError) || cause.status >= 500)
         setRetry({
-          run: () => send(command, submission),
+          kind: "command",
+          command,
+          owner: retryOwner,
           submission,
           message: apiErrorMessage(cause, "The table update could not be saved."),
         });
-      else if (cause.status === 409 || cause.status === 404) {
+      else if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
         taskRefreshRequiredRef.current = true;
         setTaskRefreshRequired(true);
         retireVerification("invalidate");
         const refreshed = await load();
         if (refreshed)
-          setError(
-            cause.status === 404
-              ? apiErrorMessage(cause, "The table item no longer exists.")
+          reportMutation(
+            cause.status === 404 || cause.status === 403
+              ? apiErrorMessage(cause, "The table item is unavailable.")
               : "The table changed. Review the latest value before saving again.",
           );
       }
@@ -499,10 +527,13 @@ export function CollaborativeTablePage({
   ): Promise<TaskSaveResult> => {
     if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId))
       return { state: "rejected", code: "draft_changed" };
-    if (!canCommit()) return { state: "rejected", code: "not_ready" };
+    if (!canCommit()) {
+      setError(readinessMessage);
+      return { state: "rejected", code: "not_ready" };
+    }
     busyRef.current = true;
     setBusy(true);
-    setError("");
+    reportMutation("");
     setRetry(null);
     try {
       const result = await api<{ visibleInView?: boolean }>(rowId ? `${tasksPath}/${rowId}` : tasksPath, {
@@ -521,14 +552,17 @@ export function CollaborativeTablePage({
       if (discardDenied(cause)) return { state: "rejected", code: (cause as ApiClientError).code };
       if (!(cause instanceof ApiClientError) || (cause.status >= 500 && !cause.notSent)) {
         setRetry({
-          run: () => saveTask(body, rowId, submission),
+          kind: "task",
+          body,
+          rowId,
+          owner: retryOwner,
           submission,
           message: apiErrorMessage(cause, "The task could not be saved."),
         });
         return { state: "uncertain" };
       }
-      if (cause.status === 409 || cause.status === 404) {
-        if (cause.code === "table_revision_conflict" || cause.status === 404) {
+      if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
+        if (cause.code === "table_revision_conflict" || cause.status === 404 || cause.status === 403) {
           if (submission)
             submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
           taskRefreshRequiredRef.current = true;
@@ -537,9 +571,9 @@ export function CollaborativeTablePage({
         }
         const refreshed = await load();
         if (refreshed && !taskRefreshRequiredRef.current)
-          setError(
-            cause.status === 404
-              ? apiErrorMessage(cause, "The task no longer exists.")
+          reportMutation(
+            cause.status === 404 || cause.status === 403
+              ? apiErrorMessage(cause, "The task is unavailable.")
               : "The task list changed. Review the latest value before saving again.",
           );
       }
@@ -630,6 +664,7 @@ export function CollaborativeTablePage({
       : undefined);
   const recovery = (
     <CellDraftRecovery
+      disabled={busy || !editable}
       account={account}
       scope={{ host, tableId: page.id }}
       classify={(draft) => {
@@ -809,8 +844,16 @@ export function CollaborativeTablePage({
       {(error || retry) && (
         <div role="alert">
           {error || "The table update could not be confirmed. Review your pending edit or retry the saved operation."}
+          {retry && !editable && <p>{readinessMessage}</p>}
           {retry && (
-            <button disabled={busy} onClick={() => void retry.run()}>
+            <button
+              disabled={busy || !editable}
+              onClick={() =>
+                void (retry.kind === "command"
+                  ? send(retry.command, retry.submission)
+                  : saveTask(retry.body, retry.rowId, retry.submission))
+              }
+            >
               Retry saved operation
             </button>
           )}
@@ -821,41 +864,46 @@ export function CollaborativeTablePage({
           This view uses a removed or changed property. Showing all rows in Grid. Open Views to repair it.
         </p>
       )}
+      {panel && !editable && <output>{readinessMessage}</output>}
       {panel === "view" && (
-        <ViewEditor
-          key={data.view?.id ?? "new"}
-          view={data.view}
-          columns={data.columns}
-          people={data.people ?? []}
-          enabledKinds={[
-            "grid",
-            ...(member.features?.tableBoard ? ["board" as const] : []),
-            ...(member.features?.tableCalendar ? ["calendar" as const] : []),
-          ]}
-          busy={busy}
-          save={async (payload) => {
-            const saved = await command("save_view", payload);
-            if (saved) setPanel(null);
-            return saved;
-          }}
-          remove={() =>
-            data.view &&
-            void command("delete_view", { viewId: data.view.id }).then((saved) => {
-              if (saved) {
-                setViewId("");
-                onViewChanged?.("");
-              }
-            })
-          }
-        />
+        <fieldset disabled={busy || !editable} style={{ border: 0, padding: 0, margin: 0 }}>
+          <ViewEditor
+            key={data.view?.id ?? "new"}
+            view={data.view}
+            columns={data.columns}
+            people={data.people ?? []}
+            enabledKinds={[
+              "grid",
+              ...(member.features?.tableBoard ? ["board" as const] : []),
+              ...(member.features?.tableCalendar ? ["calendar" as const] : []),
+            ]}
+            busy={busy || !editable}
+            save={async (payload) => {
+              const saved = await command("save_view", payload);
+              if (saved) setPanel(null);
+              return saved;
+            }}
+            remove={() =>
+              data.view &&
+              void command("delete_view", { viewId: data.view.id }).then((saved) => {
+                if (saved) {
+                  setViewId("");
+                  onViewChanged?.("");
+                }
+              })
+            }
+          />
+        </fieldset>
       )}
       {panel === "properties" && (
-        <PropertyEditor
-          columns={data.columns}
-          fixedColumnIds={taskList ? Object.values(taskColumns(page.id)) : []}
-          busy={busy}
-          command={command}
-        />
+        <fieldset disabled={busy || !editable} style={{ border: 0, padding: 0, margin: 0 }}>
+          <PropertyEditor
+            columns={data.columns}
+            fixedColumnIds={taskList ? Object.values(taskColumns(page.id)) : []}
+            busy={busy || !editable}
+            command={command}
+          />
+        </fieldset>
       )}
       {!embedded && !queryBase && (member.features?.tableRelations || Boolean(data.relations?.definitions.length)) && (
         <RelationPanel
@@ -1390,6 +1438,7 @@ function ViewEditor({
       className="table-settings"
       onSubmit={(event) => {
         event.preventDefault();
+        if (busy) return;
         void save({
           ...payload,
           ...(view ? { id: view.id, revision: draft.revision } : {}),
@@ -1728,6 +1777,7 @@ function PropertyEditor({
       <form
         onSubmit={(event) => {
           event.preventDefault();
+          if (busy) return;
           void command("create_column", { name, type, ...(type === "formula" ? { source } : {}) }).then((saved) => {
             if (saved) {
               setName("");

@@ -86,7 +86,7 @@ export function LinkedTableView({
           {context && ready ? (
             <RenderBoundary resetKey={`${tablePageId}:${viewId}`}>
               <CollaborativeTablePage
-                key={`${tablePageId}:${viewId}`}
+                key={tablePageId}
                 page={{ id: tablePageId, title, taskList: false }}
                 member={editable ? context.member : { ...context.member, role: "viewer" }}
                 onSelectPage={context.onSelectPage}
