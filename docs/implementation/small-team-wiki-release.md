@@ -592,3 +592,75 @@ The affected Chromium/Firefox/WebKit matrix passes **117/117** in 717.15 seconds
 Commands: `pnpm exec vitest run src/client/linked-table-reads.test.ts src/client/linked-table-query.test.ts src/client/CollaborativeTablePage.recovery.test.tsx --maxWorkers=1` (five independent runs); `pnpm exec playwright test --project=chromium --project=firefox --project=webkit tests/e2e/reconnect-drafts.spec.ts tests/e2e/linked-table-recovery.spec.ts --retries=0`; `pnpm exec playwright test --project=chromium --project=firefox --project=webkit tests/e2e/linked-table-recovery.spec.ts --repeat-each=5 --retries=0`; and `pnpm exec playwright test --project=chromium --retries=0` (two independent fresh runs). Mobile uses the same affected files with the recovery-scenario name filter and `--project=mobile-chromium --retries=0`; diagnostics uses `pnpm test:e2e:diagnostics --retries=0`.
 
 The previously documented built-app production reload/highlighting gate remains unresolved and separate. Its prior **24/25** result and baseline reproduction belong to the PR #271 follow-up evidence above; this pass does not claim that production browser suite passed or change its fixture/runtime. Remote CI/Sonar results remain separate from this local evidence. No deployment, remote migration, live Slack installation, receipt compatibility restoration, server-receipt pruning, portability/trust feature, or new recovery workflow is included.
+
+## PR #273 follow-up: table retries, error classification, and readiness
+
+This follow-up starts at merged main `75f6892de0f74f96aa9c2d6a9c5ccb08cdd7a429`. Runtime and regression changes are in `a0bb6ce`; browser acceptance fixtures are in `8536d24`; `a735bcd` removes two unused lint directives without changing executable behavior; `499cff0` gates recovery-panel saves through busy conflict verification; `59496497ee4fd98b9db76ad8076213c68e443ecf` retains definite conflict/restriction feedback across successful background reads and is the final implementation/measurement revision. There is no public API, browser-storage format, protocol, or D1 migration change. Matching client deployment follows ordinary rollout; no deployment or remote migration was performed.
+
+The selected canonical-table behavior is **pause writes and retry automatically** after a failed current read, even while its socket grant remains valid. Cached server rows and locally authored drafts remain available. Both canonical refresh recovery and linked reads share one intent scheduler, bounded request timeouts, and equal-jitter retry ceilings from two seconds to 30 seconds. Socket verification joins an equivalent active read; canonical heartbeat owns periodic refresh rather than adding a second polling loop. An existing canonical socket/query verification can finish when only its view query is superseded, while retired account/table work cannot restore the new owner's state.
+
+Saved-operation Retry now stores the captured command/task request and draft submission context, rather than an old render callback. Current handlers check current readiness and shared-draft ownership immediately before dispatch, retaining original operation identity, payload, and expected revision. Search, view, and month changes preserve the saved operation after fresh verification; account, incarnation, host, source-table, and draft retirement invalidate it. Linked host view changes preserve the mounted renderer instead of remounting and losing its Retry. External host view changes still synchronize the selected query. Retry is disabled with an explanation during verification; reconnection never submits a mutation.
+
+Access classification distinguishes rejected operations from loss of table access. Authentication errors, page-not-found results, and actual table/page access denials clear displayed server rows, linked buffers, and obsolete continuation work. Operation-specific `relation_target_unavailable`, `feature_disabled`, `read_only`, and `owner_required` failures retain the table and their error while capabilities are refreshed. Unknown mutation 403s require verification before writes resume; authoritative denial then retires access. Existing item-not-found handling remains separate. Rejected mutations are not replayed automatically.
+
+Denial retry progression is independent of unrelated continuation failures. Foreground/online return requests separate verification when only an append is backed off; genuine verification/denial deadlines remain intact. The scheduler owns failure invalidation and suspension, eliminating duplicate linked failure/offline transitions. Socket-generation evidence is delivered separately from present readiness and only after successful socket/query verification. A false availability signal alone cannot authorize a generation. Open View/Property forms retain local values, disable mutation controls while unavailable, and explain the verification requirement; rejected saves do not close/reset them.
+
+Successful background reads clear read failures without erasing definite conflict/restriction feedback. The next deliberate mutation clears that notice. Uncertain-save alerts and transient successful-save notices keep their existing behavior. Recovery Save/review controls use the same busy/readiness gate as ordinary cells; Copy/Discard remain available.
+
+### Regression and acceptance evidence
+
+Fourteen selected regressions fail on unchanged main in an isolated archive, including stale Retry guards, operation-specific 403 retirement, canonical automatic recovery, delayed-append foreground checks, independent denial backoff, and settings preservation. The parent-level renderer regression distinguishes view changes from source replacement. A further deterministic busy-control regression fails on `a735bcd` and passes with the correction. Final focused tests pass **122/122**; five independent deterministic table/controller runs pass **116/116 each**. No assertions, retry policy, test timeout, coverage threshold, or feature flags were weakened.
+
+Final local acceptance at `5949649`:
+
+- `pnpm test:coverage --maxWorkers=1`: **2,867 passing tests plus one pre-existing skip**, 196.19 seconds. Coverage lines/statements/branches/functions: **76.04/73.33/68.36/67.67%**.
+- `pnpm test:worker:coverage`: **2,473/2,473**, 37 files, 890.69 seconds. Coverage lines/statements/branches/functions: **86.64/83.32/76.92/89.85%**. This completed before the final browser-only corrections; Worker, migrations, and plugin sources are unchanged throughout this follow-up.
+- All five TypeScript projects, `pnpm lint`, `pnpm format:check`, `pnpm check:docs`, `pnpm analyze`, `pnpm cf-typegen:check`, `pnpm build`, and `pnpm build:worker` pass. These are the repository check components; no monolithic/default-parallel `pnpm check` run is claimed.
+- Pinned Semgrep **1.151.0** middleware/deployment scans pass with zero findings; rule regressions pass **10/10** and **2/2**. The pinned environment is first on `PATH`; scans use two jobs. No policy or exclusion changed.
+
+| Browser acceptance                                                                       | Result  | Seconds  |
+| ---------------------------------------------------------------------------------------- | ------- | -------- |
+| Chromium/Firefox/WebKit affected recovery matrix                                         | 126/126 | 720.69   |
+| Five repetitions of eight linked-table and two task Retry cases across all three engines | 150/150 | 1,284.81 |
+| First full Chromium run, fresh server state                                              | 97/97   | 461.15   |
+| Second consecutive full Chromium run, fresh server state                                 | 97/97   | 532.64   |
+| Affected mobile Chromium table/comment/draft cases                                       | 25/25   | 162.11   |
+| Diagnostics                                                                              | 1/1     | 3.53     |
+
+Every browser command uses `--retries=0`; no failed run is counted as acceptance and no browser scenario is skipped. Each application suite starts a fresh local server/D1 state; diagnostics use their separate client-only harness. The standard full Chromium command is `pnpm exec playwright test --project=chromium --retries=0`; diagnostics use `pnpm test:e2e:diagnostics --retries=0`. The affected matrix targets `tests/e2e/reconnect-drafts.spec.ts` and `tests/e2e/linked-table-recovery.spec.ts` with all three desktop projects. The repeated command uses those same files, `--repeat-each=5`, and this selection:
+
+```sh
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts \
+  --grep 'linked reads|save denial|failed conflict verification|deleted row rejects|successful hidden linked|saved linked operation|operation restrictions|canonical failed reload|top-level task Retry|task draft retries an unrelated' \
+  --repeat-each=5 --retries=0
+```
+
+Preliminary runs are excluded. Removing unused lint comments during an early development run caused Vite hot reload: a cursor request was aborted immediately after the source edit and replaced by an initial read. No product workaround, fixture retry, sleep, or timeout increase was added for that interruption. A separate `a735bcd` run finished **124/126**, exposing enabled recovery Save controls during an otherwise correctly blocked busy conflict refresh; `499cff0` fixes the controls while retaining the synchronous gate. A `499cff0` run finished **125/126**, exposing definite conflict feedback erased by a later successful background read; `5949649` fixes notice ownership. The complete final sequence above runs from the frozen corrected source.
+
+### Optimized measurements
+
+[Raw measurements](pr-273-table-readiness-measurements.json) retain the exact command and implementation/harness revision. Command: `NOTES_BENCH_TYPING_EDITS=300 NOTES_BENCH_READ_RECOVERY=1 node scripts/measure-collaboration-recovery.mjs 75f6892 /tmp/noteflare-273-measurements-final2.json`. It ran at `59496497ee4fd98b9db76ad8076213c68e443ecf`. Copying and formatting the artifact preserves parsed JSON values exactly.
+
+Both versions use the same optimized/minified production-React Chromium harness: three fresh contexts per version, 100 table rows, 500 account drafts, 5,000 unrelated storage keys, and 300 typing edits per context. Comparisons are medians of per-context results; reconnect scheduling retains randomized equal jitter, while controlled read recovery fixes its random draw at 0.5.
+
+| Metric                                                                         | Starting main         | Updated               |
+| ------------------------------------------------------------------------------ | --------------------- | --------------------- |
+| Typing p50 / p95                                                               | 0.1 / 0.2 ms          | 0.1 / 0.2 ms          |
+| First edit                                                                     | 0.6 ms                | 0.8 ms                |
+| Immediate writes / full enumeration / whole-table typing renders, each context | 300 / 0 / 0           | 300 / 0 / 0           |
+| Receipt p95 / healthy-path enumeration                                         | 0.1 ms / 0            | 0.1 ms / 0            |
+| Save/focus notifications                                                       | 3                     | 3                     |
+| Query verification p50 / p95                                                   | 16.6 / 17.9 ms        | 16.6 / 16.9 ms        |
+| Toolbar replacements / missing controls during 20 query verifications          | 0 / 0                 | 0 / 0                 |
+| Fulfilled append window/data/row reference identity, per 1,000 samples         | 1,000 / 1,000 / 1,000 | 1,000 / 1,000 / 1,000 |
+| Fulfilled append HTTP requests                                                 | 0                     | 0                     |
+| 500-row refresh p50 / p95                                                      | 33.2 / 34.1 ms        | 33.3 / 33.4 ms        |
+| Requests per 500-row refresh / buffered 100-row expansion                      | 1 / 0                 | 1 / 0                 |
+| Controlled read recovery / total fixture queries                               | 1,515.0 ms / 3        | 1,515.5 ms / 3        |
+| Reconnect p50 / p95                                                            | 1,579.4 / 1,832.1 ms  | 1,449.6 / 1,900.2 ms  |
+| Reconnect sockets / queries                                                    | 40 / 40               | 40 / 40               |
+
+No measured median p95 regression exceeds 10%. Fulfilled-append timings are below browser timer resolution, establishing reference/request behavior rather than a speedup. These controlled local API/socket fixtures do not measure production D1 or network latency. Browser acceptance establishes behavior separately from the optimized measurements.
+
+The existing production reload/highlighting gate remains separate and unresolved; the prior **24/25** production-browser result is historical evidence from the PR #271 follow-up. This pass does not change that runtime/fixture or claim the production browser suite passes. Relations stay disabled. Deployment, remote migration, live Slack installation, receipt compatibility restoration, server-receipt pruning, portability/trust features, and new recovery workflows remain excluded. Remote CI and Sonar outcomes are separate from local evidence.
