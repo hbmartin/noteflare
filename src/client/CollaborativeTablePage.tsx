@@ -1,3 +1,11 @@
+import {
+  captureTableViewSubmission,
+  acknowledgeTableViewSubmission,
+  type TableViewSubmission,
+  createTableViewCache,
+  TableViewStateContext,
+  useTableViewState,
+} from "./table-view-state";
 import { CellDraftPersistenceRetry } from "./CellDraftPersistenceRetry";
 import { useOnlineStatus } from "./online-status";
 import { RelationPanel } from "./RelationPanel";
@@ -55,11 +63,27 @@ export type CollaborativeTableProps = {
   embedded?: boolean;
 };
 type TaskSaveResult = { state: "saved" } | { state: "rejected"; code?: string } | { state: "uncertain" };
-type SavedRetry = {
-  owner: { account: string; incarnation: unknown; host: string; tableId: string };
+type TableOwner = { account: string; incarnation: unknown; host: string; tableId: string };
+const sameTableOwner = (left: TableOwner, right: TableOwner) =>
+  left.account === right.account &&
+  left.incarnation === right.incarnation &&
+  left.host === right.host &&
+  left.tableId === right.tableId;
+type MutationNotice = {
+  sequence: number;
+  owner: TableOwner;
+  operationId: string;
+  target: string;
+  message: string;
   submission?: CellDraftSubmission;
+};
+type SavedRetry = {
+  owner: TableOwner;
+  submission?: CellDraftSubmission;
+  form?: TableViewSubmission;
   message: string;
 } & ({ kind: "command"; command: TableCommand } | { kind: "task"; body: Record<string, unknown>; rowId?: string });
+const busyMessage = "A save is already in progress. Wait for it to finish.";
 const readinessMessage =
   "Editing is temporarily unavailable. Your changes are preserved. Wait for verification or refresh the table.";
 function accessFailure(cause: unknown, fromRead: boolean): "denied" | "verify" | "other" {
@@ -108,10 +132,34 @@ export function CollaborativeTablePage({
   const base = queryBase ?? `/api/tables/${page.id}/query`;
   const commandsPath = queryBase ? `${queryBase}/commands` : `/api/tables/${page.id}/commands`;
   const online = useOnlineStatus();
+  const account = `${member.user.id}\0${member.workspace?.id ?? "workspace"}`;
+  const incarnation = useRealtimeAccessAccount();
+  const host = queryBase ?? page.id;
+  const [viewId, setViewId] = useState(initialViewId ?? "");
+  const previousInitialView = useRef(initialViewId);
+  useLayoutEffect(() => {
+    if (previousInitialView.current === initialViewId) return;
+    previousInitialView.current = initialViewId;
+    setViewId(initialViewId ?? "");
+  }, [initialViewId]);
+  const currentOwner = { account, incarnation, host, tableId: page.id };
+  const [cacheLifetime, setCacheLifetime] = useState(() => ({ owner: currentOwner, cache: createTableViewCache() }));
+  let viewCache = cacheLifetime.cache;
+  if (!sameTableOwner(cacheLifetime.owner, currentOwner)) {
+    viewCache = createTableViewCache();
+    setCacheLifetime({ owner: currentOwner, cache: viewCache });
+  }
+  useLayoutEffect(() => {
+    viewCache.activate();
+    return () => viewCache.retire();
+  }, [viewCache]);
+  const viewState = viewCache.view(viewId);
+
   const ownership = useRef({
     request: 0,
     verification: 0,
     ready: false,
+    verifiedQuery: false,
     generation: 0,
     authorizedGeneration: null as number | null,
     canEdit: false,
@@ -123,13 +171,17 @@ export function CollaborativeTablePage({
   const canonicalPrefix = useRef({ id: 0, data: null as TableQueryResult | null });
   const connectionPermit = useRef<() => boolean>(() => true);
   const busyRef = useRef(false);
-  const mutationNotice = useRef("");
+  const [busy, setBusy] = useState(false);
+  const noticeSequence = useRef(0);
+  const dismissedNotice = useRef(0);
+  const [mutationNotice, setMutationNotice] = useState<MutationNotice | null>(null);
+  const [blocked, setBlocked] = useState("");
   const taskRefreshRequiredRef = useRef(false);
   const [taskRefreshRequired, setTaskRefreshRequired] = useState(false);
   const [connectionReady, setConnectionReady] = useState(false);
   const [authorizedGeneration, setAuthorizedGeneration] = useState<number | null>(null);
   const [data, setData] = useState<TableQueryResult | null>(null);
-  const [panel, setPanel] = useState<"view" | "properties" | null>(null);
+  const [panel, setPanel, acceptPanel] = useTableViewState<"view" | "properties" | null>("panel", null, viewState);
   const [savedRetry, setRetry] = useState<SavedRetry | null>(null);
   const linkedWindow = useRef<LinkedTableWindow | null>(null);
   const [linkedSnapshot, setLinkedSnapshot] = useState<LinkedTableWindow | null>(null);
@@ -139,8 +191,9 @@ export function CollaborativeTablePage({
     setLinkedSnapshot(value);
   }, []);
   const publishReadiness = useCallback((value: boolean) => {
-    ownership.current.ready = value;
-    setConnectionReady(value);
+    const ready = value && ownership.current.verifiedQuery;
+    ownership.current.ready = ready;
+    setConnectionReady(ready);
   }, []);
   const recordAuthorization = useCallback((generation: number) => {
     ownership.current.authorizedGeneration = generation;
@@ -148,7 +201,10 @@ export function CollaborativeTablePage({
   }, []);
   const retireVerification = useCallback(
     (mode: "invalidate" | "suspend" | "denied" | "retire") => {
-      if (mode !== "suspend") ownership.current.verification++;
+      if (mode !== "suspend") {
+        ownership.current.verification++;
+        ownership.current.verifiedQuery = false;
+      }
       publishReadiness(false);
       if (mode === "denied" || mode === "retire") {
         ownership.current.request++;
@@ -158,7 +214,6 @@ export function CollaborativeTablePage({
           ownership.current.canEdit = false;
           setData(null);
           setRetry(null);
-          setPanel(null);
         }
       } else if (linkedWindow.current?.verified) {
         publishLinkedWindow({ ...linkedWindow.current, verified: false });
@@ -166,28 +221,19 @@ export function CollaborativeTablePage({
     },
     [publishLinkedWindow, publishReadiness],
   );
-  const account = `${member.user.id}\0${member.workspace?.id ?? "workspace"}`;
-  const incarnation = useRealtimeAccessAccount();
-  const host = queryBase ?? page.id;
   const retryLifetime = useRef({ account, incarnation, host, tableId: page.id });
   useLayoutEffect(() => {
     const previous = retryLifetime.current;
-    if (
-      previous.account === account &&
-      previous.incarnation === incarnation &&
-      previous.host === host &&
-      previous.tableId === page.id
-    )
-      return;
+    if (sameTableOwner(previous, { account, incarnation, host, tableId: page.id })) return;
     retryLifetime.current = { account, incarnation, host, tableId: page.id };
-    mutationNotice.current = "";
-    setRetry(null);
+    setMutationNotice((value) => (value === null ? value : null));
+    setBlocked("");
+    busyRef.current = false;
+    setBusy(false);
+    setRetry((value) => (value === null ? value : null));
   }, [account, incarnation, host, page.id]);
   const retry =
-    savedRetry?.owner.account === account &&
-    savedRetry.owner.incarnation === incarnation &&
-    savedRetry.owner.host === host &&
-    savedRetry.owner.tableId === page.id
+    savedRetry && sameTableOwner(savedRetry.owner, { account, incarnation, host, tableId: page.id })
       ? savedRetry
       : null;
   const drafts = useMemo(
@@ -231,24 +277,22 @@ export function CollaborativeTablePage({
     return () => controller.abort();
   }, [draftGeneration, draftRevision, missingDraftIds, online, page.id, queryBase]);
 
-  const [viewId, setViewId] = useState(initialViewId ?? "");
-  const previousInitialView = useRef(initialViewId);
-  useLayoutEffect(() => {
-    if (previousInitialView.current === initialViewId) return;
-    previousInitialView.current = initialViewId;
-    setViewId(initialViewId ?? "");
-  }, [initialViewId]);
-  const [query, setQuery] = useState("");
-  const [month, setMonth] = useState(() => new Date().toISOString().slice(0, 7));
+  const [query, setQuery] = useTableViewState("query", "", viewState);
+  const [month, setMonth] = useTableViewState("month", () => new Date().toISOString().slice(0, 7), viewState);
   const queryIdentity = JSON.stringify([base, viewId, query, month]);
-  const queryOwner = useRef({ queryIdentity, account, incarnation });
-  const [busy, setBusy] = useState(false);
+  const queryOwner = useRef({ queryIdentity, account, incarnation, host, tableId: page.id });
   const [error, setError] = useState("");
-  const reportMutation = useCallback((message: string) => {
-    mutationNotice.current = message;
-    setError(message);
-  }, []);
-  const [newTitle, setNewTitle] = useState("");
+  const reportMutation = (notice: MutationNotice, message: string) => {
+    if (!sameTableOwner(notice.owner, retryLifetime.current) || notice.sequence <= dismissedNotice.current) return;
+    setMutationNotice((current) => (current && current.sequence > notice.sequence ? current : { ...notice, message }));
+  };
+  const resolveMutation = (notice: MutationNotice) => {
+    if (!sameTableOwner(notice.owner, retryLifetime.current)) return;
+    setMutationNotice((current) =>
+      current && current.sequence <= notice.sequence && current.target === notice.target ? null : current,
+    );
+  };
+  const [newTitle, setNewTitle] = useTableViewState("title", "", viewState);
   const active = useRef(true);
   const editable = Boolean(
     online &&
@@ -269,12 +313,11 @@ export function CollaborativeTablePage({
       !busyRef.current &&
       !taskRefreshRequiredRef.current &&
       connectionPermit.current() &&
-      queryOwner.current.account === account &&
-      queryOwner.current.incarnation === incarnation &&
+      sameTableOwner(queryOwner.current, { account, incarnation, host, tableId: page.id }) &&
       (queryBase
         ? queryOwner.current.queryIdentity === queryIdentity
         : ownership.current.authorizedGeneration === ownership.current.generation),
-    [account, incarnation, queryBase, queryIdentity],
+    [account, incarnation, host, page.id, queryBase, queryIdentity],
   );
   const taskList = Boolean(page.taskList || data?.taskList);
   const tasksPath = queryBase ? `${queryBase}/tasks` : `/api/task-lists/${page.id}/tasks`;
@@ -337,6 +380,8 @@ export function CollaborativeTablePage({
         if (owner !== ownership.current.request)
           return queryBase ? { state: "superseded" } : { state: "success", value: result, verification: "network" };
         if (queryBase && verification !== ownership.current.verification) return { state: "superseded" };
+        if (intent?.kind === "page" && (result.generation !== intent.generation || result.revision !== intent.revision))
+          return fetchTable(undefined, signal, undefined, context);
         const fresh = (!linked || linked.verification === "network") && (context?.current() ?? true);
         if (linked) {
           const verified = navigator.onLine && !document.hidden && (fresh || linkedWindow.current?.verified === true);
@@ -345,6 +390,7 @@ export function CollaborativeTablePage({
         ownership.current.generation = result.generation;
         ownership.current.canEdit = result.canEdit !== false;
         if (fresh) {
+          ownership.current.verifiedQuery = true;
           taskRefreshRequiredRef.current = false;
           setTaskRefreshRequired(false);
         }
@@ -363,7 +409,10 @@ export function CollaborativeTablePage({
             setData(result);
           }
         } else setData(result);
-        if (fresh) setError(mutationNotice.current);
+        if (fresh) {
+          setError("");
+          setBlocked("");
+        }
         if (fresh)
           publishReadiness(
             navigator.onLine &&
@@ -403,16 +452,13 @@ export function CollaborativeTablePage({
   }, [fetchTable]);
   useLayoutEffect(() => {
     const previous = queryOwner.current;
-    if (
-      previous.queryIdentity === queryIdentity &&
-      previous.account === account &&
-      previous.incarnation === incarnation
-    )
-      return;
-    queryOwner.current = { queryIdentity, account, incarnation };
-    retireVerification("retire");
-    linkedReads.current?.reset(!queryBase && previous.account === account && previous.incarnation === incarnation);
-  }, [queryIdentity, queryBase, account, incarnation, retireVerification]);
+    const next = { queryIdentity, account, incarnation, host, tableId: page.id };
+    const sameOwner = sameTableOwner(previous, next);
+    if (previous.queryIdentity === queryIdentity && sameOwner) return;
+    queryOwner.current = next;
+    retireVerification(sameOwner ? "retire" : "denied");
+    linkedReads.current?.reset(!queryBase && sameOwner);
+  }, [queryIdentity, queryBase, account, incarnation, host, page.id, retireVerification]);
   useLayoutEffect(() => {
     if (!page.id || (incarnation && incarnation.key !== account)) return undefined;
     const reads = linkedTableReads({
@@ -487,30 +533,73 @@ export function CollaborativeTablePage({
     window.addEventListener("notes:workspace-event", invalidate);
     return () => window.removeEventListener("notes:workspace-event", invalidate);
   }, []);
+  const notice =
+    mutationNotice && sameTableOwner(mutationNotice.owner, { account, incarnation, host, tableId: page.id })
+      ? mutationNotice
+      : null;
+  useEffect(() => {
+    if (!notice?.submission) return undefined;
+    const { map, key } = notice.submission;
+    const settled = () => {
+      if (map.get(key)?.changed) return;
+      setMutationNotice((current) => (current === notice ? null : current));
+    };
+    const unsubscribe = map.subscribe(key, settled);
+    settled();
+    return unsubscribe;
+  }, [notice]);
   const retryOwner = { account, incarnation, host, tableId: page.id };
-  const send = async (command: TableCommand, submission?: CellDraftSubmission) => {
+  const beginMutation = (operationId: string, target: string, submission?: CellDraftSubmission): MutationNotice => ({
+    sequence: ++noticeSequence.current,
+    owner: retryOwner,
+    operationId,
+    target: submission ? `cell:${submission.key}` : target,
+    submission,
+    message: "",
+  });
+  const send = async (command: TableCommand, submission?: CellDraftSubmission, form?: TableViewSubmission) => {
     if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId)) return false;
     if (!canCommit()) {
-      setError(readinessMessage);
+      setBlocked(busyRef.current ? busyMessage : readinessMessage);
       return false;
     }
     busyRef.current = true;
     setBusy(true);
-    reportMutation("");
+    setBlocked("");
+    setError("");
     setRetry(null);
+    const payload = command.payload as Record<string, unknown>;
+    const target =
+      command.kind === "update_cells" && Object.keys(payload.values as object).length === 1
+        ? `cell:${draftKey(String(payload.rowId), Object.keys(payload.values as object)[0]!)}`
+        : payload.columnId
+          ? `column:${String(payload.columnId)}:${command.kind}:${JSON.stringify(
+              Object.keys(payload)
+                .filter((key) => !["columnId", "revision"].includes(key))
+                .sort(),
+            )}`
+          : ["save_view", "delete_view"].includes(command.kind)
+            ? `view:${String(payload.id ?? payload.viewId ?? viewId)}`
+            : `${command.kind}:${String(payload.rowId ?? `view:${viewId}`)}`;
+    const operation = beginMutation(command.operationId, target, submission);
     try {
       const result = await api<TableCommandResult>(commandsPath, {
         method: "POST",
         body: json(command),
         signal: AbortSignal.timeout(30000),
       });
+      if (!sameTableOwner(operation.owner, retryLifetime.current)) return false;
       if (submission) submission.map.acknowledge(submission.key, submission.version, submission.operationId);
+      acknowledgeTableViewSubmission(form, "");
+      resolveMutation(operation);
       await load();
+      if (!sameTableOwner(operation.owner, retryLifetime.current)) return false;
       if (result.projectionPending) setError("Saved. Search and task lists are catching up.");
       if (result.result.visibleInView === false)
         setError("Saved. The new row is hidden by this view's filters. Open All rows to see it.");
       return true;
     } catch (cause) {
+      if (!sameTableOwner(operation.owner, retryLifetime.current)) return false;
       setError(apiErrorMessage(cause, "The table update could not be saved."));
       if (discardDenied(cause)) return false;
       if (!(cause instanceof ApiClientError) || cause.status >= 500)
@@ -519,6 +608,7 @@ export function CollaborativeTablePage({
           command,
           owner: retryOwner,
           submission,
+          form,
           message: apiErrorMessage(cause, "The table update could not be saved."),
         });
       else if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
@@ -528,6 +618,7 @@ export function CollaborativeTablePage({
         const refreshed = await load();
         if (refreshed)
           reportMutation(
+            operation,
             cause.status === 404 || cause.status === 403
               ? apiErrorMessage(cause, "The table item is unavailable.")
               : "The table changed. Review the latest value before saving again.",
@@ -535,45 +626,71 @@ export function CollaborativeTablePage({
       }
       return false;
     } finally {
-      busyRef.current = false;
-      setBusy(false);
+      if (sameTableOwner(operation.owner, retryLifetime.current)) {
+        busyRef.current = false;
+        setBusy(false);
+        setBlocked((message) => (message === busyMessage ? "" : message));
+      }
     }
   };
-  const command = (kind: TableCommand["kind"], payload: Record<string, unknown>, globalRevision = false) =>
-    send({
-      operationId: crypto.randomUUID(),
-      ...(globalRevision && data ? { expectedRevision: data.revision } : {}),
-      kind,
-      payload,
-    });
+  const command = (
+    kind: TableCommand["kind"],
+    payload: Record<string, unknown>,
+    globalRevision = false,
+    form?: TableViewSubmission,
+  ) =>
+    send(
+      {
+        operationId: crypto.randomUUID(),
+        ...(globalRevision && data ? { expectedRevision: data.revision } : {}),
+        kind,
+        payload,
+      },
+      undefined,
+      form,
+    );
   const saveTask = async (
     body: Record<string, unknown>,
     rowId?: string,
     submission?: CellDraftSubmission,
+    form?: TableViewSubmission,
   ): Promise<TaskSaveResult> => {
     if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId))
       return { state: "rejected", code: "draft_changed" };
     if (!canCommit()) {
-      setError(readinessMessage);
+      setBlocked(busyRef.current ? busyMessage : readinessMessage);
       return { state: "rejected", code: "not_ready" };
     }
     busyRef.current = true;
     setBusy(true);
-    reportMutation("");
+    setBlocked("");
+    setError("");
     setRetry(null);
+    const fields = Object.keys(body)
+      .filter((key) => !["operationId", "expectedRevision"].includes(key))
+      .sort();
+    const operation = beginMutation(
+      String(body.operationId),
+      `task:${rowId ?? `new:${viewId}`}:${JSON.stringify(fields)}`,
+      submission,
+    );
     try {
       const result = await api<{ visibleInView?: boolean }>(rowId ? `${tasksPath}/${rowId}` : tasksPath, {
         method: rowId ? "PATCH" : "POST",
         body: json(body),
         signal: AbortSignal.timeout(30000),
       });
-      if (!rowId) setNewTitle("");
+      if (!sameTableOwner(operation.owner, retryLifetime.current)) return { state: "rejected", code: "retired" };
       if (submission) submission.map.acknowledge(submission.key, submission.version, submission.operationId);
+      acknowledgeTableViewSubmission(form, "");
+      resolveMutation(operation);
       await load();
+      if (!sameTableOwner(operation.owner, retryLifetime.current)) return { state: "rejected", code: "retired" };
       if (result?.visibleInView === false)
         setError("Saved. Current filters hide this task. Choose All rows to see it.");
       return { state: "saved" };
     } catch (cause) {
+      if (!sameTableOwner(operation.owner, retryLifetime.current)) return { state: "rejected", code: "retired" };
       setError(apiErrorMessage(cause, "The task could not be saved."));
       if (discardDenied(cause)) return { state: "rejected", code: (cause as ApiClientError).code };
       if (!(cause instanceof ApiClientError) || (cause.status >= 500 && !cause.notSent)) {
@@ -583,6 +700,7 @@ export function CollaborativeTablePage({
           rowId,
           owner: retryOwner,
           submission,
+          form,
           message: apiErrorMessage(cause, "The task could not be saved."),
         });
         return { state: "uncertain" };
@@ -598,6 +716,7 @@ export function CollaborativeTablePage({
         const refreshed = await load();
         if (refreshed && !taskRefreshRequiredRef.current)
           reportMutation(
+            operation,
             cause.status === 404 || cause.status === 403
               ? apiErrorMessage(cause, "The task is unavailable.")
               : "The task list changed. Review the latest value before saving again.",
@@ -605,8 +724,11 @@ export function CollaborativeTablePage({
       }
       return { state: "rejected", code: cause.code };
     } finally {
-      busyRef.current = false;
-      setBusy(false);
+      if (sameTableOwner(operation.owner, retryLifetime.current)) {
+        busyRef.current = false;
+        setBusy(false);
+        setBlocked((message) => (message === busyMessage ? "" : message));
+      }
     }
   };
   const changeCell = async (
@@ -660,15 +782,21 @@ export function CollaborativeTablePage({
   };
   const add = async (groupId?: string, date?: string) => {
     const titleColumn = data?.columns.find((column) => column.type === "text");
+    const form = captureTableViewSubmission(viewState, "title");
     if (taskList) {
-      await saveTask({
-        operationId: crypto.randomUUID(),
-        expectedRevision: data?.revision,
-        title: newTitle || "Untitled task",
-        ...(viewId ? { viewId } : {}),
-        ...(groupId !== undefined ? { groupId } : {}),
-        ...(date ? { date } : {}),
-      });
+      await saveTask(
+        {
+          operationId: crypto.randomUUID(),
+          expectedRevision: data?.revision,
+          title: newTitle || "Untitled task",
+          ...(viewId ? { viewId } : {}),
+          ...(groupId !== undefined ? { groupId } : {}),
+          ...(date ? { date } : {}),
+        },
+        undefined,
+        undefined,
+        form,
+      );
       return;
     }
     await command(
@@ -680,8 +808,8 @@ export function CollaborativeTablePage({
         values: titleColumn ? { [titleColumn.id]: newTitle } : {},
       },
       false,
+      form,
     );
-    setNewTitle("");
   };
   const draftRow = (draft: StoredCellDraft) =>
     data?.rows.find((row) => row.id === draft.rowId) ??
@@ -740,6 +868,7 @@ export function CollaborativeTablePage({
     return (
       <output className="table-live">
         {error || "Loading table…"}
+        {blocked && <p>{blocked}</p>}
         {recovery}
         <button onClick={() => void load()}>Reload</button>
       </output>
@@ -812,305 +941,332 @@ export function CollaborativeTablePage({
     });
   };
   return (
-    <section className={`table-live ${embedded ? "table-live-embedded" : "page-canvas"}`}>
-      {!embedded && (
-        <>
-          <h1>{page.title}</h1>
-          {metadata}
-        </>
-      )}
-      <div className="table-toolbar">
-        <select
-          aria-label="Saved table view"
-          value={viewId}
-          onChange={(event) => {
-            setViewId(event.target.value);
-            onViewChanged?.(event.target.value);
-          }}
-        >
-          <option value="">All rows · Grid</option>
-          {data.views.map((savedView) => (
-            <option key={savedView.id} value={savedView.id}>
-              {savedView.name}
-              {savedView.ownerId ? " · Personal" : ""}
-              {savedView.invalid ? " · Needs repair" : ""}
-            </option>
-          ))}
-        </select>
-        <input
-          aria-label="Search table"
-          placeholder="Search rows"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-        />
-        {view?.kind === "calendar" && (
-          <input
-            aria-label="Calendar month"
-            type="month"
-            value={month}
-            onChange={(event) => setMonth(event.target.value)}
-          />
-        )}
-        <span>{data.rowCount} rows</span>
-        {member.role !== "viewer" && data.canEdit !== false && (
+    <TableViewStateContext.Provider value={viewState}>
+      <section className={`table-live ${embedded ? "table-live-embedded" : "page-canvas"}`}>
+        {!embedded && (
           <>
-            <button disabled={busy || !editable} onClick={() => setPanel(panel === "view" ? null : "view")}>
-              Views
-            </button>
-            <button disabled={busy || !editable} onClick={() => setPanel(panel === "properties" ? null : "properties")}>
-              Properties
-            </button>
+            <h1>{page.title}</h1>
+            {metadata}
           </>
         )}
-        <button disabled={busy} onClick={() => void load()}>
-          Refresh
-        </button>
-      </div>
-      {recovery}
-      {(error || retry) && (
-        <div role="alert">
-          {error || "The table update could not be confirmed. Review your pending edit or retry the saved operation."}
-          {retry && !editable && <p>{readinessMessage}</p>}
-          {retry && (
-            <button
-              disabled={busy || !editable}
-              onClick={() =>
-                void (retry.kind === "command"
-                  ? send(retry.command, retry.submission)
-                  : saveTask(retry.body, retry.rowId, retry.submission))
-              }
-            >
-              Retry saved operation
-            </button>
-          )}
-        </div>
-      )}
-      {data.invalidView && (
-        <p role="alert">
-          This view uses a removed or changed property. Showing all rows in Grid. Open Views to repair it.
-        </p>
-      )}
-      {panel && !editable && <output>{readinessMessage}</output>}
-      {panel === "view" && (
-        <fieldset disabled={busy || !editable} style={{ border: 0, padding: 0, margin: 0 }}>
-          <ViewEditor
-            key={data.view?.id ?? "new"}
-            view={data.view}
-            columns={data.columns}
-            people={data.people ?? []}
-            enabledKinds={[
-              "grid",
-              ...(member.features?.tableBoard ? ["board" as const] : []),
-              ...(member.features?.tableCalendar ? ["calendar" as const] : []),
-            ]}
-            busy={busy || !editable}
-            save={async (payload) => {
-              const saved = await command("save_view", payload);
-              if (saved) setPanel(null);
-              return saved;
+        <div className="table-toolbar">
+          <select
+            aria-label="Saved table view"
+            value={viewId}
+            onChange={(event) => {
+              setViewId(event.target.value);
+              onViewChanged?.(event.target.value);
             }}
-            remove={() =>
-              data.view &&
-              void command("delete_view", { viewId: data.view.id }).then((saved) => {
-                if (saved) {
-                  setViewId("");
-                  onViewChanged?.("");
-                }
-              })
-            }
-          />
-        </fieldset>
-      )}
-      {panel === "properties" && (
-        <fieldset disabled={busy || !editable} style={{ border: 0, padding: 0, margin: 0 }}>
-          <PropertyEditor
-            columns={data.columns}
-            fixedColumnIds={taskList ? Object.values(taskColumns(page.id)) : []}
-            busy={busy || !editable}
-            command={command}
-          />
-        </fieldset>
-      )}
-      {!embedded && !queryBase && (member.features?.tableRelations || Boolean(data.relations?.definitions.length)) && (
-        <RelationPanel
-          data={data}
-          enabled={member.features?.tableRelations ?? false}
-          editable={editable && !busy}
-          command={command}
-        />
-      )}
-      {view?.kind === "board" && groupColumn ? (
-        <div className="table-board">
-          {[
-            { id: "", label: "Unassigned" },
-            ...groupColumn.options,
-            ...Object.keys(data.groupCounts)
-              .filter((groupId) => groupId && !groupColumn.options.some((option) => option.id === groupId))
-              .map((groupId) => ({ id: groupId, label: "Deleted option", deleted: true })),
-          ].map((group) => (
-            <section
-              className="table-board-group"
-              key={group.id}
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={(event) => drop(event, group.id)}
-            >
-              <h3>
-                {group.label} · {data.groupCounts[group.id] ?? 0}
-              </h3>
-              {data.rows.filter((row) => (row.cells[groupColumn.id] ?? "") === group.id).map(card)}
-              {editable &&
-                !("deleted" in group) &&
-                !(taskList && groupColumn.id === taskColumns(page.id).status && !group.id) && (
-                  <button disabled={busy} onClick={() => void add(group.id)}>
-                    Add in {group.label}
-                  </button>
-                )}
-            </section>
-          ))}
-        </div>
-      ) : view?.kind === "calendar" && groupColumn ? (
-        <>
-          <div className="table-calendar">
-            {Array.from({ length: new Date(`${month}-01T12:00:00`).getDay() }, (_, index) => (
-              <div key={`blank-${index}`} aria-hidden="true" />
+          >
+            <option value="">All rows · Grid</option>
+            {data.views.map((savedView) => (
+              <option key={savedView.id} value={savedView.id}>
+                {savedView.name}
+                {savedView.ownerId ? " · Personal" : ""}
+                {savedView.invalid ? " · Needs repair" : ""}
+              </option>
             ))}
-            {Array.from(
-              { length: new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0).getDate() },
-              (_, index) => `${month}-${String(index + 1).padStart(2, "0")}`,
-            ).map((date) => (
-              <section key={date} onDragOver={(event) => event.preventDefault()} onDrop={(event) => drop(event, date)}>
-                <h3>{date.slice(-2)}</h3>
-                {data.rows
-                  .filter(
-                    (row) =>
-                      calendarDay(row.cells[groupColumn.id], Intl.DateTimeFormat().resolvedOptions().timeZone) === date,
-                  )
-                  .map(card)}
-                {editable && (
-                  <button disabled={busy} onClick={() => void add(undefined, date)}>
-                    Add
-                  </button>
-                )}
+          </select>
+          <input
+            aria-label="Search table"
+            placeholder="Search rows"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          {view?.kind === "calendar" && (
+            <input
+              aria-label="Calendar month"
+              type="month"
+              value={month}
+              onChange={(event) => setMonth(event.target.value)}
+            />
+          )}
+          <span>{data.rowCount} rows</span>
+          {member.role !== "viewer" && data.canEdit !== false && (
+            <>
+              <button disabled={busy || !editable} onClick={() => setPanel(panel === "view" ? null : "view")}>
+                Views
+              </button>
+              <button
+                disabled={busy || !editable}
+                onClick={() => setPanel(panel === "properties" ? null : "properties")}
+              >
+                Properties
+              </button>
+            </>
+          )}
+          <button disabled={busy} onClick={() => void load()}>
+            Refresh
+          </button>
+        </div>
+        {recovery}
+        {notice && (
+          <div role="alert">
+            {notice.message}
+            <button
+              type="button"
+              onClick={() => {
+                dismissedNotice.current = Math.max(dismissedNotice.current, notice.sequence);
+                setMutationNotice((current) => (current === notice ? null : current));
+              }}
+            >
+              Dismiss notice
+            </button>
+          </div>
+        )}
+        {blocked && <output>{blocked}</output>}
+        {(error || retry) && (
+          <div role="alert">
+            {error || "The table update could not be confirmed. Review your pending edit or retry the saved operation."}
+            {retry && !editable && <p>{readinessMessage}</p>}
+            {retry && (
+              <button
+                disabled={busy || !editable}
+                onClick={() =>
+                  void (retry.kind === "command"
+                    ? send(retry.command, retry.submission, retry.form)
+                    : saveTask(retry.body, retry.rowId, retry.submission, retry.form))
+                }
+              >
+                Retry saved operation
+              </button>
+            )}
+          </div>
+        )}
+        {data.invalidView && (
+          <p role="alert">
+            This view uses a removed or changed property. Showing all rows in Grid. Open Views to repair it.
+          </p>
+        )}
+        {panel && !editable && <output>{readinessMessage}</output>}
+        {panel === "view" && (
+          <fieldset disabled={busy || !editable} style={{ border: 0, padding: 0, margin: 0 }}>
+            <ViewEditor
+              key={data.view?.id ?? "new"}
+              view={data.view}
+              columns={data.columns}
+              people={data.people ?? []}
+              enabledKinds={[
+                "grid",
+                ...(member.features?.tableBoard ? ["board" as const] : []),
+                ...(member.features?.tableCalendar ? ["calendar" as const] : []),
+              ]}
+              busy={busy || !editable}
+              save={async (payload) => {
+                const saved = await command("save_view", payload);
+                if (saved) acceptPanel(null);
+                return saved;
+              }}
+              remove={() =>
+                data.view &&
+                void command("delete_view", { viewId: data.view.id }).then((saved) => {
+                  if (saved) {
+                    setViewId("");
+                    onViewChanged?.("");
+                  }
+                })
+              }
+            />
+          </fieldset>
+        )}
+        {panel === "properties" && (
+          <fieldset disabled={busy || !editable} style={{ border: 0, padding: 0, margin: 0 }}>
+            <PropertyEditor
+              columns={data.columns}
+              fixedColumnIds={taskList ? Object.values(taskColumns(page.id)) : []}
+              busy={busy || !editable}
+              command={command}
+            />
+          </fieldset>
+        )}
+        {!embedded &&
+          !queryBase &&
+          (member.features?.tableRelations || Boolean(data.relations?.definitions.length)) && (
+            <RelationPanel
+              data={data}
+              enabled={member.features?.tableRelations ?? false}
+              editable={editable && !busy}
+              command={command}
+            />
+          )}
+        {view?.kind === "board" && groupColumn ? (
+          <div className="table-board">
+            {[
+              { id: "", label: "Unassigned" },
+              ...groupColumn.options,
+              ...Object.keys(data.groupCounts)
+                .filter((groupId) => groupId && !groupColumn.options.some((option) => option.id === groupId))
+                .map((groupId) => ({ id: groupId, label: "Deleted option", deleted: true })),
+            ].map((group) => (
+              <section
+                className="table-board-group"
+                key={group.id}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => drop(event, group.id)}
+              >
+                <h3>
+                  {group.label} · {data.groupCounts[group.id] ?? 0}
+                </h3>
+                {data.rows.filter((row) => (row.cells[groupColumn.id] ?? "") === group.id).map(card)}
+                {editable &&
+                  !("deleted" in group) &&
+                  !(taskList && groupColumn.id === taskColumns(page.id).status && !group.id) && (
+                    <button disabled={busy} onClick={() => void add(group.id)}>
+                      Add in {group.label}
+                    </button>
+                  )}
               </section>
             ))}
           </div>
-          <section
-            className="table-unscheduled"
-            onDragOver={(event) => event.preventDefault()}
-            onDrop={(event) => drop(event, null)}
-          >
-            <h3>Unscheduled</h3>
-            {data.rows.filter((row) => !row.cells[groupColumn.id]).map(card)}
-            {editable && (
-              <button disabled={busy} onClick={() => void add()}>
-                Add unscheduled
-              </button>
-            )}
-          </section>
-        </>
-      ) : (
-        <div className="table-grid-scroll">
-          <table>
-            <thead>
-              <tr>
-                {columns.map((column) => (
-                  <th key={column.id}>
-                    {column.name}
-                    <small>{column.type.replaceAll("_", " ")}</small>
-                  </th>
-                ))}
-                <th>Row</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.rows.map((row) => (
-                <tr key={row.id}>
-                  {columns.map((column) => (
-                    <td key={column.id}>
-                      <Cell
-                        column={column}
-                        row={row}
-                        people={data.people ?? []}
-                        taskAssignee={Boolean(taskList && column.id === taskColumns(page.id).assignee)}
-                        disabled={!editable || busy}
-                        drafts={drafts}
-                        canCommit={canCommit}
-                        onChange={submitCell(row, column)}
-                      />
-                    </td>
-                  ))}
-                  <td>
-                    {row.detailPageId ? (
-                      <button onClick={() => onSelectPage(row.detailPageId!)}>Open</button>
-                    ) : (
-                      editable && (
-                        <button disabled={busy} onClick={() => void command("delete_row", { rowId: row.id })}>
-                          Delete row
-                        </button>
-                      )
-                    )}
-                  </td>
-                </tr>
+        ) : view?.kind === "calendar" && groupColumn ? (
+          <>
+            <div className="table-calendar">
+              {Array.from({ length: new Date(`${month}-01T12:00:00`).getDay() }, (_, index) => (
+                <div key={`blank-${index}`} aria-hidden="true" />
               ))}
-            </tbody>
-            {Object.keys(data.calculations ?? {}).length > 0 && (
-              <tfoot>
+              {Array.from(
+                { length: new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0).getDate() },
+                (_, index) => `${month}-${String(index + 1).padStart(2, "0")}`,
+              ).map((date) => (
+                <section
+                  key={date}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => drop(event, date)}
+                >
+                  <h3>{date.slice(-2)}</h3>
+                  {data.rows
+                    .filter(
+                      (row) =>
+                        calendarDay(row.cells[groupColumn.id], Intl.DateTimeFormat().resolvedOptions().timeZone) ===
+                        date,
+                    )
+                    .map(card)}
+                  {editable && (
+                    <button disabled={busy} onClick={() => void add(undefined, date)}>
+                      Add
+                    </button>
+                  )}
+                </section>
+              ))}
+            </div>
+            <section
+              className="table-unscheduled"
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => drop(event, null)}
+            >
+              <h3>Unscheduled</h3>
+              {data.rows.filter((row) => !row.cells[groupColumn.id]).map(card)}
+              {editable && (
+                <button disabled={busy} onClick={() => void add()}>
+                  Add unscheduled
+                </button>
+              )}
+            </section>
+          </>
+        ) : (
+          <div className="table-grid-scroll">
+            <table>
+              <thead>
                 <tr>
                   {columns.map((column) => (
-                    <td key={column.id}>
-                      {data.calculations?.[column.id]
-                        ? `${data.calculations[column.id]!.kind.replaceAll("_", " ")}: ${data.calculations[column.id]!.value ?? "—"}`
-                        : ""}
-                    </td>
+                    <th key={column.id}>
+                      {column.name}
+                      <small>{column.type.replaceAll("_", " ")}</small>
+                    </th>
                   ))}
-                  <td>
-                    All {data.rowCount} matching rows · revision {data.revision}
-                  </td>
+                  <th>Row</th>
                 </tr>
-              </tfoot>
-            )}
-          </table>
-        </div>
-      )}
-      {(queryBase
-        ? linkedSnapshot?.queryIdentity === queryIdentity && linkedSnapshot.continuation
-        : data.nextCursor) && (
-        <button
-          disabled={busy}
-          onClick={() => {
-            if (!queryBase)
-              void load({
-                cursor: data.nextCursor!,
-                queryIdentity,
-                generation: data.generation,
-                revision: data.revision,
-                prefix: canonicalPrefix.current.id,
-              });
-            else if (linkedWindow.current?.queryIdentity === queryIdentity && linkedWindow.current.continuation)
-              void load(linkedWindow.current.continuation);
-          }}
-        >
-          Load more rows
-        </button>
-      )}
-      {editable && (
-        <form
-          className="table-toolbar"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void add();
-          }}
-        >
-          <input
-            aria-label="New row title"
-            placeholder="Add a row…"
-            value={newTitle}
-            onChange={(event) => setNewTitle(event.target.value)}
-          />
-          <button disabled={busy}>Add row</button>
-        </form>
-      )}
-    </section>
+              </thead>
+              <tbody>
+                {data.rows.map((row) => (
+                  <tr key={row.id}>
+                    {columns.map((column) => (
+                      <td key={column.id}>
+                        <Cell
+                          column={column}
+                          row={row}
+                          people={data.people ?? []}
+                          taskAssignee={Boolean(taskList && column.id === taskColumns(page.id).assignee)}
+                          disabled={!editable || busy}
+                          drafts={drafts}
+                          canCommit={canCommit}
+                          onChange={submitCell(row, column)}
+                        />
+                      </td>
+                    ))}
+                    <td>
+                      {row.detailPageId ? (
+                        <button onClick={() => onSelectPage(row.detailPageId!)}>Open</button>
+                      ) : (
+                        editable && (
+                          <button disabled={busy} onClick={() => void command("delete_row", { rowId: row.id })}>
+                            Delete row
+                          </button>
+                        )
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              {Object.keys(data.calculations ?? {}).length > 0 && (
+                <tfoot>
+                  <tr>
+                    {columns.map((column) => (
+                      <td key={column.id}>
+                        {data.calculations?.[column.id]
+                          ? `${data.calculations[column.id]!.kind.replaceAll("_", " ")}: ${data.calculations[column.id]!.value ?? "—"}`
+                          : ""}
+                      </td>
+                    ))}
+                    <td>
+                      All {data.rowCount} matching rows · revision {data.revision}
+                    </td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
+          </div>
+        )}
+        {(queryBase
+          ? linkedSnapshot?.queryIdentity === queryIdentity && linkedSnapshot.continuation
+          : data.nextCursor) && (
+          <button
+            disabled={busy}
+            onClick={() => {
+              if (!queryBase)
+                void load({
+                  cursor: data.nextCursor!,
+                  queryIdentity,
+                  generation: data.generation,
+                  revision: data.revision,
+                  prefix: canonicalPrefix.current.id,
+                });
+              else if (linkedWindow.current?.queryIdentity === queryIdentity && linkedWindow.current.continuation)
+                void load(linkedWindow.current.continuation);
+            }}
+          >
+            Load more rows
+          </button>
+        )}
+        {editable && (
+          <form
+            className="table-toolbar"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void add();
+            }}
+          >
+            <input
+              aria-label="New row title"
+              placeholder="Add a row…"
+              value={newTitle}
+              onChange={(event) => setNewTitle(event.target.value)}
+            />
+            <button disabled={busy}>Add row</button>
+          </form>
+        )}
+      </section>
+    </TableViewStateContext.Provider>
   );
 }
 
@@ -1415,7 +1571,7 @@ function ViewEditor({
   save: (payload: Record<string, unknown>) => Promise<boolean>;
   remove: () => void;
 }) {
-  const [editedDraft, setDraft] = useState<ReturnType<typeof viewDraft> | null>(null);
+  const [editedDraft, setDraft] = useTableViewState<ReturnType<typeof viewDraft> | null>("view:edited", null);
   const draft = editedDraft ?? viewDraft(view, columns);
   const updateDraft = (change: Partial<typeof draft>) => {
     setDraft((current) => ({ ...(current ?? viewDraft(view, columns)), ...change }));
@@ -1431,11 +1587,14 @@ function ViewEditor({
     visibleColumnIds: visible.filter((id) => columns.some((column) => column.id === id)),
     calculations,
   };
-  const [filterColumn, setFilterColumn] = useState(""),
-    [filterValue, setFilterValue] = useState(""),
-    [filterIds, setFilterIds] = useState<string[]>([]),
-    [filterOperator, setFilterOperator] = useState<Extract<TableFilter, { kind: "condition" }>["operator"]>("eq"),
-    [filterError, setFilterError] = useState("");
+  const [filterColumn, setFilterColumn] = useTableViewState("view:filter-column", ""),
+    [filterValue, setFilterValue] = useTableViewState("view:filter-value", ""),
+    [filterIds, setFilterIds] = useTableViewState<string[]>("view:filter-ids", []),
+    [filterOperator, setFilterOperator] = useTableViewState<Extract<TableFilter, { kind: "condition" }>["operator"]>(
+      "view:filter-operator",
+      "eq",
+    ),
+    [filterError, setFilterError] = useTableViewState("view:filter-error", "");
   const filterProperty = columns.find((column) => column.id === filterColumn),
     filterType = filterProperty?.type === "formula" ? filterProperty.config?.resultType : filterProperty?.type,
     collection = filterType === "person" || filterType === "multi_select",
@@ -1794,9 +1953,9 @@ function PropertyEditor({
   busy: boolean;
   command: (kind: TableCommand["kind"], payload: Record<string, unknown>, globalRevision?: boolean) => Promise<boolean>;
 }) {
-  const [name, setName] = useState(""),
-    [type, setType] = useState("text"),
-    [source, setSource] = useState("");
+  const [name, setName, acceptName] = useTableViewState("property:new-name", ""),
+    [type, setType] = useTableViewState("property:new-type", "text"),
+    [source, setSource, acceptSource] = useTableViewState("property:new-source", "");
   return (
     <section className="table-settings">
       <h3>Properties</h3>
@@ -1813,8 +1972,8 @@ function PropertyEditor({
           if (busy) return;
           void command("create_column", { name, type, ...(type === "formula" ? { source } : {}) }).then((saved) => {
             if (saved) {
-              setName("");
-              setSource("");
+              acceptName("");
+              acceptSource("");
             }
           });
         }}
@@ -1869,12 +2028,23 @@ function Property({
         new Map(columns.map((property) => [property.id, property.name])),
       )
     : String(column.config?.source ?? "");
-  const [editedName, setNameDraft] = useState<ReturnType<typeof propertyDraft> | null>(null),
-    [editedSource, setSourceDraft] = useState<ReturnType<typeof propertyDraft> | null>(null),
-    [option, setOption] = useState(""),
-    [clearInvalid, setClearInvalid] = useState(false);
-  if (editedName?.value === column.name) setNameDraft(null);
-  if (editedSource?.value === currentSource) setSourceDraft(null);
+  const [editedName, setNameDraft, acceptName] = useTableViewState<ReturnType<typeof propertyDraft> | null>(
+      `property:${column.id}:name`,
+      null,
+    ),
+    [editedSource, setSourceDraft, acceptSource] = useTableViewState<ReturnType<typeof propertyDraft> | null>(
+      `property:${column.id}:source`,
+      null,
+    ),
+    [option, setOption, acceptOption] = useTableViewState(`property:${column.id}:option`, ""),
+    [clearInvalid, setClearInvalid] = useTableViewState(
+      `property:${column.id}:clear-invalid:${column.conversion?.id ?? ""}`,
+      false,
+    );
+  useEffect(() => {
+    if (editedName?.value === column.name) acceptName(null);
+    if (editedSource?.value === currentSource) acceptSource(null);
+  }, [editedName, editedSource, column.name, currentSource, acceptName, acceptSource]);
   const nameDraft = editedName ?? propertyDraft(column.name, column.revision),
     sourceDraft = editedSource ?? propertyDraft(currentSource, column.revision);
   const conflict =
@@ -1909,7 +2079,7 @@ function Property({
               name: nameDraft.value,
               revision: nameDraft.revision,
             }).then((saved) => {
-              if (saved) setNameDraft(null);
+              if (saved) acceptName(null);
             });
         }}
       />
@@ -1943,7 +2113,7 @@ function Property({
                 revision: sourceDraft.revision,
                 source: sourceDraft.value,
               }).then((saved) => {
-                if (saved) setSourceDraft(null);
+                if (saved) acceptSource(null);
               })
             }
           >
@@ -2009,7 +2179,7 @@ function Property({
             disabled={busy || !option}
             onClick={() => {
               void command("add_option", { columnId: column.id, label: option }).then((saved) => {
-                if (saved) setOption("");
+                if (saved) acceptOption("");
               });
             }}
           >
