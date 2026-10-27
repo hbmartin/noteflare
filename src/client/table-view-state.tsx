@@ -1,8 +1,8 @@
 import { createContext, useCallback, useContext, useSyncExternalStore, type SetStateAction } from "react";
 
-type Snapshot<T> = { value: T };
+export type TableViewSnapshot<T> = { value: T };
 export function createTableViewCache() {
-  const views = new Map<string, ViewState>();
+  const views = new Map<string, TableViewState>();
   const lifetime = { active: true };
   return {
     activate: () => {
@@ -15,7 +15,7 @@ export function createTableViewCache() {
     view: (id: string) => {
       let view = views.get(id);
       if (!view) {
-        const values = new Map<string, Snapshot<unknown>>();
+        const values = new Map<string, TableViewSnapshot<unknown>>();
         view = {
           lifetime,
           values,
@@ -26,7 +26,7 @@ export function createTableViewCache() {
               snapshot = { value: typeof initial === "function" ? (initial as () => T)() : initial };
               values.set(key, snapshot);
             }
-            return snapshot as Snapshot<T>;
+            return snapshot as TableViewSnapshot<T>;
           },
         };
         views.set(id, view);
@@ -35,14 +35,14 @@ export function createTableViewCache() {
     },
   };
 }
-type ViewState = {
+export type TableViewState = {
   lifetime: { active: boolean };
-  values: Map<string, Snapshot<unknown>>;
-  snapshot: <T>(key: string, initial: T | (() => T)) => Snapshot<T>;
+  values: Map<string, TableViewSnapshot<unknown>>;
+  snapshot: <T>(key: string, initial: T | (() => T)) => TableViewSnapshot<T>;
   listeners: Map<string, Set<() => void>>;
 };
-export type TableViewSubmission = { state: ViewState; key: string; snapshot: Snapshot<unknown> };
-export function captureTableViewSubmission(state: ViewState, key: string): TableViewSubmission | undefined {
+export type TableViewSubmission = { state: TableViewState; key: string; snapshot: TableViewSnapshot<unknown> };
+export function captureTableViewSubmission(state: TableViewState, key: string): TableViewSubmission | undefined {
   const snapshot = state.values.get(key);
   return snapshot ? { state, key, snapshot } : undefined;
 }
@@ -53,9 +53,9 @@ export function acknowledgeTableViewSubmission(submission: TableViewSubmission |
   state.values.set(key, { value });
   for (const listener of state.listeners.get(key) ?? []) listener();
 }
-export const TableViewStateContext = createContext<ViewState | null>(null);
+export const TableViewStateContext = createContext<TableViewState | null>(null);
 /** View-local values survive presentation changes; acknowledgement belongs to the captured snapshot. */
-export function useTableViewState<T>(key: string, initial: T | (() => T), explicit?: ViewState) {
+export function useTableViewState<T>(key: string, initial: T | (() => T), explicit?: TableViewState) {
   const inherited = useContext(TableViewStateContext);
   const state = explicit ?? inherited;
   if (!state) throw new Error("Missing table view state.");
