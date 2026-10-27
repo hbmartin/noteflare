@@ -19,6 +19,7 @@ export function tableConnection(options: {
   url: string;
   query: () => Promise<TableQueryResult | null>;
   ready: (value: boolean) => void;
+  invalidate?: () => void;
   verified?: (generation: number) => void;
 }) {
   let active: Slot | null = null,
@@ -160,7 +161,10 @@ export function tableConnection(options: {
               : null;
         }
         void verify(slot);
-      } else if (message?.type === "table-changed" && active === slot) void verify(slot);
+      } else if (message?.type === "table-changed" && active === slot) {
+        if (options.invalidate) options.invalidate();
+        else void verify(slot);
+      }
     });
     slot.socket.addEventListener("close", (event) => {
       clearTimeout(handshake);

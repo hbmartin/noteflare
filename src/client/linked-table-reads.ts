@@ -2,7 +2,15 @@ import { jitteredBackoff } from "../shared/retry";
 
 export type LinkedTableContinuation = { queryIdentity: string; generation: number; target: number };
 export type LinkedTableReadIntent = { kind: "refresh" } | ({ kind: "append" } & LinkedTableContinuation);
-export type TableReadIntent = LinkedTableReadIntent | { kind: "page"; cursor: string };
+export type CanonicalTableContinuation = {
+  cursor: string;
+  queryIdentity: string;
+  generation: number;
+  revision: number;
+  prefix: number;
+};
+export type TableReadIntent = LinkedTableReadIntent | ({ kind: "page" } & CanonicalTableContinuation);
+export type TableReadContext = { current: () => boolean };
 export type LinkedTableReadOutcome<T> =
   | { state: "success"; value: T; verification: "network" | "buffer" }
   | { state: "failure" | "denied" | "suspended" | "superseded" };
@@ -17,18 +25,19 @@ const intentKey = (intent: TableReadIntent) =>
   intent.kind === "refresh"
     ? "refresh"
     : intent.kind === "page"
-      ? `page:${intent.cursor}`
+      ? JSON.stringify(["page", intent.queryIdentity, intent.generation, intent.revision, intent.prefix, intent.cursor])
       : JSON.stringify([intent.queryIdentity, intent.generation, intent.target]);
 /** One active logical read. Retry ownership and deadlines belong to each intent. */
 export function linkedTableReads<T>(options: {
-  read: (intent: TableReadIntent, signal: AbortSignal) => Promise<LinkedTableReadOutcome<T>>;
+  read: (intent: TableReadIntent, signal: AbortSignal, context: TableReadContext) => Promise<LinkedTableReadOutcome<T>>;
   unavailable: (reason: "failure" | "suspended") => void;
   poll?: boolean;
 }) {
   options.unavailable("failure");
   let stopped = false,
     refreshAhead = false,
-    denialAttempt = 0;
+    denialAttempt = 0,
+    invalidation = 0;
   let active: { batch: Batch<T>; controller: AbortController } | undefined;
   const queued = new Map<string, Batch<T>>();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -94,9 +103,16 @@ export function linkedTableReads<T>(options: {
       retryAt: 0,
       manual: false,
     };
+    const trailing = queued.get("refresh");
+    // Only the same refresh chain contributes history, never a failed continuation.
+    recovery.attempt = Math.max(
+      denialAttempt,
+      recovery.intent.kind === "refresh" ? recovery.attempt : 0,
+      trailing?.attempt ?? 0,
+    );
     recovery.intent = { kind: "refresh" };
-    recovery.attempt = denialAttempt;
     recovery.manual = false;
+    if (trailing) trailing.manual = false;
     scheduleFailure(recovery);
     denialAttempt = recovery.attempt;
   }
@@ -106,13 +122,30 @@ export function linkedTableReads<T>(options: {
     active = owner;
     clear();
     let outcome: LinkedTableReadOutcome<T>;
+    const sequence = invalidation;
     try {
-      outcome = await options.read(batch.intent, owner.controller.signal);
+      outcome = await options.read(batch.intent, owner.controller.signal, {
+        current: () => active === owner && sequence === invalidation && !stopped,
+      });
     } catch {
       outcome = { state: available() ? "failure" : "suspended" };
     }
     if (active !== owner || stopped) return;
     active = undefined;
+    if (outcome.state === "success" && sequence !== invalidation) {
+      // The older snapshot may remain cached, but its verification callers need the trailing read.
+      const trailing: Batch<T> = queued.get("refresh") ?? {
+        intent: { kind: "refresh" } as const,
+        resolve: [],
+        attempt: 0,
+        retryAt: 0,
+        manual: false,
+      };
+      trailing.resolve.push(...batch.resolve.splice(0));
+      queued.set("refresh", trailing);
+      next();
+      return;
+    }
     const value = outcome.state === "success" ? outcome.value : null;
     if (outcome.state === "failure" || outcome.state === "denied") {
       options.unavailable("failure");
@@ -174,8 +207,9 @@ export function linkedTableReads<T>(options: {
   const recoverDenied = () => {
     if (stopped) return;
     clear();
+    const refresh = active?.batch.intent.kind === "refresh" ? active.batch : undefined;
     abortActive();
-    scheduleDenied();
+    scheduleDenied(refresh);
     schedule();
   };
   window.addEventListener("online", wake);
@@ -184,9 +218,19 @@ export function linkedTableReads<T>(options: {
   return {
     request: (continuation?: LinkedTableContinuation) =>
       requestIntent(continuation ? { kind: "append", ...continuation } : { kind: "refresh" }),
-    page: (cursor: string) => requestIntent({ kind: "page", cursor }),
+    page: (continuation: CanonicalTableContinuation) => requestIntent({ kind: "page", ...continuation }),
+    retirePages: () => {
+      for (const [name, batch] of queued) {
+        if (batch.intent.kind !== "page") continue;
+        queued.delete(name);
+        for (const resolve of batch.resolve.splice(0)) resolve(null);
+      }
+    },
     verify: () => requestIntent({ kind: "refresh" }, false, true),
-    invalidate: () => requestIntent({ kind: "refresh" }, false),
+    invalidate: () => {
+      invalidation++;
+      return requestIntent({ kind: "refresh" }, false);
+    },
     reset,
     recoverDenied,
     dispose: () => {

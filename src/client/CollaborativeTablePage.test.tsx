@@ -1351,3 +1351,53 @@ it("retains task conflict feedback across later successful background verificati
   await waitFor(() => expect(attempts).toBe(2));
   await waitFor(() => expect(screen.queryByText(message)).not.toBeInTheDocument());
 });
+
+it("retires a failed canonical cursor when refresh replaces its loaded prefix", async () => {
+  const rows = Array.from({ length: 350 }, (_, index) => ({
+    ...data.rows[0]!,
+    id: `row-${index}`,
+    cells: { Title: `Row ${index}` },
+  }));
+  data = { ...data, columns: [column("Title", "text")], rows, rowCount: rows.length };
+  const offsets: number[] = [];
+  let fail = true;
+  vi.mocked(api).mockImplementation(async (path) => {
+    const params = new URL(path, "https://test").searchParams;
+    const offset = Number(params.get("cursor") ?? 0);
+    offsets.push(offset);
+    if (offset === 200 && fail) {
+      fail = false;
+      throw new ApiClientError(503, "temporary", "Page failed");
+    }
+    return {
+      ...data,
+      rows: rows.slice(offset, offset + 100),
+      nextCursor: offset + 100 < rows.length ? String(offset + 100) : null,
+    };
+  });
+  render(<CollaborativeTablePage page={{ id: "table", title: "Table" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(100));
+  fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(200));
+  vi.useFakeTimers();
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+  });
+  expect(screen.getByText("Page failed")).toBeVisible();
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  });
+  expect(screen.getAllByLabelText("Title")).toHaveLength(100);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2000);
+  });
+  expect(screen.getAllByLabelText("Title")).toHaveLength(100);
+  expect(offsets.filter((offset) => offset === 200)).toHaveLength(1);
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+  });
+  expect(screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value)).toEqual(
+    rows.slice(0, 200).map((row) => row.cells.Title),
+  );
+  expect(offsets.at(-1)).toBe(100);
+});
