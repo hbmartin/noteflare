@@ -1550,3 +1550,42 @@ it.each([false, true])(
     expect(writes).toHaveLength(0);
   },
 );
+
+it.each(["view", "property"] as const)(
+  "retains the original %s revision after leaving and returning to a view",
+  async (kind) => {
+    show("grid");
+    const selected = await screen.findByLabelText("Saved table view");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: kind === "view" ? "Views" : "Properties" }));
+    fireEvent.change(screen.getByLabelText(kind === "view" ? "View name" : "Name for Title"), {
+      target: { value: "Unsubmitted settings" },
+    });
+    fireEvent.change(selected, { target: { value: "" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    if (kind === "view")
+      data.views = data.views.map((view) =>
+        view.id === "grid" ? { ...view, name: "Remote grid", revision: 2 } : view,
+      );
+    else
+      data.columns = data.columns.map((item) =>
+        item.id === "Title" ? { ...item, name: "Remote title", revision: 2 } : item,
+      );
+    fireEvent.change(selected, { target: { value: "grid" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    const input = screen.getByLabelText(kind === "view" ? "View name" : "Name for Remote title");
+    expect(input).toHaveValue("Unsubmitted settings");
+    expect(screen.getByText("These settings changed while you were editing.")).toBeVisible();
+    if (kind === "view") fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    else fireEvent.blur(input);
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]!.payload).toMatchObject({ revision: 1, name: "Unsubmitted settings" });
+    await screen.findByText("The table changed. Review the latest value before saving again.");
+    expect(input).toHaveValue("Unsubmitted settings");
+    expect(
+      kind === "view"
+        ? data.views.find((view) => view.id === "grid")!.name
+        : data.columns.find((item) => item.id === "Title")!.name,
+    ).toBe(kind === "view" ? "Remote grid" : "Remote title");
+  },
+);
