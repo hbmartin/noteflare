@@ -108,7 +108,7 @@ it.each(["clear", "purge"])("accepts a new cross-tab operation after an empty %s
       new StorageEvent("storage", { storageArea: localStorage, key: name, newValue: JSON.stringify(next) }),
     );
     expect(update).toHaveBeenCalledOnce();
-    expect(readCommentDraft(isolated, "new")).toEqual(next);
+    expect(readCommentDraft(isolated, "new")).toEqual({ ...next, storageFailed: false });
     // An older completion must not discard the operation accepted from the other tab.
     clearCommentDraft(isolated, "new", "older-operation");
     expect(JSON.parse(localStorage.getItem(name)!)).toEqual(next);
@@ -203,12 +203,15 @@ it("does not persist runtime failure state when a failed draft rotates successfu
   window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: null, storageArea: localStorage }));
   expect(readCommentDraft(isolated, "new")).toBeNull();
 });
-it("ignores legacy failure metadata in verified stored drafts and accepts later removal", () => {
-  const isolated = { ...scope, account: crypto.randomUUID() };
-  const name = `notes:comment-draft:${JSON.stringify([isolated.account, isolated.pageId, isolated.epoch, "new"])}`;
-  localStorage.setItem(name, JSON.stringify({ body: body("Legacy"), operationId: "legacy", storageFailed: true }));
-  expect(readCommentDraft(isolated, "new")!.storageFailed).toBe(false);
-  localStorage.removeItem(name);
-  window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: null, storageArea: localStorage }));
-  expect(readCommentDraft(isolated, "new")).toBeNull();
-});
+it.each([undefined, false, true])(
+  "normalizes stored failure metadata %s and accepts later removal",
+  (storageFailed) => {
+    const isolated = { ...scope, account: crypto.randomUUID() };
+    const name = `notes:comment-draft:${JSON.stringify([isolated.account, isolated.pageId, isolated.epoch, "new"])}`;
+    localStorage.setItem(name, JSON.stringify({ body: body("Legacy"), operationId: "legacy", storageFailed }));
+    expect(readCommentDraft(isolated, "new")!.storageFailed).toBe(false);
+    localStorage.removeItem(name);
+    window.dispatchEvent(new StorageEvent("storage", { key: name, newValue: null, storageArea: localStorage }));
+    expect(readCommentDraft(isolated, "new")).toBeNull();
+  },
+);

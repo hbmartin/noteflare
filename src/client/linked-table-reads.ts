@@ -1,14 +1,16 @@
 import { jitteredBackoff } from "../shared/retry";
 
-export type LinkedTableReadIntent = { kind: "refresh" } | { kind: "append"; cursor: string };
+export type LinkedTableContinuation = { queryIdentity: string; generation: number; target: number };
+export type LinkedTableReadIntent = { kind: "refresh" } | ({ kind: "append" } & LinkedTableContinuation);
 type Batch<T> = {
   intent: LinkedTableReadIntent;
   resolve: Array<(value: T | null) => void>;
   attempt: number;
   retryAt: number;
+  manual: boolean;
 };
 const intentKey = (intent: LinkedTableReadIntent) =>
-  intent.kind === "refresh" ? "refresh" : `append:${intent.cursor}`;
+  intent.kind === "refresh" ? "refresh" : JSON.stringify([intent.queryIdentity, intent.generation, intent.target]);
 /** One active logical read. Retry ownership and deadlines belong to each intent. */
 export function linkedTableReads<T>(options: {
   read: (intent: LinkedTableReadIntent, signal: AbortSignal) => Promise<T | null>;
@@ -46,6 +48,7 @@ export function linkedTableReads<T>(options: {
     void run(batch);
   }
   async function run(batch: Batch<T>) {
+    batch.manual = false;
     const owner = { batch, controller: new AbortController() };
     active = owner;
     clear();
@@ -62,8 +65,10 @@ export function linkedTableReads<T>(options: {
       batch.retryAt = Date.now() + jitteredBackoff(batch.attempt++, 2000, 30_000);
       const name = intentKey(batch.intent),
         trailing = queued.get(name);
-      if (trailing) trailing.attempt = Math.max(trailing.attempt, batch.attempt);
-      else queued.set(name, batch);
+      if (trailing) {
+        trailing.attempt = Math.max(trailing.attempt, batch.attempt);
+        if (!trailing.manual) trailing.retryAt = Math.max(trailing.retryAt, batch.retryAt);
+      } else queued.set(name, batch);
     }
     const waiting = batch.resolve.splice(0);
     for (const resolve of waiting) resolve(value);
@@ -74,8 +79,11 @@ export function linkedTableReads<T>(options: {
     const name = intentKey(intent);
     if (intent.kind === "append" && active && intentKey(active.batch.intent) === name)
       return new Promise((resolve) => active!.batch.resolve.push(resolve));
-    const batch = queued.get(name) ?? { intent, resolve: [], attempt: 0, retryAt: 0 };
-    if (manual) batch.retryAt = 0;
+    const batch = queued.get(name) ?? { intent, resolve: [], attempt: 0, retryAt: 0, manual: false };
+    if (manual) {
+      batch.retryAt = 0;
+      batch.manual = true;
+    }
     queued.set(name, batch);
     if (!available()) return Promise.resolve(null);
     return new Promise((resolve) => {
@@ -113,7 +121,8 @@ export function linkedTableReads<T>(options: {
   window.addEventListener("offline", wake);
   document.addEventListener("visibilitychange", wake);
   return {
-    request: (cursor?: string) => requestIntent(cursor ? { kind: "append", cursor } : { kind: "refresh" }),
+    request: (continuation?: LinkedTableContinuation) =>
+      requestIntent(continuation ? { kind: "append", ...continuation } : { kind: "refresh" }),
     invalidate: () => requestIntent({ kind: "refresh" }, false),
     reset,
     dispose: () => {

@@ -28,10 +28,11 @@ import {
   cellDraftKey as draftKey,
   useMissingCellDraftRowIds,
   useCellDraft,
+  type CellDraft,
   type StoredCellDraft,
 } from "./cell-drafts";
 import { CellDraftRecovery } from "./CellDraftRecovery";
-import { linkedTableReads, type LinkedTableReadIntent } from "./linked-table-reads";
+import { linkedTableReads, type LinkedTableContinuation, type LinkedTableReadIntent } from "./linked-table-reads";
 import { readLinkedTable, type LinkedTableWindow } from "./linked-table-query";
 import { tableConnection } from "./table-connection";
 import { useRealtimeAccessAccount } from "./realtime-access-status";
@@ -47,8 +48,28 @@ export type CollaborativeTableProps = {
   embedded?: boolean;
 };
 type TaskSaveResult = { state: "saved" } | { state: "rejected"; code?: string } | { state: "uncertain" };
-type SavedRetry = { run: () => Promise<unknown>; submission?: TaskDraftSubmission; message: string };
-type TaskDraftSubmission = { map: CellDraftMap; key: string; version: string | undefined; operationId: string };
+type SavedRetry = { run: () => Promise<unknown>; submission?: CellDraftSubmission; message: string };
+type CellDraftSubmission = {
+  kind: "draft";
+  map: CellDraftMap;
+  key: string;
+  version: string;
+  operationId: string;
+  submissionRevision?: number;
+};
+type CellSaveContext = CellDraftSubmission | { kind: "independent"; operationId: string };
+function captureSubmission(map: CellDraftMap, key: string, draft?: CellDraft): CellDraftSubmission | undefined {
+  return draft?.changed && draft.version && draft.operationId
+    ? {
+        kind: "draft",
+        map,
+        key,
+        version: draft.version,
+        operationId: draft.operationId,
+        submissionRevision: draft.submissionRevision,
+      }
+    : undefined;
+}
 
 /** Shared host/source renderer. A linked host uses its permission-checking endpoint for every read/write. */
 export function CollaborativeTablePage({
@@ -73,7 +94,18 @@ export function CollaborativeTablePage({
   const [authorizedGeneration, setAuthorizedGeneration] = useState<number | null>(null);
   const [data, setData] = useState<TableQueryResult | null>(null);
   const linkedWindow = useRef<LinkedTableWindow | null>(null);
-  const [linkedHasMore, setLinkedHasMore] = useState(false);
+  const [linkedSnapshot, setLinkedSnapshot] = useState<LinkedTableWindow | null>(null);
+  const verificationGeneration = useRef(0);
+  const linkedReads = useRef<ReturnType<typeof linkedTableReads<TableQueryResult>> | null>(null);
+  const publishLinkedWindow = useCallback((value: LinkedTableWindow | null) => {
+    linkedWindow.current = value;
+    setLinkedSnapshot(value);
+  }, []);
+  const invalidateVerification = useCallback(() => {
+    verificationGeneration.current++;
+    if (linkedWindow.current) linkedWindow.current.verified = false;
+    writeReady.current = false;
+  }, []);
   const account = `${member.user.id}\0${member.workspace?.id ?? "workspace"}`;
   const incarnation = useRealtimeAccessAccount();
   const host = queryBase ?? page.id;
@@ -121,17 +153,15 @@ export function CollaborativeTablePage({
   const [viewId, setViewId] = useState(initialViewId ?? "");
   const [query, setQuery] = useState("");
   const [month, setMonth] = useState(() => new Date().toISOString().slice(0, 7));
+  const queryIdentity = JSON.stringify([base, viewId, query, month]);
+  const queryOwner = useRef({ queryIdentity, account, incarnation });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [retry, setRetry] = useState<SavedRetry | null>(null);
   const [panel, setPanel] = useState<"view" | "properties" | null>(null);
   const [newTitle, setNewTitle] = useState("");
   const epoch = useRef(0),
-    dataRef = useRef(data),
     active = useRef(true);
-  useEffect(() => {
-    dataRef.current = data;
-  }, [data]);
   const editable = Boolean(
     online &&
     !taskRefreshRequired &&
@@ -142,7 +172,7 @@ export function CollaborativeTablePage({
   );
   useLayoutEffect(() => {
     writeReady.current = Boolean(editable);
-  }, [editable]);
+  });
   const canCommit = useCallback(
     () =>
       writeReady.current &&
@@ -154,16 +184,21 @@ export function CollaborativeTablePage({
   );
   const taskList = Boolean(page.taskList || data?.taskList);
   const tasksPath = queryBase ? `${queryBase}/tasks` : `/api/task-lists/${page.id}/tasks`;
-  const discardDenied = useCallback((cause: unknown) => {
-    if (!(cause instanceof ApiClientError) || ![401, 403, 404].includes(cause.status)) return false;
-    writeReady.current = false;
-    setConnectionReady(false);
-    setData(null);
-    dataRef.current = null;
-    setRetry(null);
-    setPanel(null);
-    return true;
-  }, []);
+  const discardDenied = useCallback(
+    (cause: unknown) => {
+      if (!(cause instanceof ApiClientError) || ![401, 403, 404].includes(cause.status)) return false;
+      invalidateVerification();
+      epoch.current++;
+      publishLinkedWindow(null);
+      linkedReads.current?.reset();
+      setConnectionReady(false);
+      setData(null);
+      setRetry(null);
+      setPanel(null);
+      return true;
+    },
+    [invalidateVerification, publishLinkedWindow],
+  );
   const fetchTable = useCallback(
     async function fetchTable(
       cursor?: string,
@@ -171,7 +206,7 @@ export function CollaborativeTablePage({
       intent?: LinkedTableReadIntent,
     ): Promise<TableQueryResult | null> {
       const owner = ++epoch.current;
-      const queryIdentity = JSON.stringify([base, viewId, query, month]);
+      const verification = verificationGeneration.current;
       const params = new URLSearchParams({ limit: "100" });
       if (viewId) params.set("viewId", viewId);
       if (query) params.set("q", query);
@@ -190,36 +225,38 @@ export function CollaborativeTablePage({
             signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
           });
         };
-        const window = queryBase
+        const linked = queryBase
           ? await readLinkedTable(intent ?? { kind: "refresh" }, linkedWindow.current, readPage, signal, queryIdentity)
           : null;
-        const result = window ? window.data : await readPage(cursor);
+        const result = linked ? linked.window.data : await readPage(cursor);
         if (!active.current || signal?.aborted) return null;
         // Superseded view data must not replace newer rows, but the fresh
         // authorization result still belongs to its live connection attempt.
         if (owner !== epoch.current) return queryBase ? null : result;
-        dataRef.current = result;
-        if (window) {
-          window.verified = navigator.onLine && !document.hidden;
-          linkedWindow.current = window;
-          setLinkedHasMore(window.hasMore);
+        if (queryBase && verification !== verificationGeneration.current) return null;
+        const fresh = !linked || linked.verification === "network";
+        if (linked) {
+          linked.window.verified =
+            navigator.onLine && !document.hidden && (fresh || linkedWindow.current?.verified === true);
+          publishLinkedWindow(linked.window);
         }
-        taskRefreshRequiredRef.current = false;
-        setTaskRefreshRequired(false);
+        if (fresh) {
+          taskRefreshRequiredRef.current = false;
+          setTaskRefreshRequired(false);
+        }
         setData((current) =>
           !queryBase && cursor && current?.revision === result.revision
             ? { ...result, rows: [...current.rows, ...result.rows] }
             : result,
         );
-        setError("");
-        if (queryBase && navigator.onLine && !document.hidden) setConnectionReady(true);
+        if (fresh) setError("");
+        if (queryBase && fresh && navigator.onLine && !document.hidden) setConnectionReady(true);
         return result;
       } catch (cause) {
         if (signal?.aborted) return null;
         if (owner === epoch.current && active.current) {
           if (queryBase) {
-            if (linkedWindow.current) linkedWindow.current.verified = false;
-            writeReady.current = false;
+            invalidateVerification();
             setConnectionReady(false);
           }
           if (discardDenied(cause)) {
@@ -233,44 +270,65 @@ export function CollaborativeTablePage({
       }
       return null;
     },
-    [base, viewId, query, month, discardDenied, queryBase],
+    [base, viewId, query, month, queryIdentity, discardDenied, queryBase, invalidateVerification, publishLinkedWindow],
   );
   const fetchRef = useRef(fetchTable);
   useLayoutEffect(() => {
     fetchRef.current = fetchTable;
   }, [fetchTable]);
-  const linkedReads = useRef<ReturnType<typeof linkedTableReads<TableQueryResult>> | null>(null);
+  useLayoutEffect(() => {
+    if (!queryBase) return;
+    const previous = queryOwner.current;
+    if (
+      previous.queryIdentity === queryIdentity &&
+      previous.account === account &&
+      previous.incarnation === incarnation
+    )
+      return;
+    queryOwner.current = { queryIdentity, account, incarnation };
+    epoch.current++;
+    invalidateVerification();
+    publishLinkedWindow(null);
+    setConnectionReady(false);
+    linkedReads.current?.reset();
+  }, [queryIdentity, queryBase, account, incarnation, invalidateVerification, publishLinkedWindow]);
   useLayoutEffect(() => {
     if (!queryBase || !page.id || (incarnation && incarnation.key !== account)) return undefined;
     writeReady.current = false;
     const reads = linkedTableReads({
       read: (intent, signal) => fetchRef.current(undefined, signal, intent),
       unavailable: () => {
-        if (linkedWindow.current) linkedWindow.current.verified = false;
-        writeReady.current = false;
+        invalidateVerification();
         setConnectionReady(false);
       },
     });
     linkedReads.current = reads;
+    const permit = () => linkedWindow.current?.verified === true;
+    connectionPermit.current = permit;
     return () => {
+      if (connectionPermit.current === permit) connectionPermit.current = () => false;
       linkedReads.current = null;
-      linkedWindow.current = null;
+      invalidateVerification();
+      publishLinkedWindow(null);
       reads.dispose();
     };
-  }, [queryBase, page.id, account, incarnation]);
+  }, [queryBase, page.id, account, incarnation, invalidateVerification, publishLinkedWindow]);
   const load = useCallback(
-    (cursor?: string) =>
-      queryBase ? (linkedReads.current?.request(cursor) ?? Promise.resolve(null)) : fetchTable(cursor),
+    (continuation?: string | LinkedTableContinuation) =>
+      queryBase
+        ? (linkedReads.current?.request(typeof continuation === "object" ? continuation : undefined) ??
+          Promise.resolve(null))
+        : fetchTable(typeof continuation === "string" ? continuation : undefined),
     [queryBase, fetchTable],
   );
   useEffect(() => {
     const offline = () => {
-      writeReady.current = false;
+      invalidateVerification();
       setConnectionReady(false);
     };
     window.addEventListener("offline", offline);
     return () => window.removeEventListener("offline", offline);
-  }, []);
+  }, [invalidateVerification]);
   useEffect(() => {
     if (!retry?.submission) return undefined;
     const { map, key, version, operationId } = retry.submission;
@@ -287,14 +345,13 @@ export function CollaborativeTablePage({
   useEffect(() => {
     if (incarnation && incarnation.key !== account) return undefined;
     active.current = true;
-    if (queryBase) linkedReads.current?.reset();
     void Promise.resolve().then(() => load());
     const requestEpoch = epoch;
     return () => {
       active.current = false;
       requestEpoch.current++;
     };
-  }, [load, account, incarnation, queryBase]);
+  }, [load, account, incarnation]);
   const loadRef = useRef(load);
   useLayoutEffect(() => {
     loadRef.current = load;
@@ -316,7 +373,7 @@ export function CollaborativeTablePage({
     });
     connectionPermit.current = connection.authorized;
     return () => {
-      connectionPermit.current = () => false;
+      if (connectionPermit.current === connection.authorized) connectionPermit.current = () => false;
       connection();
     };
   }, [page.id, queryBase, account, incarnation]);
@@ -328,7 +385,7 @@ export function CollaborativeTablePage({
     window.addEventListener("notes:workspace-event", invalidate);
     return () => window.removeEventListener("notes:workspace-event", invalidate);
   }, [load, queryBase]);
-  const send = async (command: TableCommand, submission?: TaskDraftSubmission) => {
+  const send = async (command: TableCommand, submission?: CellDraftSubmission) => {
     if (
       submission &&
       (!submission.map.current(submission.key, submission.version) ||
@@ -362,8 +419,12 @@ export function CollaborativeTablePage({
           message: apiErrorMessage(cause, "The table update could not be saved."),
         });
       else if (cause.status === 409) {
-        await load();
-        setError("The table changed. Review the latest value before saving again.");
+        if (queryBase) {
+          invalidateVerification();
+          setConnectionReady(false);
+        }
+        const refreshed = await load();
+        if (refreshed) setError("The table changed. Review the latest value before saving again.");
       }
       return false;
     } finally {
@@ -381,7 +442,7 @@ export function CollaborativeTablePage({
   const saveTask = async (
     body: Record<string, unknown>,
     rowId?: string,
-    submission?: TaskDraftSubmission,
+    submission?: CellDraftSubmission,
   ): Promise<TaskSaveResult> => {
     if (
       submission &&
@@ -423,6 +484,8 @@ export function CollaborativeTablePage({
             submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
           taskRefreshRequiredRef.current = true;
           setTaskRefreshRequired(true);
+          invalidateVerification();
+          if (queryBase) setConnectionReady(false);
         }
         const refreshed = await load();
         if (refreshed && !taskRefreshRequiredRef.current)
@@ -439,10 +502,10 @@ export function CollaborativeTablePage({
     column: CollaborativeColumn,
     value: TableValue,
     baseRevision?: number,
-    operationId?: string,
-    submissionRevision?: number,
+    context: CellSaveContext = { kind: "independent", operationId: crypto.randomUUID() },
   ) => {
     if (!canCommit()) return false;
+    const submission = context.kind === "draft" ? context : undefined;
     if (taskList) {
       const columns = taskColumns(page.id),
         field = Object.entries(columns).find(([, id]) => id === column.id)?.[0];
@@ -453,13 +516,10 @@ export function CollaborativeTablePage({
         due: "dueDate",
       };
       if (field) {
-        const op = operationId ?? crypto.randomUUID();
-        const key = draftKey(row.id, column.id),
-          submitted = drafts.get(key);
         const result = await saveTask(
           {
-            operationId: op,
-            expectedRevision: submissionRevision ?? data?.revision,
+            operationId: context.operationId,
+            expectedRevision: submission?.submissionRevision ?? data?.revision,
             [String(fields[field])]:
               field === "status" && typeof value === "string"
                 ? value.slice(page.id.length + 1)
@@ -468,16 +528,14 @@ export function CollaborativeTablePage({
                   : value,
           },
           row.id,
-          operationId ? { map: drafts, key, version: submitted?.version, operationId: op } : undefined,
+          submission,
         );
         return result.state === "saved";
       }
     }
-    const key = draftKey(row.id, column.id),
-      submitted = drafts.get(key);
     return send(
       {
-        operationId: operationId ?? crypto.randomUUID(),
+        operationId: context.operationId,
         kind: "update_cells",
         payload: {
           rowId: row.id,
@@ -485,7 +543,7 @@ export function CollaborativeTablePage({
           expectedCellRevisions: { [column.id]: baseRevision ?? row.cellRevisions[column.id] ?? 0 },
         },
       },
-      submitted?.changed && operationId ? { map: drafts, key, version: submitted.version, operationId } : undefined,
+      submission,
     );
   };
   const add = async (groupId?: string, date?: string) => {
@@ -556,17 +614,11 @@ export function CollaborativeTablePage({
         if (drafts.get(key)?.version !== draft.version) return false;
         if (reviewed) drafts.set(key, { ...draft, baseRevision: row.cellRevisions[column.id] ?? 0 });
         const pending = drafts.submission(key, data.revision);
-        if (!pending) return false;
+        const submission = captureSubmission(drafts, key, pending);
+        if (!pending || !submission) return false;
         const value =
           column.type === "number" ? (pending.text === "" ? null : Number(pending.text)) : pending.text || null;
-        const saved = await changeCell(
-          row,
-          column,
-          value,
-          pending.baseRevision,
-          pending.operationId,
-          pending.submissionRevision,
-        );
+        const saved = await changeCell(row, column, value, pending.baseRevision, submission);
         return saved;
       }}
     />
@@ -615,9 +667,10 @@ export function CollaborativeTablePage({
               drafts={drafts}
               canCommit={canCommit}
               onChange={(value, revision, version) => {
-                const pending = drafts.submission(draftKey(row.id, column.id), data.revision, version);
-                if (version && !pending) return Promise.resolve(false);
-                return changeCell(row, column, value, revision, pending?.operationId, pending?.submissionRevision);
+                const key = draftKey(row.id, column.id);
+                const submission = captureSubmission(drafts, key, drafts.submission(key, data.revision, version));
+                if (version && !submission) return Promise.resolve(false);
+                return changeCell(row, column, value, revision, submission);
               }}
             />
           </label>
@@ -854,16 +907,14 @@ export function CollaborativeTablePage({
                         drafts={drafts}
                         canCommit={canCommit}
                         onChange={(value, revision, version) => {
-                          const pending = drafts.submission(draftKey(row.id, column.id), data.revision, version);
-                          if (version && !pending) return Promise.resolve(false);
-                          return changeCell(
-                            row,
-                            column,
-                            value,
-                            revision,
-                            pending?.operationId,
-                            pending?.submissionRevision,
+                          const key = draftKey(row.id, column.id);
+                          const submission = captureSubmission(
+                            drafts,
+                            key,
+                            drafts.submission(key, data.revision, version),
                           );
+                          if (version && !submission) return Promise.resolve(false);
+                          return changeCell(row, column, value, revision, submission);
                         }}
                       />
                     </td>
@@ -901,10 +952,16 @@ export function CollaborativeTablePage({
           </table>
         </div>
       )}
-      {(queryBase ? linkedHasMore : data.nextCursor) && (
+      {(queryBase
+        ? linkedSnapshot?.queryIdentity === queryIdentity && linkedSnapshot.continuation
+        : data.nextCursor) && (
         <button
           disabled={busy}
-          onClick={() => void load(queryBase ? (linkedWindow.current?.continuation ?? undefined) : data.nextCursor!)}
+          onClick={() => {
+            if (!queryBase) void load(data.nextCursor!);
+            else if (linkedWindow.current?.queryIdentity === queryIdentity && linkedWindow.current.continuation)
+              void load(linkedWindow.current.continuation);
+          }}
         >
           Load more rows
         </button>

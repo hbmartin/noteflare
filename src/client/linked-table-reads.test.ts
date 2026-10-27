@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from "vitest";
 import { linkedTableReads, type LinkedTableReadIntent } from "./linked-table-reads";
+const continuation = (target = 200) => ({ queryIdentity: "query", generation: 1, target });
 const controllers: ReturnType<typeof linkedTableReads>[] = [];
 afterEach(() => {
   for (const controller of controllers.splice(0)) controller.dispose();
@@ -26,8 +27,8 @@ it("preserves refresh and pagination intents, sharing only equivalent continuati
     .mockResolvedValue(2);
   const controller = setup(read);
   const first = controller.request(),
-    second = controller.request("cursor"),
-    same = controller.request("cursor"),
+    second = controller.request(continuation()),
+    same = controller.request(continuation()),
     refresh = controller.request();
   expect(read).toHaveBeenCalledOnce();
   finish(1);
@@ -38,7 +39,7 @@ it("preserves refresh and pagination intents, sharing only equivalent continuati
   expect(read.mock.calls.map((call) => call[0])).toEqual([
     { kind: "refresh" },
     { kind: "refresh" },
-    { kind: "append", cursor: "cursor" },
+    { kind: "append", ...continuation() },
   ]);
 });
 it("preserves distinct continuation intents and releases obsolete callers on reset", async () => {
@@ -53,8 +54,8 @@ it("preserves distinct continuation intents and releases obsolete callers on res
     )
     .mockResolvedValue(2);
   const controller = setup(read);
-  const first = controller.request("first"),
-    second = controller.request("second");
+  const first = controller.request(continuation()),
+    second = controller.request(continuation(300));
   controller.reset();
   expect(await first).toBeNull();
   expect(await second).toBeNull();
@@ -139,7 +140,7 @@ it("retries a failed append even after a queued refresh succeeds", async () => {
     )
     .mockResolvedValue(2);
   const controller = setup(read);
-  const append = controller.request("cursor"),
+  const append = controller.request(continuation()),
     refresh = controller.request();
   finish(null);
   expect(await append).toBeNull();
@@ -152,7 +153,7 @@ it("serves an eligible append after at most one queued refresh", async () => {
   const read = vi.fn(() => new Promise<number>((resolve) => finishes.push(resolve)));
   const controller = setup(read);
   void controller.request();
-  void controller.request("cursor");
+  void controller.request(continuation());
   void controller.request();
   finishes.shift()!(1);
   await Promise.resolve();
@@ -178,4 +179,54 @@ it("resets retry progression for a new query while preserving separate failed in
   await controller.request();
   await vi.advanceTimersByTimeAsync(1000);
   expect(read).toHaveBeenCalledTimes(before + 2);
+});
+
+it("coalesces continuation ownership by extent rather than a refreshed revision", async () => {
+  let finish!: (value: number) => void;
+  const read = vi.fn(
+    () =>
+      new Promise<number>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const controller = setup(read);
+  const first = controller.request(continuation());
+  const same = controller.request({ ...continuation() });
+  finish(2);
+  expect(await first).toBe(2);
+  expect(await same).toBe(2);
+  expect(read).toHaveBeenCalledOnce();
+});
+
+it.each([false, true])("preserves a failed deadline behind queued work; manual bypass %s", async (manual) => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let finish!: (value: number | null) => void;
+  const read = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise<number | null>((resolve) => {
+          finish = resolve;
+        }),
+    )
+    .mockResolvedValue(2);
+  const controller = setup(read);
+  const first = controller.request();
+  const queued = manual ? controller.request() : controller.invalidate();
+  finish(null);
+  expect(await first).toBeNull();
+  expect(read).toHaveBeenCalledTimes(manual ? 2 : 1);
+  let beforeDeadline = read.mock.calls.length;
+  if (!manual) {
+    for (let i = 0; i < 10; i++) {
+      void controller.invalidate();
+      await vi.advanceTimersByTimeAsync(90);
+    }
+    beforeDeadline = read.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(100);
+  }
+  expect(beforeDeadline).toBe(manual ? 2 : 1);
+  expect(await queued).toBe(2);
+  expect(read).toHaveBeenCalledTimes(2);
 });
