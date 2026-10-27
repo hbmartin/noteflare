@@ -418,6 +418,10 @@ test("operation restrictions retain linked rows and open settings retain unsaved
   await linked.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(property).toBeEnabled();
   await expect(property).toHaveValue("Settings text survives");
+  await linked.getByRole("button", { name: "Dismiss notice", exact: true }).click();
+  await expect(linked.getByText("This operation is read-only", { exact: true })).toHaveCount(0);
+  await expect(cells.first()).toHaveValue("Restricted edit remains local");
+  await expect(linked.getByRole("region", { name: "Pending cell edits" })).toBeVisible();
 });
 
 test("canonical failed reload pauses editing and automatically recovers without submitting its draft", async ({
@@ -455,4 +459,144 @@ test("canonical failed reload pauses editing and automatically recovers without 
   await expect(cell).toBeEnabled();
   expect(reads).toBeGreaterThanOrEqual(2);
   expect(writes).toBe(0);
+});
+
+test("linked views remember presentation and unfinished settings without submitting them", async ({ page }) => {
+  const { linked, command, columnId } = await linkedFixture(page);
+  const dateId = crypto.randomUUID(),
+    viewId = crypto.randomUUID();
+  await command("create_column", { id: dateId, name: "Remembered date", type: "date" });
+  await command("save_view", {
+    id: viewId,
+    name: "Remembered calendar",
+    kind: "calendar",
+    columnId: dateId,
+    personal: false,
+    filters: null,
+    sorts: [],
+    visibleColumnIds: [columnId, dateId],
+  });
+  await linked.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(linked.getByRole("option", { name: "Remembered calendar", exact: true })).toHaveCount(1);
+  let writes = 0;
+  page.on("request", (request) => {
+    if (request.url().includes("/linked-tables/") && request.url().endsWith("/commands")) writes++;
+  });
+  await linked.getByLabel("Search table").fill("Row");
+  await expect(linked.getByRole("button", { name: "Views", exact: true })).toBeEnabled();
+  await linked.getByLabel("New row title").fill("All rows draft");
+  await linked.getByRole("button", { name: "Properties", exact: true }).click();
+  await linked.getByLabel("New property name").fill("All rows property");
+  await linked.getByRole("button", { name: "Views", exact: true }).click();
+  await linked.getByLabel("View name").fill("Unsubmitted view settings");
+  await linked.getByLabel("Saved table view").selectOption(viewId);
+  await expect(linked.getByRole("button", { name: "Views", exact: true })).toBeEnabled();
+  await expect(linked.getByLabel("Search table")).toHaveValue("");
+  await expect(linked.getByLabel("New row title")).toHaveValue("");
+  await expect(linked.getByLabel("View name")).toHaveCount(0);
+  await linked.getByLabel("Calendar month").fill("2027-03");
+  await expect(linked.getByRole("button", { name: "Properties", exact: true })).toBeEnabled();
+  await linked.getByLabel("New row title").fill("Calendar row draft");
+  await linked.getByRole("button", { name: "Properties", exact: true }).click();
+  await linked.getByLabel("New property name").fill("Calendar property");
+  await linked.getByLabel("Saved table view").selectOption("");
+  await expect(linked.getByRole("button", { name: "Views", exact: true })).toBeEnabled();
+  await expect(linked.getByLabel("Search table")).toHaveValue("Row");
+  await expect(linked.getByLabel("New row title")).toHaveValue("All rows draft");
+  await expect(linked.getByLabel("View name")).toHaveValue("Unsubmitted view settings");
+  await linked.getByRole("button", { name: "Properties", exact: true }).click();
+  await expect(linked.getByLabel("New property name")).toHaveValue("All rows property");
+  await linked.getByLabel("Saved table view").selectOption(viewId);
+  await expect(linked.getByRole("button", { name: "Properties", exact: true })).toBeEnabled();
+  await expect(linked.getByLabel("Calendar month")).toHaveValue("2027-03");
+  await expect(linked.getByLabel("New row title")).toHaveValue("Calendar row draft");
+  await expect(linked.getByLabel("New property name")).toHaveValue("Calendar property");
+  expect(writes).toBe(0);
+});
+
+test("canonical invalidation during an older read performs a trailing fresh read", async ({ page }) => {
+  const { source, columnId } = await linkedFixture(page);
+  await page.goto(`/?page=${source.id}`);
+  const table = page
+    .locator(".table-live")
+    .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
+  const cell = table.getByLabel("Linked title", { exact: true }).first();
+  await expect(cell).toBeEnabled();
+  let release!: () => void, captured!: (value: { id: string; cellRevisions: Record<string, number> }) => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const snapshot = new Promise<{ id: string; cellRevisions: Record<string, number> }>((resolve) => {
+    captured = resolve;
+  });
+  let reads = 0;
+  await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
+    if (++reads === 1) {
+      const response = await route.fetch();
+      const data = await response.json();
+      captured(data.rows[0]);
+      await held;
+      await route.fulfill({ response });
+    } else await route.continue();
+  });
+  await table.getByRole("button", { name: "Refresh", exact: true }).click();
+  const row = await snapshot;
+  const response = await page.request.post(`/api/tables/${source.id}/commands`, {
+    data: {
+      operationId: crypto.randomUUID(),
+      kind: "update_cells",
+      payload: {
+        rowId: row.id,
+        values: { [columnId]: "Fresh after notification" },
+        expectedCellRevisions: { [columnId]: row.cellRevisions[columnId] ?? 0 },
+      },
+    },
+  });
+  expect(response.ok()).toBeTruthy();
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("notes:workspace-event")));
+  release();
+  await expect(cell).toHaveValue("Fresh after notification");
+  await expect(cell).toBeEnabled();
+  expect(reads).toBeGreaterThanOrEqual(2);
+});
+
+test("canonical refresh retires a failed continuation without leaving a row gap", async ({ page }) => {
+  const { source } = await linkedFixture(page);
+  await page.goto(`/?page=${source.id}`);
+  const table = page
+    .locator(".table-live")
+    .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
+  const cells = table.getByLabel("Linked title", { exact: true });
+  await expect(cells).toHaveCount(100);
+  await expect(cells.first()).toBeEnabled();
+  await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+  await expect(cells).toHaveCount(200);
+  const original = await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value));
+  await page.clock.install();
+  let failedCursor = "",
+    attempts = 0;
+  await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
+    const cursor = new URL(route.request().url()).searchParams.get("cursor");
+    if (cursor && !failedCursor) {
+      failedCursor = cursor;
+      attempts++;
+      await route.fulfill({ status: 503, json: { error: { code: "temporary", message: "Continuation unavailable" } } });
+    } else {
+      if (cursor === failedCursor) attempts++;
+      await route.continue();
+    }
+  });
+  await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+  await expect(table.getByText("Continuation unavailable", { exact: true })).toBeVisible();
+  await table.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(cells).toHaveCount(100);
+  await expect(cells.first()).toBeEnabled();
+  await page.clock.runFor(3000);
+  await expect(cells).toHaveCount(100);
+  expect(attempts).toBe(1);
+  await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+  await expect(cells).toHaveCount(200);
+  expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
+    original,
+  );
 });
