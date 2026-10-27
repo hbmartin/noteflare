@@ -339,3 +339,120 @@ test("a successful hidden linked read preserves cached rows and verifies again o
     release();
   }
 });
+
+test("a saved linked operation retries after search verification with its original identity", async ({ page }) => {
+  const { path, linked, cells, source, columnId, command } = await linkedFixture(page);
+  const dateId = crypto.randomUUID(),
+    viewId = crypto.randomUUID();
+  await command("create_column", { id: dateId, name: "Scheduled", type: "date" });
+  await command("save_view", {
+    id: viewId,
+    name: "Retry calendar",
+    kind: "calendar",
+    columnId: dateId,
+    personal: false,
+    filters: null,
+    sorts: [],
+    visibleColumnIds: [columnId, dateId],
+  });
+  await linked.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(linked.getByRole("option", { name: "Retry calendar", exact: true })).toHaveCount(1);
+  const attempts: Record<string, unknown>[] = [];
+  await page.route(`**${path}/commands`, async (route) => {
+    attempts.push(route.request().postDataJSON());
+    if (attempts.length === 1)
+      await route.fulfill({ status: 503, json: { error: { code: "temporary", message: "Save outcome uncertain" } } });
+    else await route.continue();
+  });
+  await cells.first().fill("Retry preserved text");
+  await cells.first().press("Enter");
+  const retry = linked.getByRole("button", { name: "Retry saved operation", exact: true });
+  await expect(retry).toBeVisible();
+  await linked.getByLabel("Search table").fill("Row");
+  await expect(retry).toBeEnabled();
+  await linked.getByLabel("Saved table view").selectOption(viewId);
+  const month = linked.getByLabel("Calendar month");
+  const initial = await month.inputValue();
+  await month.fill(`${Number(initial.slice(0, 4)) + 1}-${initial.slice(5)}`);
+  await expect(retry).toBeEnabled();
+  await retry.click();
+  await expect(retry).toHaveCount(0);
+  expect(attempts).toHaveLength(2);
+  expect(attempts[1]).toEqual(attempts[0]);
+  const saved = await page.request.get(`/api/tables/${source.id}/query?limit=100&q=Retry%20preserved%20text`);
+  expect(saved.ok()).toBeTruthy();
+  expect(
+    (await saved.json()).rows.some(
+      (row: { cells: Record<string, unknown> }) => row.cells[columnId] === "Retry preserved text",
+    ),
+  ).toBe(true);
+});
+
+test("operation restrictions retain linked rows and open settings retain unsaved values", async ({ page }) => {
+  const { path, linked, cells } = await linkedFixture(page);
+  await page.route(`**${path}/commands`, async (route) => {
+    await route.fulfill({
+      status: 403,
+      json: { error: { code: "read_only", message: "This operation is read-only" } },
+    });
+  });
+  await cells.first().fill("Restricted edit remains local");
+  await cells.first().press("Enter");
+  await expect(linked.getByText("This operation is read-only", { exact: true })).toBeVisible();
+  await expect(cells).toHaveCount(500);
+  await expect(cells.first()).toBeEnabled();
+  await linked.getByRole("button", { name: "Properties", exact: true }).click();
+  const property = linked.getByLabel("New property name");
+  await property.fill("Settings text survives");
+  let unavailable = true;
+  await page.route(`**${path}?**`, async (route) => {
+    if (unavailable)
+      await route.fulfill({ status: 503, json: { error: { code: "temporary", message: "Verification unavailable" } } });
+    else await route.continue();
+  });
+  await linked.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(property).toBeDisabled();
+  await expect(property).toHaveValue("Settings text survives");
+  await expect(linked.getByRole("button", { name: "Add property", exact: true })).toBeDisabled();
+  unavailable = false;
+  await linked.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(property).toBeEnabled();
+  await expect(property).toHaveValue("Settings text survives");
+});
+
+test("canonical failed reload pauses editing and automatically recovers without submitting its draft", async ({
+  page,
+}) => {
+  const { source } = await linkedFixture(page);
+  await page.goto(`/?page=${source.id}`);
+  const table = page
+    .locator(".table-live")
+    .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
+  const cell = table.getByLabel("Linked title", { exact: true }).first();
+  await expect(cell).toBeEnabled();
+  await cell.fill("Canonical draft remains deliberate");
+  let reads = 0,
+    writes = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === `/api/tables/${source.id}/commands` && request.method() === "POST")
+      writes++;
+  });
+  await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
+    if (++reads === 1)
+      await route.fulfill({
+        status: 503,
+        json: { error: { code: "temporary", message: "Canonical verification unavailable" } },
+      });
+    else await route.continue();
+  });
+  // Dispatch a background invalidation without blurring the active cell.
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("notes:workspace-event")));
+  await expect(cell).toBeDisabled();
+  await expect(cell).toHaveValue("Canonical draft remains deliberate");
+  await expect(cell).toBeEnabled();
+  await expect(cell).toHaveValue("Canonical draft remains deliberate");
+  await table.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(cell).toBeEnabled();
+  expect(reads).toBeGreaterThanOrEqual(2);
+  expect(writes).toBe(0);
+});
