@@ -78,7 +78,7 @@ async function linkedFixture(page: Page) {
     await expect(cells).toHaveCount(count);
   }
   const path = `/api/pages/${host.id}/linked-tables/${source.id}`;
-  return { source, path, linked, cells };
+  return { source, path, linked, cells, command, columnId };
 }
 
 test("linked reads retain failed continuation after refresh and buffer 100-row increments", async ({ page }) => {
@@ -164,7 +164,7 @@ async function bufferedFixture(page: Page) {
   return fixture;
 }
 
-test("save denial retires queued buffers and requires a fresh read to recover", async ({ page }) => {
+test("save denial retires queued buffers and automatically verifies restored access", async ({ page }) => {
   const { path, linked, cells } = await bufferedFixture(page);
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
@@ -172,9 +172,11 @@ test("save denial retires queued buffers and requires a fresh read to recover", 
   });
   let held = false,
     settled = false,
-    mutations = 0;
+    mutations = 0,
+    denied = false;
   await page.route(`**${path}/commands`, async (route) => {
     mutations++;
+    denied = true;
     await route.fulfill({ status: 403, json: { error: { code: "forbidden", message: "Linked access removed" } } });
   });
   await page.route(`**${path}?**`, async (route) => {
@@ -183,6 +185,8 @@ test("save denial retires queued buffers and requires a fresh read to recover", 
       await gate;
       await route.continue();
       settled = true;
+    } else if (denied) {
+      await route.fulfill({ status: 403, json: { error: { code: "forbidden", message: "Linked access removed" } } });
     } else await route.continue();
   });
   try {
@@ -203,7 +207,7 @@ test("save denial retires queued buffers and requires a fresh read to recover", 
       const url = new URL(request.url());
       return request.method() === "GET" && url.pathname === path && !url.searchParams.has("cursor");
     });
-    await linked.getByRole("button", { name: "Reload", exact: true }).click();
+    denied = false;
     await fresh;
     await expect(cells).toHaveCount(100);
     await expect(cells.first()).toBeEnabled();
@@ -263,6 +267,74 @@ test("failed conflict verification retains cached drafts and requires network re
     await expect(cells.first()).toBeEnabled();
     await expect(cells.first()).toHaveValue("Deliberate draft remains unsaved");
     expect(mutations).toBe(1);
+  } finally {
+    release();
+  }
+});
+
+test("a deleted row rejects its save without removing the linked table", async ({ page }) => {
+  const { source, path, linked, cells, command } = await linkedFixture(page);
+  const read = await page.request.get(`/api/tables/${source.id}/query?limit=100`);
+  expect(read.ok()).toBeTruthy();
+  const row = (await read.json()).rows[0];
+  let mutations = 0;
+  await page.route(`**${path}/commands`, async (route) => {
+    mutations++;
+    await command("delete_row", { rowId: row.id });
+    await route.continue();
+  });
+  const rejected = page.waitForResponse((response) => new URL(response.url()).pathname === `${path}/commands`);
+  await cells.first().fill("Text survives a deleted row");
+  await cells.first().press("Tab");
+  const response = await rejected;
+  expect(response.status()).toBe(404);
+  expect((await response.json()).error.code).toBe("row_not_found");
+  await expect(cells).toHaveCount(500);
+  await expect(cells.first()).toBeEnabled();
+  await expect(linked.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue(
+    "Text survives a deleted row",
+  );
+  await expect(linked.getByText("Confirmed deleted row. Text recovery only.", { exact: true })).toBeVisible();
+  await expect(linked.getByRole("button", { name: "Reload", exact: true })).toHaveCount(0);
+  expect(mutations).toBe(1);
+});
+
+test("a successful hidden linked read preserves cached rows and verifies again on return", async ({ page }) => {
+  const { path, linked, cells } = await linkedFixture(page);
+  await page.evaluate(() => {
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => Boolean((window as unknown as { testHidden?: boolean }).testHidden),
+    });
+  });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started = 0;
+  await page.route(`**${path}?**`, async (route) => {
+    if (++started === 1) await gate;
+    await route.continue();
+  });
+  try {
+    await linked.getByRole("button", { name: "Refresh", exact: true }).click();
+    await expect.poll(() => started).toBe(1);
+    await page.evaluate(() => {
+      (window as unknown as { testHidden?: boolean }).testHidden = true;
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    const completed = page.waitForResponse((response) => new URL(response.url()).pathname === path);
+    release();
+    expect((await completed).ok()).toBeTruthy();
+    await expect(cells).toHaveCount(500);
+    await expect(cells.first()).toBeDisabled();
+    await expect(linked.getByRole("button", { name: "Views", exact: true })).toBeVisible();
+    await page.evaluate(() => {
+      (window as unknown as { testHidden?: boolean }).testHidden = false;
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await expect.poll(() => started).toBe(2);
+    await expect(cells.first()).toBeEnabled();
   } finally {
     release();
   }
