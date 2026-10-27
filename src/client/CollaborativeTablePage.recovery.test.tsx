@@ -530,3 +530,44 @@ it("retains toolbar identity while a changed query requires verification", async
   expect(views).toBeEnabled();
   expect(properties).toBeEnabled();
 });
+
+it("retains real server failure backoff when the response arrives while hidden", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let hidden = false;
+  vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+  fixture();
+  await act(async () => {});
+  const read = vi.mocked(api).getMockImplementation()!;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let reads = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (++reads === 1) {
+      await gate;
+      throw new ApiClientError(503, "unavailable", "Server failed while hidden");
+    }
+    return read(path, init);
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await act(async () => {
+    hidden = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    release();
+  });
+  expect(screen.getByText("Server failed while hidden")).toBeVisible();
+  await act(async () => {
+    hidden = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(999);
+  });
+  expect(reads).toBe(1);
+  expect(screen.getByLabelText("Title")).toBeDisabled();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+  });
+  expect(reads).toBe(2);
+  expect(screen.getByLabelText("Title")).toBeEnabled();
+});

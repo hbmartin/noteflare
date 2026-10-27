@@ -301,12 +301,18 @@ export function CollaborativeTablePage({
           );
         return { state: "success", value: result, verification: fresh ? "network" : "buffer" };
       } catch (cause) {
-        if (signal?.aborted || owner !== ownership.current.request || !active.current) return { state: "superseded" };
+        if (
+          signal?.aborted ||
+          owner !== ownership.current.request ||
+          !active.current ||
+          (queryBase && verification !== ownership.current.verification)
+        )
+          return { state: "superseded" };
         if (discardDenied(cause, true)) {
           setError(apiErrorMessage(cause, "The table is unavailable."));
           return { state: "denied" };
         }
-        if (!navigator.onLine || document.hidden) {
+        if (!navigator.onLine && !(cause instanceof ApiClientError)) {
           retireVerification("suspend");
           return { state: "suspended" };
         }
