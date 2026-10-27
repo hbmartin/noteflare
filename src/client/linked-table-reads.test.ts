@@ -10,7 +10,15 @@ afterEach(() => {
 });
 function setup(read: (intent: LinkedTableReadIntent, signal: AbortSignal) => Promise<number | null>) {
   const unavailable = vi.fn(),
-    controller = linkedTableReads({ read, unavailable });
+    controller = linkedTableReads({
+      read: async (...args) => {
+        const value = await read(...args);
+        return value === null
+          ? { state: "failure" as const }
+          : { state: "success" as const, value, verification: "network" as const };
+      },
+      unavailable,
+    });
   controllers.push(controller);
   return { ...controller, unavailable };
 }
@@ -229,4 +237,62 @@ it.each([false, true])("preserves a failed deadline behind queued work; manual b
   expect(beforeDeadline).toBe(manual ? 2 : 1);
   expect(await queued).toBe(2);
   expect(read).toHaveBeenCalledTimes(2);
+});
+
+it("does not back off superseded or suspended reads and preserves real failure deadlines", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let hidden = false;
+  vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce({ state: "superseded" })
+    .mockResolvedValueOnce({ state: "suspended" })
+    .mockResolvedValueOnce({ state: "failure" })
+    .mockResolvedValue({ state: "success", value: 7, verification: "network" });
+  const controller = linkedTableReads<number>({ read, unavailable: vi.fn() });
+  controllers.push(controller);
+  expect(await controller.request()).toBeNull();
+  expect(read).toHaveBeenCalledTimes(1);
+  hidden = true;
+  const pending = controller.request();
+  expect(await pending).toBeNull();
+  hidden = false;
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(read).toHaveBeenCalledTimes(3);
+  hidden = true;
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.advanceTimersByTimeAsync(500);
+  hidden = false;
+  document.dispatchEvent(new Event("visibilitychange"));
+  await vi.advanceTimersByTimeAsync(499);
+  expect(read).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(4);
+});
+it("retires denied appends without abandoning or resetting refresh recovery", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const read = vi.fn().mockResolvedValue({ state: "denied" });
+  const controller = linkedTableReads<number>({ read, unavailable: vi.fn() });
+  controllers.push(controller);
+  const first = controller.request(continuation()),
+    pending = controller.request(continuation(300));
+  expect(await first).toBeNull();
+  expect(await pending).toBeNull();
+  await vi.advanceTimersByTimeAsync(999);
+  expect(read).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(2);
+  expect(read.mock.calls[1]![0]).toEqual({ kind: "refresh" });
+  for (let i = 0; i < 8; i++) {
+    void controller.invalidate();
+    await vi.advanceTimersByTimeAsync(200);
+  }
+  expect(read).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(400);
+  expect(read).toHaveBeenCalledTimes(3);
+  await controller.request();
+  expect(read).toHaveBeenCalledTimes(4);
 });

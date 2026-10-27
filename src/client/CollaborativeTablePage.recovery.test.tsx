@@ -9,6 +9,7 @@ import type { CollaborativeColumn, TableQueryResult } from "../shared/table-prot
 vi.mock("./api", async (importOriginal) => ({ ...(await importOriginal<typeof import("./api")>()), api: vi.fn() }));
 const account = "table-ui\0workspace";
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.mocked(api).mockReset();
   purgeCellDrafts(account);
@@ -81,7 +82,18 @@ function fixture(taskList = false, count = 1) {
     }));
     data.rowCount = count;
   }
-  vi.mocked(api).mockImplementation(async (path) => {
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (path.endsWith("/draft-rows")) {
+      const requestedIds = (JSON.parse(String(init?.body)) as { rowIds: string[] }).rowIds;
+      return structuredClone({
+        pageId: data.pageId,
+        generation: data.generation,
+        revision: data.revision,
+        columns: data.columns,
+        rows: data.rows.filter((row) => requestedIds.includes(row.id)),
+        missingRowIds: requestedIds.filter((id) => !data.rows.some((row) => row.id === id)),
+      });
+    }
     const params = new URL(path, "http://localhost").searchParams;
     const limit = Number(params.get("limit") ?? 100);
     const cursor = params.get("cursor");
@@ -343,4 +355,178 @@ it.each(
   expect(accountCellDrafts(account).map((draft) => draft.text)).toEqual(
     action === "discard" ? [] : [taskList ? `${month}-09` : "Newer text"],
   );
+});
+
+it.each(["row_not_found", "column_not_found", "task_not_found", "view_not_found", "not_found"])(
+  "refreshes an item-level %s without retiring table access",
+  async (code) => {
+    const { data } = fixture(code === "task_not_found", 2);
+    const input = (await screen.findAllByLabelText("Title"))[0]!;
+    await waitFor(() => expect(input).toBeEnabled());
+    const read = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if ((init?.method === "POST" && !init.readOnly) || init?.method === "PATCH") {
+        data.revision++;
+        if (code === "row_not_found" || code === "task_not_found") data.rows.shift();
+        if (code === "column_not_found") data.columns.shift();
+        throw new ApiClientError(404, code, "Item disappeared");
+      }
+      return read(path, init);
+    });
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "Local draft" } });
+    fireEvent.blur(input);
+    await screen.findByText("Item disappeared");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
+    expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Views" })).toBeEnabled();
+    expect(accountCellDrafts(account)[0]?.text).toBe("Local draft");
+    expect(
+      vi
+        .mocked(api)
+        .mock.calls.filter(([, init]) => (init?.method === "POST" && !init.readOnly) || init?.method === "PATCH"),
+    ).toHaveLength(1);
+  },
+);
+it("retains cached data but requires successful verification after an unknown item 404", async () => {
+  fixture();
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  vi.mocked(api).mockImplementation(async (_path, init) => {
+    throw init?.method
+      ? new ApiClientError(404, "unknown_item", "Item disappeared")
+      : new ApiClientError(503, "unavailable", "Verification failed");
+  });
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Keep text" } });
+  fireEvent.blur(input);
+  await screen.findByText("Verification failed");
+  expect(screen.getByLabelText("Title")).toBeDisabled();
+  expect(screen.getByLabelText("Title")).toHaveValue("Keep text");
+  expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+  expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+});
+it("accepts successful hidden-tab reads without creating failure backoff", async () => {
+  const { data } = fixture();
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  let hidden = false;
+  vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const read = vi.mocked(api).getMockImplementation()!;
+  const releases: Array<() => void> = [];
+  let started = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    started++;
+    await new Promise<void>((resolve) => {
+      releases.push(resolve);
+    });
+    return read(path, init);
+  });
+  vi.useFakeTimers();
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  for (let cycle = 0; cycle < 5; cycle++) {
+    expect(releases).toHaveLength(1);
+    await act(async () => {
+      hidden = true;
+      document.dispatchEvent(new Event("visibilitychange"));
+      data.rows[0]!.cells[taskColumns("table").title] = "Remote " + cycle;
+      releases.shift()!();
+    });
+    expect(input).toBeDisabled();
+    expect(input).toHaveValue("Remote " + cycle);
+    const before = started;
+    await act(async () => {
+      hidden = false;
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(started).toBe(before + 1);
+    expect(input).toBeDisabled();
+  }
+  await act(async () => {
+    releases.shift()!();
+  });
+  expect(input).toBeEnabled();
+  expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method)).toHaveLength(0);
+});
+it.each(["read", "mutation"] as const)(
+  "backs off %s denial and recovers automatically through a fresh read",
+  async (kind) => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    fixture();
+    await act(async () => {});
+    const input = screen.getByLabelText("Title");
+    expect(input).toBeEnabled();
+    const read = vi.mocked(api).getMockImplementation()!;
+    let denied = true,
+      reads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (!init?.method) reads++;
+      if (denied) throw new ApiClientError(403, "forbidden", "Access removed");
+      return read(path, init);
+    });
+    await act(async () => {
+      if (kind === "read") fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      else {
+        fireEvent.focus(input);
+        fireEvent.change(input, { target: { value: "Recovery text" } });
+        fireEvent.blur(input);
+      }
+    });
+    expect(screen.queryAllByLabelText("Title")).toHaveLength(0);
+    const before = reads;
+    for (let i = 0; i < 5; i++)
+      await act(async () => {
+        window.dispatchEvent(new Event("notes:workspace-event"));
+      });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(999);
+    });
+    expect(reads).toBe(before);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(reads).toBe(before + 1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1999);
+    });
+    expect(reads).toBe(before + 1);
+    denied = false;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(reads).toBe(before + 2);
+    expect(screen.getByLabelText("Title")).toBeEnabled();
+    expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(
+      kind === "mutation" ? 1 : 0,
+    );
+  },
+);
+it("retains toolbar identity while a changed query requires verification", async () => {
+  fixture();
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  const views = screen.getByRole("button", { name: "Views" });
+  const properties = screen.getByRole("button", { name: "Properties" });
+  const read = vi.mocked(api).getMockImplementation()!;
+  let release!: () => void;
+  const hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    await hold;
+    return read(path, init);
+  });
+  fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "O" } });
+  expect(input).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Views" })).toBe(views);
+  expect(screen.getByRole("button", { name: "Properties" })).toBe(properties);
+  expect(views).toBeDisabled();
+  await act(async () => {
+    release();
+  });
+  expect(input).toBeEnabled();
+  expect(views).toBeEnabled();
+  expect(properties).toBeEnabled();
 });

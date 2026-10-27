@@ -2,6 +2,9 @@ import { jitteredBackoff } from "../shared/retry";
 
 export type LinkedTableContinuation = { queryIdentity: string; generation: number; target: number };
 export type LinkedTableReadIntent = { kind: "refresh" } | ({ kind: "append" } & LinkedTableContinuation);
+export type LinkedTableReadOutcome<T> =
+  | { state: "success"; value: T; verification: "network" | "buffer" }
+  | { state: "failure" | "denied" | "suspended" | "superseded" };
 type Batch<T> = {
   intent: LinkedTableReadIntent;
   resolve: Array<(value: T | null) => void>;
@@ -13,12 +16,13 @@ const intentKey = (intent: LinkedTableReadIntent) =>
   intent.kind === "refresh" ? "refresh" : JSON.stringify([intent.queryIdentity, intent.generation, intent.target]);
 /** One active logical read. Retry ownership and deadlines belong to each intent. */
 export function linkedTableReads<T>(options: {
-  read: (intent: LinkedTableReadIntent, signal: AbortSignal) => Promise<T | null>;
-  unavailable: () => void;
+  read: (intent: LinkedTableReadIntent, signal: AbortSignal) => Promise<LinkedTableReadOutcome<T>>;
+  unavailable: (reason: "failure" | "suspended") => void;
 }) {
-  options.unavailable();
+  options.unavailable("failure");
   let stopped = false,
-    refreshAhead = false;
+    refreshAhead = false,
+    denialAttempt = 0;
   let active: { batch: Batch<T>; controller: AbortController } | undefined;
   const queued = new Map<string, Batch<T>>();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -47,28 +51,50 @@ export function linkedTableReads<T>(options: {
     queued.delete(intentKey(batch.intent));
     void run(batch);
   }
+  function retireAppends() {
+    for (const [name, batch] of queued) {
+      if (batch.intent.kind !== "append") continue;
+      queued.delete(name);
+      for (const resolve of batch.resolve.splice(0)) resolve(null);
+    }
+  }
+  function enqueueRetry(batch: Batch<T>) {
+    const name = intentKey(batch.intent),
+      trailing = queued.get(name);
+    if (trailing) {
+      trailing.attempt = Math.max(trailing.attempt, batch.attempt);
+      if (!trailing.manual) trailing.retryAt = Math.max(trailing.retryAt, batch.retryAt);
+    } else queued.set(name, batch);
+  }
   async function run(batch: Batch<T>) {
     batch.manual = false;
     const owner = { batch, controller: new AbortController() };
     active = owner;
     clear();
-    let value: T | null = null;
+    let outcome: LinkedTableReadOutcome<T>;
     try {
-      value = await options.read(batch.intent, owner.controller.signal);
+      outcome = await options.read(batch.intent, owner.controller.signal);
     } catch {
-      /* Reader owns errors. */
+      outcome = { state: available() ? "failure" : "suspended" };
     }
     if (active !== owner || stopped) return;
     active = undefined;
-    if (value === null) {
-      options.unavailable();
+    const value = outcome.state === "success" ? outcome.value : null;
+    if (outcome.state === "denied") {
+      retireAppends();
+      batch.intent = { kind: "refresh" };
+      batch.attempt = Math.max(batch.attempt, denialAttempt);
+    }
+    if (outcome.state === "failure" || outcome.state === "denied") {
+      options.unavailable("failure");
       batch.retryAt = Date.now() + jitteredBackoff(batch.attempt++, 2000, 30_000);
-      const name = intentKey(batch.intent),
-        trailing = queued.get(name);
-      if (trailing) {
-        trailing.attempt = Math.max(trailing.attempt, batch.attempt);
-        if (!trailing.manual) trailing.retryAt = Math.max(trailing.retryAt, batch.retryAt);
-      } else queued.set(name, batch);
+      if (outcome.state === "denied") denialAttempt = batch.attempt;
+      enqueueRetry(batch);
+    } else if (outcome.state === "suspended") {
+      options.unavailable("suspended");
+      enqueueRetry(batch);
+    } else if (outcome.state === "success" && outcome.verification === "network") {
+      denialAttempt = 0;
     }
     const waiting = batch.resolve.splice(0);
     for (const resolve of waiting) resolve(value);
@@ -94,7 +120,7 @@ export function linkedTableReads<T>(options: {
   const wake = () => {
     if (!available()) {
       clear();
-      options.unavailable();
+      options.unavailable("suspended");
       return;
     }
     if (queued.size) next();
@@ -108,6 +134,7 @@ export function linkedTableReads<T>(options: {
   const reset = () => {
     clear();
     refreshAhead = false;
+    denialAttempt = 0;
     if (active) {
       const previous = active;
       active = undefined;
@@ -117,6 +144,30 @@ export function linkedTableReads<T>(options: {
     for (const batch of queued.values()) for (const resolve of batch.resolve.splice(0)) resolve(null);
     queued.clear();
   };
+  const recoverDenied = () => {
+    if (stopped) return;
+    clear();
+    const previous = active;
+    active = undefined;
+    if (previous) {
+      previous.controller.abort();
+      for (const resolve of previous.batch.resolve.splice(0)) resolve(null);
+    }
+    retireAppends();
+    const batch = queued.get("refresh") ?? {
+      intent: { kind: "refresh" } as const,
+      resolve: [],
+      attempt: denialAttempt,
+      retryAt: 0,
+      manual: false,
+    };
+    batch.attempt = Math.max(batch.attempt, denialAttempt, previous?.batch.attempt ?? 0);
+    batch.retryAt = Math.max(batch.retryAt, Date.now() + jitteredBackoff(batch.attempt++, 2000, 30_000));
+    batch.manual = false;
+    denialAttempt = batch.attempt;
+    queued.set("refresh", batch);
+    schedule();
+  };
   window.addEventListener("online", wake);
   window.addEventListener("offline", wake);
   document.addEventListener("visibilitychange", wake);
@@ -125,6 +176,7 @@ export function linkedTableReads<T>(options: {
       requestIntent(continuation ? { kind: "append", ...continuation } : { kind: "refresh" }),
     invalidate: () => requestIntent({ kind: "refresh" }, false),
     reset,
+    recoverDenied,
     dispose: () => {
       stopped = true;
       reset();
