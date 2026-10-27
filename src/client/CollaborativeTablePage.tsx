@@ -119,6 +119,7 @@ export function CollaborativeTablePage({
   }, [member.role]);
   const connectionPermit = useRef<() => boolean>(() => true);
   const busyRef = useRef(false);
+  const mutationNotice = useRef("");
   const taskRefreshRequiredRef = useRef(false);
   const [taskRefreshRequired, setTaskRefreshRequired] = useState(false);
   const [connectionReady, setConnectionReady] = useState(false);
@@ -174,6 +175,7 @@ export function CollaborativeTablePage({
     )
       return;
     retryLifetime.current = { account, incarnation, host, tableId: page.id };
+    mutationNotice.current = "";
     setRetry(null);
   }, [account, incarnation, host, page.id]);
   const retry =
@@ -237,6 +239,10 @@ export function CollaborativeTablePage({
   const queryOwner = useRef({ queryIdentity, account, incarnation });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const reportMutation = useCallback((message: string) => {
+    mutationNotice.current = message;
+    setError(message);
+  }, []);
   const [newTitle, setNewTitle] = useState("");
   const active = useRef(true);
   const editable = Boolean(
@@ -334,7 +340,7 @@ export function CollaborativeTablePage({
             ? { ...result, rows: [...current.rows, ...result.rows] }
             : result,
         );
-        if (fresh) setError("");
+        if (fresh) setError(mutationNotice.current);
         if (fresh)
           publishReadiness(
             navigator.onLine &&
@@ -464,7 +470,7 @@ export function CollaborativeTablePage({
     }
     busyRef.current = true;
     setBusy(true);
-    setError("");
+    reportMutation("");
     setRetry(null);
     try {
       const result = await api<TableCommandResult>(commandsPath, {
@@ -495,7 +501,7 @@ export function CollaborativeTablePage({
         retireVerification("invalidate");
         const refreshed = await load();
         if (refreshed)
-          setError(
+          reportMutation(
             cause.status === 404 || cause.status === 403
               ? apiErrorMessage(cause, "The table item is unavailable.")
               : "The table changed. Review the latest value before saving again.",
@@ -527,7 +533,7 @@ export function CollaborativeTablePage({
     }
     busyRef.current = true;
     setBusy(true);
-    setError("");
+    reportMutation("");
     setRetry(null);
     try {
       const result = await api<{ visibleInView?: boolean }>(rowId ? `${tasksPath}/${rowId}` : tasksPath, {
@@ -565,7 +571,7 @@ export function CollaborativeTablePage({
         }
         const refreshed = await load();
         if (refreshed && !taskRefreshRequiredRef.current)
-          setError(
+          reportMutation(
             cause.status === 404 || cause.status === 403
               ? apiErrorMessage(cause, "The task is unavailable.")
               : "The task list changed. Review the latest value before saving again.",

@@ -1318,3 +1318,36 @@ it("keeps recovery Save disabled when a successful invalidation precedes the bus
   expect(attempts[2]!.expectedRevision).toBe(2);
   await waitFor(() => expect(screen.queryByLabelText("Pending cell edits")).toBeNull());
 });
+
+it("retains task conflict feedback across later successful background verification", async () => {
+  taskColumnFixture();
+  const read = vi.mocked(api).getMockImplementation()!;
+  let attempts = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (path === "/api/task-lists/table/tasks/row") {
+      attempts++;
+      if (attempts === 1) {
+        data = { ...data, revision: 2 };
+        throw new ApiClientError(409, "table_revision_conflict", "Conflict");
+      }
+      return {};
+    }
+    return read(path, init);
+  });
+  show("", member, vi.fn(), true);
+  const input = await screen.findByLabelText("Task");
+  await waitFor(() => expect(input).toBeEnabled());
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Preserved conflict text" } });
+  fireEvent.blur(input);
+  const message = "The task list changed. Review the latest value before saving again.";
+  await screen.findByText(message);
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent("notes:workspace-event"));
+  });
+  expect(screen.getByText(message)).toBeVisible();
+  expect(input).toHaveValue("Preserved conflict text");
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await waitFor(() => expect(attempts).toBe(2));
+  await waitFor(() => expect(screen.queryByText(message)).not.toBeInTheDocument());
+});
