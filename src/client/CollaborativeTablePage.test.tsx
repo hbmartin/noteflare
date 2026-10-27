@@ -1269,3 +1269,52 @@ it("pauses a canonical background read failure and automatically verifies before
   expect(writes).toHaveLength(0);
   expect(attempts).toBe(2);
 });
+
+it("keeps recovery Save disabled when a successful invalidation precedes the busy conflict refresh", async () => {
+  taskColumnFixture();
+  const read = vi.mocked(api).getMockImplementation()!;
+  let releaseRefresh!: () => void;
+  const held = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  let conflict = false,
+    reads = 0;
+  const attempts: { operationId: string; expectedRevision: number }[] = [];
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (path === "/api/task-lists/table/tasks/row") {
+      attempts.push(JSON.parse(String(init?.body)));
+      if (attempts.length === 1) throw new TypeError("Response lost");
+      if (attempts.length === 2) {
+        data = { ...data, revision: 2 };
+        conflict = true;
+        window.dispatchEvent(new CustomEvent("notes:workspace-event"));
+        throw new ApiClientError(409, "table_revision_conflict", "Task revision changed");
+      }
+      return {};
+    }
+    if (conflict && path.startsWith("/api/tables/table/query") && ++reads === 2) await held;
+    return read(path, init);
+  });
+  show("", member, vi.fn(), true);
+  const input = await screen.findByLabelText("Task");
+  await waitFor(() => expect(input).toBeEnabled());
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Preserved busy draft" } });
+  fireEvent.blur(input);
+  fireEvent.click(await screen.findByRole("button", { name: "Retry saved operation" }));
+  const save = await screen.findByRole("button", { name: "Save draft" });
+  await waitFor(() => expect(reads).toBe(2));
+  expect(save).toBeDisabled();
+  fireEvent.click(save);
+  expect(attempts).toHaveLength(2);
+  await act(async () => {
+    releaseRefresh();
+  });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Save draft" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await waitFor(() => expect(attempts).toHaveLength(3));
+  expect(attempts[1]!.operationId).toBe(attempts[0]!.operationId);
+  expect(attempts[2]!.operationId).not.toBe(attempts[1]!.operationId);
+  expect(attempts[2]!.expectedRevision).toBe(2);
+  await waitFor(() => expect(screen.queryByLabelText("Pending cell edits")).toBeNull());
+});

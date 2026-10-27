@@ -658,6 +658,7 @@ export function CollaborativeTablePage({
       : undefined);
   const recovery = (
     <CellDraftRecovery
+      disabled={busy || !editable}
       account={account}
       scope={{ host, tableId: page.id }}
       classify={(draft) => {
