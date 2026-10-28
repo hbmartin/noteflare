@@ -35,7 +35,7 @@ class Socket extends EventTarget {
 let stop: ReturnType<typeof tableConnection>;
 let query: ReturnType<typeof vi.fn<() => Promise<TableSocketVerification>>>;
 let ready: ReturnType<typeof vi.fn<(value: boolean) => void>>;
-const value = { generation: 1, canEdit: true } as TableQueryResult;
+const value = { generation: 1, revision: 1, canEdit: true } as TableQueryResult;
 const result = { state: "complete", value } as const;
 beforeEach(() => {
   vi.useFakeTimers();
@@ -360,4 +360,17 @@ it("does not assign its socket generation to legacy change revisions", async () 
   await settle();
   expect(invalidate).toHaveBeenCalledExactlyOnceWith(undefined);
   expect(query).toHaveBeenCalledOnce();
+});
+
+it("never promotes an initial grant from malformed query coverage", async () => {
+  query.mockResolvedValueOnce({ state: "complete", value: { ...value, revision: Number.NaN } });
+  const socket = Socket.all[0]!;
+  socket.ready(10000, null);
+  await settle();
+  expect(socket.readyState).toBe(1);
+  expect(stop.authorized()).toBe(false);
+  expect(ready).not.toHaveBeenCalledWith(true);
+  document.dispatchEvent(new Event("visibilitychange"));
+  await settle();
+  expect(stop.authorized()).toBe(true);
 });

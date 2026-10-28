@@ -268,7 +268,7 @@ globalThis.measureReconnect=async()=>{
  }
  globalThis.WebSocket=Socket;const controllers=[];
  try{
-  for(let i=0;i<20;i++){const id='ws://measurement/'+i;controllers.push(tableConnection({url:id,query:async()=>{queries++;const value={generation:1,canEdit:true};return SOCKET_RECEIPT?{state:"complete",value}:value},ready:value=>{if(value&&starts.has(id)){times.push(performance.now()-starts.get(id));starts.delete(id)}}}));}
+  for(let i=0;i<20;i++){const id='ws://measurement/'+i;controllers.push(tableConnection({url:id,query:async()=>{queries++;const value={generation:1,revision:1,canEdit:true};return SOCKET_RECEIPT?{state:"complete",value}:value},ready:value=>{if(value&&starts.has(id)){times.push(performance.now()-starts.get(id));starts.delete(id)}}}));}
   await frame();
   const initial=[...Socket.all];for(const socket of initial)starts.set(socket.url,performance.now());
   for(const socket of initial)socket.fenced();

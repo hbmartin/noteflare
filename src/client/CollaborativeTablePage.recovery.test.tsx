@@ -8,12 +8,24 @@ import { taskColumns } from "../shared/tasks";
 import type { CollaborativeColumn, TableQueryResult } from "../shared/table-protocol";
 vi.mock("./api", async (importOriginal) => ({ ...(await importOriginal<typeof import("./api")>()), api: vi.fn() }));
 const account = "table-ui\0workspace";
-afterEach(() => {
+afterEach(async () => {
+  for (const release of heldFixtureReads.splice(0)) release();
+  for (const barrier of fixtureBarriers.splice(0)) barrier.resolve();
+  await act(async () => {});
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.mocked(api).mockReset();
   purgeCellDrafts(account);
 });
+const heldFixtureReads: Array<() => void> = [];
+function heldFixtureRead() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+    heldFixtureReads.push(resolve);
+  });
+  return { promise, release };
+}
 let firstFixtureRead: Promise<void>;
 let fixtureBarriers: Array<{ matches: (params: URLSearchParams) => boolean; resolve: () => void }> = [];
 function nextFixtureRead(matches: (params: URLSearchParams) => boolean) {
@@ -157,16 +169,14 @@ async function bufferedRows() {
 }
 
 it.each(["read", "mutation"] as const)("retires buffered and late rows after confirmed %s denial", async (kind) => {
+  vi.useFakeTimers();
   fixture(false, 800);
   await bufferedRows();
   const input = titleInputs()[0]!;
   fireEvent.focus(input);
   fireEvent.change(input, { target: { value: "Locally authored recovery" } });
   const read = vi.mocked(api).getMockImplementation()!;
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  const held = heldFixtureRead();
   let started = false,
     restored = false;
   vi.mocked(api).mockImplementation(async (path, init) => {
@@ -175,22 +185,24 @@ it.each(["read", "mutation"] as const)("retires buffered and late rows after con
     if (!init?.method) {
       if (!started) {
         started = true;
-        await held;
+        await held.promise;
         if (kind === "mutation") return read(path, init);
       }
       if (!restored) throw new ApiClientError(403, "forbidden", "Access removed");
     }
     return read(path, init);
   });
-  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-  await waitFor(() => expect(started).toBe(true));
-  fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-  if (kind === "mutation") fireEvent.blur(input);
-  else release();
-  await screen.findByText("Access removed");
   await act(async () => {
-    release();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
   });
+  expect(started).toBe(true);
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    if (kind === "mutation") fireEvent.blur(input);
+    else held.release();
+  });
+  expect(screen.getByText("Access removed")).toBeVisible();
+  await act(async () => held.release());
   expect(titleInputs()).toHaveLength(0);
   expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
   expect(screen.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue("Locally authored recovery");
@@ -199,18 +211,23 @@ it.each(["read", "mutation"] as const)("retires buffered and late rows after con
   );
   restored = true;
   const before = vi.mocked(api).mock.calls.length;
-  fireEvent.click(screen.getByRole("button", { name: "Reload" }));
-  await waitFor(() => expect(titleInputs()).toHaveLength(100));
+  await act(async () => {
+    const verification = nextFixtureRead((params) => !params.has("cursor"));
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+    await verification;
+  });
+  expect(titleInputs()).toHaveLength(100);
   expect(
     vi
       .mocked(api)
       .mock.calls.slice(before)
       .some(([path, init]) => !init?.method && !new URL(path, "http://localhost").searchParams.has("cursor")),
   ).toBe(true);
-  await waitFor(() => expect(titleInputs()[0]).toBeEnabled());
+  expect(titleInputs()[0]).toBeEnabled();
 });
 
 it("retires continuation controls synchronously when the query changes", async () => {
+  vi.useFakeTimers();
   fixture(false, 800);
   await bufferedRows();
   const read = vi.mocked(api).getMockImplementation()!;
@@ -234,6 +251,7 @@ it("retires continuation controls synchronously when the query changes", async (
 it.each(["success", "failure"] as const)(
   "requires current network verification after a task conflict: %s",
   async (outcome) => {
+    vi.useFakeTimers();
     const { data } = fixture(true, 800);
     await bufferedRows();
     vi.spyOn(Math, "random").mockReturnValue(1);
@@ -256,25 +274,27 @@ it.each(["success", "failure"] as const)(
       }
       return read(path, init);
     });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-    await waitFor(() => expect(started).toBe(1));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    });
+    expect(started).toBe(1);
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
     const input = titleInputs()[0]!;
     fireEvent.focus(input);
     fireEvent.change(input, { target: { value: "Preserved task draft" } });
-    fireEvent.blur(input);
-    await waitFor(() => expect(input).toBeDisabled());
+    await act(async () => fireEvent.blur(input));
+    expect(input).toBeDisabled();
     await act(async () => {
       releases.shift()!();
     });
-    await waitFor(() => expect(started).toBe(2));
+    expect(started).toBe(2);
     expect(input).toBeDisabled();
     expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
     await act(async () => {
       releases.shift()!();
     });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
-    await waitFor(() => expect(titleInputs()).toHaveLength(outcome === "failure" ? 300 : 400));
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+    expect(titleInputs()).toHaveLength(outcome === "failure" ? 300 : 400);
     expect(input.hasAttribute("disabled")).toBe(outcome === "failure");
     expect(screen.queryByText("Fresh verification failed") !== null).toBe(outcome === "failure");
     expect(accountCellDrafts(account)[0]!.text).toBe("Preserved task draft");

@@ -183,7 +183,7 @@ export function linkedTableReads<T>(options: {
     }
     if (active !== owner || stopped) return;
     active = undefined;
-    const coverage = outcome.state === "success" ? options.coverage?.(outcome.value) : undefined;
+    const coverage = outcome.state === "success" ? readTableCoverage(options.coverage?.(outcome.value)) : undefined;
     if (outcome.state === "stale" || (outcome.state === "success" && !covered(sequence, coverage))) {
       if (outcome.state === "stale") {
         unscoped = ++invalidation;

@@ -112,10 +112,10 @@ export function tableConnection(options: {
         fenced();
         return;
       }
-      if (result.state !== "complete" && result.state !== "generation-changed") {
+      if ((result.state !== "complete" && result.state !== "generation-changed") || !readTableCoverage(result.value)) {
         // The shared read coordinator owns recovery. A query outcome cannot revoke a live socket grant.
         slot.waiting = true;
-        if (result.state === "failure" || result.state === "suspended") options.ready(false);
+        if (result.state !== "pending" && result.state !== "retired") options.ready(false);
         if (!slot.unsubscribe && options.subscribe) {
           slot.unsubscribe = options.subscribe((receipt) => void verify(slot, () => Promise.resolve(receipt)));
         }
