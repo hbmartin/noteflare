@@ -31,6 +31,7 @@ import {
   useThreads,
   useBlockNoteEditor,
 } from "@blocknote/react";
+import { preserveCommentDraftFocus } from "./comment-draft-focus";
 import { settleCommentDiscard } from "./comment-discard";
 import { apiErrorMessage } from "./api";
 import { submitAnchoredComment, CommentSubmissionOwner, CommentAnchorUnavailableError } from "./comment-submission";
@@ -70,8 +71,10 @@ function useDraft(editor: BlockNoteEditor<any, any, any>, id: string, anchor?: C
       if (draft && JSON.stringify(editor.document) === JSON.stringify(draft.body)) return;
       try {
         syncing = true;
-        if (draft) editor.replaceBlocks(editor.document, draft.body);
-        else editor.removeBlocks(editor.document);
+        preserveCommentDraftFocus(editor.domElement, () => {
+          if (draft) editor.replaceBlocks(editor.document, draft.body);
+          else editor.removeBlocks(editor.document);
+        });
       } catch {
         setFailed(true);
       } finally {
