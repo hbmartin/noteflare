@@ -266,6 +266,7 @@ test("cell text survives reload and appears in Personal Settings before sign-out
   await page.getByRole("button", { name: "Members & settings", exact: true }).click();
   await expect(page.getByRole("region", { name: "Pending cell edits" })).toBeVisible();
   await expect(page.getByLabel("Recovered cell draft")).toHaveValue("Persisted unfinished text");
+  await openNavigation(page);
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
   await expect(page.getByRole("heading", { name: /sign in/i })).toBeVisible();
   expect(
@@ -312,7 +313,8 @@ test("floating and sidebar replies share one draft and submit it once", async ({
   await page.getByRole("button", { name: "Comments", exact: true }).click();
   await expect(sidebar).toBeVisible();
   await expect(sidebar).toHaveText("Shared reply");
-  await sidebar.click();
+  // Keyboard focus switches surfaces even when the mobile floating thread overlaps the sidebar.
+  await sidebar.focus();
   await sidebar.press("End");
   await sidebar.pressSequentially(" from sidebar");
   await expect(floating).toHaveText("Shared reply from sidebar");
