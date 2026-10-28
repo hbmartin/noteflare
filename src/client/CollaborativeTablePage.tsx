@@ -612,6 +612,11 @@ export function CollaborativeTablePage({
           message: apiErrorMessage(cause, "The table update could not be saved."),
         });
       else if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
+        setError("");
+        reportMutation(
+          operation,
+          apiErrorMessage(cause, "The table update was rejected. Refresh before saving again."),
+        );
         taskRefreshRequiredRef.current = true;
         setTaskRefreshRequired(true);
         retireVerification("invalidate");
@@ -706,6 +711,8 @@ export function CollaborativeTablePage({
         return { state: "uncertain" };
       }
       if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
+        setError("");
+        reportMutation(operation, apiErrorMessage(cause, "The task update was rejected. Refresh before saving again."));
         if (cause.code === "table_revision_conflict" || cause.status === 404 || cause.status === 403) {
           if (submission)
             submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
@@ -1002,7 +1009,7 @@ export function CollaborativeTablePage({
         {recovery}
         {notice && (
           <div role="alert">
-            {notice.message}
+            <span>{notice.message}</span>
             <button
               type="button"
               onClick={() => {

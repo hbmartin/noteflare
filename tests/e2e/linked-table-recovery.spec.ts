@@ -600,3 +600,52 @@ test("canonical refresh retires a failed continuation without leaving a row gap"
     original,
   );
 });
+
+test("conflict notice survives a query change before its refresh completes", async ({ page }) => {
+  const { path, linked, cells } = await linkedFixture(page);
+  let release!: () => void, started!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const loading = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let rejected = false,
+    heldUrl = "",
+    writes = 0;
+  await page.route(`**${path}/commands`, async (route) => {
+    rejected = true;
+    writes++;
+    await route.fulfill({
+      status: 409,
+      json: { error: { code: "table_revision_conflict", message: "Conflict before refresh" } },
+    });
+  });
+  await page.route(`**${path}?**`, async (route) => {
+    if (rejected && !new URL(route.request().url()).searchParams.has("q") && !heldUrl) {
+      heldUrl = route.request().url();
+      const response = await route.fetch();
+      started();
+      await held;
+      if (!route.request().failure()) await route.fulfill({ response });
+    } else await route.continue();
+  });
+  try {
+    await cells.first().fill("Preserved after superseded refresh");
+    await cells.first().press("Enter");
+    await loading;
+    const aborted = page.waitForEvent("requestfailed", { predicate: (request) => request.url() === heldUrl });
+    await linked.getByLabel("Search table").fill("Row");
+    await aborted;
+    await expect(cells.first()).toBeEnabled();
+    await expect(linked.getByText("Conflict before refresh", { exact: true })).toBeVisible();
+    await expect(cells.first()).toHaveValue("Preserved after superseded refresh");
+    expect(writes).toBe(1);
+    release();
+    await linked.getByRole("button", { name: "Dismiss notice", exact: true }).click();
+    await expect(linked.getByText("Conflict before refresh", { exact: true })).toHaveCount(0);
+    await expect(cells.first()).toHaveValue("Preserved after superseded refresh");
+  } finally {
+    release();
+  }
+});
