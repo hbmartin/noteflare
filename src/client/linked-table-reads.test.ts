@@ -3,6 +3,9 @@ import { afterEach, expect, it, vi } from "vitest";
 import { linkedTableReads, type TableReadContext, type TableReadIntent } from "./linked-table-reads";
 const continuation = (target = 200) => ({ queryIdentity: "query", generation: 1, target });
 const controllers: ReturnType<typeof linkedTableReads>[] = [];
+const flushReads = async () => {
+  for (let pass = 0; pass < 40; pass++) await Promise.resolve();
+};
 afterEach(() => {
   for (const controller of controllers.splice(0)) controller.dispose();
   vi.useRealTimers();
@@ -360,10 +363,10 @@ it("coalesces canonical verification with an equivalent active read", async () =
   );
   const controller = setup(read);
   const first = controller.request(),
-    second = controller.verify();
+    second = controller.verifyReceipt();
   release(1);
   expect(await first).toBe(1);
-  expect(await second).toBe(1);
+  expect(await second).toEqual({ state: "complete", value: 1 });
   expect(read).toHaveBeenCalledOnce();
 });
 
@@ -420,7 +423,7 @@ it("requires a trailing fresh read after invalidation without multiplying active
   const controller = linkedTableReads<number>({ read, unavailable: vi.fn(), poll: false });
   controllers.push(controller);
   const initial = controller.request();
-  const verification = controller.verify();
+  const verification = controller.verifyReceipt();
   const changed = controller.invalidate();
   void controller.invalidate();
   expect(read).toHaveBeenCalledTimes(1);
@@ -431,7 +434,7 @@ it("requires a trailing fresh read after invalidation without multiplying active
   expect(read).toHaveBeenCalledTimes(2);
   release.shift()!();
   expect(await initial).toBe(2);
-  expect(await verification).toBe(2);
+  expect(await verification).toEqual({ state: "complete", value: 2 });
   expect(await changed).toBe(2);
   expect(current).toEqual([false, true]);
 });
@@ -456,10 +459,10 @@ it("bounds a freshness wait to two superseded passes and continues jittered reco
   expect(read).toHaveBeenCalledTimes(3);
   finishes.shift()!(3);
   for (let i = 0; i < 6; i++) await Promise.resolve();
-  const verified = c.verify();
+  const verified = c.verifyReceipt();
   for (let i = 0; i < 6; i++) await Promise.resolve();
   finishes.shift()!(4);
-  expect(await verified).toBe(4);
+  expect(await verified).toEqual({ state: "complete", value: 4 });
 });
 it("bounds wall-clock waiting without aborting background verification", async () => {
   vi.useFakeTimers();
@@ -570,4 +573,158 @@ it("retains genuine failure history through a superseded successful read", async
   expect(read).toHaveBeenCalledTimes(3);
   await vi.advanceTimersByTimeAsync(1);
   expect(read).toHaveBeenCalledTimes(4);
+});
+
+it("lets timers progress while an uncovered buffered continuation awaits its refresh", async () => {
+  let release!: (value: {
+    state: "success";
+    value: { generation: number; revision: number };
+    verification: "network";
+  }) => void;
+  let pages = 0;
+  const controller = linkedTableReads({
+    poll: false,
+    unavailable: vi.fn(),
+    coverage: (value: { generation: number; revision: number }) => value,
+    read: async (intent) => {
+      if (intent.kind === "refresh" || ++pages > 25) return { state: "failure" };
+      if (pages === 1)
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      return { state: "success", value: { generation: 1, revision: 1 }, verification: "buffer" };
+    },
+  });
+  controllers.push(controller);
+  void controller.page({ queryIdentity: "query", generation: 1, revision: 1, prefix: 1, cursor: "next", target: 300 });
+  void controller.refresh({ generation: 1, revision: 2 });
+  release({ state: "success", value: { generation: 1, revision: 1 }, verification: "network" });
+  const observed = await new Promise<number>((resolve) => setTimeout(() => resolve(pages), 0));
+  expect(observed).toBe(1);
+});
+
+it("keeps append failures out of the first denial recovery deadline", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let pages = 0;
+  let release!: (value: {
+    state: "success";
+    value: { generation: number; revision: number };
+    verification: "network";
+  }) => void;
+  const read = vi.fn(async (intent: TableReadIntent) => {
+    if (intent.kind === "refresh") return { state: "denied" as const };
+    if (++pages <= 5) return { state: "failure" as const };
+    return new Promise<{ state: "success"; value: { generation: number; revision: number }; verification: "network" }>(
+      (resolve) => {
+        release = resolve;
+      },
+    );
+  });
+  const controller = linkedTableReads({ read, poll: false, coverage: (value) => value, unavailable: vi.fn() });
+  controllers.push(controller);
+  void controller.page({ queryIdentity: "query", generation: 1, revision: 1, prefix: 1, cursor: "next", target: 300 });
+  await flushReads();
+  for (const delay of [1000, 2000, 4000, 8000, 15000]) await vi.advanceTimersByTimeAsync(delay);
+  void controller.refresh({ generation: 1, revision: 2 });
+  release({ state: "success", value: { generation: 1, revision: 1 }, verification: "network" });
+  await flushReads();
+  const before = read.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(999);
+  expect(read).toHaveBeenCalledTimes(before);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(before + 1);
+});
+
+it("runs prerequisite verification before a dependent continuation at the recovery deadline", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let finish!: (value: {
+    state: "success";
+    value: { generation: number; revision: number };
+    verification: "network";
+  }) => void;
+  let pages = 0,
+    refreshes = 0;
+  const read = vi.fn(async (intent: TableReadIntent) => {
+    if (intent.kind === "refresh")
+      return ++refreshes === 1
+        ? { state: "failure" as const }
+        : { state: "success" as const, value: { generation: 1, revision: 2 }, verification: "network" as const };
+    if (++pages === 1)
+      return new Promise<{
+        state: "success";
+        value: { generation: number; revision: number };
+        verification: "network";
+      }>((resolve) => {
+        finish = resolve;
+      });
+    return { state: "success" as const, value: { generation: 1, revision: 2 }, verification: "buffer" as const };
+  });
+  const controller = linkedTableReads<{ generation: number; revision: number }>({
+    read,
+    coverage: (value) => value,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(controller);
+  const pending = controller.page({
+    queryIdentity: "query",
+    generation: 1,
+    revision: 1,
+    prefix: 1,
+    cursor: "next",
+    target: 300,
+  });
+  void controller.refresh({ generation: 1, revision: 2 });
+  finish({ state: "success", value: { generation: 1, revision: 1 }, verification: "network" });
+  await flushReads();
+  expect(pages).toBe(1);
+  await vi.advanceTimersByTimeAsync(999);
+  expect(read).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(await pending).toEqual({ generation: 1, revision: 2 });
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["page", "refresh", "refresh", "page"]);
+});
+
+it("reports exhausted cursor churn as pending and resumes its extent after network verification", async () => {
+  const unavailable = vi.fn();
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce({ state: "stale" })
+    .mockResolvedValueOnce({ state: "success", value: 2, verification: "network" })
+    .mockResolvedValueOnce({ state: "success", value: 3, verification: "buffer" });
+  const controller = linkedTableReads<number>({ read, unavailable, poll: false });
+  controllers.push(controller);
+  expect(
+    await controller.page({
+      queryIdentity: "query",
+      generation: 1,
+      revision: 1,
+      prefix: 1,
+      cursor: "next",
+      target: 300,
+    }),
+  ).toBeNull();
+  await flushReads();
+  expect(unavailable.mock.calls).toEqual([["failure"], ["stale"]]);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["page", "refresh", "page"]);
+});
+
+it("delivers only verified network recovery to observers and isolates subscriber failures", async () => {
+  const controller = setup(vi.fn().mockResolvedValueOnce(null).mockResolvedValue(2));
+  const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const observer = vi.fn();
+  controller.subscribe(() => {
+    throw new Error("retired consumer");
+  });
+  const unsubscribe = controller.subscribe(observer);
+  expect(await controller.request()).toBeNull();
+  expect(observer).not.toHaveBeenCalled();
+  expect(await controller.request()).toBe(2);
+  expect(observer).toHaveBeenCalledExactlyOnceWith({ state: "complete", value: 2 });
+  expect(warning).toHaveBeenCalledOnce();
+  unsubscribe();
+  await controller.request();
+  expect(observer).toHaveBeenCalledOnce();
 });

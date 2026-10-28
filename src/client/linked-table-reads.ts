@@ -1,6 +1,7 @@
 import { jitteredBackoff } from "../shared/retry";
+import { readTableCoverage, type TableCoverage } from "../shared/table-coverage";
 
-export type TableCoverage = { generation: number; revision: number };
+export type { TableCoverage } from "../shared/table-coverage";
 export type LinkedTableContinuation = { queryIdentity: string; generation: number; target: number };
 export type LinkedTableReadIntent = { kind: "refresh" } | ({ kind: "append" } & LinkedTableContinuation);
 export type CanonicalTableContinuation = {
@@ -15,7 +16,7 @@ export type TableReadIntent = LinkedTableReadIntent | ({ kind: "page" } & Canoni
 export type TableReadContext = { current: (coverage?: TableCoverage) => boolean };
 export type LinkedTableReadOutcome<T> =
   | { state: "success"; value: T; verification: "network" | "buffer" }
-  | { state: "failure" | "denied" | "suspended" | "superseded" };
+  | { state: "failure" | "denied" | "suspended" | "superseded" | "stale" };
 export type TableReadReceipt<T> =
   | { state: "complete" | "generation-changed"; value: T }
   | { state: "pending" | "failure" | "denied" | "suspended" | "retired" };
@@ -31,6 +32,7 @@ type Batch<T> = {
   attempt: number;
   retryAt: number;
   manual: boolean;
+  needsFreshness: boolean;
 };
 const intentKey = (intent: TableReadIntent) =>
   intent.kind === "refresh"
@@ -44,11 +46,12 @@ const freshBatch = <T>(intent: TableReadIntent = { kind: "refresh" }): Batch<T> 
   attempt: 0,
   retryAt: 0,
   manual: false,
+  needsFreshness: false,
 });
 /** One active logical read. Freshness debt never owns an unbounded caller lifetime. */
 export function linkedTableReads<T>(options: {
   read: (intent: TableReadIntent, signal: AbortSignal, context: TableReadContext) => Promise<LinkedTableReadOutcome<T>>;
-  unavailable: (reason: "failure" | "suspended") => void;
+  unavailable: (reason: "failure" | "suspended" | "stale") => void;
   coverage?: (value: T) => TableCoverage;
   poll?: boolean;
 }) {
@@ -62,6 +65,7 @@ export function linkedTableReads<T>(options: {
   let active: { batch: Batch<T>; controller: AbortController } | undefined;
   let completed: { value: T; sequence: number; coverage?: TableCoverage } | undefined;
   const watermarks = new Map<number, { revision: number; sequence: number }>();
+  const observers = new Set<(receipt: TableReadReceipt<T>) => void>();
   const queued = new Map<string, Batch<T>>();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const available = () => !stopped && navigator.onLine && !document.hidden;
@@ -89,6 +93,13 @@ export function linkedTableReads<T>(options: {
   const settleBatch = (batch: Batch<T>, value: TableReadReceipt<T>) => {
     for (const waiter of batch.waiters.splice(0)) settle(waiter, value);
   };
+  const observe = (observer: (receipt: TableReadReceipt<T>) => void, receipt: TableReadReceipt<T>) => {
+    try {
+      observer(receipt);
+    } catch (cause) {
+      console.warn("Table verification observer failed", cause);
+    }
+  };
   const retireQueued = (predicate: (intent: TableReadIntent) => boolean) => {
     for (const [name, batch] of queued) {
       if (!predicate(batch.intent)) continue;
@@ -100,12 +111,14 @@ export function linkedTableReads<T>(options: {
   const schedule = () => {
     clear();
     if (!available() || active || !queued.size) return;
-    const earliest = Math.min(...[...queued.values()].map((batch) => batch.retryAt));
+    const runnable = [...queued.values()].filter((batch) => !batch.needsFreshness);
+    if (!runnable.length) return;
+    const earliest = Math.min(...runnable.map((batch) => batch.retryAt));
     timer = setTimeout(next, Math.max(0, earliest - Date.now()));
   };
   function next() {
     if (!available() || active) return;
-    const eligible = [...queued.values()].filter((batch) => batch.retryAt <= Date.now());
+    const eligible = [...queued.values()].filter((batch) => !batch.needsFreshness && batch.retryAt <= Date.now());
     const append = eligible.find((batch) => batch.intent.kind !== "refresh");
     const refresh = eligible.find((batch) => batch.intent.kind === "refresh");
     const batch = append && (!refresh || refreshAhead) ? append : refresh;
@@ -123,6 +136,7 @@ export function linkedTableReads<T>(options: {
     if (trailing) {
       trailing.waiters.push(...batch.waiters.splice(0));
       trailing.attempt = Math.max(trailing.attempt, batch.attempt);
+      trailing.needsFreshness ||= batch.needsFreshness;
       if (!trailing.manual) trailing.retryAt = Math.max(trailing.retryAt, batch.retryAt);
     } else queued.set(name, batch);
   }
@@ -170,9 +184,14 @@ export function linkedTableReads<T>(options: {
     if (active !== owner || stopped) return;
     active = undefined;
     const coverage = outcome.state === "success" ? options.coverage?.(outcome.value) : undefined;
-    if (outcome.state === "success" && !covered(sequence, coverage)) {
+    if (outcome.state === "stale" || (outcome.state === "success" && !covered(sequence, coverage))) {
+      if (outcome.state === "stale") {
+        unscoped = ++invalidation;
+        options.unavailable("stale");
+        settleBatch(batch, { state: "pending" });
+      }
       const trailing = queued.get("refresh") ?? freshBatch<T>();
-      trailing.attempt = Math.max(trailing.attempt, batch.attempt);
+      if (batch.intent.kind === "refresh") trailing.attempt = Math.max(trailing.attempt, batch.attempt);
       for (const waiter of batch.waiters.splice(0)) {
         if (++waiter.passes >= 2) settle(waiter, { state: "pending" });
         else if (!waiter.settled) {
@@ -180,7 +199,10 @@ export function linkedTableReads<T>(options: {
           else batch.waiters.push(waiter);
         }
       }
-      if (batch.intent.kind !== "refresh") enqueueRetry(batch);
+      if (batch.intent.kind !== "refresh") {
+        batch.needsFreshness = true;
+        enqueueRetry(batch);
+      }
       // First supersession gets one immediate trailing read; continued churn is bounded background work.
       if (freshnessAttempt++ > 0 && !trailing.manual)
         trailing.retryAt = Math.max(trailing.retryAt, Date.now() + jitteredBackoff(freshnessAttempt - 2, 2000, 30_000));
@@ -213,6 +235,8 @@ export function linkedTableReads<T>(options: {
       freshnessAttempt = 0;
       completed = { value: outcome.value, sequence: invalidation, coverage };
       watermarks.clear();
+      for (const pending of queued.values()) pending.needsFreshness = false;
+      for (const observer of observers) observe(observer, receipt);
     }
     next();
   }
@@ -221,6 +245,8 @@ export function linkedTableReads<T>(options: {
     const name = intentKey(intent);
     const joining = (intent.kind !== "refresh" || joinActive) && active && intentKey(active.batch.intent) === name;
     const batch = joining ? active!.batch : (queued.get(name) ?? freshBatch<T>(intent));
+    if (intent.kind !== "refresh" && invalidation > 0 && !covered(completed?.sequence ?? -1, completed?.coverage))
+      batch.needsFreshness = true;
     if (manual && !joining) {
       batch.retryAt = 0;
       batch.manual = true;
@@ -239,14 +265,7 @@ export function linkedTableReads<T>(options: {
     });
   }
   const requireFreshness = (coverage?: TableCoverage) => {
-    if (
-      coverage &&
-      (!Number.isSafeInteger(coverage.generation) ||
-        coverage.generation < 1 ||
-        !Number.isSafeInteger(coverage.revision) ||
-        coverage.revision < 0)
-    )
-      coverage = undefined;
+    coverage = readTableCoverage(coverage);
     if (
       coverage &&
       completed?.coverage?.generation === coverage.generation &&
@@ -262,6 +281,7 @@ export function linkedTableReads<T>(options: {
         sequence: invalidation,
       });
     } else unscoped = invalidation;
+    for (const batch of queued.values()) if (batch.intent.kind !== "refresh") batch.needsFreshness = true;
     return requestIntent({ kind: "refresh" }, false, Boolean(coverage));
   };
   const valueOf = async (receipt: Promise<TableReadReceipt<T>>) => {
@@ -313,8 +333,15 @@ export function linkedTableReads<T>(options: {
     page: (continuation: CanonicalTableContinuation) => valueOf(requestIntent({ kind: "page", ...continuation })),
     retirePages: (keep?: (intent: CanonicalTableContinuation) => boolean) =>
       retireQueued((intent) => intent.kind === "page" && !keep?.(intent)),
-    verify: () => valueOf(requestIntent({ kind: "refresh" }, false, true)),
     verifyReceipt: () => requestIntent({ kind: "refresh" }, false, true),
+    subscribe: (observer: (receipt: TableReadReceipt<T>) => void) => {
+      observers.add(observer);
+      if (available() && completed && covered(completed.sequence, completed.coverage))
+        observe(observer, { state: "complete", value: completed.value });
+      return () => {
+        observers.delete(observer);
+      };
+    },
     refresh: requireFreshness,
     invalidate: (coverage?: TableCoverage) => valueOf(requireFreshness(coverage)),
     reset,
@@ -323,6 +350,7 @@ export function linkedTableReads<T>(options: {
       stopped = true;
       reset();
       clearInterval(poll);
+      observers.clear();
       window.removeEventListener("online", wake);
       window.removeEventListener("offline", wake);
       document.removeEventListener("visibilitychange", wake);
