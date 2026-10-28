@@ -348,7 +348,12 @@ test("a saved linked operation retries after search verification with its origin
   const initial = await month.inputValue();
   await month.fill(`${Number(initial.slice(0, 4)) + 1}-${initial.slice(5)}`);
   await expect(retry).toBeEnabled();
+  const committedRetry = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === `${path}/commands` && response.request().method() === "POST",
+  );
   await retry.click();
+  const retryResponse = await committedRetry;
+  expect(retryResponse.ok(), await retryResponse.text()).toBeTruthy();
   await expect(retry).toHaveCount(0);
   expect(attempts).toHaveLength(2);
   expect(attempts[1]).toEqual(attempts[0]);
