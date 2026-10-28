@@ -22,6 +22,7 @@ import {flushSync} from 'react-dom';
 import {CollaborativeTablePage} from './src/client/CollaborativeTablePage';
 import {tableConnection} from './src/client/table-connection';
 import {readLinkedTable} from './src/client/linked-table-query';
+import {linkedTableReads} from './src/client/linked-table-reads';
 import {registerCommentPublication,initializeCommentPublications,useCommentPublicationWarning} from './src/client/comment-publication';
 const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
 const percentile=(values,q)=>[...values].sort((a,b)=>a-b)[Math.ceil(values.length*q)-1];
@@ -185,6 +186,22 @@ globalThis.measureViewSwitch=async()=>{
   return {samples:20,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),restored,renderCounts,queries};
  }finally{tree.unmount();host.remove();globalThis.__data=previous;}
 };
+globalThis.measureFreshnessCompletion=async()=>{
+ const durations=[],reads=[],outcomes=[];
+ for(let sample=0;sample<10;sample++){
+  let finish=null,count=0,finishedAt=0;
+  const controller=linkedTableReads({poll:false,unavailable(){},read:()=>new Promise(resolve=>{count++;finish=()=>{finish=null;resolve({state:'success',value:1,verification:'network'});};})});
+  const started=performance.now();
+  const first=controller.request().then(value=>{finishedAt=performance.now();return value;});
+  try{
+   for(let event=0;event<8;event++){void controller.invalidate();if(finish)finish();await frame();}
+   if(finish)finish();
+   const outcome=await first;
+   durations.push(finishedAt-started);reads.push(count);outcomes.push(outcome===null?'pending':'complete');
+  }finally{controller.dispose();}
+ }
+ return {samples:10,invalidationsPerSample:8,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),reads,outcomes,meaning:'Caller completion under controlled invalidation churn; pending is not fresh verification.'};
+};
 globalThis.measureFulfilledContinuations=async()=>{
  const current={data:globalThis.__data,buffered:[],serverCursor:null,pageSize:100,queryIdentity:'noop',verified:true,hasMore:false,continuation:null};
  const durations=[];let requests=0,sameWindows=0,sameData=0,sameRows=0;
@@ -319,6 +336,8 @@ const results = {
     paginationRefreshSamplesPerContext: 5,
     queryVerificationSamplesPerContext: 20,
     fulfilledContinuationSamplesPerContext: 1000,
+    freshnessCompletionSamplesPerContext: 10,
+    invalidationsPerFreshnessSample: 8,
   },
   limits:
     "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
@@ -341,6 +360,7 @@ try {
         queryVerification: await page.evaluate(() => globalThis.measureQueryVerification()),
         fulfilledContinuations: await page.evaluate(() => globalThis.measureFulfilledContinuations()),
         viewSwitch: await page.evaluate(() => globalThis.measureViewSwitch()),
+        freshnessCompletion: await page.evaluate(() => globalThis.measureFreshnessCompletion()),
         ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });
       await context.close();
