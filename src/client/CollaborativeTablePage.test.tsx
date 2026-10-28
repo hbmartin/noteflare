@@ -1959,3 +1959,65 @@ it.each([false, true])("deduplicates a covered remote task event, own %s", async
 it("restores the original jitter function after every earlier test", () => {
   expect(Math.random).toBe(originalRandom);
 });
+
+it("keeps a committed mutation certain when its separate refresh fails and retries", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const original = vi.mocked(api).getMockImplementation()!;
+  let reads = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (!init?.method && ++reads === 1) throw new ApiClientError(503, "read_unavailable", "Refresh dependency failed");
+    return original(path, init);
+  });
+  await act(async () => fireEvent.click(screen.getByLabelText("Check")));
+  expect(writes).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  expect(screen.getByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Retry saved operation" })).toBeNull();
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(reads).toBe(2);
+  expect(writes).toHaveLength(1);
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+});
+it("turns a second canonical cursor churn into pending freshness with its extent retained", async () => {
+  const rows = Array.from({ length: 200 }, (_, i) => ({
+    ...data.rows[0]!,
+    id: `churn-${i}`,
+    cells: { Title: `Row ${i}` },
+  }));
+  data = { ...data, columns: [column("Title", "text")], rows, rowCount: rows.length };
+  let pages = 0,
+    refreshes = 0;
+  let release!: () => void;
+  vi.mocked(api).mockImplementation(async (path) => {
+    const cursor = new URL(path, "https://test").searchParams.get("cursor");
+    if (cursor) {
+      pages++;
+      return { ...data, revision: pages === 1 ? 2 : 3, rows: rows.slice(100), nextCursor: null };
+    }
+    refreshes++;
+    if (refreshes === 3)
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    return { ...data, revision: Math.min(refreshes, 3), rows: rows.slice(0, 100), nextCursor: "100" };
+  });
+  render(<CollaborativeTablePage page={{ id: "table", title: "Table" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(screen.getAllByLabelText("Title")[0]).toBeEnabled());
+  vi.useFakeTimers();
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
+  expect(pages).toBe(2);
+  expect(screen.getAllByLabelText("Title")).toHaveLength(100);
+  expect(screen.getByText("The table is changing. Refreshing the latest data…")).toBeVisible();
+  expect(screen.getAllByLabelText("Title")[0]).toBeDisabled();
+  expect(screen.queryByRole("alert")).toBeNull();
+  await act(async () => release());
+  expect(pages).toBe(3);
+  expect(screen.getAllByLabelText("Title")).toHaveLength(200);
+  expect(screen.getAllByLabelText("Title")[0]).toBeEnabled();
+});

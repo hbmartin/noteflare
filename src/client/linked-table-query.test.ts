@@ -240,3 +240,16 @@ it("completes exhausted continuations without issuing reads or inventing rows", 
   expect(result.window.continuation).toBeNull();
   expect(read).not.toHaveBeenCalled();
 });
+
+it("retains network provenance when a restarted continuation reaches exhaustion", async () => {
+  const current = loaded(page(["a"], "old"));
+  const read = vi
+    .fn()
+    .mockRejectedValueOnce(new ApiClientError(409, "table_cursor_stale", "Changed"))
+    .mockResolvedValueOnce(page(["remaining"], null));
+  const result = await query(append(current), current, read);
+  expect(read).toHaveBeenCalledTimes(2);
+  expect(result.window.data.rows.map((row) => row.id)).toEqual(["remaining"]);
+  expect(result.window.hasMore).toBe(false);
+  expect(result.verification).toBe("network");
+});
