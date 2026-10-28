@@ -1,11 +1,9 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promisify } from "node:util";
-import { resolve } from "node:path";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type APIResponse, type BrowserContext, type Page } from "@playwright/test";
 
 import { signInOwner as signIn, completeEnrollment } from "./security-helpers";
+import { clearLocalImportPreview } from "./local-import-fixture";
 
 function settledRequestFailure(
   result: PromiseSettledResult<APIResponse>,
@@ -391,21 +389,7 @@ test("refreshes an old import preview and imports only after a second confirmati
   const item = activities.locator(".activity-list > li").first();
   await expect(item.getByRole("button", { name: "Confirm import" })).toBeVisible({ timeout: 30_000 });
   const original = (await (await page.request.get(`/api/jobs/${job.id}`)).json()).job.result.preview.previewId;
-  await promisify(execFile)(process.execPath, [
-    resolve("node_modules/wrangler/bin/wrangler.js"),
-    "--config",
-    resolve("wrangler.jsonc"),
-    "d1",
-    "execute",
-    "DB",
-    "--env",
-    "notes-checks-e2e",
-    "--local",
-    "--persist-to",
-    resolve(".wrangler/e2e"),
-    "--command",
-    `UPDATE jobs SET result_json = json_remove(result_json, '$.preview.previewId') WHERE id = '${job.id}'`,
-  ]);
+  await clearLocalImportPreview(job.id);
   const refreshing = page.waitForResponse((response) => response.url().endsWith(`/api/imports/${job.id}/confirm`));
   await item.getByRole("button", { name: "Confirm import" }).click();
   expect((await (await refreshing).json()).job.progress.label).toBe("Refreshing preview");

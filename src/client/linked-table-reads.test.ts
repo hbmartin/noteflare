@@ -435,3 +435,139 @@ it("requires a trailing fresh read after invalidation without multiplying active
   expect(await changed).toBe(2);
   expect(current).toEqual([false, true]);
 });
+
+it("bounds a freshness wait to two superseded passes and continues jittered recovery", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const finishes: Array<(value: number) => void> = [];
+  const read = vi.fn(() => new Promise<number>((resolve) => finishes.push(resolve)));
+  const c = setup(read);
+  const first = c.request();
+  void c.invalidate();
+  finishes.shift()!(1);
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  void c.invalidate();
+  finishes.shift()!(2);
+  expect(await first).toBeNull();
+  expect(read).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(999);
+  expect(read).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(3);
+  finishes.shift()!(3);
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  const verified = c.verify();
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  finishes.shift()!(4);
+  expect(await verified).toBe(4);
+});
+it("bounds wall-clock waiting without aborting background verification", async () => {
+  vi.useFakeTimers();
+  let finish!: (value: number) => void;
+  const controller = setup(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const receipt = controller.verifyReceipt();
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(await receipt).toEqual({ state: "pending" });
+  finish(2);
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  controller.dispose();
+});
+it("reuses only network coverage in the same generation and retains newer unknown changes", async () => {
+  const finishes: Array<(value: { generation: number; revision: number }) => void> = [];
+  const read = vi.fn(() => new Promise<{ generation: number; revision: number }>((resolve) => finishes.push(resolve)));
+  const c = linkedTableReads({
+    read: async () => ({ state: "success", value: await read(), verification: "network" }),
+    coverage: (value) => value,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(c);
+  const first = c.verifyReceipt();
+  const commit = c.refresh({ generation: 1, revision: 4 });
+  finishes.shift()!({ generation: 1, revision: 4 });
+  expect((await first).state).toBe("complete");
+  expect((await commit).state).toBe("complete");
+  expect((await c.refresh({ generation: 1, revision: 4 })).state).toBe("complete");
+  expect(read).toHaveBeenCalledOnce();
+  const next = c.refresh({ generation: 1, revision: 5 });
+  void c.invalidate();
+  finishes.shift()!({ generation: 1, revision: 5 });
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  expect(read).toHaveBeenCalledTimes(3);
+  finishes.shift()!({ generation: 1, revision: 5 });
+  expect((await next).state).toBe("complete");
+  const changedGeneration = c.refresh({ generation: 2, revision: 1 });
+  expect(read).toHaveBeenCalledTimes(4);
+  finishes.shift()!({ generation: 2, revision: 1 });
+  expect((await changedGeneration).state).toBe("complete");
+});
+
+it("keeps an invalidated continuation attached to its extent after the trailing refresh", async () => {
+  const finishes: Array<(value: number) => void> = [];
+  const read = vi.fn(() => new Promise<number>((resolve) => finishes.push(resolve)));
+  const c = setup(read);
+  const page = c.request(continuation(300));
+  void c.invalidate();
+  finishes.shift()!(1);
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  expect(read.mock.calls).toHaveLength(2);
+  finishes.shift()!(2);
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  expect(read.mock.calls).toHaveLength(3);
+  finishes.shift()!(3);
+  expect(await page).toBe(3);
+});
+
+it("rejects older generation coverage and retires old requirements on a newer generation", async () => {
+  const finishes: Array<(value: { generation: number; revision: number }) => void> = [];
+  const c = linkedTableReads({
+    read: async () => ({
+      state: "success",
+      value: await new Promise<{ generation: number; revision: number }>((resolve) => finishes.push(resolve)),
+      verification: "network",
+    }),
+    coverage: (value) => value,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(c);
+  const waiting = c.refresh({ generation: 2, revision: 10 });
+  finishes.shift()!({ generation: 1, revision: 100 });
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  expect(finishes).toHaveLength(1);
+  finishes.shift()!({ generation: 3, revision: 1 });
+  expect(await waiting).toEqual({ state: "generation-changed", value: { generation: 3, revision: 1 } });
+});
+
+it("retains genuine failure history through a superseded successful read", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let finish!: (value: number) => void;
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce(null)
+    .mockImplementationOnce(
+      () =>
+        new Promise<number>((resolve) => {
+          finish = resolve;
+        }),
+    )
+    .mockResolvedValueOnce(null)
+    .mockResolvedValue(4);
+  const c = setup(read);
+  expect(await c.request()).toBeNull();
+  await vi.advanceTimersByTimeAsync(1000);
+  void c.invalidate();
+  finish(2);
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  expect(read).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(1999);
+  expect(read).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(4);
+});

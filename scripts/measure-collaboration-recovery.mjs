@@ -22,6 +22,7 @@ import {flushSync} from 'react-dom';
 import {CollaborativeTablePage} from './src/client/CollaborativeTablePage';
 import {tableConnection} from './src/client/table-connection';
 import {readLinkedTable} from './src/client/linked-table-query';
+import {linkedTableReads} from './src/client/linked-table-reads';
 import {registerCommentPublication,initializeCommentPublications,useCommentPublicationWarning} from './src/client/comment-publication';
 const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
 const percentile=(values,q)=>[...values].sort((a,b)=>a-b)[Math.ceil(values.length*q)-1];
@@ -157,7 +158,7 @@ globalThis.measureQueryVerification=async()=>{
 };
 globalThis.measureViewSwitch=async()=>{
  const previous=globalThis.__data;
- globalThis.__data={...previous,views:[{id:'grid',name:'Grid',kind:'grid',revision:1,ownerId:null,columnId:null,filters:null,sorts:[],visibleColumnIds:previous.columns.map(column=>column.id)}]};
+ globalThis.__data={...previous,views:[{id:'grid',name:'Grid',kind:'grid',revision:1,ownerId:null,columnId:null,filters:null,sorts:[],visibleColumnIds:previous.columns.filter(column=>column.id!=='Done').map(column=>column.id)}]};
  const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
  flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'View measurement'},member:{role:'editor',user:{id:'view-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
  const button=text=>[...host.querySelectorAll('button')].find(item=>item.textContent.trim()===text);
@@ -174,6 +175,8 @@ globalThis.measureViewSwitch=async()=>{
    change(host.querySelector('input[aria-label="New property name"]'),'All '+sample);
    const renders=globalThis.__wholeTableRenders,before=globalThis.__requests,start=performance.now();
    select('grid');await settle(before);
+   const headers=[...host.querySelectorAll('table thead th')].map(node=>node.firstChild?.textContent);
+   if(!headers.includes('Title')||!headers.includes('Amount')||headers.includes('Done'))throw Error('Saved-view visible columns were not applied');
    if(!host.querySelector('input[aria-label="New property name"]')){button('Properties').click();await frame();}
    change(host.querySelector('input[aria-label="New property name"]'),'Grid '+sample);
    const back=globalThis.__requests;select('');await settle(back);
@@ -182,6 +185,22 @@ globalThis.measureViewSwitch=async()=>{
   }
   return {samples:20,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),restored,renderCounts,queries};
  }finally{tree.unmount();host.remove();globalThis.__data=previous;}
+};
+globalThis.measureFreshnessCompletion=async()=>{
+ const durations=[],reads=[],outcomes=[];
+ for(let sample=0;sample<10;sample++){
+  let finish=null,count=0,finishedAt=0;
+  const controller=linkedTableReads({poll:false,unavailable(){},read:()=>new Promise(resolve=>{count++;finish=()=>{finish=null;resolve({state:'success',value:1,verification:'network'});};})});
+  const started=performance.now();
+  const first=controller.request().then(value=>{finishedAt=performance.now();return value;});
+  try{
+   for(let event=0;event<8;event++){void controller.invalidate();if(finish)finish();await frame();}
+   if(finish)finish();
+   const outcome=await first;
+   durations.push(finishedAt-started);reads.push(count);outcomes.push(outcome===null?'pending':'complete');
+  }finally{controller.dispose();}
+ }
+ return {samples:10,invalidationsPerSample:8,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),reads,outcomes,meaning:'Caller completion under controlled invalidation churn; pending is not fresh verification.'};
 };
 globalThis.measureFulfilledContinuations=async()=>{
  const current={data:globalThis.__data,buffered:[],serverCursor:null,pageSize:100,queryIdentity:'noop',verified:true,hasMore:false,continuation:null};
@@ -242,7 +261,8 @@ async function bundle(before) {
                 const end=decoded.offset+limit;
                 return {...globalThis.__data,rows:globalThis.__pagedRows.slice(decoded.offset,end),rowCount:globalThis.__pagedRows.length,nextCursor:end<globalThis.__pagedRows.length?JSON.stringify({offset:end,limit}):null};
               }
-              return path?.endsWith('/commands')?{revision:1,result:{},projectionPending:false}:globalThis.__data;
+              const viewId=new URL(path,'http://fixture').searchParams.get('viewId');
+              return path?.endsWith('/commands')?{revision:1,result:{},projectionPending:false}:{...globalThis.__data,view:viewId?globalThis.__data.views.find(view=>view.id===viewId)??null:null};
             }`,
             loader: "ts",
           }));
@@ -316,6 +336,8 @@ const results = {
     paginationRefreshSamplesPerContext: 5,
     queryVerificationSamplesPerContext: 20,
     fulfilledContinuationSamplesPerContext: 1000,
+    freshnessCompletionSamplesPerContext: 10,
+    invalidationsPerFreshnessSample: 8,
   },
   limits:
     "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
@@ -338,6 +360,7 @@ try {
         queryVerification: await page.evaluate(() => globalThis.measureQueryVerification()),
         fulfilledContinuations: await page.evaluate(() => globalThis.measureFulfilledContinuations()),
         viewSwitch: await page.evaluate(() => globalThis.measureViewSwitch()),
+        freshnessCompletion: await page.evaluate(() => globalThis.measureFreshnessCompletion()),
         ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });
       await context.close();

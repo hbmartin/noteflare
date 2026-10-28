@@ -2,6 +2,8 @@ import { REALTIME_GRANT_MS } from "../shared/realtime-limits";
 import type { TableQueryResult } from "../shared/table-protocol";
 import { jitteredBackoff } from "../shared/retry";
 
+export type TableSocketVerification = TableQueryResult | { state: "pending" } | null;
+type VerificationWork = () => Promise<TableSocketVerification>;
 type Slot = {
   socket: WebSocket;
   started: number;
@@ -9,7 +11,9 @@ type Slot = {
   renewAt: number | null;
   generation: number | null;
   checking: boolean;
-  trailing: boolean;
+  waiting: boolean;
+  trailing: VerificationWork | null;
+  pending?: ReturnType<typeof setTimeout>;
   retired: boolean;
   handshake?: ReturnType<typeof setTimeout>;
 };
@@ -17,9 +21,13 @@ const available = () => navigator.onLine && !document.hidden;
 /** One live grant and one replacement. Query/view lifetimes do not own the transport. */
 export function tableConnection(options: {
   url: string;
-  query: () => Promise<TableQueryResult | null>;
+  query: () => Promise<TableSocketVerification>;
   ready: (value: boolean) => void;
-  invalidate?: () => void;
+  invalidate?: (coverage?: {
+    generation: number;
+    revision: number;
+    operationId?: string;
+  }) => Promise<TableSocketVerification> | void;
   verified?: (generation: number) => void;
 }) {
   let active: Slot | null = null,
@@ -35,6 +43,7 @@ export function tableConnection(options: {
     if (slot) {
       slot.retired = true;
       clearTimeout(slot.handshake);
+      clearTimeout(slot.pending);
       slot.socket.close();
     }
   };
@@ -71,15 +80,32 @@ export function tableConnection(options: {
     clearTimeout(retry);
     if (available()) retry = setTimeout(connect, delay);
   };
-  const verify = async (slot: Slot) => {
+  const verify = async (slot: Slot, work: VerificationWork = options.query) => {
     if (slot.checking) {
-      slot.trailing = true;
+      slot.trailing = work;
       return;
     }
     slot.checking = true;
     try {
-      const result = await options.query();
+      const result = await work();
       if (stopped || slot.retired) return;
+      if (result && "state" in result) {
+        if (slot.deadline <= Date.now()) {
+          failed(slot, true);
+          return;
+        }
+        slot.waiting = true;
+        clearTimeout(slot.pending);
+        slot.pending = setTimeout(
+          () => {
+            if (available()) void verify(slot);
+          },
+          Math.min(2000, slot.deadline - Date.now()),
+        );
+        return;
+      }
+      slot.waiting = false;
+      clearTimeout(slot.pending);
       if (
         !result ||
         slot.deadline <= Date.now() ||
@@ -108,8 +134,9 @@ export function tableConnection(options: {
     } finally {
       slot.checking = false;
       if (slot.trailing && !slot.retired && !stopped) {
-        slot.trailing = false;
-        void verify(slot);
+        const trailing = slot.trailing;
+        slot.trailing = null;
+        void verify(slot, trailing);
       }
     }
   };
@@ -127,7 +154,8 @@ export function tableConnection(options: {
       generation: null,
       renewAt: null,
       checking: false,
-      trailing: false,
+      waiting: false,
+      trailing: null,
       retired: false,
     };
     replacement = slot;
@@ -162,8 +190,19 @@ export function tableConnection(options: {
         }
         void verify(slot);
       } else if (message?.type === "table-changed" && active === slot) {
-        if (options.invalidate) options.invalidate();
-        else void verify(slot);
+        if (options.invalidate) {
+          const revision = message.revision;
+          const pending = options.invalidate(
+            slot.generation !== null && Number.isSafeInteger(revision) && Number(revision) >= 0
+              ? {
+                  generation: slot.generation,
+                  revision: Number(revision),
+                  ...(typeof message.operationId === "string" ? { operationId: message.operationId } : {}),
+                }
+              : undefined,
+          );
+          if (pending) void verify(slot, () => pending);
+        } else void verify(slot);
       }
     });
     slot.socket.addEventListener("close", (event) => {
@@ -192,6 +231,7 @@ export function tableConnection(options: {
       return;
     }
     options.ready(false);
+    if (replacement?.waiting) void verify(replacement);
     if (!valid()) {
       retire(active);
       active = null;
