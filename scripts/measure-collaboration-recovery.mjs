@@ -14,7 +14,7 @@ if (!Number.isSafeInteger(typingEdits) || typingEdits < 20 || typingEdits > 1000
   throw new Error("Invalid typing sample count");
 const root = process.cwd();
 const controlled =
-  /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection|comment-publication|linked-table-reads|linked-table-query)\.(ts|tsx)$/;
+  /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection|comment-publication|linked-table-reads|linked-table-query|table-view-state)\.(ts|tsx)$/;
 const entry = `
 import {createElement} from 'react';
 import {createRoot} from 'react-dom/client';
@@ -154,6 +154,34 @@ globalThis.measureQueryVerification=async()=>{
   }
   return {samples:20,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),toolbarReplacements,controlsMissingDuringVerification,renderCounts,queries};
  }finally{tree.unmount();host.remove();}
+};
+globalThis.measureViewSwitch=async()=>{
+ const previous=globalThis.__data;
+ globalThis.__data={...previous,views:[{id:'grid',name:'Grid',kind:'grid',revision:1,ownerId:null,columnId:null,filters:null,sorts:[],visibleColumnIds:previous.columns.map(column=>column.id)}]};
+ const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
+ flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'View measurement'},member:{role:'editor',user:{id:'view-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
+ const button=text=>[...host.querySelectorAll('button')].find(item=>item.textContent.trim()===text);
+ const ready=()=>button('Views')&&!button('Views').disabled;
+ const settle=async before=>{for(let i=0;i<100;i++){await frame();if(ready()&&globalThis.__requests>before)return;}throw Error('View did not verify');};
+ const change=(input,value)=>flushSync(()=>{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,value);input.dispatchEvent(new Event('input',{bubbles:true}));});
+ const select=value=>flushSync(()=>{const input=host.querySelector('select[aria-label="Saved table view"]');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(input,value);input.dispatchEvent(new Event('change',{bubbles:true}));});
+ const durations=[],renderCounts=[],queries=[];let restored=0;
+ try{
+  for(let i=0;i<100&&!ready();i++)await frame();
+  if(!ready())throw Error('View fixture not ready');
+  button('Properties').click();await frame();
+  for(let sample=0;sample<20;sample++){
+   change(host.querySelector('input[aria-label="New property name"]'),'All '+sample);
+   const renders=globalThis.__wholeTableRenders,before=globalThis.__requests,start=performance.now();
+   select('grid');await settle(before);
+   if(!host.querySelector('input[aria-label="New property name"]')){button('Properties').click();await frame();}
+   change(host.querySelector('input[aria-label="New property name"]'),'Grid '+sample);
+   const back=globalThis.__requests;select('');await settle(back);
+   restored+=Number(host.querySelector('input[aria-label="New property name"]')?.value==='All '+sample);
+   durations.push(performance.now()-start);renderCounts.push(globalThis.__wholeTableRenders-renders);queries.push(globalThis.__requests-before);
+  }
+  return {samples:20,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),restored,renderCounts,queries};
+ }finally{tree.unmount();host.remove();globalThis.__data=previous;}
 };
 globalThis.measureFulfilledContinuations=async()=>{
  const current={data:globalThis.__data,buffered:[],serverCursor:null,pageSize:100,queryIdentity:'noop',verified:true,hasMore:false,continuation:null};
@@ -309,6 +337,7 @@ try {
         pagination: await page.evaluate(() => globalThis.measurePagination()),
         queryVerification: await page.evaluate(() => globalThis.measureQueryVerification()),
         fulfilledContinuations: await page.evaluate(() => globalThis.measureFulfilledContinuations()),
+        viewSwitch: await page.evaluate(() => globalThis.measureViewSwitch()),
         ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });
       await context.close();

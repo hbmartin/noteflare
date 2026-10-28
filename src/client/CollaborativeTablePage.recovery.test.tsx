@@ -664,3 +664,48 @@ it.each(["Views", "Properties"])("retains the open %s form while verification bl
   await waitFor(() => expect(input).toBeEnabled());
   expect(input).toHaveValue("Unsubmitted settings");
 });
+
+it.each([false, true])(
+  "keeps a definite conflict notice when a query change supersedes its refresh; task %s",
+  async (taskList) => {
+    fixture(taskList, taskList ? 2 : 1);
+    const input = (await screen.findAllByLabelText("Title"))[0]!;
+    await waitFor(() => expect(input).toBeEnabled());
+    const read = vi.mocked(api).getMockImplementation()!;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let conflict = false,
+      refreshStarted = false,
+      writes = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (
+        (path.endsWith("/commands") && init?.method === "POST") ||
+        (path.endsWith("/tasks/row") && init?.method === "PATCH")
+      ) {
+        writes++;
+        conflict = true;
+        throw new ApiClientError(409, "table_revision_conflict", "Conflict before refresh");
+      }
+      if (conflict && !new URL(path, "http://test").searchParams.get("q")) {
+        refreshStarted = true;
+        await held;
+      }
+      return read(path, init);
+    });
+    try {
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "Preserved during view change" } });
+      fireEvent.blur(input);
+      await waitFor(() => expect(refreshStarted).toBe(true));
+      fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Other query" } });
+      await waitFor(() => expect(input).toBeEnabled());
+      expect(screen.getByText("Conflict before refresh")).toBeVisible();
+      expect(input).toHaveValue("Preserved during view change");
+      expect(writes).toBe(1);
+    } finally {
+      await act(async () => release());
+    }
+  },
+);

@@ -218,3 +218,20 @@ it("records verified generation independently of hidden readiness and never from
   expect(verified).toHaveBeenCalledTimes(1);
   expect(stop.authorized()).toBe(false);
 });
+
+it("routes table changes through invalidation while heartbeat verification remains joinable", async () => {
+  stop();
+  const invalidate = vi.fn();
+  stop = tableConnection({ url: "ws://example.test/table", query, ready, invalidate });
+  const socket = Socket.all.at(-1)!;
+  socket.ready();
+  await settle();
+  expect(query).toHaveBeenCalledTimes(1);
+  socket.dispatchEvent(new MessageEvent("message", { data: '{"type":"table-changed"}' }));
+  expect(invalidate).toHaveBeenCalledOnce();
+  expect(query).toHaveBeenCalledTimes(1);
+  socket.ready();
+  await settle();
+  expect(query).toHaveBeenCalledTimes(2);
+  expect(stop.authorized()).toBe(true);
+});

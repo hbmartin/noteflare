@@ -1351,3 +1351,241 @@ it("retains task conflict feedback across later successful background verificati
   await waitFor(() => expect(attempts).toBe(2));
   await waitFor(() => expect(screen.queryByText(message)).not.toBeInTheDocument());
 });
+
+it("retires a failed canonical cursor when refresh replaces its loaded prefix", async () => {
+  const rows = Array.from({ length: 350 }, (_, index) => ({
+    ...data.rows[0]!,
+    id: `row-${index}`,
+    cells: { Title: `Row ${index}` },
+  }));
+  data = { ...data, columns: [column("Title", "text")], rows, rowCount: rows.length };
+  const offsets: number[] = [];
+  let fail = true;
+  vi.mocked(api).mockImplementation(async (path) => {
+    const params = new URL(path, "https://test").searchParams;
+    const offset = Number(params.get("cursor") ?? 0);
+    offsets.push(offset);
+    if (offset === 200 && fail) {
+      fail = false;
+      throw new ApiClientError(503, "temporary", "Page failed");
+    }
+    return {
+      ...data,
+      rows: rows.slice(offset, offset + 100),
+      nextCursor: offset + 100 < rows.length ? String(offset + 100) : null,
+    };
+  });
+  render(<CollaborativeTablePage page={{ id: "table", title: "Table" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(100));
+  fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(200));
+  vi.useFakeTimers();
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+  });
+  expect(screen.getByText("Page failed")).toBeVisible();
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  });
+  expect(screen.getAllByLabelText("Title")).toHaveLength(100);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2000);
+  });
+  expect(screen.getAllByLabelText("Title")).toHaveLength(100);
+  expect(offsets.filter((offset) => offset === 200)).toHaveLength(1);
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+  });
+  expect(screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value)).toEqual(
+    rows.slice(0, 200).map((row) => row.cells.Title),
+  );
+  expect(offsets.at(-1)).toBe(100);
+});
+
+it("remembers query, month, row title and unfinished settings separately for each view", async () => {
+  data.views = data.views.map((view) => ({ ...view, visibleColumnIds: data.columns.map((item) => item.id) }));
+  show("grid");
+  const select = await screen.findByLabelText("Saved table view");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Alpha" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Grid row draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Properties" }));
+  fireEvent.change(screen.getByLabelText("New property name"), { target: { value: "Grid property draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Grid settings draft" } });
+  fireEvent.change(select, { target: { value: "calendar" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  expect(screen.getByLabelText("Search table")).toHaveValue("");
+  expect(screen.getByLabelText("New row title")).toHaveValue("");
+  expect(screen.queryByLabelText("View name")).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Calendar month"), { target: { value: "2027-03" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Properties" })).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Calendar row draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Properties" }));
+  fireEvent.change(screen.getByLabelText("New property name"), { target: { value: "Calendar property draft" } });
+  fireEvent.change(select, { target: { value: "grid" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  expect(screen.getByLabelText("Search table")).toHaveValue("Alpha");
+  expect(screen.getByLabelText("New row title")).toHaveValue("Grid row draft");
+  expect(screen.getByLabelText("View name")).toHaveValue("Grid settings draft");
+  fireEvent.click(screen.getByRole("button", { name: "Properties" }));
+  expect(screen.getByLabelText("New property name")).toHaveValue("Grid property draft");
+  fireEvent.change(select, { target: { value: "calendar" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  expect(screen.getByLabelText("Calendar month")).toHaveValue("2027-03");
+  expect(screen.getByLabelText("New row title")).toHaveValue("Calendar row draft");
+  expect(screen.getByLabelText("New property name")).toHaveValue("Calendar property draft");
+  expect(writes).toHaveLength(0);
+});
+
+it("keeps a busy-only rejection separate from an existing conflict notice", async () => {
+  data.rows[0]!.detailPageId = null;
+  show();
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  failure = new ApiClientError(409, "table_revision_conflict", "Conflict");
+  fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Retain title" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+  const message = "The table changed. Review the latest value before saving again.";
+  await screen.findByText(message);
+  expect(screen.getByLabelText("New row title")).toHaveValue("Retain title");
+  const release = delayNextCommand();
+  fireEvent.click(screen.getByRole("button", { name: "Delete row" }));
+  await waitFor(() => expect(writes).toHaveLength(2));
+  fireEvent.submit(screen.getByLabelText("New row title").closest("form")!);
+  expect(screen.getByText("A save is already in progress. Wait for it to finish.")).toBeVisible();
+  expect(screen.getByText(message)).toBeVisible();
+  expect(screen.getByLabelText("New row title")).toHaveValue("Retain title");
+  await act(async () => release());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+  expect(screen.getByText(message)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
+  expect(screen.queryByText(message)).not.toBeInTheDocument();
+  expect(screen.getByLabelText("New row title")).toHaveValue("Retain title");
+});
+
+it("keeps row titles scoped to their view when a save completes after switching", async () => {
+  show();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Submitted All rows" } });
+  const release = delayNextCommand();
+  fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+  await waitFor(() => expect(writes).toHaveLength(1));
+  fireEvent.change(screen.getByLabelText("Saved table view"), { target: { value: "grid" } });
+  await screen.findByLabelText("New row title");
+  fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Unrelated grid title" } });
+  await act(async () => release());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+  expect(screen.getByLabelText("New row title")).toHaveValue("Unrelated grid title");
+  fireEvent.change(screen.getByLabelText("Saved table view"), { target: { value: "" } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+  expect(screen.getByLabelText("New row title")).toHaveValue("");
+  expect(writes).toHaveLength(1);
+});
+
+it("does not let superseded socket verification authorize a still-pending view query", async () => {
+  render(<CollaborativeTablePage page={{ id: "table", title: "Table" }} member={member} onSelectPage={vi.fn()} />);
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  const read = vi.mocked(api).getMockImplementation()!;
+  let releaseOld!: (value: TableQueryResult) => void, releaseNew!: (value: TableQueryResult) => void;
+  let count = 0;
+  vi.mocked(api).mockImplementation((path, init) => {
+    if (path.startsWith("/api/tables/table/query") && ++count === 1)
+      return new Promise((resolve) => {
+        releaseOld = resolve;
+      });
+    if (count === 2)
+      return new Promise((resolve) => {
+        releaseNew = resolve;
+      });
+    return read(path, init);
+  });
+  await act(async () => {
+    AuthorizedTableSocket.instances[0]!.dispatchEvent(new MessageEvent("message", { data: '{"type":"table-ready"}' }));
+  });
+  fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Fresh query" } });
+  await act(async () => {
+    releaseOld(data);
+  });
+  expect(count).toBe(2);
+  expect(input).toBeDisabled();
+  await act(async () => {
+    releaseNew(data);
+  });
+  await waitFor(() => expect(input).toBeEnabled());
+  expect(AuthorizedTableSocket.instances).toHaveLength(1);
+});
+
+it.each([false, true])(
+  "acknowledges only the captured row title on saved-operation Retry; task %s",
+  async (taskList) => {
+    if (taskList) taskColumnFixture();
+    const read = vi.mocked(api).getMockImplementation()!;
+    const submissions: Record<string, unknown>[] = [];
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if ((path.endsWith("/commands") || path.endsWith("/tasks")) && init?.method === "POST") {
+        submissions.push(JSON.parse(String(init.body)));
+        if (submissions.length === 1) throw new ApiClientError(503, "temporary", "Uncertain row creation");
+        return { result: {} };
+      }
+      return read(path, init);
+    });
+    show("", member, vi.fn(), taskList);
+    const title = await screen.findByLabelText("New row title");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+    fireEvent.change(title, { target: { value: "Captured creation" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+    const retry = await screen.findByRole("button", { name: "Retry saved operation" });
+    fireEvent.change(title, { target: { value: "Newer row title" } });
+    await waitFor(() => expect(retry).toBeEnabled());
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Retry saved operation" })).not.toBeInTheDocument(),
+    );
+    expect(submissions).toHaveLength(2);
+    expect(submissions[1]).toEqual(submissions[0]);
+    expect(title).toHaveValue("Newer row title");
+    expect(writes).toHaveLength(0);
+  },
+);
+
+it.each(["view", "property"] as const)(
+  "retains the original %s revision after leaving and returning to a view",
+  async (kind) => {
+    show("grid");
+    const selected = await screen.findByLabelText("Saved table view");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: kind === "view" ? "Views" : "Properties" }));
+    fireEvent.change(screen.getByLabelText(kind === "view" ? "View name" : "Name for Title"), {
+      target: { value: "Unsubmitted settings" },
+    });
+    fireEvent.change(selected, { target: { value: "" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    if (kind === "view")
+      data.views = data.views.map((view) =>
+        view.id === "grid" ? { ...view, name: "Remote grid", revision: 2 } : view,
+      );
+    else
+      data.columns = data.columns.map((item) =>
+        item.id === "Title" ? { ...item, name: "Remote title", revision: 2 } : item,
+      );
+    fireEvent.change(selected, { target: { value: "grid" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    const input = screen.getByLabelText(kind === "view" ? "View name" : "Name for Remote title");
+    expect(input).toHaveValue("Unsubmitted settings");
+    expect(screen.getByText("These settings changed while you were editing.")).toBeVisible();
+    if (kind === "view") fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    else fireEvent.blur(input);
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]!.payload).toMatchObject({ revision: 1, name: "Unsubmitted settings" });
+    await screen.findByText("The table changed. Review the latest value before saving again.");
+    expect(input).toHaveValue("Unsubmitted settings");
+    expect(
+      kind === "view"
+        ? data.views.find((view) => view.id === "grid")!.name
+        : data.columns.find((item) => item.id === "Title")!.name,
+    ).toBe(kind === "view" ? "Remote grid" : "Remote title");
+  },
+);

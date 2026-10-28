@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from "vitest";
-import { linkedTableReads, type TableReadIntent } from "./linked-table-reads";
+import { linkedTableReads, type TableReadContext, type TableReadIntent } from "./linked-table-reads";
 const continuation = (target = 200) => ({ queryIdentity: "query", generation: 1, target });
 const controllers: ReturnType<typeof linkedTableReads>[] = [];
 afterEach(() => {
@@ -11,8 +11,8 @@ afterEach(() => {
 function setup(read: (intent: TableReadIntent, signal: AbortSignal) => Promise<number | null>) {
   const unavailable = vi.fn(),
     controller = linkedTableReads({
-      read: async (...args) => {
-        const value = await read(...args);
+      read: async (intent, signal) => {
+        const value = await read(intent, signal);
         return value === null
           ? { state: "failure" as const }
           : { state: "success" as const, value, verification: "network" as const };
@@ -365,4 +365,73 @@ it("coalesces canonical verification with an equivalent active read", async () =
   expect(await first).toBe(1);
   expect(await second).toBe(1);
   expect(read).toHaveBeenCalledOnce();
+});
+
+it("revokes a pre-denial manual bypass but permits a later deliberate reload", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const read = vi
+    .fn()
+    .mockImplementationOnce(() => new Promise(() => {}))
+    .mockResolvedValue({ state: "success", value: 7, verification: "network" });
+  const controller = linkedTableReads<number>({ read, unavailable: vi.fn(), poll: false });
+  controllers.push(controller);
+  void controller.request();
+  const queued = controller.request();
+  controller.recoverDenied();
+  await vi.advanceTimersByTimeAsync(999);
+  expect(read).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(await queued).toBe(7);
+  expect(read).toHaveBeenCalledTimes(2);
+  controller.recoverDenied();
+  expect(await controller.request()).toBe(7);
+  expect(read).toHaveBeenCalledTimes(3);
+});
+
+it("preserves the same refresh's failure progression when it first becomes denied", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const read = vi.fn().mockResolvedValue({ state: "failure" });
+  const controller = linkedTableReads<number>({ read, unavailable: vi.fn(), poll: false });
+  controllers.push(controller);
+  await controller.request();
+  for (const delay of [1000, 2000, 4000, 8000]) await vi.advanceTimersByTimeAsync(delay);
+  expect(read).toHaveBeenCalledTimes(5);
+  read.mockResolvedValue({ state: "denied" });
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect(read).toHaveBeenCalledTimes(6);
+  await vi.advanceTimersByTimeAsync(14_999);
+  expect(read).toHaveBeenCalledTimes(6);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(7);
+});
+
+it("requires a trailing fresh read after invalidation without multiplying active work", async () => {
+  const release: Array<() => void> = [];
+  const current: boolean[] = [];
+  let calls = 0;
+  const read = vi.fn(async (_intent: TableReadIntent, _signal: AbortSignal, context: TableReadContext) => {
+    calls++;
+    await new Promise<void>((resolve) => release.push(resolve));
+    current.push(context.current());
+    return { state: "success" as const, value: calls, verification: "network" as const };
+  });
+  const controller = linkedTableReads<number>({ read, unavailable: vi.fn(), poll: false });
+  controllers.push(controller);
+  const initial = controller.request();
+  const verification = controller.verify();
+  const changed = controller.invalidate();
+  void controller.invalidate();
+  expect(read).toHaveBeenCalledTimes(1);
+  release.shift()!();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(read).toHaveBeenCalledTimes(2);
+  release.shift()!();
+  expect(await initial).toBe(2);
+  expect(await verification).toBe(2);
+  expect(await changed).toBe(2);
+  expect(current).toEqual([false, true]);
 });
