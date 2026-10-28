@@ -2021,3 +2021,25 @@ it("turns a second canonical cursor churn into pending freshness with its extent
   expect(screen.getAllByLabelText("Title")).toHaveLength(200);
   expect(screen.getAllByLabelText("Title")[0]).toBeEnabled();
 });
+
+it("pauses the old generation's permit immediately after a rebuilt table commits", async () => {
+  data = { ...data, revision: 100 };
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  let release!: () => void;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method) return { generation: 2, revision: 2, result: {} };
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    data = { ...data, generation: 2, revision: 2 };
+    return original(path, init);
+  });
+  await act(async () => fireEvent.click(screen.getByLabelText("Check")));
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
+  await act(async () => release());
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+});

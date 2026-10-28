@@ -650,7 +650,9 @@ export function CollaborativeTablePage({
     setRefreshStatus(message ?? "Saved. Refreshing the latest table data…");
     const reads = linkedReads.current;
     if (!reads) return;
-    void reads.refresh(readTableCoverage(result)).then((receipt) => {
+    const coverage = readTableCoverage(result);
+    if (coverage && coverage.generation !== ownership.current.generation) retireVerification("invalidate");
+    void reads.refresh(coverage).then((receipt) => {
       if (
         !active.current ||
         !sameTableOwner(operation.owner, retryLifetime.current) ||
