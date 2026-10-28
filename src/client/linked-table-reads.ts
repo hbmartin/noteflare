@@ -172,6 +172,7 @@ export function linkedTableReads<T>(options: {
     const coverage = outcome.state === "success" ? options.coverage?.(outcome.value) : undefined;
     if (outcome.state === "success" && !covered(sequence, coverage)) {
       const trailing = queued.get("refresh") ?? freshBatch<T>();
+      trailing.attempt = Math.max(trailing.attempt, batch.attempt);
       for (const waiter of batch.waiters.splice(0)) {
         if (++waiter.passes >= 2) settle(waiter, { state: "pending" });
         else if (!waiter.settled) {

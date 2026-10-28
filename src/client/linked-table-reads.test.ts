@@ -543,3 +543,31 @@ it("rejects older generation coverage and retires old requirements on a newer ge
   finishes.shift()!({ generation: 3, revision: 1 });
   expect(await waiting).toEqual({ state: "generation-changed", value: { generation: 3, revision: 1 } });
 });
+
+it("retains genuine failure history through a superseded successful read", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let finish!: (value: number) => void;
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce(null)
+    .mockImplementationOnce(
+      () =>
+        new Promise<number>((resolve) => {
+          finish = resolve;
+        }),
+    )
+    .mockResolvedValueOnce(null)
+    .mockResolvedValue(4);
+  const c = setup(read);
+  expect(await c.request()).toBeNull();
+  await vi.advanceTimersByTimeAsync(1000);
+  void c.invalidate();
+  finish(2);
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  expect(read).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(1999);
+  expect(read).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(4);
+});
