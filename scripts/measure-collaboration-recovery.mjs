@@ -1,3 +1,4 @@
+import { receiptMeasurementState } from "./collaboration-measurement.mjs";
 import { build } from "esbuild";
 import { chromium } from "@playwright/test";
 import { createServer } from "node:http";
@@ -16,6 +17,7 @@ const root = process.cwd();
 const controlled =
   /src\/client\/(CollaborativeTablePage|CellDraftRecovery|cell-drafts|table-connection|comment-publication|linked-table-reads|linked-table-query|table-view-state)\.(ts|tsx)$/;
 const entry = `
+${receiptMeasurementState.toString()}
 import {createElement} from 'react';
 import {createRoot} from 'react-dom/client';
 import {flushSync} from 'react-dom';
@@ -192,12 +194,12 @@ globalThis.measureFreshnessCompletion=async()=>{
   let finish=null,count=0,finishedAt=0;
   const controller=linkedTableReads({poll:false,unavailable(){},read:()=>new Promise(resolve=>{count++;finish=()=>{finish=null;resolve({state:'success',value:1,verification:'network'});};})});
   const started=performance.now();
-  const first=controller.request().then(value=>{finishedAt=performance.now();return value;});
+  const first=controller.verifyReceipt().then(value=>{finishedAt=performance.now();return value;});
   try{
    for(let event=0;event<8;event++){void controller.invalidate();if(finish)finish();await frame();}
    if(finish)finish();
    const outcome=await first;
-   durations.push(finishedAt-started);reads.push(count);outcomes.push(outcome===null?'pending':'complete');
+   durations.push(finishedAt-started);reads.push(count);outcomes.push(receiptMeasurementState(outcome));
   }finally{controller.dispose();}
  }
  return {samples:10,invalidationsPerSample:8,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),reads,outcomes,meaning:'Caller completion under controlled invalidation churn; pending is not fresh verification.'};
@@ -212,6 +214,50 @@ globalThis.measureFulfilledContinuations=async()=>{
  }
  return {samples:1000,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),requests,sameWindows,sameData,sameRows};
 };
+globalThis.measureSchedulerProgress=async()=>{
+ let pages=0,release;
+ const controller=linkedTableReads({poll:false,unavailable(){},coverage:value=>value,read:async intent=>{
+  if(intent.kind==='refresh'||++pages>50)return {state:'failure'};
+  if(pages===1)return new Promise(resolve=>{release=resolve});
+  return {state:'success',value:{generation:1,revision:1},verification:'buffer'};
+ }});
+ try{
+  void controller.page({queryIdentity:'progress',generation:1,revision:1,prefix:1,cursor:'next',target:300});
+  void controller.refresh({generation:1,revision:2});
+  release({state:'success',value:{generation:1,revision:1},verification:'network'});
+  const started=performance.now();
+  const callsBeforeTimer=await new Promise(resolve=>setTimeout(()=>resolve(pages),0));
+  return {callsBeforeTimer,timerLatencyMs:performance.now()-started,safetyStop:50};
+ }finally{controller.dispose()}
+};
+globalThis.measureCommitCompletion=async()=>{
+ const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
+ flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'Commit measurement'},member:{role:'editor',user:{id:'commit-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
+ const button=()=>[...host.querySelectorAll('button')].find(item=>item.textContent.trim()==='Refresh');
+ const durations=[],refreshLatency=[],queries=[];
+ globalThis.__heldReads=[];
+ try{
+  for(let i=0;i<100&&(!button()||button().disabled);i++)await frame();
+  for(let sample=0;sample<20;sample++){
+   globalThis.__holdReads=true;globalThis.__committedAt=0;
+   const before=globalThis.__requests;let releasedAt=0;
+   host.querySelector('input[aria-label="Done"]').click();
+   for(let pass=0;pass<100&&!globalThis.__committedAt;pass++)await frame();
+   if(!globalThis.__committedAt)throw Error('Mutation did not commit');
+   // Controlled application barriers hold the read across two frames, independently of mutation completion.
+   for(let pass=0;pass<2;pass++){await frame();if(!button().disabled&&!releasedAt)releasedAt=performance.now();}
+   globalThis.__holdReads=false;for(const release of globalThis.__heldReads.splice(0))release();
+   for(let pass=0;pass<100;pass++){
+    await frame();
+    if(!button().disabled&&!releasedAt)releasedAt=performance.now();
+    if(releasedAt&&!host.textContent.includes('Saved. Refreshing the latest table data'))break;
+   }
+   if(!releasedAt)throw Error('Commit busy state did not release');
+   durations.push(releasedAt-globalThis.__committedAt);refreshLatency.push(performance.now()-globalThis.__committedAt);queries.push(globalThis.__requests-before-1);
+  }
+  return {samples:20,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),refreshP50Ms:percentile(refreshLatency,.5),refreshP95Ms:percentile(refreshLatency,.95),readsPerCommit:queries,heldReadFrames:2};
+ }finally{globalThis.__holdReads=false;for(const release of globalThis.__heldReads.splice(0))release();tree.unmount();host.remove();}
+};
 globalThis.measureReconnect=async()=>{
  const Native=globalThis.WebSocket,times=[],starts=new Map();let queries=0,created=0;
  class Socket extends EventTarget{
@@ -222,7 +268,7 @@ globalThis.measureReconnect=async()=>{
  }
  globalThis.WebSocket=Socket;const controllers=[];
  try{
-  for(let i=0;i<20;i++){const id='ws://measurement/'+i;controllers.push(tableConnection({url:id,query:async()=>{queries++;return {generation:1,canEdit:true}},ready:value=>{if(value&&starts.has(id)){times.push(performance.now()-starts.get(id));starts.delete(id)}}}));}
+  for(let i=0;i<20;i++){const id='ws://measurement/'+i;controllers.push(tableConnection({url:id,query:async()=>{queries++;const value={generation:1,canEdit:true};return SOCKET_RECEIPT?{state:"complete",value}:value},ready:value=>{if(value&&starts.has(id)){times.push(performance.now()-starts.get(id));starts.delete(id)}}}));}
   await frame();
   const initial=[...Socket.all];for(const socket of initial)starts.set(socket.url,performance.now());
   for(const socket of initial)socket.fenced();
@@ -237,7 +283,19 @@ globalThis.measureReconnect=async()=>{
 async function bundle(before) {
   const result = await build({
     absWorkingDir: root,
-    stdin: { contents: entry, resolveDir: root, sourcefile: "collaboration-measurement.mjs" },
+    stdin: {
+      contents: entry.replace(
+        "SOCKET_RECEIPT",
+        String(
+          (before
+            ? execFileSync("git", ["show", `${baseline}:src/client/table-connection.ts`], { encoding: "utf8" })
+            : await readFile("src/client/table-connection.ts", "utf8")
+          ).includes("TableReadReceipt<TableQueryResult>"),
+        ),
+      ),
+      resolveDir: root,
+      sourcefile: "collaboration-measurement.mjs",
+    },
     bundle: true,
     write: false,
     format: "iife",
@@ -252,6 +310,7 @@ async function bundle(before) {
           builder.onLoad({ filter: /src\/client\/api\.ts$/ }, () => ({
             contents: `export class ApiClientError extends Error{}; export const isPageNotFoundError=e=>e instanceof ApiClientError&&e.code==='page_not_found'&&(e.status===404||e.status===410); export const json=JSON.stringify; export const apiErrorMessage=(e,f)=>f; export async function api(path,init){
               globalThis.__requests++;
+              if(globalThis.__holdReads&&!init?.method)await new Promise(resolve=>globalThis.__heldReads.push(resolve));
               if(globalThis.__failNextRead&&!init?.method){globalThis.__failNextRead=false;throw Error('Controlled read failure')}
               if(globalThis.__pagedRows&&!init?.method){
                 const params=new URL(path,'http://fixture').searchParams,limit=Number(params.get('limit')??100),cursor=params.get('cursor');
@@ -262,7 +321,8 @@ async function bundle(before) {
                 return {...globalThis.__data,rows:globalThis.__pagedRows.slice(decoded.offset,end),rowCount:globalThis.__pagedRows.length,nextCursor:end<globalThis.__pagedRows.length?JSON.stringify({offset:end,limit}):null};
               }
               const viewId=new URL(path,'http://fixture').searchParams.get('viewId');
-              return path?.endsWith('/commands')?{revision:1,result:{},projectionPending:false}:{...globalThis.__data,view:viewId?globalThis.__data.views.find(view=>view.id===viewId)??null:null};
+              if(path?.endsWith('/commands')){globalThis.__data={...globalThis.__data,revision:globalThis.__data.revision+1};globalThis.__committedAt=performance.now();return {generation:globalThis.__data.generation,revision:globalThis.__data.revision,result:{},projectionPending:false};}
+              return {...globalThis.__data,view:viewId?globalThis.__data.views.find(view=>view.id===viewId)??null:null};
             }`,
             loader: "ts",
           }));
@@ -361,6 +421,8 @@ try {
         fulfilledContinuations: await page.evaluate(() => globalThis.measureFulfilledContinuations()),
         viewSwitch: await page.evaluate(() => globalThis.measureViewSwitch()),
         freshnessCompletion: await page.evaluate(() => globalThis.measureFreshnessCompletion()),
+        schedulerProgress: await page.evaluate(() => globalThis.measureSchedulerProgress()),
+        commitCompletion: await page.evaluate(() => globalThis.measureCommitCompletion()),
         ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });
       await context.close();

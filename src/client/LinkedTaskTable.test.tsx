@@ -194,7 +194,7 @@ describe("linked task query metadata", () => {
     vi.mocked(api).mockResolvedValueOnce({ rowId: "hidden", revision: 8, visibleInView: false });
     fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Hidden task" } });
     fireEvent.click(screen.getByRole("button", { name: "Add row" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Current filters hide this task. Choose All rows");
+    expect(await screen.findByText("Saved. Current filters hide this task. Choose All rows to see it.")).toBeVisible();
     expect(screen.getByLabelText("New row title")).toHaveValue("");
   });
 

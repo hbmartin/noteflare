@@ -1,6 +1,6 @@
 import { PAGE_KINDS, type PageKind } from "./page-kind.ts";
 import type { ColumnType, Page, Role, WorkspaceEvent } from "./types";
-import { readTableCoverage } from "./table-coverage";
+import { readTableCoverage } from "./table-coverage.ts";
 
 export class ValidationError extends Error {}
 

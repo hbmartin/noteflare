@@ -24,6 +24,7 @@ const column = (id: string, type: CollaborativeColumn["type"]): CollaborativeCol
   generation: 1,
   options: [],
 });
+const originalRandom = Math.random;
 const grid: TableView = {
   id: "grid",
   name: "Grid",
@@ -1953,4 +1954,8 @@ it.each([false, true])("deduplicates a covered remote task event, own %s", async
     window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { ...changed, forceRefresh: true } }));
   });
   expect(reads).toBe(2);
+});
+
+it("restores the original jitter function after every earlier test", () => {
+  expect(Math.random).toBe(originalRandom);
 });

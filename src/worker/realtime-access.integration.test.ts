@@ -411,77 +411,78 @@ describe("realtime access barriers", () => {
     console.log("REALTIME_BARRIER_BENCHMARK_LOCAL_MS", JSON.stringify(results));
     expect(Object.values(results).every((sample) => Number.isFinite(sample.p95))).toBe(true);
   });
-  it("measures request impact capture and bounded draining for 1, 4 and 12 affected workspaces", async () => {
-    const results: Record<string, unknown> = {};
-    for (const count of [1, 4, 12]) {
-      for (const cold of [true, false]) {
-        const warm = await userWorkspaces(count);
-        for (const variant of ["before", "after"] as const) {
-          const samples: number[] = [];
-          let d1 = 0,
-            calls = 0;
-          for (let iteration = 0; iteration < 20; iteration++) {
-            const f = cold ? await userWorkspaces(count) : warm;
-            let queries = 0,
-              rounds = 0;
-            const bindings = runtime(async (id, request) => {
-              rounds++;
-              return env.WORKSPACE_EVENTS.getByName(id).fetch(request);
-            });
-            bindings.DB = {
-              prepare(sql: string) {
-                queries++;
-                return env.DB.prepare(sql);
-              },
-            } as D1Database;
-            const mutate = async () => {
-              for (const id of f.ids)
-                await env.DB.prepare("UPDATE realtime_revocations SET revision=revision+1 WHERE workspace_id=?")
-                  .bind(id)
-                  .run();
-            };
-            const start = performance.now();
-            if (variant === "after")
-              await withRealtimeAccessTracking(bindings, async () => {
-                for (let hook = 0; hook < 3; hook++) await trackRealtimeUser(bindings, f.user);
-                await mutate();
-                return new Response(null, { status: 204 });
-              });
-            else {
-              // dce5d25: repeat membership enumeration; memoize separate baseline
-              // reads; drain affected workspaces serially at the request boundary.
-              const before = new Map<string, number>();
-              for (let hook = 0; hook < 3; hook++) {
-                const rows = await bindings.DB.prepare("SELECT workspace_id FROM workspace_members WHERE user_id=?")
-                  .bind(f.user)
-                  .all<{ workspace_id: string }>();
-                for (const row of rows.results)
-                  if (!before.has(row.workspace_id))
-                    before.set(row.workspace_id, (await realtimeAccessStatus(bindings, row.workspace_id)).revision);
-              }
-              await mutate();
-              for (const [id, revision] of before) {
-                const after = await realtimeAccessStatus(bindings, id);
-                if (after.revision > revision) await reconcileRealtimeAccessStatus(bindings, id, after);
-              }
-            }
-            samples.push(performance.now() - start);
-            d1 = queries;
-            calls = rounds;
-          }
-          samples.sort((a, b) => a - b);
-          results[`${count}_${cold ? "cold" : "warm"}_${variant}`] = {
-            d1,
-            do: calls,
-            p50: samples[10],
-            p95: samples[18],
-          };
-          expect(d1).toBe(variant === "before" ? 3 + 5 * count : 1 + 4 * count);
-          expect(calls).toBe(count);
+  // Deliberately sequential: twenty real D1/DO samples per independently timed case.
+  it.each(
+    [1, 4, 12].flatMap((count) =>
+      [true, false].flatMap((cold) => (["before", "after"] as const).map((variant) => ({ count, cold, variant }))),
+    ),
+  )("measures request impact: $count workspaces, cold=$cold, $variant", async ({ count, cold, variant }) => {
+    const warm = await userWorkspaces(count);
+    const samples: number[] = [];
+    let d1 = 0,
+      calls = 0;
+    for (let iteration = 0; iteration < 20; iteration++) {
+      const f = cold ? await userWorkspaces(count) : warm;
+      let queries = 0,
+        rounds = 0;
+      const bindings = runtime(async (id, request) => {
+        rounds++;
+        return env.WORKSPACE_EVENTS.getByName(id).fetch(request);
+      });
+      bindings.DB = {
+        prepare(sql: string) {
+          queries++;
+          return env.DB.prepare(sql);
+        },
+      } as D1Database;
+      const mutate = async () => {
+        for (const id of f.ids)
+          await env.DB.prepare("UPDATE realtime_revocations SET revision=revision+1 WHERE workspace_id=?")
+            .bind(id)
+            .run();
+      };
+      const start = performance.now();
+      if (variant === "after")
+        await withRealtimeAccessTracking(bindings, async () => {
+          for (let hook = 0; hook < 3; hook++) await trackRealtimeUser(bindings, f.user);
+          await mutate();
+          return new Response(null, { status: 204 });
+        });
+      else {
+        // dce5d25: repeat membership enumeration; memoize separate baseline
+        // reads; drain affected workspaces serially at the request boundary.
+        const before = new Map<string, number>();
+        for (let hook = 0; hook < 3; hook++) {
+          const rows = await bindings.DB.prepare("SELECT workspace_id FROM workspace_members WHERE user_id=?")
+            .bind(f.user)
+            .all<{ workspace_id: string }>();
+          for (const row of rows.results)
+            if (!before.has(row.workspace_id))
+              before.set(row.workspace_id, (await realtimeAccessStatus(bindings, row.workspace_id)).revision);
+        }
+        await mutate();
+        for (const [id, revision] of before) {
+          const after = await realtimeAccessStatus(bindings, id);
+          if (after.revision > revision) await reconcileRealtimeAccessStatus(bindings, id, after);
         }
       }
+      samples.push(performance.now() - start);
+      d1 = queries;
+      calls = rounds;
     }
-    console.log("REALTIME_IMPACT_BENCHMARK_LOCAL_MS", JSON.stringify(results));
+    samples.sort((a, b) => a - b);
+    const result = {
+      d1,
+      do: calls,
+      p50: samples[10],
+      p95: samples[18],
+    };
+    console.log(
+      "REALTIME_IMPACT_BENCHMARK_LOCAL_MS",
+      JSON.stringify({ [`${count}_${cold ? "cold" : "warm"}_${variant}`]: result }),
+    );
+    expect(d1).toBe(variant === "before" ? 3 + 5 * count : 1 + 4 * count);
+    expect(calls).toBe(count);
   });
 });
 

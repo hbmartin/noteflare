@@ -313,11 +313,15 @@ test("floating and sidebar replies share one draft and submit it once", async ({
   await page.getByRole("button", { name: "Comments", exact: true }).click();
   await expect(sidebar).toBeVisible();
   await expect(sidebar).toHaveText("Shared reply");
+  await floating.focus();
+  await floating.press("End");
+  await floating.pressSequentially(" from floating");
+  await expect(sidebar).toHaveText("Shared reply from floating");
   // Keyboard focus switches surfaces even when the mobile floating thread overlaps the sidebar.
   await sidebar.focus();
   await sidebar.press("End");
   await sidebar.pressSequentially(" from sidebar");
-  await expect(floating).toHaveText("Shared reply from sidebar");
+  await expect(floating).toHaveText("Shared reply from floating from sidebar");
   const posts: string[] = [];
   page.on("request", (request) => {
     if (request.method() === "POST" && request.url().includes("/replies")) posts.push(request.url());
