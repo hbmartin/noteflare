@@ -1352,7 +1352,7 @@ it("retains task conflict feedback across later successful background verificati
   await waitFor(() => expect(screen.queryByText(message)).not.toBeInTheDocument());
 });
 
-it("retires a failed canonical cursor when refresh replaces its loaded prefix", async () => {
+it("rebinds a failed canonical extent to the refreshed prefix without a row gap", async () => {
   const rows = Array.from({ length: 350 }, (_, index) => ({
     ...data.rows[0]!,
     id: `row-${index}`,
@@ -1391,15 +1391,15 @@ it("retires a failed canonical cursor when refresh replaces its loaded prefix", 
   await act(async () => {
     await vi.advanceTimersByTimeAsync(2000);
   });
-  expect(screen.getAllByLabelText("Title")).toHaveLength(100);
-  expect(offsets.filter((offset) => offset === 200)).toHaveLength(1);
+  expect(screen.getAllByLabelText("Title")).toHaveLength(300);
+  expect(offsets.slice(-2)).toEqual([100, 200]);
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
   });
   expect(screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value)).toEqual(
-    rows.slice(0, 200).map((row) => row.cells.Title),
+    rows.slice(0, 350).map((row) => row.cells.Title),
   );
-  expect(offsets.at(-1)).toBe(100);
+  expect(offsets.at(-1)).toBe(300);
 });
 
 it("remembers query, month, row title and unfinished settings separately for each view", async () => {
@@ -1589,3 +1589,255 @@ it.each(["view", "property"] as const)(
     ).toBe(kind === "view" ? "Remote grid" : "Remote title");
   },
 );
+
+it.each(["grid", ""])("acknowledges submitted view settings after success for %s", async (initial) => {
+  show(initial);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Submitted view name" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+  await waitFor(() => expect(screen.queryByLabelText("View name")).not.toBeInTheDocument());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  expect(screen.getByLabelText("View name")).toHaveValue(initial ? "Submitted view name" : "New view");
+  expect(screen.queryByText("These settings changed while you were editing.")).toBeNull();
+  fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Second edit" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+  await waitFor(() => expect(writes).toHaveLength(2));
+  expect(writes[1]!.payload.revision).toBe(initial ? 2 : undefined);
+});
+it("acknowledges view settings on saved Retry without clearing newer text", async () => {
+  show("grid");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Submitted view" } });
+  failure = new ApiClientError(503, "temporary", "Unknown result");
+  fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+  const retry = await screen.findByRole("button", { name: "Retry saved operation" });
+  await waitFor(() => expect(retry).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Newer settings" } });
+  fireEvent.click(retry);
+  await waitFor(() => expect(writes).toHaveLength(2));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Retry saved operation" })).toBeNull());
+  expect(screen.getByLabelText("View name")).toHaveValue("Newer settings");
+  expect(writes[1]).toEqual(writes[0]);
+});
+it("retains a deliberate canonical extent across an unchanged refresh", async () => {
+  const rows = Array.from({ length: 350 }, (_, i) => ({ ...data.rows[0]!, id: `p${i}`, cells: { Title: `Row ${i}` } }));
+  data = { ...data, columns: [column("Title", "text")], rows, rowCount: 350 };
+  let release: (() => void) | undefined,
+    delay = false;
+  const offsets: number[] = [];
+  vi.mocked(api).mockImplementation(async (path) => {
+    const offset = Number(new URL(path, "https://test").searchParams.get("cursor") ?? 0);
+    offsets.push(offset);
+    if (delay && offset === 0) {
+      delay = false;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    }
+    return {
+      ...data,
+      rows: rows.slice(offset, offset + 100),
+      nextCursor: offset + 100 < 350 ? String(offset + 100) : null,
+    };
+  });
+  render(<CollaborativeTablePage page={{ id: "table", title: "Table" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(100));
+  await waitFor(() => expect(screen.getAllByLabelText("Title")[0]).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(200));
+  delay = true;
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await waitFor(() => expect(release).toBeDefined());
+  fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+  await act(async () => release!());
+  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(300));
+  expect(screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value)).toEqual(
+    rows.slice(0, 300).map((row) => row.cells.Title),
+  );
+  expect(offsets.slice(-3)).toEqual([0, 100, 200]);
+});
+it.each([
+  { task: false, mode: "settle" },
+  { task: true, mode: "settle" },
+  { task: false, mode: "replace" },
+  { task: true, mode: "replace" },
+  { task: false, mode: "purge" },
+  { task: true, mode: "purge" },
+])("acknowledges only the captured draft after owner retirement: $task $mode", async ({ task, mode }) => {
+  const titleId = task ? taskColumnFixture() : "Title";
+  const original = vi.mocked(api).getMockImplementation()!;
+  let release!: () => void,
+    sent = false,
+    committed = false;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if ((path.endsWith("/commands") || path.endsWith("/tasks/row")) && init?.method !== undefined) {
+      sent = true;
+      await pending;
+      committed = true;
+      data.rows[0]!.cells[titleId] = "Saved after retirement";
+      return { result: {}, revision: 2 };
+    }
+    return original(path, init);
+  });
+  const component = render(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "Table", taskList: task }}
+      member={member}
+      queryBase={task ? undefined : "/linked"}
+      onSelectPage={vi.fn()}
+    />,
+  );
+  const input = await screen.findByLabelText(task ? "Task" : "Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Saved after retirement" } });
+  fireEvent.blur(input);
+  await waitFor(() => expect(sent).toBe(true));
+  const map = new CellDraftMap({
+    account: "owner\0workspace",
+    host: task ? "table" : "/linked",
+    tableId: "table",
+    generation: 1,
+  });
+  const key = cellDraftKey("row", titleId);
+  expect(map.get(key)?.operationId).toBeTruthy();
+  if (mode === "replace") map.set(key, { ...map.get(key)!, text: "Newer shared edit" });
+  if (mode === "purge") purgeCellDrafts("owner\0workspace");
+  component.rerender(
+    <CollaborativeTablePage
+      page={{ id: "replacement", title: "Other", taskList: task }}
+      member={member}
+      queryBase={task ? undefined : "/replacement"}
+      onSelectPage={vi.fn()}
+    />,
+  );
+  await act(async () => release());
+  expect(committed).toBe(true);
+  expect(map.get(key)?.text).toBe(mode === "replace" ? "Newer shared edit" : undefined);
+});
+it("keeps settings Close usable after viewer downgrade and preserves its text", async () => {
+  const component = render(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "Table" }}
+      member={member}
+      queryBase="/linked"
+      onSelectPage={vi.fn()}
+    />,
+  );
+  await waitFor(() => expect(screen.getByRole("button", { name: "Properties" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Properties" }));
+  fireEvent.change(screen.getByLabelText("New property name"), { target: { value: "Retained property" } });
+  component.rerender(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "Table" }}
+      member={{ ...member, role: "viewer" }}
+      queryBase="/linked"
+      onSelectPage={vi.fn()}
+    />,
+  );
+  expect(screen.getByLabelText("Name for Title")).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Close settings" }));
+  expect(screen.queryByLabelText("Name for Title")).toBeNull();
+  component.rerender(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "Table" }}
+      member={member}
+      queryBase="/linked"
+      onSelectPage={vi.fn()}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Properties" }));
+  expect(screen.getByLabelText("New property name")).toHaveValue("Retained property");
+  expect(writes).toHaveLength(0);
+});
+it("ignores irrelevant workspace events while conservatively refreshing unknown details", async () => {
+  show();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  vi.mocked(api).mockClear();
+  await act(async () => {
+    for (const type of ["comments-invalidated", "notifications-invalidated", "jobs-invalidated"])
+      window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type, pageId: "table" } }));
+  });
+  expect(vi.mocked(api)).not.toHaveBeenCalled();
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type: "unknown" } }));
+  });
+  expect(vi.mocked(api)).toHaveBeenCalledOnce();
+});
+it.each([false, true])(
+  "shares an own-save broadcast with committed network coverage; broadcast %s",
+  async (broadcast) => {
+    render(<CollaborativeTablePage page={{ id: "table", title: "Table" }} member={member} onSelectPage={vi.fn()} />);
+    const input = await screen.findByLabelText("Title");
+    await waitFor(() => expect(input).toBeEnabled());
+    const original = vi.mocked(api).getMockImplementation()!;
+    let reads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.endsWith("/commands")) {
+        const result = await original(path, init);
+        if (broadcast)
+          AuthorizedTableSocket.instances[0]!.dispatchEvent(
+            new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", revision: 2 }) }),
+          );
+        return result;
+      }
+      reads++;
+      return original(path, init);
+    });
+    fireEvent.click(screen.getByLabelText("Check"));
+    await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+    expect(writes).toHaveLength(1);
+    expect(reads).toBe(1);
+  },
+);
+
+it.each(["saved", "conflict"] as const)("releases busy during continuous refresh invalidation: %s", async (mode) => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  const finishes: Array<(value: TableQueryResult) => void> = [];
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (path.endsWith("/commands")) return original(path, init);
+    return new Promise<TableQueryResult>((resolve) => finishes.push(resolve));
+  });
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  if (mode === "conflict") failure = new ApiClientError(409, "table_revision_conflict", "Rejected edit");
+  await act(async () => {
+    fireEvent.click(screen.getByLabelText("Check"));
+  });
+  expect(finishes).toHaveLength(1);
+  for (let pass = 0; pass < 2; pass++)
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type: "workspace-invalidated" } }));
+      finishes.shift()!({ ...data });
+    });
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  expect(screen.getByLabelText("Check").hasAttribute("disabled")).toBe(mode === "conflict");
+  expect(
+    screen.getByText(mode === "saved" ? "Saved. Refreshing the latest table data…" : "Rejected edit"),
+  ).toBeVisible();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+    finishes.shift()!({ ...data });
+  });
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+  expect(writes).toHaveLength(1);
+});
+it("clears a successfully copied view's submitted form without changing the selected view", async () => {
+  show("grid");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Draft copy" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save as new view" }));
+  await waitFor(() => expect(screen.queryByLabelText("View name")).toBeNull());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  expect(screen.getByLabelText("View name")).toHaveValue("Grid");
+  expect(screen.getByLabelText("Saved table view")).toHaveValue("grid");
+  expect(writes[0]!.payload.id).toBeUndefined();
+});

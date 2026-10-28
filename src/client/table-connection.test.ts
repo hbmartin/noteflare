@@ -235,3 +235,32 @@ it("routes table changes through invalidation while heartbeat verification remai
   expect(query).toHaveBeenCalledTimes(2);
   expect(stop.authorized()).toBe(true);
 });
+
+it("validates the invalidation result against its socket generation without another query", async () => {
+  stop();
+  const invalidate = vi.fn(async () => ({ ...result, generation: 2 }));
+  stop = tableConnection({ url: "ws://example.test/table", query, ready, invalidate });
+  const socket = Socket.all.at(-1)!;
+  socket.ready();
+  await settle();
+  socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", revision: 4 }) }));
+  await settle();
+  expect(invalidate).toHaveBeenCalledWith({ generation: 1, revision: 4 });
+  expect(query).toHaveBeenCalledOnce();
+  expect(socket.readyState).toBe(3);
+  expect(stop.authorized()).toBe(false);
+});
+it("keeps a live grant through pending freshness without extending its deadline", async () => {
+  stop();
+  const invalidate = vi.fn(async () => ({ state: "pending" as const }));
+  stop = tableConnection({ url: "ws://example.test/table", query, ready, invalidate });
+  const socket = Socket.all.at(-1)!;
+  socket.ready(1000, null);
+  await settle();
+  socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", revision: 4 }) }));
+  await settle();
+  expect(stop.authorized()).toBe(true);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(stop.authorized()).toBe(false);
+  expect(socket.readyState).toBe(3);
+});

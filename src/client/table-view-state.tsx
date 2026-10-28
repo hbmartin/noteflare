@@ -41,12 +41,24 @@ export type TableViewState = {
   snapshot: <T>(key: string, initial: T | (() => T)) => TableViewSnapshot<T>;
   listeners: Map<string, Set<() => void>>;
 };
-export type TableViewSubmission = { state: TableViewState; key: string; snapshot: TableViewSnapshot<unknown> };
-export function captureTableViewSubmission(state: TableViewState, key: string): TableViewSubmission | undefined {
+export type TableViewSubmission = {
+  state: TableViewState;
+  key: string;
+  snapshot: TableViewSnapshot<unknown>;
+  reset: unknown;
+};
+export function captureTableViewSubmission(
+  state: TableViewState,
+  key: string,
+  reset: unknown = "",
+): TableViewSubmission | undefined {
   const snapshot = state.values.get(key);
-  return snapshot ? { state, key, snapshot } : undefined;
+  return snapshot ? { state, key, snapshot, reset } : undefined;
 }
-export function acknowledgeTableViewSubmission(submission: TableViewSubmission | undefined, value: unknown) {
+export function acknowledgeTableViewSubmission(
+  submission: TableViewSubmission | undefined,
+  value: unknown = submission?.reset,
+) {
   if (!submission) return;
   const { state, key, snapshot } = submission;
   if (!state.lifetime.active || state.values.get(key) !== snapshot || Object.is(snapshot.value, value)) return;
@@ -86,7 +98,7 @@ export function useTableViewState<T>(key: string, initial: T | (() => T), explic
   );
   const acknowledge = useCallback(
     (value: T) => {
-      acknowledgeTableViewSubmission({ state, key, snapshot }, value);
+      acknowledgeTableViewSubmission({ state, key, snapshot, reset: value }, value);
     },
     [state, key, snapshot],
   );
