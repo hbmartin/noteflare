@@ -17,7 +17,7 @@ export type LinkedTableReadOutcome<T> =
   | { state: "success"; value: T; verification: "network" | "buffer" }
   | { state: "failure" | "denied" | "suspended" | "superseded" };
 export type TableReadReceipt<T> =
-  | { state: "complete"; value: T }
+  | { state: "complete" | "generation-changed"; value: T }
   | { state: "pending" | "failure" | "denied" | "suspended" | "retired" };
 type Waiter<T> = {
   resolve: (value: TableReadReceipt<T>) => void;
@@ -68,7 +68,11 @@ export function linkedTableReads<T>(options: {
   const covered = (sequence: number, coverage?: TableCoverage) => {
     if (sequence < unscoped) return false;
     for (const [generation, required] of watermarks)
-      if (coverage?.generation === generation ? required.revision > coverage.revision : required.sequence > sequence)
+      if (
+        coverage?.generation === generation
+          ? required.revision > coverage.revision
+          : !coverage || coverage.generation < generation || required.sequence > sequence
+      )
         return false;
     return true;
   };
@@ -185,7 +189,13 @@ export function linkedTableReads<T>(options: {
     }
     const receipt: TableReadReceipt<T> =
       outcome.state === "success"
-        ? { state: "complete", value: outcome.value }
+        ? {
+            state:
+              coverage && [...watermarks.keys()].some((generation) => generation < coverage.generation)
+                ? "generation-changed"
+                : "complete",
+            value: outcome.value,
+          }
         : { state: outcome.state === "superseded" ? "retired" : outcome.state };
     // Settle before queueing recovery so retry ownership cannot move this request's callers.
     settleBatch(batch, receipt);

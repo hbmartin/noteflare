@@ -522,3 +522,24 @@ it("keeps an invalidated continuation attached to its extent after the trailing 
   finishes.shift()!(3);
   expect(await page).toBe(3);
 });
+
+it("rejects older generation coverage and retires old requirements on a newer generation", async () => {
+  const finishes: Array<(value: { generation: number; revision: number }) => void> = [];
+  const c = linkedTableReads({
+    read: async () => ({
+      state: "success",
+      value: await new Promise<{ generation: number; revision: number }>((resolve) => finishes.push(resolve)),
+      verification: "network",
+    }),
+    coverage: (value) => value,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(c);
+  const waiting = c.refresh({ generation: 2, revision: 10 });
+  finishes.shift()!({ generation: 1, revision: 100 });
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  expect(finishes).toHaveLength(1);
+  finishes.shift()!({ generation: 3, revision: 1 });
+  expect(await waiting).toEqual({ state: "generation-changed", value: { generation: 3, revision: 1 } });
+});

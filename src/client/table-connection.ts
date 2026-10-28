@@ -22,7 +22,11 @@ export function tableConnection(options: {
   url: string;
   query: () => Promise<TableSocketVerification>;
   ready: (value: boolean) => void;
-  invalidate?: (coverage?: { generation: number; revision: number }) => Promise<TableSocketVerification> | void;
+  invalidate?: (coverage?: {
+    generation: number;
+    revision: number;
+    operationId?: string;
+  }) => Promise<TableSocketVerification> | void;
   verified?: (generation: number) => void;
 }) {
   let active: Slot | null = null,
@@ -181,7 +185,11 @@ export function tableConnection(options: {
           const revision = message.revision;
           const pending = options.invalidate(
             slot.generation !== null && Number.isSafeInteger(revision) && Number(revision) >= 0
-              ? { generation: slot.generation, revision: Number(revision) }
+              ? {
+                  generation: slot.generation,
+                  revision: Number(revision),
+                  ...(typeof message.operationId === "string" ? { operationId: message.operationId } : {}),
+                }
               : undefined,
           );
           if (pending) void verify(slot, () => pending);

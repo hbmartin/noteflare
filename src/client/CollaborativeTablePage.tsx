@@ -86,7 +86,11 @@ type SavedRetry = {
   message: string;
 } & ({ kind: "command"; command: TableCommand } | { kind: "task"; body: Record<string, unknown>; rowId?: string });
 const socketResult = (result: TableReadReceipt<TableQueryResult> | undefined) =>
-  result?.state === "complete" ? result.value : result?.state === "pending" ? { state: "pending" as const } : null;
+  result?.state === "complete" || result?.state === "generation-changed"
+    ? result.value
+    : result?.state === "pending"
+      ? { state: "pending" as const }
+      : null;
 const busyMessage = "A save is already in progress. Wait for it to finish.";
 const readinessMessage =
   "Editing is temporarily unavailable. Your changes are preserved. Wait for verification or refresh the table.";
@@ -177,6 +181,12 @@ export function CollaborativeTablePage({
   }, [member.role]);
   const canonicalPrefix = useRef({ id: 0, data: null as TableQueryResult | null });
   const connectionPermit = useRef<() => boolean>(() => true);
+  const mutationCoverage = useRef<{
+    owner: TableOwner;
+    operationId: string;
+    generation: number;
+    revision: number;
+  } | null>(null);
   const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
   const noticeSequence = useRef(0);
@@ -233,6 +243,7 @@ export function CollaborativeTablePage({
     const previous = retryLifetime.current;
     if (sameTableOwner(previous, currentOwner)) return;
     retryLifetime.current = currentOwner;
+    mutationCoverage.current = null;
     setMutationNotice((value) => (value === null ? value : null));
     setBlocked("");
     busyRef.current = false;
@@ -575,7 +586,15 @@ export function CollaborativeTablePage({
       },
       ready: publishReadiness,
       invalidate: async (coverage) => {
-        const result = await linkedReads.current?.refresh(coverage);
+        const operation = mutationCoverage.current;
+        const ownChange =
+          coverage &&
+          operation &&
+          sameTableOwner(operation.owner, retryLifetime.current) &&
+          coverage.operationId === operation.operationId &&
+          coverage.generation === operation.generation &&
+          coverage.revision > operation.revision;
+        const result = await linkedReads.current?.refresh(ownChange ? coverage : undefined);
         return socketResult(result);
       },
       verified: recordAuthorization,
@@ -653,6 +672,14 @@ export function CollaborativeTablePage({
             : `${command.kind}:${String(payload.rowId ?? `view:${viewId}`)}`;
     const operation = beginMutation(command.operationId, target, submission);
     const generation = data?.generation;
+    const previousRevision = data?.revision;
+    if (generation !== undefined && previousRevision !== undefined)
+      mutationCoverage.current = {
+        owner: retryOwner,
+        operationId: operation.operationId,
+        generation,
+        revision: previousRevision,
+      };
     try {
       const result = await api<TableCommandResult>(commandsPath, {
         method: "POST",
@@ -664,7 +691,9 @@ export function CollaborativeTablePage({
       acknowledgeTableViewSubmission(form);
       resolveMutation(operation);
       const refreshed = await linkedReads.current?.refresh(
-        generation === undefined ? undefined : { generation, revision: result.revision },
+        generation === undefined || (result.revision <= (previousRevision ?? Infinity) && !result.replayed)
+          ? undefined
+          : { generation, revision: result.revision },
       );
       if (!sameTableOwner(operation.owner, retryLifetime.current)) return false;
       if (refreshed?.state === "pending") setError("Saved. Refreshing the latest table data…");
@@ -754,8 +783,16 @@ export function CollaborativeTablePage({
       submission,
     );
     const generation = data?.generation;
+    const previousRevision = data?.revision;
+    if (generation !== undefined && previousRevision !== undefined)
+      mutationCoverage.current = {
+        owner: retryOwner,
+        operationId: operation.operationId,
+        generation,
+        revision: previousRevision,
+      };
     try {
-      const result = await api<{ visibleInView?: boolean; revision?: number }>(
+      const result = await api<{ visibleInView?: boolean; revision?: number; replayed?: boolean }>(
         rowId ? `${tasksPath}/${rowId}` : tasksPath,
         {
           method: rowId ? "PATCH" : "POST",
@@ -768,7 +805,9 @@ export function CollaborativeTablePage({
       acknowledgeTableViewSubmission(form);
       resolveMutation(operation);
       const refreshed = await linkedReads.current?.refresh(
-        generation === undefined || result.revision === undefined
+        generation === undefined ||
+          result.revision === undefined ||
+          (result.revision <= (previousRevision ?? Infinity) && !result.replayed)
           ? undefined
           : { generation, revision: result.revision },
       );

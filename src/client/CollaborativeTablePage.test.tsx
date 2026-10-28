@@ -1782,7 +1782,9 @@ it.each([false, true])(
         const result = await original(path, init);
         if (broadcast)
           AuthorizedTableSocket.instances[0]!.dispatchEvent(
-            new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", revision: 2 }) }),
+            new MessageEvent("message", {
+              data: JSON.stringify({ type: "table-changed", revision: 2, operationId: writes.at(-1)!.operationId }),
+            }),
           );
         return result;
       }
@@ -1840,4 +1842,25 @@ it("clears a successfully copied view's submitted form without changing the sele
   expect(screen.getByLabelText("View name")).toHaveValue("Grid");
   expect(screen.getByLabelText("Saved table view")).toHaveValue("grid");
   expect(writes[0]!.payload.id).toBeUndefined();
+});
+
+it("reconnects immediately after observing a generation transition through invalidation", async () => {
+  render(<CollaborativeTablePage page={{ id: "table", title: "Table" }} member={member} onSelectPage={vi.fn()} />);
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  const socket = AuthorizedTableSocket.instances[0]!;
+  vi.useFakeTimers();
+  data = { ...data, generation: 2 };
+  await act(async () => {
+    socket.dispatchEvent(
+      new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", revision: data.revision }) }),
+    );
+  });
+  expect(socket.readyState).toBe(3);
+  expect(input).toBeDisabled();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2000);
+  });
+  expect(AuthorizedTableSocket.instances).toHaveLength(2);
+  expect(screen.getByLabelText("Title")).toBeEnabled();
 });
