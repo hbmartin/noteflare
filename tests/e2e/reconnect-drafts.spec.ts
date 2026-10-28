@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { signInOwner, createTestSpace, editableDocument } from "./security-helpers";
+import { signInOwner, createTestSpace, editableDocument, openNavigation } from "./security-helpers";
 test.setTimeout(60_000);
 test.use({ serviceWorkers: "block" });
 async function create(page: Page, kind: string, title: string) {
@@ -262,6 +262,7 @@ test("cell text survives reload and appears in Personal Settings before sign-out
   await expect(cell).toHaveValue("Persisted unfinished text");
   const result = await (await page.request.get(`/api/tables/${table.id}/query`)).json();
   expect(result.rows.find((row: { id: string }) => row.id === rowId).cells[columnId]).toBe("Original");
+  await openNavigation(page);
   await page.getByRole("button", { name: "Members & settings", exact: true }).click();
   await expect(page.getByRole("region", { name: "Pending cell edits" })).toBeVisible();
   await expect(page.getByLabel("Recovered cell draft")).toHaveValue("Persisted unfinished text");
@@ -302,14 +303,14 @@ test("floating and sidebar replies share one draft and submit it once", async ({
   await composer.fill("Root discussion");
   await composer.press("Enter");
   await expect(composer).toHaveCount(0);
-  await page.getByRole("button", { name: "Page details", exact: true }).click();
-  await page.getByRole("button", { name: "Comments", exact: true }).click();
   await page.locator(".notes-editor .bn-thread-mark").first().click();
   const sidebar = page.locator(".comments-panel .bn-thread-composer .bn-editor");
   const floating = page.locator(".bn-thread-composer .bn-editor:not(.comments-panel *)");
-  await expect(sidebar).toBeVisible();
   await expect(floating).toBeVisible();
   await floating.fill("Shared reply");
+  await page.getByRole("button", { name: "Page details", exact: true }).click();
+  await page.getByRole("button", { name: "Comments", exact: true }).click();
+  await expect(sidebar).toBeVisible();
   await expect(sidebar).toHaveText("Shared reply");
   await sidebar.click();
   await sidebar.press("End");
