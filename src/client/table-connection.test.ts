@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { tableConnection } from "./table-connection";
+import { tableConnection, type TableSocketVerification } from "./table-connection";
 import type { TableQueryResult } from "../shared/table-protocol";
 class Socket extends EventTarget {
   static OPEN = 1;
@@ -33,7 +33,7 @@ class Socket extends EventTarget {
   }
 }
 let stop: ReturnType<typeof tableConnection>;
-let query: ReturnType<typeof vi.fn<() => Promise<TableQueryResult | null>>>;
+let query: ReturnType<typeof vi.fn<() => Promise<TableSocketVerification>>>;
 let ready: ReturnType<typeof vi.fn<(value: boolean) => void>>;
 const result = { generation: 1, canEdit: true } as TableQueryResult;
 beforeEach(() => {
@@ -264,3 +264,39 @@ it("keeps a live grant through pending freshness without extending its deadline"
   expect(stop.authorized()).toBe(false);
   expect(socket.readyState).toBe(3);
 });
+
+it.each([false, true])(
+  "pauses pending freshness while hidden and resumes the existing slot; candidate %s",
+  async (candidate) => {
+    stop();
+    let hidden = false;
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    query.mockResolvedValue(candidate ? { state: "pending" } : result);
+    const invalidate = vi.fn(async () => ({ state: "pending" as const }));
+    stop = tableConnection({ url: "ws://example.test/table", query, ready, invalidate });
+    const socket = Socket.all.at(-1)!;
+    socket.ready(6000, null);
+    await settle();
+    if (!candidate) {
+      socket.dispatchEvent(
+        new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", revision: 3 }) }),
+      );
+      await settle();
+    }
+    const before = query.mock.calls.length;
+    hidden = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(query).toHaveBeenCalledTimes(before);
+    expect(socket.readyState).toBe(1);
+    query.mockResolvedValue(result);
+    hidden = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await settle();
+    expect(query).toHaveBeenCalledTimes(before + 1);
+    expect(stop.authorized()).toBe(true);
+    expect(Socket.all.at(-1)).toBe(socket);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(socket.readyState).toBe(3);
+  },
+);

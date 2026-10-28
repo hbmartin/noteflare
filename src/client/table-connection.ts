@@ -11,6 +11,7 @@ type Slot = {
   renewAt: number | null;
   generation: number | null;
   checking: boolean;
+  waiting: boolean;
   trailing: VerificationWork | null;
   pending?: ReturnType<typeof setTimeout>;
   retired: boolean;
@@ -93,10 +94,17 @@ export function tableConnection(options: {
           failed(slot, true);
           return;
         }
+        slot.waiting = true;
         clearTimeout(slot.pending);
-        slot.pending = setTimeout(() => void verify(slot), Math.min(2000, slot.deadline - Date.now()));
+        slot.pending = setTimeout(
+          () => {
+            if (available()) void verify(slot);
+          },
+          Math.min(2000, slot.deadline - Date.now()),
+        );
         return;
       }
+      slot.waiting = false;
       clearTimeout(slot.pending);
       if (
         !result ||
@@ -146,6 +154,7 @@ export function tableConnection(options: {
       generation: null,
       renewAt: null,
       checking: false,
+      waiting: false,
       trailing: null,
       retired: false,
     };
@@ -222,6 +231,7 @@ export function tableConnection(options: {
       return;
     }
     options.ready(false);
+    if (replacement?.waiting) void verify(replacement);
     if (!valid()) {
       retire(active);
       active = null;
