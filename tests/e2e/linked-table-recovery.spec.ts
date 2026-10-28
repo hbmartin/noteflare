@@ -35,33 +35,6 @@ async function linkedFixture(page: Page) {
       })),
     });
   const host = await create("document", "Linked paging host");
-  // Other pages' projection is unrelated to this static source. Keep source,
-  // unknown, restore, and access invalidations observable in this read fixture.
-  await page.addInitScript(
-    ({ sourceId }) => {
-      window.addEventListener(
-        "notes:workspace-event",
-        (event) => {
-          const detail = (event as CustomEvent).detail;
-          if (
-            (detail?.type === "projection-updated" &&
-              typeof detail.pageId === "string" &&
-              detail.pageId !== sourceId) ||
-            (detail?.type === "pages-upserted" &&
-              !detail.restored &&
-              Array.isArray(detail.pages) &&
-              detail.pages.length > 0 &&
-              detail.pages.every(
-                (item: { id?: unknown } | null) => typeof item?.id === "string" && item.id !== sourceId,
-              ))
-          )
-            event.stopImmediatePropagation();
-        },
-        true,
-      );
-    },
-    { sourceId: source.id },
-  );
   await page.goto(`/?page=${host.id}`);
   const editor = await editableDocument(page, host.id);
   await editor.click();
@@ -560,7 +533,7 @@ test("canonical invalidation during an older read performs a trailing fresh read
   expect(reads).toBeGreaterThanOrEqual(2);
 });
 
-test("canonical refresh retires a failed continuation without leaving a row gap", async ({ page }) => {
+test("canonical refresh rebinds the requested continuation extent without leaving a row gap", async ({ page }) => {
   const { source } = await linkedFixture(page);
   await page.goto(`/?page=${source.id}`);
   const table = page
@@ -571,7 +544,11 @@ test("canonical refresh retires a failed continuation without leaving a row gap"
   await expect(cells.first()).toBeEnabled();
   await table.getByRole("button", { name: "Load more rows", exact: true }).click();
   await expect(cells).toHaveCount(200);
-  const original = await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value));
+  const expectedResponse = await page.request.get(`/api/tables/${source.id}/query?limit=400`);
+  expect(expectedResponse.ok()).toBeTruthy();
+  const expected = (await expectedResponse.json()).rows.map((row: { cells: Record<string, unknown> }) =>
+    String(Object.values(row.cells)[0]),
+  );
   await page.clock.install();
   let failedCursor = "",
     attempts = 0;
@@ -592,12 +569,15 @@ test("canonical refresh retires a failed continuation without leaving a row gap"
   await expect(cells).toHaveCount(100);
   await expect(cells.first()).toBeEnabled();
   await page.clock.runFor(3000);
-  await expect(cells).toHaveCount(100);
-  expect(attempts).toBe(1);
-  await table.getByRole("button", { name: "Load more rows", exact: true }).click();
-  await expect(cells).toHaveCount(200);
+  await expect(cells).toHaveCount(300);
+  expect(attempts).toBe(2);
   expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
-    original,
+    expected.slice(0, 300),
+  );
+  await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+  await expect(cells).toHaveCount(400);
+  expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
+    expected,
   );
 });
 
@@ -647,5 +627,80 @@ test("conflict notice survives a query change before its refresh completes", asy
     await expect(cells.first()).toHaveValue("Preserved after superseded refresh");
   } finally {
     release();
+  }
+});
+
+test("successful view saves acknowledge cached drafts for creation, edit and copy", async ({ page }) => {
+  const { linked, path } = await linkedFixture(page);
+  await linked.getByRole("button", { name: "Views", exact: true }).click();
+  await linked.getByRole("textbox", { name: "View name", exact: true }).fill("Acknowledged grid");
+  const save = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === `${path}/commands` && response.request().method() === "POST",
+  );
+  await linked.getByRole("button", { name: "Save view", exact: true }).click();
+  expect((await save).ok()).toBeTruthy();
+  await expect(linked.getByRole("textbox", { name: "View name", exact: true })).toHaveCount(0);
+  await linked.getByRole("button", { name: "Views", exact: true }).click();
+  await expect(linked.getByRole("textbox", { name: "View name", exact: true })).toHaveValue("New view");
+  await linked.getByRole("button", { name: "Close settings" }).click();
+  await linked.getByLabel("Saved table view").selectOption({ label: "Acknowledged grid" });
+  await expect(linked.getByRole("button", { name: "Views", exact: true })).toBeEnabled();
+  await linked.getByRole("button", { name: "Views", exact: true }).click();
+  await linked.getByRole("textbox", { name: "View name", exact: true }).fill("Renamed grid");
+  await linked.getByRole("button", { name: "Save view", exact: true }).click();
+  await expect(linked.getByRole("textbox", { name: "View name", exact: true })).toHaveCount(0);
+  await linked.getByRole("button", { name: "Views", exact: true }).click();
+  await expect(linked.getByRole("textbox", { name: "View name", exact: true })).toHaveValue("Renamed grid");
+  await expect(linked.getByText("These settings changed while you were editing.", { exact: true })).toHaveCount(0);
+  await linked.getByRole("textbox", { name: "View name", exact: true }).fill("Copy draft");
+  await linked.getByRole("button", { name: "Save as new view", exact: true }).click();
+  await expect(linked.getByRole("textbox", { name: "View name", exact: true })).toHaveCount(0);
+  await linked.getByRole("button", { name: "Views", exact: true }).click();
+  await expect(linked.getByRole("textbox", { name: "View name", exact: true })).toHaveValue("Renamed grid");
+});
+
+test("continuous invalidations release a successful save while automatic refresh continues", async ({ page }) => {
+  const { source } = await linkedFixture(page);
+  await page.goto(`/?page=${source.id}`);
+  const table = page
+    .locator(".table-live")
+    .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
+  const cell = table.getByLabel("Linked title", { exact: true }).first();
+  await expect(cell).toBeEnabled();
+  const releases: Array<() => void> = [];
+  let reads = 0;
+  await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
+    const response = await route.fetch();
+    const held = new Promise<void>((resolve) => releases.push(resolve));
+    reads++;
+    await held;
+    await route.fulfill({ response });
+  });
+  try {
+    const saved = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === `/api/tables/${source.id}/commands` &&
+        response.request().method() === "POST",
+    );
+    await cell.fill("Saved during churn");
+    await cell.press("Enter");
+    expect((await saved).ok()).toBeTruthy();
+    for (let pass = 0; pass < 2; pass++) {
+      await expect.poll(() => reads).toBeGreaterThanOrEqual(pass + 1);
+      await page.evaluate(() =>
+        window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type: "workspace-invalidated" } })),
+      );
+      releases.shift()!();
+    }
+    await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toBeVisible();
+    await expect(table.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
+    await expect.poll(() => reads).toBeGreaterThanOrEqual(3);
+    releases.shift()!();
+    await expect(cell).toHaveValue("Saved during churn");
+    await expect(cell).toBeEnabled();
+    await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toHaveCount(0);
+  } finally {
+    for (const release of releases) release();
+    await page.unroute(`**/api/tables/${source.id}/query?**`);
   }
 });

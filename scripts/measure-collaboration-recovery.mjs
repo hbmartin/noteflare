@@ -157,7 +157,7 @@ globalThis.measureQueryVerification=async()=>{
 };
 globalThis.measureViewSwitch=async()=>{
  const previous=globalThis.__data;
- globalThis.__data={...previous,views:[{id:'grid',name:'Grid',kind:'grid',revision:1,ownerId:null,columnId:null,filters:null,sorts:[],visibleColumnIds:previous.columns.map(column=>column.id)}]};
+ globalThis.__data={...previous,views:[{id:'grid',name:'Grid',kind:'grid',revision:1,ownerId:null,columnId:null,filters:null,sorts:[],visibleColumnIds:previous.columns.filter(column=>column.id!=='Done').map(column=>column.id)}]};
  const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
  flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'View measurement'},member:{role:'editor',user:{id:'view-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
  const button=text=>[...host.querySelectorAll('button')].find(item=>item.textContent.trim()===text);
@@ -174,6 +174,8 @@ globalThis.measureViewSwitch=async()=>{
    change(host.querySelector('input[aria-label="New property name"]'),'All '+sample);
    const renders=globalThis.__wholeTableRenders,before=globalThis.__requests,start=performance.now();
    select('grid');await settle(before);
+   const headers=[...host.querySelectorAll('table thead th')].map(node=>node.firstChild?.textContent);
+   if(!headers.includes('Title')||!headers.includes('Amount')||headers.includes('Done'))throw Error('Saved-view visible columns were not applied');
    if(!host.querySelector('input[aria-label="New property name"]')){button('Properties').click();await frame();}
    change(host.querySelector('input[aria-label="New property name"]'),'Grid '+sample);
    const back=globalThis.__requests;select('');await settle(back);
@@ -242,7 +244,8 @@ async function bundle(before) {
                 const end=decoded.offset+limit;
                 return {...globalThis.__data,rows:globalThis.__pagedRows.slice(decoded.offset,end),rowCount:globalThis.__pagedRows.length,nextCursor:end<globalThis.__pagedRows.length?JSON.stringify({offset:end,limit}):null};
               }
-              return path?.endsWith('/commands')?{revision:1,result:{},projectionPending:false}:globalThis.__data;
+              const viewId=new URL(path,'http://fixture').searchParams.get('viewId');
+              return path?.endsWith('/commands')?{revision:1,result:{},projectionPending:false}:{...globalThis.__data,view:viewId?globalThis.__data.views.find(view=>view.id===viewId)??null:null};
             }`,
             loader: "ts",
           }));
