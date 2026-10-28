@@ -575,33 +575,43 @@ it("retains genuine failure history through a superseded successful read", async
   expect(read).toHaveBeenCalledTimes(4);
 });
 
-it("lets timers progress while an uncovered buffered continuation awaits its refresh", async () => {
-  let release!: (value: {
-    state: "success";
-    value: { generation: number; revision: number };
-    verification: "network";
-  }) => void;
-  let pages = 0;
-  const controller = linkedTableReads({
-    poll: false,
-    unavailable: vi.fn(),
-    coverage: (value: { generation: number; revision: number }) => value,
-    read: async (intent) => {
-      if (intent.kind === "refresh" || ++pages > 25) return { state: "failure" };
-      if (pages === 1)
-        return new Promise((resolve) => {
-          release = resolve;
-        });
-      return { state: "success", value: { generation: 1, revision: 1 }, verification: "buffer" };
-    },
-  });
-  controllers.push(controller);
-  void controller.page({ queryIdentity: "query", generation: 1, revision: 1, prefix: 1, cursor: "next", target: 300 });
-  void controller.refresh({ generation: 1, revision: 2 });
-  release({ state: "success", value: { generation: 1, revision: 1 }, verification: "network" });
-  const observed = await new Promise<number>((resolve) => setTimeout(() => resolve(pages), 0));
-  expect(observed).toBe(1);
-});
+it.each(["buffer", "network"] as const)(
+  "lets timers progress while an uncovered %s continuation awaits its refresh",
+  async (verification) => {
+    let release!: (value: {
+      state: "success";
+      value: { generation: number; revision: number };
+      verification: "network";
+    }) => void;
+    let pages = 0;
+    const controller = linkedTableReads({
+      poll: false,
+      unavailable: vi.fn(),
+      coverage: (value: { generation: number; revision: number }) => value,
+      read: async (intent) => {
+        if (intent.kind === "refresh" || ++pages > 25) return { state: "failure" };
+        if (pages === 1)
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        return { state: "success", value: { generation: 1, revision: 1 }, verification };
+      },
+    });
+    controllers.push(controller);
+    void controller.page({
+      queryIdentity: "query",
+      generation: 1,
+      revision: 1,
+      prefix: 1,
+      cursor: "next",
+      target: 300,
+    });
+    void controller.refresh({ generation: 1, revision: 2 });
+    release({ state: "success", value: { generation: 1, revision: 1 }, verification: "network" });
+    const observed = await new Promise<number>((resolve) => setTimeout(() => resolve(pages), 0));
+    expect(observed).toBe(1);
+  },
+);
 
 it("keeps append failures out of the first denial recovery deadline", async () => {
   vi.useFakeTimers();

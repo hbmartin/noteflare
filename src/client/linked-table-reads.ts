@@ -225,8 +225,10 @@ export function linkedTableReads<T>(options: {
     if (outcome.state === "failure" || outcome.state === "denied") {
       options.unavailable("failure");
       completed = undefined;
-      if (outcome.state === "denied") scheduleDenied(batch);
-      else scheduleFailure(batch);
+      if (outcome.state === "denied") {
+        for (const observer of observers) observe(observer, receipt);
+        scheduleDenied(batch);
+      } else scheduleFailure(batch);
     } else if (outcome.state === "suspended") {
       options.unavailable("suspended");
       enqueueRetry(batch);
