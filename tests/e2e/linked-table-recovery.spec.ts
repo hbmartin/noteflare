@@ -668,12 +668,15 @@ test("continuous invalidations release a successful save while automatic refresh
   const cell = table.getByLabel("Linked title", { exact: true }).first();
   await expect(cell).toBeEnabled();
   const releases: Array<() => void> = [];
-  let reads = 0;
+  let reads = 0,
+    draining = false;
   await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
     const response = await route.fetch();
-    const held = new Promise<void>((resolve) => releases.push(resolve));
-    reads++;
-    await held;
+    if (!draining) {
+      const held = new Promise<void>((resolve) => releases.push(resolve));
+      reads++;
+      await held;
+    }
     await route.fulfill({ response });
   });
   try {
@@ -700,7 +703,8 @@ test("continuous invalidations release a successful save while automatic refresh
     await expect(cell).toBeEnabled();
     await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toHaveCount(0);
   } finally {
+    draining = true;
     for (const release of releases) release();
-    await page.unroute(`**/api/tables/${source.id}/query?**`);
+    await page.unrouteAll({ behavior: "wait" });
   }
 });
