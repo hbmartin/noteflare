@@ -23,6 +23,7 @@ import {
 } from "./table-service";
 import { ACCEPTED_PAGE_DELETION_SQL } from "./deletion-policy";
 import type { TableCommand } from "../shared/table-protocol";
+import { readTableCoverage } from "../shared/table-coverage";
 import { readComparison, pruneDocumentChanges } from "./document-changes";
 import { buildTableRowQuery, tableRowBinds, stableTableSnapshot, collectRowCells } from "./table-read";
 import { processDueSlackFileCleanup, slackFileCleanupHealth } from "./slack-file-cleanup";
@@ -5187,6 +5188,7 @@ app.post("/api/pages/:id/linked-tables/:tableId/tasks", async (c) => {
   const result = await mutateTask(c.env, member, tableId, null, body, linkedHostAuthorization(host, member));
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "task-list-invalidated",
+    ...readTableCoverage(result),
     pageId: tableId,
     ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
   });
@@ -5214,6 +5216,7 @@ app.patch("/api/pages/:id/linked-tables/:tableId/tasks/:rowId", async (c) => {
   );
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "task-list-invalidated",
+    ...readTableCoverage(result),
     pageId: tableId,
     ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
   });
@@ -6107,6 +6110,7 @@ app.post("/api/task-lists/:pageId/tasks", async (c) => {
   const result = await mutateTask(c.env, member, pageId, null, body);
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "task-list-invalidated",
+    ...readTableCoverage(result),
     pageId,
     ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
   });
@@ -6120,6 +6124,7 @@ app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
   const result = await mutateTask(c.env, member, pageId, c.req.param("rowId"), body);
   sendWorkspaceEvent(c, member.workspace.id, {
     type: "task-list-invalidated",
+    ...readTableCoverage(result),
     pageId,
     ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
     forceRefresh: body.archived === true,

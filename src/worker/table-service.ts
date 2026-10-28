@@ -1,5 +1,6 @@
 import { registerRealtimeRoom } from "./realtime-access";
 import { REALTIME_GRANT_MS, REALTIME_ROOM_MARGIN_MS } from "../shared/realtime-limits";
+import { readTableCoverage } from "../shared/table-coverage";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { decodeTableResponse, tableReadPages } from "./table-transport";
@@ -127,6 +128,28 @@ export async function queryTable(env: Env, member: MemberContext, pageId: string
   );
   const page = await pageForMember(env, member, pageId);
   return { ...result, taskList: Boolean(page.is_task_list), canEdit: page.effective_role !== "viewer" };
+}
+/** Original authority receipt only: a later rebuild cannot relabel an old mutation. */
+export async function tableReceiptCoverage(
+  env: Env,
+  member: MemberContext,
+  pageId: string,
+  operationId: string,
+  authorization?: { sql: string; binds: unknown[] },
+) {
+  return readTableCoverage(
+    await decodeTableResponse<unknown>(
+      await tableFetch(
+        env,
+        member,
+        pageId,
+        `/receipt?${new URLSearchParams({ operationId })}`,
+        "GET",
+        undefined,
+        authorization ? { authorization } : {},
+      ),
+    ),
+  );
 }
 export async function tableInternal<T>(env: Env, pageId: string, path: string, body?: unknown) {
   return decodeTableResponse<T>(

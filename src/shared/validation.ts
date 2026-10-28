@@ -1,5 +1,6 @@
 import { PAGE_KINDS, type PageKind } from "./page-kind.ts";
 import type { ColumnType, Page, Role, WorkspaceEvent } from "./types";
+import { readTableCoverage } from "./table-coverage";
 
 export class ValidationError extends Error {}
 
@@ -166,6 +167,7 @@ export function parseWorkspaceEvent(value: unknown): WorkspaceEvent | null {
     return {
       type: "task-list-invalidated",
       pageId: event.pageId,
+      ...readTableCoverage(event),
       ...(typeof event.operationId === "string" && ID_PATTERN.test(event.operationId)
         ? { operationId: event.operationId }
         : {}),
