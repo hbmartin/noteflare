@@ -305,8 +305,10 @@ export async function mutateTask(
         : undefined;
     let coverage;
     try {
-      if (await collaborativeTable(env, listId))
-        coverage = await tableReceiptCoverage(env, member, listId, operationId, authorization);
+      coverage = await tableReceiptCoverage(env, member, listId, operationId, {
+        ...(authorization ? { authorization } : {}),
+        page,
+      });
     } catch (cause) {
       // Coverage is optional metadata; the committed receipt remains authoritative.
       logger.warn(

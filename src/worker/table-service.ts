@@ -4,7 +4,7 @@ import { readTableCoverage } from "../shared/table-coverage";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { decodeTableResponse, tableReadPages } from "./table-transport";
-import { pageForMember, requirePageEditor } from "./page-access";
+import { pageForMember, requirePageEditor, type PageRow } from "./page-access";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import {
   normalizedColumnName,
@@ -44,6 +44,15 @@ export async function collaborativeTable(env: Env, pageId: string) {
   const registry = await tableRegistry(env, pageId);
   return registry?.state === "do" || registry?.state === "repairing";
 }
+type TableFetchExtras = {
+  authorization?: { sql: string; binds: unknown[] };
+  effects?: ProjectionStatement[];
+  effectsAfter?: ProjectionStatement[];
+  detailPageId?: string;
+  allowDeleteDetail?: boolean;
+  cancelRowOnPublicationFailure?: string;
+  taskMutation?: true;
+};
 export async function tableFetch(
   env: Env,
   member: MemberContext,
@@ -51,21 +60,28 @@ export async function tableFetch(
   path: string,
   method = "GET",
   body?: unknown,
-  extras?: {
-    authorization?: { sql: string; binds: unknown[] };
-    effects?: ProjectionStatement[];
-    effectsAfter?: ProjectionStatement[];
-    detailPageId?: string;
-    allowDeleteDetail?: boolean;
-    cancelRowOnPublicationFailure?: string;
-    taskMutation?: true;
-  },
+  extras?: TableFetchExtras,
 ) {
-  const page = await pageForMember(env, member, pageId);
+  return fetchTable(env, member, pageId, path, method, body, extras);
+}
+async function fetchTable(
+  env: Env,
+  member: MemberContext,
+  pageId: string,
+  path: string,
+  method = "GET",
+  body?: unknown,
+  extras?: TableFetchExtras,
+  construction?: { page?: PageRow; registry: TableRegistry },
+) {
+  // Request-local construction inputs never replace the authority's live authorization.
+  const page = construction?.page ?? (await pageForMember(env, member, pageId));
+  if (page.id !== pageId || page.workspace_id !== member.workspace.id)
+    throw new HttpError(403, "table_forbidden", "Table is unavailable.");
   if (page.kind !== "table") throw new HttpError(422, "table_required", "Choose a table.");
   const write = method !== "GET" && !(method === "POST" && path === "/draft-rows");
   if (write) requirePageEditor(page);
-  const registry = await tableRegistry(env, pageId);
+  const registry = construction?.registry ?? (await tableRegistry(env, pageId));
   if (!registry || !["do", "repairing"].includes(registry.state))
     throw new HttpError(409, "table_authority_required", "Enable collaboration for this table first.");
   if (write && registry.state === "repairing")
@@ -135,18 +151,21 @@ export async function tableReceiptCoverage(
   member: MemberContext,
   pageId: string,
   operationId: string,
-  authorization?: { sql: string; binds: unknown[] },
+  options: { authorization?: { sql: string; binds: unknown[] }; page?: PageRow } = {},
 ) {
+  const registry = await tableRegistry(env, pageId);
+  if (!registry || !["do", "repairing"].includes(registry.state)) return undefined;
   return readTableCoverage(
     await decodeTableResponse<unknown>(
-      await tableFetch(
+      await fetchTable(
         env,
         member,
         pageId,
         `/receipt?${new URLSearchParams({ operationId })}`,
         "GET",
         undefined,
-        authorization ? { authorization } : {},
+        options.authorization ? { authorization: options.authorization } : {},
+        { ...(options.page ? { page: options.page } : {}), registry },
       ),
     ),
   );
