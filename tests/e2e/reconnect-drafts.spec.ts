@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page, type Locator } from "@playwright/test";
 import { signInOwner, createTestSpace, editableDocument, openNavigation } from "./security-helpers";
 test.setTimeout(60_000);
 test.use({ serviceWorkers: "block" });
@@ -55,6 +55,20 @@ async function anchoredComposer(page: Page, title: string, selectedText: string)
   const composer = page.locator(".bn-thread .bn-editor");
   await expect(composer).toHaveCount(1);
   return { document, composer };
+}
+async function focusReplyEnd(editor: Locator) {
+  // Programmatic keyboard focus does not consistently position Firefox's DOM
+  // caret. Establish it inside this composer without clicking an overlapping card.
+  await editor.focus();
+  await editor.evaluate((element) => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    const selection = document.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+  await expect(editor).toBeFocused();
 }
 test("diagram access refresh reconnects an authorized viewer without removing the page", async ({ page }) => {
   await signInOwner(page);
@@ -313,13 +327,11 @@ test("floating and sidebar replies share one draft and submit it once", async ({
   await page.getByRole("button", { name: "Comments", exact: true }).click();
   await expect(sidebar).toBeVisible();
   await expect(sidebar).toHaveText("Shared reply");
-  await floating.focus();
-  await floating.press("End");
+  await focusReplyEnd(floating);
   await floating.pressSequentially(" from floating");
   await expect(sidebar).toHaveText("Shared reply from floating");
   // Keyboard focus switches surfaces even when the mobile floating thread overlaps the sidebar.
-  await sidebar.focus();
-  await sidebar.press("End");
+  await focusReplyEnd(sidebar);
   await sidebar.pressSequentially(" from sidebar");
   await expect(floating).toHaveText("Shared reply from floating from sidebar");
   const posts: string[] = [];
