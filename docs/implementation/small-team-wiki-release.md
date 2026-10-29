@@ -832,3 +832,125 @@ The command completes in **39.92 seconds**. Three fresh Chromium contexts per ve
 No measured median p95 regression exceeds 10%; reconnect p95 changes by **+2.33%** and controlled read recovery remains within the threshold. The first visit opens a pristine Property panel with one additional render, followed by six-render round trips. Fulfilled-append timing is below timer resolution, so reference/request counts establish its behavior. The churn fixture measures caller release, not the total cost or latency of eventual background verification: updated callers settle pending while required gates remain intact, and background recovery continues. These local controlled API/socket results do not establish production D1 or network performance. Formatting the committed artifact preserves parsed JSON values exactly.
 
 The existing production reload/highlighting release gate remains separate. Its earlier 24/25 production-browser result is historical evidence, not a pass claimed for this follow-up. Production builds and middleware/deployment policy checks are recorded independently. Remote CI/Sonar results remain separate from local acceptance. No deployment, remote migration, live Slack installation, receipt compatibility restoration, server-receipt pruning, portability/trust work or new persistent recovery workflow is included.
+
+## PR #276 follow-up: refresh scheduling, coverage, and CI recovery
+
+### Contracts and compatibility
+
+Implementation starts from `5cd7c64e5272c54367280fa03e1efb4f6c7f6492`. The follow-up separates request ownership, accepted freshness, and caller completion. An uncovered continuation retains its extent but becomes ineligible until its prerequisite network verification succeeds. A buffer-only result cannot discharge that debt. Freshness churn, genuine dependency failures, and denial have separate progression; append failures cannot lengthen the first denial or an unrelated refresh. Callers retain the two-superseded-pass/30-second bound, while background work uses equal jitter and yields to timers. One cursor restart remains; further churn reports pending verification, retains recovery text and extent, and coordinates a refresh rather than becoming a false dependency error. Network work remains network provenance when a restarted extent is finally satisfied from the refreshed prefix or exhaustion.
+
+New table command receipts and committed table broadcasts contain their authority's generation/revision pair. Task results and ordinary task events use that committed pair, including on idempotent replay. Task receipt replay retrieves original metadata from its actor-scoped authority receipt; missing legacy metadata or an unavailable optional metadata lookup preserves the committed result and requires a conservative network check. It never labels an older receipt with today's generation. This lookup adds an authenticated authority round-trip only on task replay. Safe-integer validation rejects malformed and incomplete pairs. Workspace security generations remain a separate, owner-only contract. Forced projection, access-wide, removal and unknown events retain authoritative checking.
+
+Socket verification consumes explicit receipts. Suspension, retired query work, pending freshness and transient query failure preserve healthy transports until their original deadlines. Coordinator subscription delivers recovery without a second polling loop. Initial/replacement sockets wait for successful matching verification; denial, incompatible generation and fixed expiry still retire them. Candidates receive a fixed expiry timer even while waiting for recovery.
+
+Confirmed table/task commits acknowledge only their captured draft snapshot before owner-dependent UI work. Save busy ends without awaiting refresh. Background status says “Saved. Refreshing the latest table data…”; a failed read remains refresh trouble and creates no mutation Retry or replay. A committed generation change invalidates the obsolete write permit immediately. Late results cannot update a replacement account, clear newer drafts, or replace newer feedback.
+
+All additions are backward-compatible metadata and internal lifecycle contracts. No public protocol version, browser-storage format, D1 migration, authorization lifetime, deployment flag or deployment changes. Relations remain disabled. Property settings remain per view. Terminal receipts, immediate persistence, deliberate retries, connection-required editing and existing sign-out cleanup remain intact.
+
+### Test and harness corrections
+
+The Node 22 recovery fixtures use request/application barriers, deterministic scheduling clocks and teardown that settles held work. Large fixtures retain 800 source rows and the 100/200/300/400 visible-count, permission, recovered-text and server-read assertions; unrelated date columns and repeated full-DOM accessibility scans are removed from these large pagination fixtures. The Math.random spy is restored unconditionally, with a later original-function assertion. The floating composer is edited after both reply surfaces mount, using keyboard focus for mobile overlap, before reverse synchronization and exactly-once submission checks.
+
+The revocation benchmark has twelve sequential cases (1/4/12 workspaces × cold/warm × before/after), twenty samples each, unchanged D1/DO assertions, percentile definitions and 20-second timeout. Browser measurements consume discriminated receipt outcomes; failures, denials, suspension and retirement fail the controlled fixture rather than becoming pending. Negative controls retain historical measurements without claiming those measurements were proven skewed. Corrected baseline and updated measurements share the same harness, including timer progress and commit busy-release barriers.
+
+### Validation and release gates
+
+Implementation starts from main `5cd7c64e5272c54367280fa03e1efb4f6c7f6492`. Application sources are frozen at `c13bb34`; final browser fixtures are `6d9bbfc`. Validation uses a managed worktree excluding unrelated edits and Node **22.23.4**, with the repository's normal unit/Worker concurrency. Worker/shared sources are unchanged from the full Worker coverage run. Later fixture-only changes do not alter those covered contracts.
+
+Full unit coverage passes **2,959 tests plus one pre-existing skip** across 167 passing files and one skipped file, with Vitest reporting **49.14 seconds**. Line/statement/branch/function coverage is **76.40/73.71/68.73/68.16%**. Full Worker coverage passes **2,484/2,484** across 37 files in **913.62 seconds**, with coverage **86.65/83.33/76.91/89.85%**. These are Node 22 full-suite results with default concurrency, not only isolated regression passes.
+
+The affected Chromium/Firefox/WebKit matrix passes **90/90** in **631.65 seconds**. Nine concurrency scenarios pass five times in each engine (**135/135**). The original ten-scenario repeated run is retained as development evidence: **149/150**, with one Firefox sign-out-screen assertion before client cleanup completed. The final corrected sign-out scenario passes five times in Chromium, Firefox, WebKit and mobile (**20/20**, **2.5 minutes**) with retries disabled. It awaits both the server response and the existing local-purge completion marker, then retains the original sign-in and zero-draft assertions. No arbitrary delay or configured timeout increase is added.
+
+Live reply synchronization is exercised by typing in the floating composer after both surfaces mount, then typing in the sidebar and checking exactly-once submission. Firefox's native End-key transition could move focus before typing reached the controller. The fixture now establishes the caret inside the intended composer before real keyboard typing; it does not replace the live assertions with pre-mount text or direct draft writes. A speculative application focus workaround was removed. Resource-contention failures and interrupted development runs are excluded from passing evidence; the final coverage and browser acceptance are recorded separately.
+
+Two consecutive full Chromium runs from fresh server/D1 state pass **103/103 each** (**533.02 and 533.59 seconds**) at browser-fixture revision `5563302`. The subsequent `6d9bbfc` change affects only comment selection setup, with all application sources unchanged: its protocol scenario passes five times in all four engines (**20/20**, **149.37 seconds**), the complete affected desktop comment matrix passes **63/63** (**312.52 seconds**), and the full affected mobile matrix passes **48/48** (**330.41 seconds**). Diagnostics pass **1/1** (Playwright **2.2 seconds**). The final optimized production-browser suite passes **25/25** (**86.60 seconds**); that current pass is separate evidence, not a claim to have fixed the previously observed intermittent reload/highlighting issue.
+
+The earlier mobile run is retained as development evidence (**47/48**). Its timeout occurred before any protocol request: native Shift/Arrow selection left the formatting toolbar hidden. The shared fixture now verifies inserted text, scrolls that paragraph into view, establishes and asserts its selected range, then uses the actual Add comment UI. No protocol, publication, recovery, or exactly-once assertion is removed.
+
+All repository-check components pass: formatting, docs, lint, all five TypeScript projects, Fallow, generated Worker bindings, both coverage suites, production client build, Worker dry run, and middleware/deployment policies. The builds complete in **9.26 and 1.38 seconds**; Fallow reports no issues (**48.38 seconds**). Pinned Semgrep 1.151.0 reports no findings; middleware rule tests pass **10/10** and deployment rule tests **2/2**. Final documentation and raw artifacts are formatted and checked again after generation. No coverage threshold, assertion timeout, test timeout, policy exclusion, or browser retry is relaxed.
+
+Commands use the Node 22 binary on PATH and `--retries=0` for browser acceptance:
+
+```sh
+pnpm test:coverage
+pnpm test:worker:coverage
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts \
+  --grep 'linked|canonical|table|task|cell|save denial|failed conflict|conflict notice|successful view saves|continuous invalidations|floating and sidebar replies' --retries=0
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts \
+  --grep 'continuous invalidations|successful view saves|requested continuation extent|invalidation during|failed conflict verification|conflict notice survives|saved linked operation|successful hidden linked|floating and sidebar replies|cell text survives reload' \
+  --repeat-each=5 --retries=0
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit --project=mobile-chromium \
+  tests/e2e/reconnect-drafts.spec.ts --grep 'cell text survives reload' --repeat-each=5 --retries=0
+pnpm exec playwright test --project=chromium --retries=0
+pnpm exec playwright test --project=chromium --retries=0
+pnpm exec playwright test --project=mobile-chromium \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts --retries=0
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit --project=mobile-chromium \
+  tests/e2e/reconnect-drafts.spec.ts --grep 'protocol mismatch' --repeat-each=5 --retries=0
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit \
+  tests/e2e/reconnect-drafts.spec.ts --grep 'comment|replies|preparation|receipt|protocol' --retries=0
+pnpm test:e2e:diagnostics --retries=0
+NOTES_E2E_RESET=1 pnpm test:e2e:production --retries=0
+```
+
+### Corrected optimized measurements
+
+[Raw browser measurements](pr-276-refresh-measurements.json) compare baseline `5cd7c64e5272c54367280fa03e1efb4f6c7f6492` with updated/harness `6d9bbfca2cc341082733e9b60fcdd0bfce6152cc`, using exactly the same corrected harness. After all heavy acceptance work finishes, the command completes in **46.12 seconds**:
+
+```sh
+NOTES_BENCH_TYPING_EDITS=300 NOTES_BENCH_READ_RECOVERY=1 \
+  node scripts/measure-collaboration-recovery.mjs \
+  5cd7c64e5272c54367280fa03e1efb4f6c7f6492 /tmp/noteflare-276-measurements.json
+```
+
+Three fresh contexts per version use an optimized/minified production-React bundle, 100 visible rows, 500 account drafts, 5,000 unrelated storage keys, 300 immediate edits, twenty query/view samples, five 500-row refreshes, 1,000 fulfilled continuations, ten churn samples and twenty reconnecting clients. Table values are medians of per-context p50/p95 values except controlled recovery, which reports p50/p95 across three context samples. Its jitter draw is fixed at 0.5; reconnect jitter remains randomized.
+
+| Metric                                                                       | Starting main         | Updated runtime       |
+| ---------------------------------------------------------------------------- | --------------------- | --------------------- |
+| Typing p50 / p95                                                             | 0.1 / 0.2 ms          | 0.1 / 0.2 ms          |
+| First edit                                                                   | 0.6 ms                | 0.7 ms                |
+| Immediate writes / full enumeration / whole-table typing renders per context | 300 / 0 / 0           | 300 / 0 / 0           |
+| Save/focus notifications                                                     | 3                     | 3                     |
+| Receipt p95 / healthy-path enumeration                                       | 0.1 ms / 0            | 0.1 ms / 0            |
+| Receipt writes / removals per context                                        | 20 / 20               | 20 / 20               |
+| Subscription changes over twenty ordinary renders                            | 0                     | 0                     |
+| Query verification p50 / p95                                                 | 16.6 / 18.2 ms        | 16.6 / 17.7 ms        |
+| Query renders / requests per verification                                    | 3 / 1                 | 3 / 1                 |
+| Toolbar replacements / missing controls                                      | 0 / 0                 | 0 / 0                 |
+| View round-trip p50 / p95                                                    | 33.2 / 35.1 ms        | 33.2 / 35.0 ms        |
+| Restored Property drafts / median renders / requests                         | 20 / 6 / 2            | 20 / 6 / 2            |
+| 500-row linked refresh p50 / p95                                             | 33.3 / 34.0 ms        | 33.3 / 33.8 ms        |
+| Requests per 500-row refresh / buffered expansion                            | 1 / 0                 | 1 / 0                 |
+| Fulfilled append window/data/row identity per 1,000 observations             | 1,000 / 1,000 / 1,000 | 1,000 / 1,000 / 1,000 |
+| Fulfilled append HTTP requests                                               | 0                     | 0                     |
+| Caller completion under churn p50 / p95                                      | 16.6 / 18.0 ms        | 16.6 / 18.3 ms        |
+| Caller outcome / observed reads per churn sample                             | pending / 2           | pending / 2           |
+| Continuation calls before timer (fixture safety cutoff: 50)                  | 51, cutoff reached    | 1, cutoff not reached |
+| Observed save busy release p50 / p95                                         | 49.8 / 51.4 ms        | 17.4 / 18.2 ms        |
+| Committed refresh completion p50 / p95                                       | 49.8 / 51.4 ms        | 49.8 / 50.6 ms        |
+| Refresh reads per controlled commit                                          | 1                     | 1                     |
+| Controlled read recovery p50 / p95 (three contexts)                          | 1,516.3 / 1,516.7 ms  | 1,515.1 / 1,515.5 ms  |
+| Controlled recovery fixture queries                                          | 3                     | 3                     |
+| Reconnect p50 / p95                                                          | 1,516.0 / 1,848.2 ms  | 1,557.6 / 1,981.9 ms  |
+| Reconnect sockets / queries                                                  | 40 / 40               | 40 / 40               |
+
+No measured median p95 regression exceeds 10%; reconnect p95 changes **+7.23%**, and observed busy-release p95 changes **−64.59%**. The two-frame held-read barrier separates busy release from refresh completion: it does not demonstrate faster server reads. First-edit observations are single samples per context, not a p95 distribution. Fulfilled append timings are below timer resolution; identity and request counts establish their behavior. The scheduler negative control caps baseline work at fifty calls, so its timer latency is not presented as the latency of an uncapped starvation loop. Updated work performs one continuation before the timer. Churn callers remain pending while required verification continues. These controlled local API/socket measurements do not establish production D1 or network latency.
+
+### Sequential revocation fixture
+
+[Raw revocation measurements](pr-276-revocation-measurements.json) record the twelve sequential cases, twenty samples each, with unchanged call-count assertions, sorted p50/p95 indices **10/18**, and the existing 20-second per-test timeout. The final quiet run passes all twelve in **14.59 seconds**. The before variant models historical `dce5d25` impact tracking; this follow-up corrects fixture structure and does not change revocation runtime behavior.
+
+| Workspaces / mode | D1 before / after | DO before / after | Before p50 / p95 | After p50 / p95 |
+| ----------------- | ----------------- | ----------------- | ---------------- | --------------- |
+| 1 / cold          | 8 / 5             | 1 / 1             | 6 / 9 ms         | 5 / 6 ms        |
+| 1 / warm          | 8 / 5             | 1 / 1             | 5 / 9 ms         | 3 / 4 ms        |
+| 4 / cold          | 23 / 17           | 4 / 4             | 22 / 41 ms       | 15 / 19 ms      |
+| 4 / warm          | 23 / 17           | 4 / 4             | 12 / 15 ms       | 9 / 13 ms       |
+| 12 / cold         | 63 / 49           | 12 / 12           | 61 / 72 ms       | 51 / 65 ms      |
+| 12 / warm         | 63 / 49           | 12 / 12           | 36 / 88 ms       | 24 / 33 ms      |
+
+No paired p95 regression exceeds 10% in that run. These are local fixture timings, not production latency. The actor-scoped table receipt lookup introduced here adds an authenticated DO round trip on task replay only; unavailable legacy metadata keeps the committed response and requires a conservative client read.
+
+The existing production reload/highlighting release gate remains separate. Remote CI and Sonar results are reported independently from local checks. No deployment, remote migration, live Slack installation, receipt compatibility restoration, server-receipt pruning, portability/trust work or new recovery workflow is included. Relations remain disabled; unrelated working-tree changes remain untouched.
