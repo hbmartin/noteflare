@@ -281,7 +281,11 @@ test("cell text survives reload and appears in Personal Settings before sign-out
   await expect(page.getByRole("region", { name: "Pending cell edits" })).toBeVisible();
   await expect(page.getByLabel("Recovered cell draft")).toHaveValue("Persisted unfinished text");
   await openNavigation(page);
+  const signedOut = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === "/api/auth/sign-out" && response.request().method() === "POST",
+  );
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
+  expect((await signedOut).ok()).toBeTruthy();
   await expect(page.getByRole("heading", { name: /sign in/i })).toBeVisible();
   expect(
     await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith("notes:cell-draft:v1:")).length),
