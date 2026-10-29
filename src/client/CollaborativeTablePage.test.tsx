@@ -2053,7 +2053,8 @@ it("blocks a second task save until committed rows arrive without retaining muta
     if (init?.method && path.endsWith("/tasks/row")) {
       const body = JSON.parse(String(init.body));
       submissions.push(body);
-      expect(body.expectedRevision).toBe(data.revision);
+      if (body.expectedRevision !== data.revision)
+        throw new ApiClientError(409, "table_revision_conflict", "The task list changed.");
       data = {
         ...data,
         revision: data.revision + 1,

@@ -109,12 +109,10 @@ export function linkedTableReads<T>(options: {
     }
   };
   const retireAppends = () => retireQueued((intent) => intent.kind !== "refresh");
-  const needsFreshness = (batch: Batch<T>) =>
-    batch.intent.kind !== "refresh" &&
-    invalidation > 0 &&
-    (!completed || !covered(completed.sequence, completed.coverage));
+  const freshnessPending = () => invalidation > 0 && (!completed || !covered(completed.sequence, completed.coverage));
+  const needsFreshness = (batch: Batch<T>) => batch.intent.kind !== "refresh" && freshnessPending();
   const prerequisite = () => {
-    if (![...queued.values()].some(needsFreshness) || active?.batch.intent.kind === "refresh") return;
+    if (![...queued.values()].some(needsFreshness) || active?.batch.intent.kind === "refresh") return undefined;
     let refresh = queued.get("refresh");
     if (!refresh) queued.set("refresh", (refresh = freshBatch<T>()));
     return refresh;
@@ -246,7 +244,7 @@ export function linkedTableReads<T>(options: {
     } else if (outcome.state === "suspended") {
       options.unavailable("suspended");
       enqueueRetry(batch);
-    } else if (outcome.state === "superseded" && [...queued.values()].some(needsFreshness)) {
+    } else if (outcome.state === "superseded" && freshnessPending()) {
       const refresh = queued.get("refresh") ?? freshBatch<T>();
       if (batch.intent.kind === "refresh") refresh.attempt = Math.max(refresh.attempt, batch.attempt);
       if (freshnessAttempt++ > 0 && !refresh.manual)

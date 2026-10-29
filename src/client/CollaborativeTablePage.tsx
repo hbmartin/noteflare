@@ -194,6 +194,7 @@ export function CollaborativeTablePage({
   const dismissedNotice = useRef(0);
   const [mutationNotice, setMutationNotice] = useState<MutationNotice | null>(null);
   const [saveExplanation, setSaveExplanation] = useState<MutationNotice | null>(null);
+  const [refreshStatus, setRefreshStatus] = useState("");
   const [blocked, setBlocked] = useState("");
   const taskRefreshRequiredRef = useRef(false);
   const [taskRefreshRequired, setTaskRefreshRequired] = useState(false);
@@ -300,7 +301,6 @@ export function CollaborativeTablePage({
   const queryIdentity = JSON.stringify([base, viewId, query, month]);
   const queryOwner = useRef({ queryIdentity, account, incarnation, host, tableId: page.id });
   const [error, setError] = useState("");
-  const [refreshStatus, setRefreshStatus] = useState("");
   const reportMutation = (notice: MutationNotice, message: string) => {
     if (!sameTableOwner(notice.owner, retryLifetime.current) || notice.sequence <= dismissedNotice.current) return;
     setMutationNotice((current) => (current && current.sequence > notice.sequence ? current : { ...notice, message }));
@@ -1092,7 +1092,7 @@ export function CollaborativeTablePage({
       <section className={`table-live ${embedded ? "table-live-embedded" : "page-canvas"}`}>
         {refreshStatus && <output>{refreshStatus}</output>}
         {saveExplanation && sameTableOwner(saveExplanation.owner, currentOwner) && (
-          <div role="status">
+          <output>
             {saveExplanation.message}
             <button
               type="button"
@@ -1100,7 +1100,7 @@ export function CollaborativeTablePage({
             >
               Dismiss saved notice
             </button>
-          </div>
+          </output>
         )}
         {!embedded && (
           <>

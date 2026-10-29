@@ -859,3 +859,19 @@ it("yields to timers when prerequisite reads keep being superseded", async () =>
   await vi.advanceTimersByTimeAsync(1);
   expect(read).toHaveBeenCalledTimes(3);
 });
+
+it("retains required verification after supersession even without a waiting continuation", async () => {
+  const value = { generation: 2, revision: 1 };
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce({ state: "superseded" })
+    .mockResolvedValue({ state: "success", value, verification: "network" });
+  const observer = vi.fn();
+  const c = linkedTableReads({ read, coverage: (result: typeof value) => result, unavailable: vi.fn(), poll: false });
+  controllers.push(c);
+  c.subscribe(observer);
+  expect(await c.refresh(value)).toEqual({ state: "retired" });
+  await flushReads();
+  expect(read).toHaveBeenCalledTimes(2);
+  expect(observer).toHaveBeenLastCalledWith({ state: "complete", value });
+});
