@@ -286,6 +286,11 @@ test("cell text survives reload and appears in Personal Settings before sign-out
   );
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
   expect((await signedOut).ok()).toBeTruthy();
+  // Server sign-out and local IndexedDB cleanup complete independently. Wait for
+  // the existing purge marker before asserting the final screen and removed text.
+  await page.waitForFunction(
+    () => !Object.keys(localStorage).some((key) => key.startsWith("noteflare-purging-account:")),
+  );
   await expect(page.getByRole("heading", { name: /sign in/i })).toBeVisible();
   expect(
     await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith("notes:cell-draft:v1:")).length),
