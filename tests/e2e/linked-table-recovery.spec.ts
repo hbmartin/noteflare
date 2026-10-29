@@ -696,6 +696,7 @@ test("continuous invalidations release a successful save while automatic refresh
     await expect.poll(() => reads).toBeGreaterThanOrEqual(1);
     // Commit completion releases busy before even the first held verification can finish.
     await expect(table.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
+    await expect(cell).toBeDisabled();
     await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toBeVisible();
     for (let pass = 0; pass < 2; pass++) {
       await expect.poll(() => reads).toBeGreaterThanOrEqual(pass + 1);
