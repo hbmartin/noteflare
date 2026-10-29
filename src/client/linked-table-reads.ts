@@ -32,7 +32,6 @@ type Batch<T> = {
   attempt: number;
   retryAt: number;
   manual: boolean;
-  needsFreshness: boolean;
 };
 const intentKey = (intent: TableReadIntent) =>
   intent.kind === "refresh"
@@ -46,7 +45,6 @@ const freshBatch = <T>(intent: TableReadIntent = { kind: "refresh" }): Batch<T> 
   attempt: 0,
   retryAt: 0,
   manual: false,
-  needsFreshness: false,
 });
 /** One active logical read. Freshness debt never owns an unbounded caller lifetime. */
 export function linkedTableReads<T>(options: {
@@ -100,6 +98,9 @@ export function linkedTableReads<T>(options: {
       console.warn("Table verification observer failed", cause);
     }
   };
+  const notify = (receipt: TableReadReceipt<T>) => {
+    for (const observer of observers) observe(observer, receipt);
+  };
   const retireQueued = (predicate: (intent: TableReadIntent) => boolean) => {
     for (const [name, batch] of queued) {
       if (!predicate(batch.intent)) continue;
@@ -108,17 +109,29 @@ export function linkedTableReads<T>(options: {
     }
   };
   const retireAppends = () => retireQueued((intent) => intent.kind !== "refresh");
+  const needsFreshness = (batch: Batch<T>) =>
+    batch.intent.kind !== "refresh" &&
+    invalidation > 0 &&
+    (!completed || !covered(completed.sequence, completed.coverage));
+  const prerequisite = () => {
+    if (![...queued.values()].some(needsFreshness) || active?.batch.intent.kind === "refresh") return;
+    let refresh = queued.get("refresh");
+    if (!refresh) queued.set("refresh", (refresh = freshBatch<T>()));
+    return refresh;
+  };
   const schedule = () => {
     clear();
+    prerequisite();
     if (!available() || active || !queued.size) return;
-    const runnable = [...queued.values()].filter((batch) => !batch.needsFreshness);
+    const runnable = [...queued.values()].filter((batch) => !needsFreshness(batch));
     if (!runnable.length) return;
     const earliest = Math.min(...runnable.map((batch) => batch.retryAt));
     timer = setTimeout(next, Math.max(0, earliest - Date.now()));
   };
   function next() {
+    prerequisite();
     if (!available() || active) return;
-    const eligible = [...queued.values()].filter((batch) => !batch.needsFreshness && batch.retryAt <= Date.now());
+    const eligible = [...queued.values()].filter((batch) => !needsFreshness(batch) && batch.retryAt <= Date.now());
     const append = eligible.find((batch) => batch.intent.kind !== "refresh");
     const refresh = eligible.find((batch) => batch.intent.kind === "refresh");
     const batch = append && (!refresh || refreshAhead) ? append : refresh;
@@ -136,7 +149,6 @@ export function linkedTableReads<T>(options: {
     if (trailing) {
       trailing.waiters.push(...batch.waiters.splice(0));
       trailing.attempt = Math.max(trailing.attempt, batch.attempt);
-      trailing.needsFreshness ||= batch.needsFreshness;
       if (!trailing.manual) trailing.retryAt = Math.max(trailing.retryAt, batch.retryAt);
     } else queued.set(name, batch);
   }
@@ -199,10 +211,7 @@ export function linkedTableReads<T>(options: {
           else batch.waiters.push(waiter);
         }
       }
-      if (batch.intent.kind !== "refresh") {
-        batch.needsFreshness = true;
-        enqueueRetry(batch);
-      }
+      if (batch.intent.kind !== "refresh") enqueueRetry(batch);
       // First supersession gets one immediate trailing read; continued churn is bounded background work.
       if (freshnessAttempt++ > 0 && !trailing.manual)
         trailing.retryAt = Math.max(trailing.retryAt, Date.now() + jitteredBackoff(freshnessAttempt - 2, 2000, 30_000));
@@ -226,19 +235,29 @@ export function linkedTableReads<T>(options: {
       options.unavailable("failure");
       completed = undefined;
       if (outcome.state === "denied") {
-        for (const observer of observers) observe(observer, receipt);
+        notify(receipt);
         scheduleDenied(batch);
-      } else scheduleFailure(batch);
+      } else {
+        scheduleFailure(batch);
+        // A failed continuation cannot run from its stale buffer. Its prerequisite starts
+        // its own recovery chain, rather than inheriting append history or retrying immediately.
+        if (needsFreshness(batch) && !queued.has("refresh")) scheduleFailure(freshBatch<T>());
+      }
     } else if (outcome.state === "suspended") {
       options.unavailable("suspended");
       enqueueRetry(batch);
+    } else if (outcome.state === "superseded" && [...queued.values()].some(needsFreshness)) {
+      const refresh = queued.get("refresh") ?? freshBatch<T>();
+      if (batch.intent.kind === "refresh") refresh.attempt = Math.max(refresh.attempt, batch.attempt);
+      if (freshnessAttempt++ > 0 && !refresh.manual)
+        refresh.retryAt = Math.max(refresh.retryAt, Date.now() + jitteredBackoff(freshnessAttempt - 2, 2000, 30_000));
+      queued.set("refresh", refresh);
     } else if (outcome.state === "success" && outcome.verification === "network") {
       denialAttempt = 0;
       freshnessAttempt = 0;
       completed = { value: outcome.value, sequence: invalidation, coverage };
       watermarks.clear();
-      for (const pending of queued.values()) pending.needsFreshness = false;
-      for (const observer of observers) observe(observer, receipt);
+      notify(receipt);
     }
     next();
   }
@@ -247,13 +266,18 @@ export function linkedTableReads<T>(options: {
     const name = intentKey(intent);
     const joining = (intent.kind !== "refresh" || joinActive) && active && intentKey(active.batch.intent) === name;
     const batch = joining ? active!.batch : (queued.get(name) ?? freshBatch<T>(intent));
-    if (intent.kind !== "refresh" && invalidation > 0 && !covered(completed?.sequence ?? -1, completed?.coverage))
-      batch.needsFreshness = true;
     if (manual && !joining) {
       batch.retryAt = 0;
       batch.manual = true;
     }
     if (!joining) queued.set(name, batch);
+    if (manual && needsFreshness(batch)) {
+      const refresh = prerequisite();
+      if (refresh) {
+        refresh.retryAt = 0;
+        refresh.manual = true;
+      }
+    }
     if (!available()) return Promise.resolve({ state: "suspended" });
     return new Promise((resolve) => {
       const waiter: Waiter<T> = {
@@ -266,9 +290,10 @@ export function linkedTableReads<T>(options: {
       next();
     });
   }
-  const requireFreshness = (coverage?: TableCoverage) => {
+  const requireFreshness = (coverage?: TableCoverage, { fresh = false } = {}) => {
     coverage = readTableCoverage(coverage);
     if (
+      !fresh &&
       coverage &&
       completed?.coverage?.generation === coverage.generation &&
       completed.coverage.revision >= coverage.revision &&
@@ -282,9 +307,9 @@ export function linkedTableReads<T>(options: {
         revision: Math.max(previous?.revision ?? 0, coverage.revision),
         sequence: invalidation,
       });
-    } else unscoped = invalidation;
-    for (const batch of queued.values()) if (batch.intent.kind !== "refresh") batch.needsFreshness = true;
-    return requestIntent({ kind: "refresh" }, false, Boolean(coverage));
+    }
+    if (!coverage || fresh) unscoped = invalidation;
+    return requestIntent({ kind: "refresh" }, false, Boolean(coverage) && !fresh);
   };
   const valueOf = async (receipt: Promise<TableReadReceipt<T>>) => {
     const result = await receipt;

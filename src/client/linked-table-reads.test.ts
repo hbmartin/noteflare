@@ -738,3 +738,124 @@ it("delivers only verified network recovery to observers and isolates subscriber
   await controller.request();
   expect(observer).toHaveBeenCalledOnce();
 });
+
+it("recovers a denied continuation even when another click required fresh coverage", async () => {
+  vi.useFakeTimers();
+  let release!: (outcome: { state: "denied" }) => void;
+  const value = { generation: 1, revision: 2 };
+  const read = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    )
+    .mockResolvedValue({ state: "success", value, verification: "network" });
+  const c = linkedTableReads({ read, coverage: (result: typeof value) => result, unavailable: vi.fn(), poll: false });
+  controllers.push(c);
+  void c.request(continuation());
+  void c.refresh(value);
+  void c.request(continuation());
+  release({ state: "denied" });
+  await flushReads();
+  expect(read).toHaveBeenCalledOnce();
+  expect(await c.request()).toEqual(value);
+  expect(read).toHaveBeenCalledTimes(2);
+});
+it("queues prerequisite verification when a failed continuation is requested again", async () => {
+  const value = { generation: 1, revision: 1 };
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce({ state: "success", value, verification: "network" })
+    .mockResolvedValueOnce({ state: "failure" })
+    .mockResolvedValue({ state: "success", value, verification: "network" });
+  const c = linkedTableReads({ read, coverage: (result: typeof value) => result, unavailable: vi.fn(), poll: false });
+  controllers.push(c);
+  await c.refresh(value);
+  expect(await c.request(continuation())).toBeNull();
+  expect(await c.request(continuation())).toEqual(value);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "append", "refresh", "append"]);
+});
+it("replaces a superseded prerequisite instead of stranding its continuations", async () => {
+  const value = { generation: 1, revision: 1 };
+  let release!: (outcome: { state: "superseded" }) => void;
+  const read = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    )
+    .mockResolvedValue({ state: "success", value, verification: "network" });
+  const c = linkedTableReads({ read, coverage: (result: typeof value) => result, unavailable: vi.fn(), poll: false });
+  controllers.push(c);
+  void c.refresh();
+  const page = c.request(continuation());
+  release({ state: "superseded" });
+  expect(await page).toEqual(value);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "refresh", "append"]);
+});
+it("deliberate Load more advances its prerequisite once without bypassing subsequent failures", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const value = { generation: 1, revision: 1 };
+  let release!: (outcome: { state: "success"; value: typeof value; verification: "network" }) => void;
+  const read = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    )
+    .mockResolvedValue({ state: "failure" });
+  const c = linkedTableReads({ read, coverage: (result: typeof value) => result, unavailable: vi.fn(), poll: false });
+  controllers.push(c);
+  void c.request(continuation());
+  void c.refresh({ generation: 1, revision: 2 });
+  release({ state: "success", value, verification: "network" });
+  await flushReads();
+  expect(read).toHaveBeenCalledTimes(2);
+  void c.request(continuation());
+  void c.request(continuation());
+  await flushReads();
+  expect(read).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(1999);
+  expect(read).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(4);
+});
+
+it("yields to timers when prerequisite reads keep being superseded", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let release!: (value: { state: "superseded" }) => void;
+  const read = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    )
+    .mockResolvedValue({ state: "superseded" });
+  const c = linkedTableReads({ read, unavailable: vi.fn(), poll: false });
+  controllers.push(c);
+  void c.refresh();
+  void c.request(continuation());
+  release({ state: "superseded" });
+  await flushReads();
+  expect(read).toHaveBeenCalledTimes(2);
+  let timerRan = false;
+  setTimeout(() => {
+    timerRan = true;
+  }, 0);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(timerRan).toBe(true);
+  await vi.advanceTimersByTimeAsync(999);
+  expect(read).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(3);
+});
