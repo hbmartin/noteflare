@@ -48,9 +48,20 @@ async function anchoredComposer(page: Page, title: string, selectedText: string)
   const editor = await editableDocument(page, document.id);
   await editor.click();
   await page.keyboard.insertText(selectedText);
-  await page.keyboard.down("Shift");
-  for (let index = 0; index < selectedText.length; index++) await page.keyboard.press("ArrowLeft");
-  await page.keyboard.up("Shift");
+  const paragraph = editor.locator(".bn-inline-content").filter({ hasText: selectedText });
+  await expect(paragraph).toHaveText(selectedText);
+  await paragraph.scrollIntoViewIfNeeded();
+  // These cases exercise publication, not native mobile key scrolling. Select
+  // the verified text directly so the toolbar's reference remains in the viewport.
+  await paragraph.evaluate((element) => {
+    (element.closest("[contenteditable=true]") as HTMLElement).focus();
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+  await expect.poll(() => page.evaluate(() => window.getSelection()?.toString())).toBe(selectedText);
   await page.getByRole("button", { name: /add comment/i }).click();
   const composer = page.locator(".bn-thread .bn-editor");
   await expect(composer).toHaveCount(1);
