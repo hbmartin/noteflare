@@ -2174,3 +2174,25 @@ it("keeps a hidden-row outcome across verification and query changes until dismi
   fireEvent.click(screen.getByRole("button", { name: "Dismiss saved notice" }));
   expect(screen.queryByText(message)).toBeNull();
 });
+
+it("settles a disposed view mutation without invoking its parent success callback", async () => {
+  const changed = vi.fn();
+  const component = render(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "First" }}
+      member={member}
+      queryBase="/linked"
+      initialViewId="board"
+      onSelectPage={vi.fn()}
+      onViewChanged={changed}
+    />,
+  );
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  const release = delayNextCommand();
+  fireEvent.click(screen.getByRole("button", { name: "Delete view" }));
+  await waitFor(() => expect(writes).toHaveLength(1));
+  component.unmount();
+  await act(async () => release());
+  expect(changed).not.toHaveBeenCalled();
+});

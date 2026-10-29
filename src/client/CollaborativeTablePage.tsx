@@ -653,7 +653,7 @@ export function CollaborativeTablePage({
     message?: string,
   ): MutationCompletion => {
     submission?.map.acknowledge(submission.key, submission.version, submission.operationId);
-    if (!sameTableOwner(operation.owner, retryLifetime.current)) return "committed-retired";
+    if (!active.current || !sameTableOwner(operation.owner, retryLifetime.current)) return "committed-retired";
     acknowledgeTableViewSubmission(form);
     resolveMutation(operation);
     setSaveExplanation(message ? { ...operation, message } : null);
@@ -733,7 +733,7 @@ export function CollaborativeTablePage({
       );
       return completion === "committed-current";
     } catch (cause) {
-      if (!sameTableOwner(operation.owner, retryLifetime.current)) return false;
+      if (!active.current || !sameTableOwner(operation.owner, retryLifetime.current)) return false;
       setError(apiErrorMessage(cause, "The table update could not be saved."));
       if (discardDenied(cause)) return false;
       if (!(cause instanceof ApiClientError) || cause.status >= 500)
@@ -765,7 +765,7 @@ export function CollaborativeTablePage({
       }
       return false;
     } finally {
-      if (sameTableOwner(operation.owner, retryLifetime.current)) {
+      if (active.current && sameTableOwner(operation.owner, retryLifetime.current)) {
         busyRef.current = false;
         setBusy(false);
         setBlocked((message) => (message === busyMessage ? "" : message));
@@ -834,7 +834,8 @@ export function CollaborativeTablePage({
       );
       return { state: "saved", completion };
     } catch (cause) {
-      if (!sameTableOwner(operation.owner, retryLifetime.current)) return { state: "rejected", code: "retired" };
+      if (!active.current || !sameTableOwner(operation.owner, retryLifetime.current))
+        return { state: "rejected", code: "retired" };
       setError(apiErrorMessage(cause, "The task could not be saved."));
       if (discardDenied(cause)) return { state: "rejected", code: (cause as ApiClientError).code };
       if (!(cause instanceof ApiClientError) || (cause.status >= 500 && !cause.notSent)) {
@@ -870,7 +871,7 @@ export function CollaborativeTablePage({
       }
       return { state: "rejected", code: cause.code };
     } finally {
-      if (sameTableOwner(operation.owner, retryLifetime.current)) {
+      if (active.current && sameTableOwner(operation.owner, retryLifetime.current)) {
         busyRef.current = false;
         setBusy(false);
         setBlocked((message) => (message === busyMessage ? "" : message));
