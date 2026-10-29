@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page, type Locator } from "@playwright/test";
 import { signInOwner, createTestSpace, editableDocument, openNavigation } from "./security-helpers";
 test.setTimeout(60_000);
 test.use({ serviceWorkers: "block" });
@@ -48,13 +48,38 @@ async function anchoredComposer(page: Page, title: string, selectedText: string)
   const editor = await editableDocument(page, document.id);
   await editor.click();
   await page.keyboard.insertText(selectedText);
-  await page.keyboard.down("Shift");
-  for (let index = 0; index < selectedText.length; index++) await page.keyboard.press("ArrowLeft");
-  await page.keyboard.up("Shift");
+  const paragraph = editor.locator(".bn-inline-content").filter({ hasText: selectedText });
+  await expect(paragraph).toHaveText(selectedText);
+  await paragraph.scrollIntoViewIfNeeded();
+  // These cases exercise publication, not native mobile key scrolling. Select
+  // the verified text directly so the toolbar's reference remains in the viewport.
+  await paragraph.evaluate((element) => {
+    (element.closest("[contenteditable=true]") as HTMLElement).focus();
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+  await expect.poll(() => page.evaluate(() => window.getSelection()?.toString())).toBe(selectedText);
   await page.getByRole("button", { name: /add comment/i }).click();
   const composer = page.locator(".bn-thread .bn-editor");
   await expect(composer).toHaveCount(1);
   return { document, composer };
+}
+async function focusReplyEnd(editor: Locator) {
+  // Programmatic keyboard focus does not consistently position Firefox's DOM
+  // caret. Establish it inside this composer without clicking an overlapping card.
+  await editor.focus();
+  await editor.evaluate((element) => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    const selection = document.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+  await expect(editor).toBeFocused();
 }
 test("diagram access refresh reconnects an authorized viewer without removing the page", async ({ page }) => {
   await signInOwner(page);
@@ -267,7 +292,16 @@ test("cell text survives reload and appears in Personal Settings before sign-out
   await expect(page.getByRole("region", { name: "Pending cell edits" })).toBeVisible();
   await expect(page.getByLabel("Recovered cell draft")).toHaveValue("Persisted unfinished text");
   await openNavigation(page);
+  const signedOut = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === "/api/auth/sign-out" && response.request().method() === "POST",
+  );
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
+  expect((await signedOut).ok()).toBeTruthy();
+  // Server sign-out and local IndexedDB cleanup complete independently. Wait for
+  // the existing purge marker before asserting the final screen and removed text.
+  await page.waitForFunction(
+    () => !Object.keys(localStorage).some((key) => key.startsWith("noteflare-purging-account:")),
+  );
   await expect(page.getByRole("heading", { name: /sign in/i })).toBeVisible();
   expect(
     await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith("notes:cell-draft:v1:")).length),
@@ -313,11 +347,13 @@ test("floating and sidebar replies share one draft and submit it once", async ({
   await page.getByRole("button", { name: "Comments", exact: true }).click();
   await expect(sidebar).toBeVisible();
   await expect(sidebar).toHaveText("Shared reply");
+  await focusReplyEnd(floating);
+  await floating.pressSequentially(" from floating");
+  await expect(sidebar).toHaveText("Shared reply from floating");
   // Keyboard focus switches surfaces even when the mobile floating thread overlaps the sidebar.
-  await sidebar.focus();
-  await sidebar.press("End");
+  await focusReplyEnd(sidebar);
   await sidebar.pressSequentially(" from sidebar");
-  await expect(floating).toHaveText("Shared reply from sidebar");
+  await expect(floating).toHaveText("Shared reply from floating from sidebar");
   const posts: string[] = [];
   page.on("request", (request) => {
     if (request.method() === "POST" && request.url().includes("/replies")) posts.push(request.url());

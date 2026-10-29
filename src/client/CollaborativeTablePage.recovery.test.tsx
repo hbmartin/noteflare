@@ -8,13 +8,32 @@ import { taskColumns } from "../shared/tasks";
 import type { CollaborativeColumn, TableQueryResult } from "../shared/table-protocol";
 vi.mock("./api", async (importOriginal) => ({ ...(await importOriginal<typeof import("./api")>()), api: vi.fn() }));
 const account = "table-ui\0workspace";
-afterEach(() => {
+afterEach(async () => {
+  for (const release of heldFixtureReads.splice(0)) release();
+  for (const barrier of fixtureBarriers.splice(0)) barrier.resolve();
+  await act(async () => {});
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.mocked(api).mockReset();
   purgeCellDrafts(account);
 });
+const heldFixtureReads: Array<() => void> = [];
+function heldFixtureRead() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+    heldFixtureReads.push(resolve);
+  });
+  return { promise, release };
+}
+let firstFixtureRead: Promise<void>;
+let fixtureBarriers: Array<{ matches: (params: URLSearchParams) => boolean; resolve: () => void }> = [];
+function nextFixtureRead(matches: (params: URLSearchParams) => boolean) {
+  return new Promise<void>((resolve) => fixtureBarriers.push({ matches, resolve }));
+}
 function fixture(taskList = false, count = 1) {
+  fixtureBarriers = [];
+  firstFixtureRead = nextFixtureRead(() => true);
   const ids = taskColumns("table"),
     month = new Date().toISOString().slice(0, 7);
   const column = (id: string, name: string, type: CollaborativeColumn["type"]): CollaborativeColumn => ({
@@ -25,7 +44,7 @@ function fixture(taskList = false, count = 1) {
     revision: 1,
     options: [],
   });
-  const columns = [column(ids.title, "Title", "text"), column(ids.due, "Due", "date")];
+  const columns = [column(ids.title, "Title", "text"), ...(count === 1 ? [column(ids.due, "Due", "date")] : [])];
   const view =
     taskList && count === 1
       ? {
@@ -100,11 +119,15 @@ function fixture(taskList = false, count = 1) {
     const position = cursor ? (JSON.parse(cursor) as { offset: number; limit: number }) : { offset: 0, limit };
     if (position.limit !== limit) throw new ApiClientError(409, "table_cursor_stale", "Page size changed");
     const end = position.offset + limit;
-    return structuredClone({
+    const result = structuredClone({
       ...data,
       rows: data.rows.slice(position.offset, end),
       nextCursor: end < data.rows.length ? JSON.stringify({ offset: end, limit }) : null,
     });
+    const matching = fixtureBarriers.filter((barrier) => barrier.matches(params));
+    fixtureBarriers = fixtureBarriers.filter((barrier) => !matching.includes(barrier));
+    for (const barrier of matching) barrier.resolve();
+    return result;
   });
   const rendered = render(
     <CollaborativeTablePage
@@ -117,33 +140,43 @@ function fixture(taskList = false, count = 1) {
   return { data, ids, month, ...rendered };
 }
 
+const titleInputs = () => [...document.querySelectorAll<HTMLInputElement>('input[aria-label="Title"]')];
 async function bufferedRows() {
-  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(100));
-  fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(200));
-  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-  await waitFor(() =>
-    expect(
-      vi.mocked(api).mock.calls.some(([path]) => new URL(path, "http://localhost").searchParams.get("limit") === "200"),
-    ).toBe(true),
-  );
-  // Wait for the refreshed extent before asking for its new continuation.
-  await act(async () => {});
-  fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(300));
+  await act(async () => {
+    await firstFixtureRead;
+  });
+  expect(titleInputs()).toHaveLength(100);
+  await act(async () => {
+    const read = nextFixtureRead((params) => params.has("cursor"));
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await read;
+  });
+  expect(titleInputs()).toHaveLength(200);
+  await act(async () => {
+    const read = nextFixtureRead((params) => params.get("limit") === "200" && !params.has("cursor"));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await read;
+  });
+  // The request barrier plus async act proves the refreshed extent was applied before its continuation.
+  expect(titleInputs()).toHaveLength(200);
+  expect(screen.getByRole("button", { name: "Views" })).toBeEnabled();
+  await act(async () => {
+    const read = nextFixtureRead((params) => params.has("cursor"));
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await read;
+  });
+  expect(titleInputs()).toHaveLength(300);
 }
 
 it.each(["read", "mutation"] as const)("retires buffered and late rows after confirmed %s denial", async (kind) => {
+  vi.useFakeTimers();
   fixture(false, 800);
   await bufferedRows();
-  const input = screen.getAllByLabelText("Title")[0]!;
+  const input = titleInputs()[0]!;
   fireEvent.focus(input);
   fireEvent.change(input, { target: { value: "Locally authored recovery" } });
   const read = vi.mocked(api).getMockImplementation()!;
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  const held = heldFixtureRead();
   let started = false,
     restored = false;
   vi.mocked(api).mockImplementation(async (path, init) => {
@@ -152,23 +185,25 @@ it.each(["read", "mutation"] as const)("retires buffered and late rows after con
     if (!init?.method) {
       if (!started) {
         started = true;
-        await held;
+        await held.promise;
         if (kind === "mutation") return read(path, init);
       }
       if (!restored) throw new ApiClientError(403, "forbidden", "Access removed");
     }
     return read(path, init);
   });
-  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-  await waitFor(() => expect(started).toBe(true));
-  fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-  if (kind === "mutation") fireEvent.blur(input);
-  else release();
-  await screen.findByText("Access removed");
   await act(async () => {
-    release();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
   });
-  expect(screen.queryAllByLabelText("Title")).toHaveLength(0);
+  expect(started).toBe(true);
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    if (kind === "mutation") fireEvent.blur(input);
+    else held.release();
+  });
+  expect(screen.getByText("Access removed")).toBeVisible();
+  await act(async () => held.release());
+  expect(titleInputs()).toHaveLength(0);
   expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
   expect(screen.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue("Locally authored recovery");
   expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(
@@ -176,18 +211,23 @@ it.each(["read", "mutation"] as const)("retires buffered and late rows after con
   );
   restored = true;
   const before = vi.mocked(api).mock.calls.length;
-  fireEvent.click(screen.getByRole("button", { name: "Reload" }));
-  await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(100));
+  await act(async () => {
+    const verification = nextFixtureRead((params) => !params.has("cursor"));
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+    await verification;
+  });
+  expect(titleInputs()).toHaveLength(100);
   expect(
     vi
       .mocked(api)
       .mock.calls.slice(before)
       .some(([path, init]) => !init?.method && !new URL(path, "http://localhost").searchParams.has("cursor")),
   ).toBe(true);
-  await waitFor(() => expect(screen.getAllByLabelText("Title")[0]).toBeEnabled());
+  expect(titleInputs()[0]).toBeEnabled();
 });
 
 it("retires continuation controls synchronously when the query changes", async () => {
+  vi.useFakeTimers();
   fixture(false, 800);
   await bufferedRows();
   const read = vi.mocked(api).getMockImplementation()!;
@@ -201,18 +241,20 @@ it("retires continuation controls synchronously when the query changes", async (
   });
   fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "different" } });
   expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
-  expect(screen.getAllByLabelText("Title")[0]).toBeDisabled();
+  expect(titleInputs()[0]).toBeDisabled();
   await act(async () => {
     release();
   });
-  expect(screen.getAllByLabelText("Title")).toHaveLength(100);
+  expect(titleInputs()).toHaveLength(100);
 });
 
 it.each(["success", "failure"] as const)(
   "requires current network verification after a task conflict: %s",
   async (outcome) => {
+    vi.useFakeTimers();
     const { data } = fixture(true, 800);
     await bufferedRows();
+    vi.spyOn(Math, "random").mockReturnValue(1);
     const read = vi.mocked(api).getMockImplementation()!;
     const releases: Array<() => void> = [];
     let started = 0;
@@ -232,25 +274,27 @@ it.each(["success", "failure"] as const)(
       }
       return read(path, init);
     });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-    await waitFor(() => expect(started).toBe(1));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    });
+    expect(started).toBe(1);
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    const input = screen.getAllByLabelText("Title")[0]!;
+    const input = titleInputs()[0]!;
     fireEvent.focus(input);
     fireEvent.change(input, { target: { value: "Preserved task draft" } });
-    fireEvent.blur(input);
-    await waitFor(() => expect(input).toBeDisabled());
+    await act(async () => fireEvent.blur(input));
+    expect(input).toBeDisabled();
     await act(async () => {
       releases.shift()!();
     });
-    await waitFor(() => expect(started).toBe(2));
+    expect(started).toBe(2);
     expect(input).toBeDisabled();
     expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
     await act(async () => {
       releases.shift()!();
     });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
-    await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(outcome === "failure" ? 300 : 400));
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+    expect(titleInputs()).toHaveLength(outcome === "failure" ? 300 : 400);
     expect(input.hasAttribute("disabled")).toBe(outcome === "failure");
     expect(screen.queryByText("Fresh verification failed") !== null).toBe(outcome === "failure");
     expect(accountCellDrafts(account)[0]!.text).toBe("Preserved task draft");
@@ -474,7 +518,7 @@ it.each(["read", "mutation"] as const)(
         fireEvent.blur(input);
       }
     });
-    expect(screen.queryAllByLabelText("Title")).toHaveLength(0);
+    expect(titleInputs()).toHaveLength(0);
     const before = reads;
     for (let i = 0; i < 5; i++)
       await act(async () => {

@@ -15,6 +15,7 @@ import {
   tableRepairStatus,
   tableCommand,
   tableFetch,
+  tableReceiptCoverage,
   tableInternal,
   verifyTableProjection,
 } from "./table-service";
@@ -3051,7 +3052,24 @@ describe("per-table authority", () => {
     const first = await write(pageId, member, "create_row", { values: { legacy: "Hello" } }, operationId);
     expect(first.projectionPending).toBe(false);
     const replay = await write(pageId, member, "create_row", { values: { legacy: "Hello" } }, operationId);
-    expect(replay).toMatchObject({ revision: first.revision, replayed: true });
+    expect(first.generation).toBe(1);
+    expect(replay).toMatchObject({ generation: first.generation, revision: first.revision, replayed: true });
+    expect(await tableReceiptCoverage(env, member, pageId, operationId)).toEqual({
+      generation: 1,
+      revision: first.revision,
+    });
+    await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+      const row = state.storage.sql
+        .exec<{ result: string }>("SELECT result FROM receipts WHERE operation_id=?", operationId)
+        .one();
+      const legacy = JSON.parse(row.result);
+      delete legacy.generation;
+      state.storage.sql.exec("UPDATE receipts SET result=? WHERE operation_id=?", JSON.stringify(legacy), operationId);
+    });
+    expect(await tableReceiptCoverage(env, member, pageId, operationId)).toBeUndefined();
+    expect(
+      (await write(pageId, member, "create_row", { values: { legacy: "Hello" } }, operationId)).generation,
+    ).toBeUndefined();
     await expect(
       write(pageId, member, "create_row", { values: { legacy: "Different" } }, operationId),
     ).rejects.toMatchObject({ code: "idempotency_key_reused" });
@@ -3474,7 +3492,23 @@ describe("per-table authority", () => {
         title: "Collaborative task",
         status: "todo",
       }),
-    ).toMatchObject({ rowId: result.rowId, replayed: true });
+    ).toMatchObject({ rowId: result.rowId, generation: 1, revision: result.revision, replayed: true });
+    await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+      const row = state.storage.sql
+        .exec<{ result: string }>("SELECT result FROM receipts WHERE operation_id=?", op)
+        .one();
+      const legacy = JSON.parse(row.result);
+      delete legacy.generation;
+      state.storage.sql.exec("UPDATE receipts SET result=? WHERE operation_id=?", JSON.stringify(legacy), op);
+    });
+    const legacy = await mutateTask(env, member, pageId, null, {
+      operationId: op,
+      expectedRevision: 1,
+      title: "Collaborative task",
+      status: "todo",
+    });
+    expect(legacy.generation).toBeUndefined();
+    expect(legacy).toMatchObject({ revision: result.revision, replayed: true });
     expect(
       await env.DB.prepare("SELECT count(*) count FROM task_mutation_receipts WHERE row_id=?")
         .bind(result.rowId)

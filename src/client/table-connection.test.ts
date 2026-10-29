@@ -35,7 +35,8 @@ class Socket extends EventTarget {
 let stop: ReturnType<typeof tableConnection>;
 let query: ReturnType<typeof vi.fn<() => Promise<TableSocketVerification>>>;
 let ready: ReturnType<typeof vi.fn<(value: boolean) => void>>;
-const result = { generation: 1, canEdit: true } as TableQueryResult;
+const value = { generation: 1, revision: 1, canEdit: true } as TableQueryResult;
+const result = { state: "complete", value } as const;
 beforeEach(() => {
   vi.useFakeTimers();
   vi.spyOn(Math, "random").mockReturnValue(1);
@@ -82,7 +83,7 @@ describe("table grant handover", () => {
     Socket.all[0]!.ready();
     await settle();
     await vi.advanceTimersByTimeAsync(270_000);
-    query.mockResolvedValueOnce({ ...result, generation: 2 });
+    query.mockResolvedValueOnce({ state: "complete", value: { ...value, generation: 2 } } as const);
     Socket.all[1]!.ready();
     await settle();
     expect(Socket.all[0]!.readyState).toBe(1);
@@ -108,7 +109,7 @@ describe("table grant handover", () => {
     Socket.all[0]!.ready();
     await settle();
     await vi.advanceTimersByTimeAsync(270_000);
-    let release!: (value: TableQueryResult) => void;
+    let release!: (value: TableSocketVerification) => void;
     query.mockImplementationOnce(
       () =>
         new Promise((resolve) => {
@@ -146,7 +147,7 @@ describe("table grant handover", () => {
     expect(Socket.all).toHaveLength(2);
   });
   it("retirement ignores pending authorization, sockets and timers", async () => {
-    let release!: (value: TableQueryResult) => void;
+    let release!: (value: TableSocketVerification) => void;
     query.mockImplementationOnce(
       () =>
         new Promise((resolve) => {
@@ -197,7 +198,7 @@ it("jitters fenced reconnects and does not bypass the pending delay on visibilit
 it("records verified generation independently of hidden readiness and never from a failed query", async () => {
   stop();
   const verified = vi.fn();
-  let release!: (value: TableQueryResult | null) => void;
+  let release!: (value: TableSocketVerification) => void;
   query.mockImplementationOnce(
     () =>
       new Promise((resolve) => {
@@ -212,11 +213,12 @@ it("records verified generation independently of hidden readiness and never from
   expect(verified).toHaveBeenCalledExactlyOnceWith(1);
   expect(ready).toHaveBeenLastCalledWith(false);
   vi.spyOn(document, "hidden", "get").mockReturnValue(false);
-  query.mockResolvedValueOnce(null);
+  query.mockResolvedValueOnce({ state: "failure" });
   document.dispatchEvent(new Event("visibilitychange"));
   await settle();
   expect(verified).toHaveBeenCalledTimes(1);
-  expect(stop.authorized()).toBe(false);
+  expect(stop.authorized()).toBe(true);
+  expect(ready).toHaveBeenLastCalledWith(false);
 });
 
 it("routes table changes through invalidation while heartbeat verification remains joinable", async () => {
@@ -238,12 +240,14 @@ it("routes table changes through invalidation while heartbeat verification remai
 
 it("validates the invalidation result against its socket generation without another query", async () => {
   stop();
-  const invalidate = vi.fn(async () => ({ ...result, generation: 2 }));
+  const invalidate = vi.fn(async () => ({ state: "complete", value: { ...value, generation: 2 } }) as const);
   stop = tableConnection({ url: "ws://example.test/table", query, ready, invalidate });
   const socket = Socket.all.at(-1)!;
   socket.ready();
   await settle();
-  socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", revision: 4 }) }));
+  socket.dispatchEvent(
+    new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", generation: 1, revision: 4 }) }),
+  );
   await settle();
   expect(invalidate).toHaveBeenCalledWith({ generation: 1, revision: 4 });
   expect(query).toHaveBeenCalledOnce();
@@ -257,7 +261,9 @@ it("keeps a live grant through pending freshness without extending its deadline"
   const socket = Socket.all.at(-1)!;
   socket.ready(1000, null);
   await settle();
-  socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", revision: 4 }) }));
+  socket.dispatchEvent(
+    new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", generation: 1, revision: 4 }) }),
+  );
   await settle();
   expect(stop.authorized()).toBe(true);
   await vi.advanceTimersByTimeAsync(1000);
@@ -300,3 +306,71 @@ it.each([false, true])(
     expect(socket.readyState).toBe(3);
   },
 );
+
+it.each(["failure", "suspended", "retired", "pending"] as const)(
+  "preserves a healthy transport through %s and accepts coordinator recovery without polling",
+  async (state) => {
+    stop();
+    const observers = new Set<(receipt: TableSocketVerification) => void>();
+    const subscribe = vi.fn((observer: (receipt: TableSocketVerification) => void) => {
+      observers.add(observer);
+      return () => {
+        observers.delete(observer);
+      };
+    });
+    const invalidate = vi.fn(async () => ({ state }));
+    stop = tableConnection({ url: "ws://example.test/table", query, ready, invalidate, subscribe });
+    const socket = Socket.all.at(-1)!;
+    socket.ready(10000, null);
+    await settle();
+    socket.dispatchEvent(
+      new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", generation: 1, revision: 4 }) }),
+    );
+    await settle();
+    expect(socket.readyState).toBe(1);
+    expect(stop.authorized()).toBe(true);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(query).toHaveBeenCalledOnce();
+    for (const observer of observers) observer(result);
+    await settle();
+    expect(ready).toHaveBeenLastCalledWith(true);
+    expect(observers.size).toBe(0);
+    await vi.advanceTimersByTimeAsync(7000);
+    expect(socket.readyState).toBe(3);
+  },
+);
+it("expires an initial candidate while coordinator verification remains unavailable", async () => {
+  query.mockResolvedValue({ state: "failure" });
+  const socket = Socket.all[0]!;
+  socket.ready(1000, null);
+  await settle();
+  expect(stop.authorized()).toBe(false);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(socket.readyState).toBe(3);
+  expect(query).toHaveBeenCalledOnce();
+});
+it("does not assign its socket generation to legacy change revisions", async () => {
+  stop();
+  const invalidate = vi.fn(async () => result);
+  stop = tableConnection({ url: "ws://example.test/table", query, ready, invalidate });
+  const socket = Socket.all.at(-1)!;
+  socket.ready();
+  await settle();
+  socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ type: "table-changed", revision: 4 }) }));
+  await settle();
+  expect(invalidate).toHaveBeenCalledExactlyOnceWith(undefined);
+  expect(query).toHaveBeenCalledOnce();
+});
+
+it("never promotes an initial grant from malformed query coverage", async () => {
+  query.mockResolvedValueOnce({ state: "complete", value: { ...value, revision: Number.NaN } });
+  const socket = Socket.all[0]!;
+  socket.ready(10000, null);
+  await settle();
+  expect(socket.readyState).toBe(1);
+  expect(stop.authorized()).toBe(false);
+  expect(ready).not.toHaveBeenCalledWith(true);
+  document.dispatchEvent(new Event("visibilitychange"));
+  await settle();
+  expect(stop.authorized()).toBe(true);
+});

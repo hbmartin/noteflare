@@ -47,10 +47,10 @@ import {
   type CanonicalTableContinuation,
   type TableReadContext,
   type TableReadIntent,
-  type TableReadReceipt,
   type LinkedTableReadOutcome,
 } from "./linked-table-reads";
-import { readLinkedTable, type LinkedTableWindow } from "./linked-table-query";
+import { CursorChanged, readLinkedTable, type LinkedTableWindow } from "./linked-table-query";
+import { readTableCoverage } from "../shared/table-coverage";
 import { tableConnection } from "./table-connection";
 import { useRealtimeAccessAccount } from "./realtime-access-status";
 import type { TableDraftRows } from "../shared/table-protocol";
@@ -85,12 +85,6 @@ type SavedRetry = {
   form?: TableViewSubmission;
   message: string;
 } & ({ kind: "command"; command: TableCommand } | { kind: "task"; body: Record<string, unknown>; rowId?: string });
-const socketResult = (result: TableReadReceipt<TableQueryResult> | undefined) =>
-  result?.state === "complete" || result?.state === "generation-changed"
-    ? result.value
-    : result?.state === "pending"
-      ? { state: "pending" as const }
-      : null;
 const busyMessage = "A save is already in progress. Wait for it to finish.";
 const readinessMessage =
   "Editing is temporarily unavailable. Your changes are preserved. Wait for verification or refresh the table.";
@@ -181,12 +175,6 @@ export function CollaborativeTablePage({
   }, [member.role]);
   const canonicalPrefix = useRef({ id: 0, data: null as TableQueryResult | null });
   const connectionPermit = useRef<() => boolean>(() => true);
-  const mutationCoverage = useRef<{
-    owner: TableOwner;
-    operationId: string;
-    generation: number;
-    revision: number;
-  } | null>(null);
   const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
   const noticeSequence = useRef(0);
@@ -243,7 +231,6 @@ export function CollaborativeTablePage({
     const previous = retryLifetime.current;
     if (sameTableOwner(previous, currentOwner)) return;
     retryLifetime.current = currentOwner;
-    mutationCoverage.current = null;
     setMutationNotice((value) => (value === null ? value : null));
     setBlocked("");
     busyRef.current = false;
@@ -297,6 +284,8 @@ export function CollaborativeTablePage({
   const queryIdentity = JSON.stringify([base, viewId, query, month]);
   const queryOwner = useRef({ queryIdentity, account, incarnation, host, tableId: page.id });
   const [error, setError] = useState("");
+  const [refreshStatus, setRefreshStatus] = useState("");
+  const backgroundSave = useRef<MutationNotice | null>(null);
   const reportMutation = (notice: MutationNotice, message: string) => {
     if (!sameTableOwner(notice.owner, retryLifetime.current) || notice.sequence <= dismissedNotice.current) return;
     setMutationNotice((current) => (current && current.sequence > notice.sequence ? current : { ...notice, message }));
@@ -352,13 +341,14 @@ export function CollaborativeTablePage({
       intent?: TableReadIntent,
       context?: TableReadContext,
       restarts = 0,
+      network = false,
     ): Promise<LinkedTableReadOutcome<TableQueryResult>> {
       if (intent?.kind === "page" && intent.target !== undefined) {
         const prefix = canonicalPrefix.current;
         if (intent.queryIdentity !== queryIdentity || prefix.data?.generation !== intent.generation)
           return { state: "superseded" };
         if (prefix.data.rows.length >= intent.target || !prefix.data.nextCursor)
-          return { state: "success", value: prefix.data, verification: "buffer" };
+          return { state: "success", value: prefix.data, verification: network ? "network" : "buffer" };
         intent = { ...intent, cursor: prefix.data.nextCursor, prefix: prefix.id, revision: prefix.data.revision };
       }
       const ownsPrefix = () =>
@@ -399,6 +389,7 @@ export function CollaborativeTablePage({
             )
           : null;
         const result = linked ? linked.window.data : await readPage(cursor);
+        network ||= !linked || linked.verification === "network";
         if (!active.current || signal?.aborted || !ownsPrefix()) return { state: "superseded" };
         // Canonical transport queries retain their authorization result when only view data is superseded.
         if (owner !== ownership.current.request)
@@ -408,13 +399,12 @@ export function CollaborativeTablePage({
           intent?.kind === "page" &&
           (result.generation !== intent.generation || result.revision !== intent.revision)
         ) {
-          if (restarts)
-            throw new ApiClientError(409, "table_cursor_stale", "The table changed while loading more rows.");
-          const refreshed = await fetchTable(undefined, signal, undefined, context, 1);
+          if (restarts) return { state: "stale" };
+          const refreshed = await fetchTable(undefined, signal, undefined, context, 1, network);
           return refreshed.state === "success" &&
             refreshed.value.generation === intent.generation &&
             intent.target !== undefined
-            ? fetchTable(undefined, signal, intent, context, 1)
+            ? fetchTable(undefined, signal, intent, context, 1, true)
             : refreshed;
         }
         const fresh = (!linked || linked.verification === "network") && (context?.current(result) ?? true);
@@ -470,11 +460,11 @@ export function CollaborativeTablePage({
           prefix.data.rows.length < intent.target &&
           prefix.data.nextCursor
         )
-          return fetchTable(undefined, signal, intent, context, restarts);
+          return fetchTable(undefined, signal, intent, context, restarts, network);
         return {
           state: "success",
           value: queryBase ? result : (prefix.data ?? result),
-          verification: fresh ? "network" : "buffer",
+          verification: network ? "network" : "buffer",
         };
       } catch (cause) {
         if (
@@ -491,6 +481,11 @@ export function CollaborativeTablePage({
         if (!navigator.onLine && !(cause instanceof ApiClientError)) {
           return { state: "suspended" };
         }
+        if (
+          cause instanceof CursorChanged ||
+          (cause instanceof ApiClientError && cause.code === "table_cursor_stale" && (queryBase || restarts))
+        )
+          return { state: "stale" };
         setError(apiErrorMessage(cause, "The table could not be loaded."));
         if (
           cause instanceof ApiClientError &&
@@ -499,12 +494,12 @@ export function CollaborativeTablePage({
           !queryBase &&
           !restarts
         ) {
-          const refreshed = await fetchTable(undefined, signal, undefined, context, 1);
+          const refreshed = await fetchTable(undefined, signal, undefined, context, 1, network);
           return intent?.kind === "page" &&
             intent.target !== undefined &&
             refreshed.state === "success" &&
             refreshed.value.generation === intent.generation
-            ? fetchTable(undefined, signal, intent, context, 1)
+            ? fetchTable(undefined, signal, intent, context, 1, true)
             : refreshed;
         }
         return { state: "failure" };
@@ -532,15 +527,20 @@ export function CollaborativeTablePage({
       poll: Boolean(queryBase),
       coverage: (value: TableQueryResult) => ({ generation: value.generation, revision: value.revision }),
       read: (intent, signal, context) => fetchRef.current(undefined, signal, intent, context),
-      unavailable: (reason) => retireVerification(reason === "suspended" ? "suspend" : "invalidate"),
+      unavailable: (reason) => {
+        retireVerification(reason === "suspended" ? "suspend" : "invalidate");
+        if (reason === "stale") setRefreshStatus("The table is changing. Refreshing the latest data…");
+      },
     });
     linkedReads.current = reads;
+    const unsubscribe = reads.subscribe(() => setRefreshStatus(""));
     const permit = () => linkedWindow.current?.verified === true;
     if (queryBase) connectionPermit.current = permit;
     return () => {
       if (connectionPermit.current === permit) connectionPermit.current = () => false;
       linkedReads.current = null;
       retireVerification("retire");
+      unsubscribe();
       reads.dispose();
     };
   }, [queryBase, page.id, account, incarnation, retireVerification]);
@@ -580,23 +580,10 @@ export function CollaborativeTablePage({
     url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const connection = tableConnection({
       url: url.href,
-      query: async () => {
-        const result = await linkedReads.current?.verifyReceipt();
-        return socketResult(result);
-      },
+      query: () => linkedReads.current?.verifyReceipt() ?? Promise.resolve({ state: "retired" }),
       ready: publishReadiness,
-      invalidate: async (coverage) => {
-        const operation = mutationCoverage.current;
-        const ownChange =
-          coverage &&
-          operation &&
-          sameTableOwner(operation.owner, retryLifetime.current) &&
-          coverage.operationId === operation.operationId &&
-          coverage.generation === operation.generation &&
-          coverage.revision > operation.revision;
-        const result = await linkedReads.current?.refresh(ownChange ? coverage : undefined);
-        return socketResult(result);
-      },
+      invalidate: (coverage) => linkedReads.current?.refresh(coverage) ?? Promise.resolve({ state: "retired" }),
+      subscribe: (observer) => linkedReads.current?.subscribe(observer) ?? (() => {}),
       verified: recordAuthorization,
     });
     connectionPermit.current = connection.authorized;
@@ -620,7 +607,9 @@ export function CollaborativeTablePage({
         )
           return;
       }
-      void linkedReads.current?.invalidate();
+      void linkedReads.current?.invalidate(
+        detail?.type === "task-list-invalidated" && !detail.forceRefresh ? readTableCoverage(detail) : undefined,
+      );
     };
     window.addEventListener("notes:workspace-event", invalidate);
     return () => window.removeEventListener("notes:workspace-event", invalidate);
@@ -646,6 +635,37 @@ export function CollaborativeTablePage({
     submission,
     message: "",
   });
+  const completeMutation = (
+    operation: MutationNotice,
+    result: unknown,
+    submission?: CellDraftSubmission,
+    form?: TableViewSubmission,
+    message?: string,
+  ) => {
+    submission?.map.acknowledge(submission.key, submission.version, submission.operationId);
+    if (!sameTableOwner(operation.owner, retryLifetime.current)) return;
+    acknowledgeTableViewSubmission(form);
+    resolveMutation(operation);
+    backgroundSave.current = operation;
+    setRefreshStatus(message ?? "Saved. Refreshing the latest table data…");
+    const reads = linkedReads.current;
+    if (!reads) return;
+    const coverage = readTableCoverage(result);
+    if (coverage && coverage.generation !== ownership.current.generation) retireVerification("invalidate");
+    void reads.refresh(coverage).then((receipt) => {
+      if (
+        !active.current ||
+        !sameTableOwner(operation.owner, retryLifetime.current) ||
+        backgroundSave.current !== operation ||
+        noticeSequence.current !== operation.sequence
+      )
+        return;
+      if (receipt.state === "complete" || receipt.state === "generation-changed") setRefreshStatus(message ?? "");
+      else if (receipt.state === "failure")
+        setRefreshStatus("Saved. The latest table data could not be refreshed. Retrying…");
+      else if (receipt.state === "denied") setRefreshStatus("Saved. Access to the table could not be confirmed.");
+    });
+  };
   const send = async (command: TableCommand, submission?: CellDraftSubmission, form?: TableViewSubmission) => {
     if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId)) return false;
     if (!canCommit()) {
@@ -656,6 +676,7 @@ export function CollaborativeTablePage({
     setBusy(true);
     setBlocked("");
     setError("");
+    setRefreshStatus("");
     setRetry(null);
     const payload = command.payload as Record<string, unknown>;
     const target =
@@ -671,35 +692,23 @@ export function CollaborativeTablePage({
             ? `view:${String(payload.id ?? payload.viewId ?? viewId)}`
             : `${command.kind}:${String(payload.rowId ?? `view:${viewId}`)}`;
     const operation = beginMutation(command.operationId, target, submission);
-    const generation = data?.generation;
-    const previousRevision = data?.revision;
-    if (generation !== undefined && previousRevision !== undefined)
-      mutationCoverage.current = {
-        owner: retryOwner,
-        operationId: operation.operationId,
-        generation,
-        revision: previousRevision,
-      };
     try {
       const result = await api<TableCommandResult>(commandsPath, {
         method: "POST",
         body: json(command),
         signal: AbortSignal.timeout(30000),
       });
-      if (submission) submission.map.acknowledge(submission.key, submission.version, submission.operationId);
-      if (!sameTableOwner(operation.owner, retryLifetime.current)) return false;
-      acknowledgeTableViewSubmission(form);
-      resolveMutation(operation);
-      const refreshed = await linkedReads.current?.refresh(
-        generation === undefined || (result.revision <= (previousRevision ?? Infinity) && !result.replayed)
-          ? undefined
-          : { generation, revision: result.revision },
+      completeMutation(
+        operation,
+        result,
+        submission,
+        form,
+        result.result.visibleInView === false
+          ? "Saved. The new row is hidden by this view's filters. Open All rows to see it."
+          : result.projectionPending
+            ? "Saved. Search and task lists are catching up."
+            : undefined,
       );
-      if (!sameTableOwner(operation.owner, retryLifetime.current)) return false;
-      if (refreshed?.state === "pending") setError("Saved. Refreshing the latest table data…");
-      if (result.projectionPending) setError("Saved. Search and task lists are catching up.");
-      if (result.result.visibleInView === false)
-        setError("Saved. The new row is hidden by this view's filters. Open All rows to see it.");
       return true;
     } catch (cause) {
       if (!sameTableOwner(operation.owner, retryLifetime.current)) return false;
@@ -773,6 +782,7 @@ export function CollaborativeTablePage({
     setBusy(true);
     setBlocked("");
     setError("");
+    setRefreshStatus("");
     setRetry(null);
     const fields = Object.keys(body)
       .filter((key) => !["operationId", "expectedRevision"].includes(key))
@@ -782,17 +792,8 @@ export function CollaborativeTablePage({
       `task:${rowId ?? `new:${viewId}`}:${JSON.stringify(fields)}`,
       submission,
     );
-    const generation = data?.generation;
-    const previousRevision = data?.revision;
-    if (generation !== undefined && previousRevision !== undefined)
-      mutationCoverage.current = {
-        owner: retryOwner,
-        operationId: operation.operationId,
-        generation,
-        revision: previousRevision,
-      };
     try {
-      const result = await api<{ visibleInView?: boolean; revision?: number; replayed?: boolean }>(
+      const result = await api<{ visibleInView?: boolean; generation?: number; revision?: number; replayed?: boolean }>(
         rowId ? `${tasksPath}/${rowId}` : tasksPath,
         {
           method: rowId ? "PATCH" : "POST",
@@ -800,21 +801,15 @@ export function CollaborativeTablePage({
           signal: AbortSignal.timeout(30000),
         },
       );
-      if (submission) submission.map.acknowledge(submission.key, submission.version, submission.operationId);
-      if (!sameTableOwner(operation.owner, retryLifetime.current)) return { state: "rejected", code: "retired" };
-      acknowledgeTableViewSubmission(form);
-      resolveMutation(operation);
-      const refreshed = await linkedReads.current?.refresh(
-        generation === undefined ||
-          result.revision === undefined ||
-          (result.revision <= (previousRevision ?? Infinity) && !result.replayed)
-          ? undefined
-          : { generation, revision: result.revision },
+      completeMutation(
+        operation,
+        result,
+        submission,
+        form,
+        result.visibleInView === false
+          ? "Saved. Current filters hide this task. Choose All rows to see it."
+          : undefined,
       );
-      if (!sameTableOwner(operation.owner, retryLifetime.current)) return { state: "rejected", code: "retired" };
-      if (refreshed?.state === "pending") setError("Saved. Refreshing the latest table data…");
-      if (result?.visibleInView === false)
-        setError("Saved. Current filters hide this task. Choose All rows to see it.");
       return { state: "saved" };
     } catch (cause) {
       if (!sameTableOwner(operation.owner, retryLifetime.current)) return { state: "rejected", code: "retired" };
@@ -1072,6 +1067,7 @@ export function CollaborativeTablePage({
   return (
     <TableViewStateContext.Provider value={viewState}>
       <section className={`table-live ${embedded ? "table-live-embedded" : "page-canvas"}`}>
+        {refreshStatus && <output>{refreshStatus}</output>}
         {!embedded && (
           <>
             <h1>{page.title}</h1>

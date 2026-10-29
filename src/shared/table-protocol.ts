@@ -145,6 +145,8 @@ export type TableCommand = {
   payload: Record<string, unknown>;
 };
 export type TableCommandResult = {
+  /** Absent on legacy receipts; never infer their generation from current registry state. */
+  generation?: number;
   revision: number;
   operationId: string;
   replayed: boolean;

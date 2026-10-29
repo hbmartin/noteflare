@@ -24,6 +24,7 @@ const column = (id: string, type: CollaborativeColumn["type"]): CollaborativeCol
   generation: 1,
   options: [],
 });
+const originalRandom = Math.random;
 const grid: TableView = {
   id: "grid",
   name: "Grid",
@@ -203,7 +204,7 @@ beforeEach(() => {
         if (command.kind === "delete_view")
           data.views = data.views.filter((view) => view.id !== command.payload.viewId);
         data = { ...data, revision: data.revision + 1 };
-        return { revision: data.revision, result: {}, projectionPending: false };
+        return { generation: data.generation, revision: data.revision, result: {}, projectionPending: false };
       }
       if (deniedRead) throw new ApiClientError(403, "forbidden", "Table access was removed.");
       const selected = new URL(path, "https://test").searchParams.get("viewId");
@@ -212,6 +213,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 function delayNextCommand() {
@@ -1783,7 +1785,12 @@ it.each([false, true])(
         if (broadcast)
           AuthorizedTableSocket.instances[0]!.dispatchEvent(
             new MessageEvent("message", {
-              data: JSON.stringify({ type: "table-changed", revision: 2, operationId: writes.at(-1)!.operationId }),
+              data: JSON.stringify({
+                type: "table-changed",
+                generation: 1,
+                revision: 2,
+                operationId: writes.at(-1)!.operationId,
+              }),
             }),
           );
         return result;
@@ -1863,4 +1870,176 @@ it("reconnects immediately after observing a generation transition through inval
   });
   expect(AuthorizedTableSocket.instances).toHaveLength(2);
   expect(screen.getByLabelText("Title")).toBeEnabled();
+});
+
+it.each([false, true])("releases a committed save before its delayed refresh: task %s", async (task) => {
+  if (task) taskColumnFixture();
+  show("", member, vi.fn(), task);
+  const label = task ? "Task" : "Title";
+  await waitFor(() => expect(screen.getByLabelText(label)).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  let finish!: () => void;
+  let mutations = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method) {
+      mutations++;
+      return { generation: data.generation, revision: 2, result: {} };
+    }
+    await new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    return original(path, init);
+  });
+  const input = screen.getByLabelText(label);
+  await act(async () => {
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "Committed" } });
+    fireEvent.blur(input);
+  });
+  expect(mutations).toBe(1);
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Retry saved operation" })).toBeNull();
+  // The refresh remains unresolved; the mutation's busy lifetime has already ended.
+  expect(finish).toBeDefined();
+  await act(async () => finish());
+  expect(mutations).toBe(1);
+});
+it.each([true, false])("uses only authority generation for committed coverage, metadata %s", async (metadata) => {
+  data = { ...data, revision: 100 };
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  let reads = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method) return { ...(metadata ? { generation: 2 } : {}), revision: 2, result: {}, replayed: true };
+    reads++;
+    data = { ...data, generation: 2, revision: 2 };
+    return original(path, init);
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByLabelText("Check"));
+  });
+  expect(reads).toBe(1);
+  expect(screen.queryByRole("button", { name: "Retry saved operation" })).toBeNull();
+});
+it.each([false, true])("deduplicates a covered remote task event, own %s", async (own) => {
+  taskColumnFixture();
+  show("", member, vi.fn(), true);
+  await waitFor(() => expect(screen.getByLabelText("Task")).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  let reads = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method) return { generation: 1, revision: 2, result: {} };
+    reads++;
+    data = { ...data, revision: 2 };
+    return original(path, init);
+  });
+  const changed = {
+    type: "task-list-invalidated",
+    pageId: "table",
+    generation: 1,
+    revision: 2,
+    operationId: own ? "own" : "remote",
+  };
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: changed }));
+  });
+  expect(reads).toBe(1);
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: changed }));
+  });
+  expect(reads).toBe(1);
+  await act(async () => {
+    window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { ...changed, forceRefresh: true } }));
+  });
+  expect(reads).toBe(2);
+});
+
+it("restores the original jitter function after every earlier test", () => {
+  expect(Math.random).toBe(originalRandom);
+});
+
+it("keeps a committed mutation certain when its separate refresh fails and retries", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const original = vi.mocked(api).getMockImplementation()!;
+  let reads = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (!init?.method && ++reads === 1) throw new ApiClientError(503, "read_unavailable", "Refresh dependency failed");
+    return original(path, init);
+  });
+  await act(async () => fireEvent.click(screen.getByLabelText("Check")));
+  expect(writes).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  expect(screen.getByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Retry saved operation" })).toBeNull();
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(reads).toBe(2);
+  expect(writes).toHaveLength(1);
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+});
+it("turns a second canonical cursor churn into pending freshness with its extent retained", async () => {
+  const rows = Array.from({ length: 200 }, (_, i) => ({
+    ...data.rows[0]!,
+    id: `churn-${i}`,
+    cells: { Title: `Row ${i}` },
+  }));
+  data = { ...data, columns: [column("Title", "text")], rows, rowCount: rows.length };
+  let pages = 0,
+    refreshes = 0;
+  let release!: () => void;
+  vi.mocked(api).mockImplementation(async (path) => {
+    const cursor = new URL(path, "https://test").searchParams.get("cursor");
+    if (cursor) {
+      pages++;
+      return { ...data, revision: pages === 1 ? 2 : 3, rows: rows.slice(100), nextCursor: null };
+    }
+    refreshes++;
+    if (refreshes === 3)
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    return { ...data, revision: Math.min(refreshes, 3), rows: rows.slice(0, 100), nextCursor: "100" };
+  });
+  render(<CollaborativeTablePage page={{ id: "table", title: "Table" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(screen.getAllByLabelText("Title")[0]).toBeEnabled());
+  vi.useFakeTimers();
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
+  expect(pages).toBe(2);
+  expect(screen.getAllByLabelText("Title")).toHaveLength(100);
+  expect(screen.getByText("The table is changing. Refreshing the latest data…")).toBeVisible();
+  expect(screen.getAllByLabelText("Title")[0]).toBeDisabled();
+  expect(screen.queryByRole("alert")).toBeNull();
+  await act(async () => release());
+  expect(pages).toBe(3);
+  expect(screen.getAllByLabelText("Title")).toHaveLength(200);
+  expect(screen.getAllByLabelText("Title")[0]).toBeEnabled();
+});
+
+it("pauses the old generation's permit immediately after a rebuilt table commits", async () => {
+  data = { ...data, revision: 100 };
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  let release!: () => void;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method) return { generation: 2, revision: 2, result: {} };
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    data = { ...data, generation: 2, revision: 2 };
+    return original(path, init);
+  });
+  await act(async () => fireEvent.click(screen.getByLabelText("Check")));
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
+  await act(async () => release());
+  expect(screen.getByLabelText("Check")).toBeEnabled();
 });

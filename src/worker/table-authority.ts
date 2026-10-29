@@ -670,6 +670,17 @@ export class TableAuthority extends DurableObject<Env> {
       const meta = this.meta();
       if (meta.pageId !== actor.pageId || meta.generation !== actor.generation || !meta.seeded)
         return fail("Table generation is not active.", 503);
+      if (path === "/receipt" && request.method === "GET") {
+        const operationId = id(url.searchParams.get("operationId"), "Operation ID");
+        const receipt = this.rows<{ result: string }>(
+          "SELECT result FROM receipts WHERE actor_id=? AND operation_id=?",
+          actor.userId,
+          operationId,
+        )[0];
+        const result = receipt ? (JSON.parse(receipt.result) as TableCommandResult) : null;
+        await this.authorize(request, false);
+        return Response.json(result ? { generation: result.generation, revision: result.revision } : null);
+      }
       if (path === "/draft-rows" && request.method === "POST") {
         const raw = await request.text();
         if (new TextEncoder().encode(raw).byteLength > 20_000) return fail("Draft lookup body is too large.", 413);
@@ -1718,7 +1729,15 @@ export class TableAuthority extends DurableObject<Env> {
       );
       result = { results };
     } else return fail("Unsupported command.");
-    if (sub) return { revision, operationId: command.operationId, replayed: false, result, projectionPending: true };
+    if (sub)
+      return {
+        generation: meta.generation,
+        revision,
+        operationId: command.operationId,
+        replayed: false,
+        result,
+        projectionPending: true,
+      };
     if (schemaChanged) {
       const original = this.columns();
       const invalidTypes = new Set<string>();
@@ -1844,6 +1863,7 @@ export class TableAuthority extends DurableObject<Env> {
       });
     this.putMeta({ ...meta, revision, schemaRevision });
     const answer: TableCommandResult = {
+      generation: meta.generation,
       revision,
       operationId: command.operationId,
       replayed: false,
@@ -1883,7 +1903,14 @@ export class TableAuthority extends DurableObject<Env> {
       const socketActor = socket.deserializeAttachment() as TableActor | null;
       if (!validSocketGrant(socketActor)) continue;
       try {
-        socket.send(JSON.stringify({ type: "table-changed", revision, operationId: command.operationId }));
+        socket.send(
+          JSON.stringify({
+            type: "table-changed",
+            generation: meta.generation,
+            revision,
+            operationId: command.operationId,
+          }),
+        );
       } catch {
         socket.close();
       }
@@ -3411,7 +3438,11 @@ export class TableAuthority extends DurableObject<Env> {
       this.putMeta({ ...this.meta(), projectedRevision: Math.max(this.meta().projectedRevision, revision) });
       this.ctx.storage.sql.exec("DELETE FROM projection_steps WHERE revision=?", revision);
     });
-    await broadcastWorkspaceEvent(this.env, workspaceId, { type: "task-list-invalidated", pageId, forceRefresh: true });
+    await broadcastWorkspaceEvent(this.env, workspaceId, {
+      type: "task-list-invalidated",
+      pageId,
+      forceRefresh: true,
+    });
   }
   private repairHeaders(seedBaseline: boolean): ProjectionStatement[] {
     const meta = this.meta();

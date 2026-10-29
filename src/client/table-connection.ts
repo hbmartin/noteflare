@@ -1,8 +1,10 @@
 import { REALTIME_GRANT_MS } from "../shared/realtime-limits";
 import type { TableQueryResult } from "../shared/table-protocol";
+import { readTableCoverage, type TableCoverage } from "../shared/table-coverage";
+import type { TableReadReceipt } from "./linked-table-reads";
 import { jitteredBackoff } from "../shared/retry";
 
-export type TableSocketVerification = TableQueryResult | { state: "pending" } | null;
+export type TableSocketVerification = TableReadReceipt<TableQueryResult>;
 type VerificationWork = () => Promise<TableSocketVerification>;
 type Slot = {
   socket: WebSocket;
@@ -13,7 +15,8 @@ type Slot = {
   checking: boolean;
   waiting: boolean;
   trailing: VerificationWork | null;
-  pending?: ReturnType<typeof setTimeout>;
+  expiry?: ReturnType<typeof setTimeout>;
+  unsubscribe?: () => void;
   retired: boolean;
   handshake?: ReturnType<typeof setTimeout>;
 };
@@ -23,11 +26,8 @@ export function tableConnection(options: {
   url: string;
   query: () => Promise<TableSocketVerification>;
   ready: (value: boolean) => void;
-  invalidate?: (coverage?: {
-    generation: number;
-    revision: number;
-    operationId?: string;
-  }) => Promise<TableSocketVerification> | void;
+  invalidate?: (coverage?: TableCoverage & { operationId?: string }) => Promise<TableSocketVerification> | void;
+  subscribe?: (observer: (receipt: TableSocketVerification) => void) => () => void;
   verified?: (generation: number) => void;
 }) {
   let active: Slot | null = null,
@@ -43,7 +43,9 @@ export function tableConnection(options: {
     if (slot) {
       slot.retired = true;
       clearTimeout(slot.handshake);
-      clearTimeout(slot.pending);
+      clearTimeout(slot.expiry);
+      slot.unsubscribe?.();
+      slot.unsubscribe = undefined;
       slot.socket.close();
     }
   };
@@ -80,6 +82,19 @@ export function tableConnection(options: {
     clearTimeout(retry);
     if (available()) retry = setTimeout(connect, delay);
   };
+  const fenced = () => {
+    options.ready(false);
+    retire(active);
+    retire(replacement);
+    active = null;
+    replacement = null;
+    clearTimeout(renewal);
+    clearTimeout(expiry);
+    clearTimeout(retry);
+    retryAt = Date.now() + jitteredBackoff(attempt++, 2000, 30_000);
+    renewNotBefore = retryAt;
+    if (available()) retry = setTimeout(connect, retryAt - Date.now());
+  };
   const verify = async (slot: Slot, work: VerificationWork = options.query) => {
     if (slot.checking) {
       slot.trailing = work;
@@ -89,34 +104,34 @@ export function tableConnection(options: {
     try {
       const result = await work();
       if (stopped || slot.retired) return;
-      if (result && "state" in result) {
-        if (slot.deadline <= Date.now()) {
-          failed(slot, true);
-          return;
-        }
+      if (slot.deadline <= Date.now()) {
+        failed(slot, true);
+        return;
+      }
+      if (result.state === "denied") {
+        fenced();
+        return;
+      }
+      if ((result.state !== "complete" && result.state !== "generation-changed") || !readTableCoverage(result.value)) {
+        // The shared read coordinator owns recovery. A query outcome cannot revoke a live socket grant.
         slot.waiting = true;
-        clearTimeout(slot.pending);
-        slot.pending = setTimeout(
-          () => {
-            if (available()) void verify(slot);
-          },
-          Math.min(2000, slot.deadline - Date.now()),
-        );
+        if (result.state !== "pending" && result.state !== "retired") options.ready(false);
+        if (!slot.unsubscribe && options.subscribe) {
+          slot.unsubscribe = options.subscribe((receipt) => void verify(slot, () => Promise.resolve(receipt)));
+        }
         return;
       }
       slot.waiting = false;
-      clearTimeout(slot.pending);
-      if (
-        !result ||
-        slot.deadline <= Date.now() ||
-        (slot.generation !== null && result.generation !== slot.generation)
-      ) {
+      slot.unsubscribe?.();
+      slot.unsubscribe = undefined;
+      if (slot.generation !== null && result.value.generation !== slot.generation) {
         failed(slot);
         return;
       }
       if (replacement === slot) {
         const previous = active;
         active = slot;
+        clearTimeout(slot.expiry);
         replacement = null;
         retire(previous);
         attempt = 0;
@@ -124,13 +139,18 @@ export function tableConnection(options: {
         renewNotBefore = 0;
       }
       if (active === slot) {
-        slot.generation ??= result.generation;
+        slot.generation ??= result.value.generation;
         options.verified?.(slot.generation);
         options.ready(Boolean(available() && valid()));
         schedule();
       }
     } catch {
-      failed(slot);
+      if (!stopped && !slot.retired) {
+        slot.waiting = true;
+        options.ready(false);
+        if (!slot.unsubscribe && options.subscribe)
+          slot.unsubscribe = options.subscribe((receipt) => void verify(slot, () => Promise.resolve(receipt)));
+      }
     } finally {
       slot.checking = false;
       if (slot.trailing && !slot.retired && !stopped) {
@@ -188,15 +208,17 @@ export function tableConnection(options: {
               ? Math.min(slot.renewAt ?? Infinity, Date.now() + delay)
               : null;
         }
+        clearTimeout(slot.expiry);
+        if (active === slot) schedule();
+        else slot.expiry = setTimeout(() => failed(slot, true), Math.max(0, slot.deadline - Date.now()));
         void verify(slot);
       } else if (message?.type === "table-changed" && active === slot) {
         if (options.invalidate) {
-          const revision = message.revision;
+          const coverage = readTableCoverage(message);
           const pending = options.invalidate(
-            slot.generation !== null && Number.isSafeInteger(revision) && Number(revision) >= 0
+            coverage
               ? {
-                  generation: slot.generation,
-                  revision: Number(revision),
+                  ...coverage,
                   ...(typeof message.operationId === "string" ? { operationId: message.operationId } : {}),
                 }
               : undefined,
@@ -209,17 +231,7 @@ export function tableConnection(options: {
       clearTimeout(handshake);
       if (stopped || slot.retired) return;
       if (event.code === 4403 || event.code === 1008) {
-        options.ready(false);
-        retire(active);
-        retire(replacement);
-        active = null;
-        replacement = null;
-        clearTimeout(renewal);
-        clearTimeout(expiry);
-        clearTimeout(retry);
-        retryAt = Date.now() + jitteredBackoff(attempt++, 2000, 30_000);
-        renewNotBefore = retryAt;
-        if (available()) retry = setTimeout(connect, retryAt - Date.now());
+        fenced();
       } else failed(slot, event.code === 4401 || slot.deadline <= Date.now());
     });
   }

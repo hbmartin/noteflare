@@ -19,7 +19,7 @@ import { notificationFanoutStatements } from "./notifications";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import { normalizeSearchValue } from "../shared/search-normalization";
 import { logger } from "./observability";
-import { collaborativeTable, tableCommand, queryTable } from "./table-service";
+import { collaborativeTable, tableCommand, queryTable, tableReceiptCoverage } from "./table-service";
 import { tableFilterDefaults } from "../shared/table-protocol";
 import type { ProjectionStatement } from "./table-authority";
 import { requireTaskRestorable, TASK_DELETION_PENDING_SQL } from "./cleanup";
@@ -303,7 +303,22 @@ export async function mutateTask(
       body.archived === true
         ? await env.DB.prepare(ARCHIVED_TASK_DETAIL_SUBTREE_SQL).bind(replay.detail_page_id).all<{ id: string }>()
         : undefined;
+    let coverage;
+    try {
+      if (await collaborativeTable(env, listId))
+        coverage = await tableReceiptCoverage(env, member, listId, operationId, authorization);
+    } catch (cause) {
+      // Coverage is optional metadata; the committed receipt remains authoritative.
+      logger.warn(
+        "tasks.replay.coverage_unavailable",
+        "tasks",
+        "Task replay coverage could not be verified.",
+        { operationId, pageId: listId },
+        cause,
+      );
+    }
     return {
+      ...(coverage?.revision === replay.revision ? { generation: coverage.generation } : {}),
       rowId: replay.row_id,
       detailPageId: replay.detail_page_id,
       revision: replay.revision,
@@ -524,6 +539,7 @@ export async function mutateTask(
     return {
       rowId,
       detailPageId,
+      ...(result.generation === undefined ? {} : { generation: result.generation }),
       revision: result.revision,
       replayed: result.replayed,
       visibleInView: typeof result.result.visibleInView === "boolean" ? result.result.visibleInView : undefined,
