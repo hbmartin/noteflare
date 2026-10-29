@@ -44,7 +44,7 @@ export async function collaborativeTable(env: Env, pageId: string) {
   const registry = await tableRegistry(env, pageId);
   return registry?.state === "do" || registry?.state === "repairing";
 }
-type TableFetchExtras = {
+export type TableFetchExtras = {
   authorization?: { sql: string; binds: unknown[] };
   effects?: ProjectionStatement[];
   effectsAfter?: ProjectionStatement[];
