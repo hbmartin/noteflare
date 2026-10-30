@@ -4037,7 +4037,11 @@ it("preserves a committed task replay when optional receipt metadata cannot be r
   }
 });
 
-it.each(["d1", "do", "missing"] as const)("checks receipt page access before %s registry state", async (state) => {
+it.each(
+  (["d1", "do", "missing"] as const).flatMap((state) =>
+    (["nonmember", "private-space editor"] as const).map((principal) => ({ state, principal })),
+  ),
+)("checks $principal receipt page access before $state registry state", async ({ state, principal }) => {
   const { pageId, member } = await fixture();
   if (state === "do") await enableTableAuthority(env, member, pageId);
   if (state === "d1")
@@ -4048,8 +4052,18 @@ it.each(["d1", "do", "missing"] as const)("checks receipt page access before %s 
       .run();
   const page = await pageForMember(env, member, pageId);
   await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(page.space_id).run();
-  const outsider = { ...member, user: { ...member.user, id: "not-a-member" } };
-  let registryReads = 0;
+  if (principal === "private-space editor") {
+    await addReceiptBackupOwner(member);
+    await env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE workspace_id=? AND user_id=?")
+      .bind(member.workspace.id, member.user.id)
+      .run();
+  }
+  const outsider =
+    principal === "nonmember"
+      ? { ...member, user: { ...member.user, id: "not-a-member" } }
+      : { ...member, role: "editor" as const };
+  let registryReads = 0,
+    accessReads = 0;
   const bindings = {
     ...env,
     DB: new Proxy(env.DB, {
@@ -4057,6 +4071,7 @@ it.each(["d1", "do", "missing"] as const)("checks receipt page access before %s 
         if (property === "prepare")
           return (sql: string) => {
             if (sql.includes("SELECT * FROM table_authority")) registryReads++;
+            if (sql.includes("wm.role workspace_role")) accessReads++;
             return target.prepare(sql);
           };
         const value = Reflect.get(target, property);
@@ -4069,6 +4084,7 @@ it.each(["d1", "do", "missing"] as const)("checks receipt page access before %s 
     code: "page_not_found",
   });
   expect(registryReads).toBe(0);
+  expect(accessReads).toBe(1);
 });
 
 async function addReceiptBackupOwner(member: MemberContext) {
