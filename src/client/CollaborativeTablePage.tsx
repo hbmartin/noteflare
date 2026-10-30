@@ -183,7 +183,6 @@ export function CollaborativeTablePage({
   const ownership = useRef({
     request: 0,
     verification: 0,
-    scope: {},
     ready: false,
     verifiedQuery: false,
     generation: 0,
@@ -239,7 +238,6 @@ export function CollaborativeTablePage({
     (mode: "invalidate" | "suspend" | "denied" | "retire") => {
       if (mode !== "suspend") {
         ownership.current.verification++;
-        ownership.current.scope = {};
         ownership.current.verifiedQuery = false;
       }
       publishReadiness(false);
@@ -656,7 +654,7 @@ export function CollaborativeTablePage({
       // Canonical polling is driven by its authorized socket heartbeat.
       poll: Boolean(queryBase),
       coverage: (value: TableQueryResult) => ({ generation: value.generation, revision: value.revision }),
-      scope: () => ownership.current.scope,
+      scope: () => ownership.current.verification,
       read: (intent, signal, context) =>
         owns() ? fetchRef.current({ signal, intent, context }) : Promise.resolve({ state: "superseded" }),
       unavailable: (reason) => {

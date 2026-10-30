@@ -40,7 +40,7 @@ type Batch<T> = {
   manual: boolean;
   networkRequired?: boolean;
   failures?: number;
-  scope?: object;
+  scope?: unknown;
 };
 const isContinuation = (intent: TableReadIntent): intent is Extract<TableReadIntent, { kind: "append" | "page" }> =>
   intent.kind === "append" || intent.kind === "page";
@@ -62,7 +62,7 @@ export function linkedTableReads<T>(options: {
   read: (intent: TableReadIntent, signal: AbortSignal, context: TableReadContext) => Promise<LinkedTableReadOutcome<T>>;
   unavailable: (reason: "failure" | "suspended" | "stale") => void;
   coverage?: (value: T) => TableCoverage;
-  scope?: () => object;
+  scope?: () => unknown;
   poll?: boolean;
 }) {
   options.unavailable("failure");
@@ -75,7 +75,7 @@ export function linkedTableReads<T>(options: {
   let refreshVerificationRequired = false;
   let verificationPending = false;
   let active: { batch: Batch<T>; controller: AbortController } | undefined;
-  let completed: { value: T; sequence: number; coverage?: TableCoverage; scope?: object } | undefined;
+  let completed: { value: T; sequence: number; coverage?: TableCoverage; scope?: unknown } | undefined;
   const watermarks = new Map<number, { revision: number; sequence: number }>();
   const observers = new Set<(receipt: TableReadReceipt<T>) => void>();
   const queued = new Map<string, Batch<T>>();
@@ -253,6 +253,7 @@ export function linkedTableReads<T>(options: {
     if (scopeRetired && outcome.state === "success") outcome = { state: "superseded" };
     const coverage = outcome.state === "success" ? readTableCoverage(options.coverage?.(outcome.value)) : undefined;
     if (outcome.state === "success" && outcome.verification === "network") {
+      batch.failures = 0;
       verificationPending = false;
       const verify = queued.get("verify");
       if (verify) {
