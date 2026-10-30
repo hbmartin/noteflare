@@ -987,6 +987,9 @@ it("requires current-scope network application instead of reusing retired cached
 });
 
 it("does not join retired active verification or approve newer invalidations from an older result", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const observer = vi.fn();
   const value = { generation: 1, revision: 2 };
   let scope = {};
   const releases: (() => void)[] = [];
@@ -1004,6 +1007,7 @@ it("does not join retired active verification or approve newer invalidations fro
     poll: false,
   });
   controllers.push(c);
+  c.subscribe(observer);
   const first = c.verifyReceipt();
   scope = {};
   const second = c.verifyReceipt();
@@ -1014,6 +1018,9 @@ it("does not join retired active verification or approve newer invalidations fro
   const invalidation = c.refresh(undefined, { fresh: true });
   releases.shift()!();
   await flushReads();
+  expect(observer).not.toHaveBeenCalled();
+  expect(read).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1000);
   expect(read).toHaveBeenCalledTimes(3);
   releases.shift()!();
   expect(await second).toEqual({ state: "complete", value });
@@ -1048,5 +1055,42 @@ it("keeps a failed full query's deadline when it takes over independent verifica
   await vi.advanceTimersByTimeAsync(999);
   expect(read).toHaveBeenCalledTimes(5);
   await vi.advanceTimersByTimeAsync(1);
+  expect(read.mock.calls[5]![0].kind).toBe("refresh");
+});
+
+it.each(["stale", "superseded"] as const)("yields when independent verification remains %s", async (state) => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let scope = 0;
+  const value = { generation: 1, revision: 1 };
+  const read = vi.fn(async (intent: TableReadIntent) => {
+    if (read.mock.calls.length === 1) return { state: "success" as const, value, verification: "network" as const };
+    if (intent.kind === "append") return { state: "failure" as const };
+    if (state === "superseded") scope++;
+    if (read.mock.calls.length > 8) throw Error("Scheduler safety stop");
+    return { state };
+  });
+  const c = linkedTableReads({
+    read,
+    scope: () => scope,
+    coverage: (result: typeof value) => result,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(c);
+  await c.request();
+  await c.request(continuation());
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "append", "append", "verify", "refresh"]);
+  let timerRan = false;
+  setTimeout(() => {
+    timerRan = true;
+  }, 0);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(timerRan).toBe(true);
+  await vi.advanceTimersByTimeAsync(999);
+  expect(read).toHaveBeenCalledTimes(5);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(6);
   expect(read.mock.calls[5]![0].kind).toBe("refresh");
 });

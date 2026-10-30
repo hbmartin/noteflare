@@ -230,6 +230,14 @@ export function linkedTableReads<T>(options: {
     queued.set("refresh", refresh);
     return refresh;
   }
+  function mergeVerification(batch: Batch<T>) {
+    verificationPending = false;
+    const verify = queued.get("verify");
+    if (verify) {
+      batch.waiters.push(...verify.waiters.splice(0));
+      queued.delete("verify");
+    }
+  }
   async function run(batch: Batch<T>) {
     batch.manual = false;
     const owner = { batch, controller: new AbortController() };
@@ -254,15 +262,11 @@ export function linkedTableReads<T>(options: {
     const coverage = outcome.state === "success" ? readTableCoverage(options.coverage?.(outcome.value)) : undefined;
     if (outcome.state === "success" && outcome.verification === "network") {
       batch.failures = 0;
-      verificationPending = false;
-      const verify = queued.get("verify");
-      if (verify) {
-        batch.waiters.push(...verify.waiters.splice(0));
-        queued.delete("verify");
-      }
+      mergeVerification(batch);
     }
     if (outcome.state === "stale" || (outcome.state === "success" && !covered(sequence, coverage))) {
       if (outcome.state === "stale") {
+        if (!isContinuation(batch.intent)) mergeVerification(batch);
         unscoped = ++invalidation;
         options.unavailable("stale");
         settleBatch(batch, { state: "pending" });
@@ -300,12 +304,7 @@ export function linkedTableReads<T>(options: {
       } else {
         if (batch.intent.kind === "refresh") {
           refreshVerificationRequired = true;
-          verificationPending = false;
-          const verify = queued.get("verify");
-          if (verify) {
-            batch.waiters.push(...verify.waiters.splice(0));
-            queued.delete("verify");
-          }
+          mergeVerification(batch);
         } else if (batch.intent.kind === "verify") verificationPending = true;
         else {
           batch.networkRequired = true;
@@ -320,8 +319,10 @@ export function linkedTableReads<T>(options: {
       options.unavailable("suspended");
       enqueueRetry(batch);
     } else if (outcome.state === "superseded") {
-      if (refreshVerificationRequired || freshnessPending()) queueFreshnessRecovery(batch);
-      else if (scopeRetired && !isContinuation(batch.intent)) verificationPending = true;
+      if (refreshVerificationRequired || freshnessPending() || (scopeRetired && !isContinuation(batch.intent))) {
+        const refresh = queueFreshnessRecovery(batch);
+        if (!isContinuation(batch.intent)) mergeVerification(refresh);
+      }
     } else if (outcome.state === "success" && outcome.verification === "network") {
       denialAttempt = 0;
       freshnessAttempt = 0;
