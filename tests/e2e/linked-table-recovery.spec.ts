@@ -783,3 +783,135 @@ test("canonical continuation failure retains 500 rows and retries only its page"
   expect(cursors[0]).toBeTruthy();
   expect(cursors[1]).toBe(cursors[0]);
 });
+
+test("projection completion preserves a collaborator's focused draft and a covered own save", async ({
+  page,
+  context,
+}) => {
+  const { source, path, linked, cells, columnId } = await linkedFixture(page);
+  const peer = await context.newPage();
+  const snapshot = await (await peer.request.get(`/api/tables/${source.id}/query`)).json();
+  const rowId = snapshot.rows[1].id;
+  await page.evaluate((pageId) => {
+    const received: unknown[] = [];
+    Object.assign(window, { projectionCompletions: received });
+    window.addEventListener("notes:workspace-event", (event) => {
+      const detail = (event as CustomEvent).detail;
+      if (detail.type === "task-list-invalidated" && detail.pageId === pageId && detail.forceRefresh)
+        received.push(detail);
+    });
+  }, source.id);
+  const input = cells.first();
+  await input.fill("Unsubmitted local typing");
+  await input.evaluate((element: HTMLInputElement) => element.setSelectionRange(3, 8));
+  let writes = 0,
+    held = 0,
+    draining = false;
+  const releases: Array<() => void> = [];
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === `${path}/commands`) writes++;
+  });
+  await page.route(`**${path}?**`, async (route) => {
+    if (!draining) {
+      held++;
+      await new Promise<void>((resolve) => releases.push(resolve));
+    }
+    await route.continue();
+  });
+  try {
+    const response = await peer.request.post(`/api/tables/${source.id}/commands`, {
+      data: {
+        operationId: crypto.randomUUID(),
+        kind: "update_cells",
+        payload: { rowId, values: { [columnId]: "Peer committed change" } },
+      },
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as unknown as { projectionCompletions: unknown[] }).projectionCompletions.length),
+      )
+      .toBeGreaterThan(0);
+    await expect.poll(() => held).toBeGreaterThan(0);
+    await expect(input).toBeEnabled();
+    await expect(input).toBeFocused();
+    await expect(input).toHaveValue("Unsubmitted local typing");
+    expect(await input.evaluate((element: HTMLInputElement) => [element.selectionStart, element.selectionEnd])).toEqual(
+      [3, 8],
+    );
+    expect(writes).toBe(0);
+    draining = true;
+    for (const release of releases.splice(0)) release();
+    await page.unrouteAll({ behavior: "wait" });
+    const committed = page.waitForResponse((result) => new URL(result.url()).pathname === `${path}/commands`);
+    await input.press("Enter");
+    expect((await committed).ok()).toBeTruthy();
+    await expect(input).toBeEnabled();
+    await expect(linked.getByText("Saved. Refreshing the latest table data…", { exact: true })).toHaveCount(0);
+    // Replay the producer's actual payload after own-save coverage to test the later ordering too.
+    const refreshed = page.waitForResponse((result) => new URL(result.url()).pathname === path);
+    await page.evaluate(() => {
+      const received = (window as unknown as { projectionCompletions: unknown[] }).projectionCompletions;
+      window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: received.at(-1) }));
+    });
+    await expect(input).toBeEnabled();
+    expect((await refreshed).ok()).toBeTruthy();
+    await expect(input).toHaveValue("Unsubmitted local typing");
+    await expect(input).toBeEnabled();
+    expect(writes).toBe(1);
+  } finally {
+    draining = true;
+    for (const release of releases) release();
+    await page.unrouteAll({ behavior: "wait" });
+    await peer.close();
+  }
+});
+
+test("two broken linked pages independently verify loaded rows without losing pending Load more", async ({ page }) => {
+  const { path, linked, cells } = await linkedFixture(page);
+  let failures = 0,
+    broken = true,
+    verifying = false;
+  let release!: () => void;
+  const verified = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const cursors: Array<string | null> = [];
+  await page.route(`**${path}?**`, async (route) => {
+    const cursor = new URL(route.request().url()).searchParams.get("cursor");
+    cursors.push(cursor);
+    if (cursor && broken) {
+      failures++;
+      await route.fulfill({
+        status: 503,
+        json: { error: { code: "temporary_read", message: "Page temporarily unavailable" } },
+      });
+    } else {
+      if (!cursor && failures >= 2) {
+        verifying = true;
+        await verified;
+      }
+      await route.continue();
+    }
+  });
+  try {
+    await linked.getByRole("button", { name: "Load more rows" }).click();
+    await expect(linked.getByText("Page temporarily unavailable", { exact: true })).toBeVisible();
+    await expect(cells).toHaveCount(500);
+    await expect(cells.first()).toBeDisabled();
+    await expect.poll(() => verifying).toBe(true);
+    expect(failures).toBe(2);
+    expect(cursors).toEqual([cursors[0], cursors[0], null]);
+    expect(cursors[0]).toBeTruthy();
+    release();
+    await expect(cells.first()).toBeEnabled();
+    await expect(cells).toHaveCount(500);
+    broken = false;
+    await linked.getByRole("button", { name: "Load more rows" }).click();
+    await expect(cells).toHaveCount(600);
+    await expect(cells.first()).toBeEnabled();
+  } finally {
+    release();
+    await page.unrouteAll({ behavior: "wait" });
+  }
+});
