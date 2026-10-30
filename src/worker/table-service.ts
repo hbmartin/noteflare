@@ -2,6 +2,7 @@ import { registerRealtimeRoom } from "./realtime-access";
 import { REALTIME_GRANT_MS, REALTIME_ROOM_MARGIN_MS } from "../shared/realtime-limits";
 import { readTableCoverage } from "../shared/table-coverage";
 import type { Env, MemberContext } from "./env";
+import type { Role } from "../shared/types";
 import { HttpError } from "./http";
 import { decodeTableResponse, tableReadPages } from "./table-transport";
 import { pageForMember, requirePageEditor, type PageRow } from "./page-access";
@@ -151,7 +152,14 @@ export async function tableReceiptCoverage(
   operationId: string,
   options: { authorization?: { sql: string; binds: unknown[] }; page?: PageRow } = {},
 ) {
-  const page = options.page ?? (await pageForMember(env, member, pageId));
+  let page = options.page;
+  if (!page) {
+    const role = await env.DB.prepare("SELECT role FROM workspace_members WHERE workspace_id=? AND user_id=?")
+      .bind(member.workspace.id, member.user.id)
+      .first<Role>("role");
+    if (!role) throw new HttpError(404, "page_not_found", "Page not found.");
+    page = await pageForMember(env, { ...member, role }, pageId);
+  }
   validateTablePage(member, pageId, page);
   const registry = await tableRegistry(env, pageId);
   if (!registry || !readableAuthorityState(registry.state)) return undefined;

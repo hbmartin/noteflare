@@ -4048,7 +4048,7 @@ it.each(["d1", "do", "missing"] as const)("checks receipt page access before %s 
       .run();
   const page = await pageForMember(env, member, pageId);
   await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(page.space_id).run();
-  const outsider = { ...member, role: "editor" as const, user: { ...member.user, id: "not-a-member" } };
+  const outsider = { ...member, user: { ...member.user, id: "not-a-member" } };
   let registryReads = 0;
   const bindings = {
     ...env,
@@ -4069,4 +4069,45 @@ it.each(["d1", "do", "missing"] as const)("checks receipt page access before %s 
     code: "page_not_found",
   });
   expect(registryReads).toBe(0);
+});
+
+async function addReceiptBackupOwner(member: MemberContext) {
+  const userId = `receipt-backup-${member.user.id}`;
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES(?,'Backup',?,1,1)").bind(
+      userId,
+      `${userId}@example.test`,
+    ),
+    env.DB.prepare("INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES(?,?,'owner',1)").bind(
+      member.workspace.id,
+      userId,
+    ),
+  ]);
+}
+it.each(["d1", "do", "missing"] as const)("hides %s registry state from a removed workspace member", async (state) => {
+  const { pageId, member } = await fixture();
+  await addReceiptBackupOwner(member);
+  if (state === "do") await enableTableAuthority(env, member, pageId);
+  if (state === "d1")
+    await env.DB.prepare("INSERT INTO table_authority(page_id,state) VALUES(?,'d1')").bind(pageId).run();
+  await env.DB.prepare("DELETE FROM workspace_members WHERE workspace_id=? AND user_id=?")
+    .bind(member.workspace.id, member.user.id)
+    .run();
+  await expect(tableReceiptCoverage(env, member, pageId, "receipt")).rejects.toMatchObject({
+    status: 404,
+    code: "page_not_found",
+  });
+});
+it("uses the live role rather than captured owner privileges before looking up receipt registry state", async () => {
+  const { pageId, member } = await fixture();
+  await addReceiptBackupOwner(member);
+  const page = await pageForMember(env, member, pageId);
+  await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(page.space_id).run();
+  await env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE workspace_id=? AND user_id=?")
+    .bind(member.workspace.id, member.user.id)
+    .run();
+  await expect(tableReceiptCoverage(env, member, pageId, "receipt")).rejects.toMatchObject({
+    status: 404,
+    code: "page_not_found",
+  });
 });
