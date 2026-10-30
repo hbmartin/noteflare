@@ -412,16 +412,16 @@ it("preserves the same refresh's failure progression when it first becomes denie
 
 it("requires a trailing fresh read after invalidation without multiplying active work", async () => {
   const release: Array<() => void> = [];
-  const current: boolean[] = [];
+  const observer = vi.fn();
   let calls = 0;
-  const read = vi.fn(async (_intent: TableReadIntent, _signal: AbortSignal, context: TableReadContext) => {
+  const read = vi.fn(async (_intent: TableReadIntent, _signal: AbortSignal) => {
     calls++;
     await new Promise<void>((resolve) => release.push(resolve));
-    current.push(context.current());
     return { state: "success" as const, value: calls, verification: "network" as const };
   });
   const controller = linkedTableReads<number>({ read, unavailable: vi.fn(), poll: false });
   controllers.push(controller);
+  controller.subscribe(observer);
   const initial = controller.request();
   const verification = controller.verifyReceipt();
   const changed = controller.invalidate();
@@ -436,7 +436,7 @@ it("requires a trailing fresh read after invalidation without multiplying active
   expect(await initial).toBe(2);
   expect(await verification).toEqual({ state: "complete", value: 2 });
   expect(await changed).toBe(2);
-  expect(current).toEqual([false, true]);
+  expect(observer).toHaveBeenCalledExactlyOnceWith({ state: "complete", value: 2 });
 });
 
 it("bounds a freshness wait to two superseded passes and continues jittered recovery", async () => {
@@ -913,4 +913,109 @@ it("requires network verification after a refresh fails before any invalidation"
   await flushReads();
   expect(await pending).toBe(1);
   expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "refresh", "refresh", "append"]);
+});
+
+it("verifies loaded rows independently only after the same continuation fails twice", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const value = { generation: 1, revision: 1 };
+  let verificationAttempts = 0;
+  const read = vi.fn(async (intent: TableReadIntent) => {
+    if (intent.kind === "append") return { state: "failure" as const };
+    if (intent.kind === "verify" && ++verificationAttempts === 1) return { state: "failure" as const };
+    return { state: "success" as const, value, verification: "network" as const };
+  });
+  const observer = vi.fn();
+  const c = linkedTableReads({ read, coverage: (result: typeof value) => result, unavailable: vi.fn() });
+  controllers.push(c);
+  c.subscribe(observer);
+  await c.request();
+  expect(await c.request(continuation(600))).toBeNull();
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "append"]);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "append", "append", "verify"]);
+  await vi.advanceTimersByTimeAsync(999);
+  expect(verificationAttempts).toBe(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(verificationAttempts).toBe(2);
+  expect(observer).toHaveBeenLastCalledWith({ state: "complete", value });
+  // Verification has its own initial delay; the retained append still owns its 2s retry.
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(read.mock.calls.filter(([intent]) => intent.kind === "append")).toHaveLength(3);
+  expect(read.mock.calls.filter(([intent]) => intent.kind === "append").map(([intent]) => intent)).toEqual(
+    Array.from({ length: 3 }, () => ({ kind: "append", ...continuation(600) })),
+  );
+});
+
+it("requires current-scope network application instead of reusing retired cached coverage", async () => {
+  const value = { generation: 1, revision: 2 };
+  let scope = {};
+  let release!: () => void;
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce({ state: "success", value, verification: "network" })
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ state: "success", value, verification: "network" });
+        }),
+    );
+  const c = linkedTableReads({
+    read,
+    scope: () => scope,
+    coverage: (result: typeof value) => result,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(c);
+  await c.request();
+  expect(await c.refresh(value)).toEqual({ state: "complete", value });
+  expect(read).toHaveBeenCalledOnce();
+  scope = {};
+  let settled = false;
+  const pending = c.refresh(value).then((receipt) => {
+    settled = true;
+    return receipt;
+  });
+  await flushReads();
+  expect(settled).toBe(false);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "verify"]);
+  release();
+  expect(await pending).toEqual({ state: "complete", value });
+  expect(await c.refresh(value)).toEqual({ state: "complete", value });
+  expect(read).toHaveBeenCalledTimes(2);
+});
+
+it("does not join retired active verification or approve newer invalidations from an older result", async () => {
+  const value = { generation: 1, revision: 2 };
+  let scope = {};
+  const releases: (() => void)[] = [];
+  const read = vi.fn(
+    () =>
+      new Promise<{ state: "success"; value: typeof value; verification: "network" }>((resolve) =>
+        releases.push(() => resolve({ state: "success", value, verification: "network" })),
+      ),
+  );
+  const c = linkedTableReads({
+    read,
+    scope: () => scope,
+    coverage: (result: typeof value) => result,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(c);
+  const first = c.verifyReceipt();
+  scope = {};
+  const second = c.verifyReceipt();
+  releases.shift()!();
+  expect(await first).toEqual({ state: "retired" });
+  await flushReads();
+  expect(read).toHaveBeenCalledTimes(2);
+  const invalidation = c.refresh(undefined, { fresh: true });
+  releases.shift()!();
+  await flushReads();
+  expect(read).toHaveBeenCalledTimes(3);
+  releases.shift()!();
+  expect(await second).toEqual({ state: "complete", value });
+  expect(await invalidation).toEqual({ state: "complete", value });
 });

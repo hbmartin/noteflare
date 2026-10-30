@@ -28,8 +28,9 @@ export async function readLinkedTable(
   read: (cursor?: string, limit?: number) => Promise<TableQueryResult>,
   signal?: AbortSignal,
   queryIdentity = "",
-  networkRequired = false,
+  options: { networkRequired?: boolean; verify?: boolean; pageSize?: number } = {},
 ): Promise<LinkedTableReadResult> {
+  const { networkRequired = false } = options;
   signal?.throwIfAborted();
   const current = previous?.queryIdentity === queryIdentity ? previous : null;
   const applicable =
@@ -65,9 +66,25 @@ export async function readLinkedTable(
         cursor = current.serverCursor;
         pageSize = current.pageSize;
       } else {
-        pageSize = Math.min(TABLE_PAGE_MAX, Math.max(100, target));
+        pageSize = options.pageSize ?? Math.min(TABLE_PAGE_MAX, Math.max(100, target));
         data = await read(undefined, pageSize);
         network = true;
+        if (
+          options.verify &&
+          current &&
+          data.generation === current.data.generation &&
+          data.revision === current.data.revision
+        ) {
+          signal?.throwIfAborted();
+          return {
+            window: {
+              ...current,
+              data: { ...data, rows: current.data.rows, nextCursor: current.data.nextCursor },
+              verified: true,
+            },
+            verification: "network",
+          };
+        }
         if (intent.kind === "append" && data.generation !== intent.generation) target = 100;
         rows = mergeRows([], data.rows);
         cursor = data.nextCursor;
