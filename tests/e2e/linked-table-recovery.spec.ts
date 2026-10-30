@@ -664,57 +664,74 @@ test("successful view saves acknowledge cached drafts for creation, edit and cop
   await expect(linked.getByRole("textbox", { name: "View name", exact: true })).toHaveValue("Renamed grid");
 });
 
-test("continuous invalidations release a successful save while automatic refresh continues", async ({ page }) => {
-  const { source } = await linkedFixture(page);
-  await page.goto(`/?page=${source.id}`);
-  const table = page
-    .locator(".table-live")
-    .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
-  const cell = table.getByLabel("Linked title", { exact: true }).first();
-  await expect(cell).toBeEnabled();
-  const releases: Array<() => void> = [];
-  let reads = 0,
-    draining = false;
-  await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
-    const response = await route.fetch();
-    if (!draining) {
-      const held = new Promise<void>((resolve) => releases.push(resolve));
-      reads++;
-      await held;
-    }
-    await route.fulfill({ response });
-  });
-  try {
-    const saved = page.waitForResponse(
-      (response) =>
-        new URL(response.url()).pathname === `/api/tables/${source.id}/commands` &&
-        response.request().method() === "POST",
-    );
-    await cell.fill("Saved during churn");
-    await cell.press("Enter");
-    expect((await saved).ok()).toBeTruthy();
-    await expect.poll(() => reads).toBeGreaterThanOrEqual(1);
-    // Commit completion releases busy before even the first held verification can finish.
-    await expect(table.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
-    await expect(cell).toBeDisabled();
-    await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toBeVisible();
-    for (let pass = 0; pass < 2; pass++) {
-      await expect.poll(() => reads).toBeGreaterThanOrEqual(pass + 1);
-      await page.evaluate(() =>
-        window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type: "workspace-invalidated" } })),
-      );
-      releases.shift()!();
-    }
-    await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toBeVisible();
-    await expect(table.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
-    await expect.poll(() => reads).toBeGreaterThanOrEqual(3);
-    releases.shift()!();
-    await expect(cell).toHaveValue("Saved during churn");
+for (const contentOnly of [false, true])
+  test(`continuous ${contentOnly ? "content" : "access"} invalidations preserve the save coverage gate`, async ({
+    page,
+  }) => {
+    const { source } = await linkedFixture(page);
+    await page.goto(`/?page=${source.id}`);
+    const table = page
+      .locator(".table-live")
+      .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
+    const cell = table.getByLabel("Linked title", { exact: true }).first();
     await expect(cell).toBeEnabled();
-    await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toHaveCount(0);
-  } finally {
-    draining = true;
-    for (const release of releases) release();
-    await page.unrouteAll({ behavior: "wait" });
-  }
-});
+    const releases: Array<() => void> = [];
+    let reads = 0,
+      draining = false;
+    await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
+      const response = await route.fetch();
+      if (!draining) {
+        const held = new Promise<void>((resolve) => releases.push(resolve));
+        reads++;
+        await held;
+      }
+      await route.fulfill({ response });
+    });
+    try {
+      const saved = page.waitForResponse(
+        (response) =>
+          new URL(response.url()).pathname === `/api/tables/${source.id}/commands` &&
+          response.request().method() === "POST",
+      );
+      await cell.fill("Saved during churn");
+      await cell.press("Enter");
+      const response = await saved;
+      expect(response.ok()).toBeTruthy();
+      const receipt = await response.json();
+      await expect.poll(() => reads).toBeGreaterThanOrEqual(1);
+      // Commit completion releases busy before even the first held verification can finish.
+      await expect(table.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
+      await expect(cell).toBeDisabled();
+      await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toBeVisible();
+      for (let pass = 0; pass < 2; pass++) {
+        await expect.poll(() => reads).toBeGreaterThanOrEqual(pass + 1);
+        await page.evaluate(
+          (detail) => window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail })),
+          contentOnly
+            ? {
+                type: "task-list-invalidated",
+                pageId: source.id,
+                generation: receipt.generation,
+                revision: receipt.revision + pass + 1,
+              }
+            : { type: "workspace-invalidated" },
+        );
+        releases.shift()!();
+      }
+      await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toHaveCount(
+        contentOnly ? 0 : 1,
+      );
+      if (contentOnly) await expect(cell).toBeEnabled();
+      else await expect(cell).toBeDisabled();
+      await expect(table.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
+      await expect.poll(() => reads).toBeGreaterThanOrEqual(3);
+      releases.shift()!();
+      await expect(cell).toHaveValue("Saved during churn");
+      await expect(cell).toBeEnabled();
+      await expect(table.getByText("Saved. Refreshing the latest table data…", { exact: true })).toHaveCount(0);
+    } finally {
+      draining = true;
+      for (const release of releases) release();
+      await page.unrouteAll({ behavior: "wait" });
+    }
+  });

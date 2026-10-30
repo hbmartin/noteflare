@@ -50,7 +50,7 @@ import {
   type LinkedTableReadOutcome,
 } from "./linked-table-reads";
 import { CursorChanged, readLinkedTable, type LinkedTableWindow } from "./linked-table-query";
-import { readTableCoverage } from "../shared/table-coverage";
+import { readTableCoverage, type TableCoverage } from "../shared/table-coverage";
 import { tableConnection } from "./table-connection";
 import { useRealtimeAccessAccount } from "./realtime-access-status";
 import type { TableDraftRows } from "../shared/table-protocol";
@@ -83,6 +83,14 @@ const sameTableOwner = (left: TableOwner, right: TableOwner) =>
   left.incarnation === right.incarnation &&
   left.host === right.host &&
   left.tableId === right.tableId;
+type AppliedTableRead = {
+  coverage: TableCoverage;
+  owner: TableOwner;
+  queryIdentity: string;
+  verification: number;
+  request: number;
+};
+type CommitVerification = { operation: MutationNotice; coverage?: TableCoverage; afterRequest: number };
 type MutationNotice = {
   sequence: number;
   owner: TableOwner;
@@ -178,7 +186,7 @@ export function CollaborativeTablePage({
     ready: false,
     verifiedQuery: false,
     generation: 0,
-    revision: 0,
+    applied: null as AppliedTableRead | null,
     authorizedGeneration: null as number | null,
     canEdit: false,
     role: member.role,
@@ -196,8 +204,15 @@ export function CollaborativeTablePage({
   const [saveExplanation, setSaveExplanation] = useState<MutationNotice | null>(null);
   const [refreshStatus, setRefreshStatus] = useState("");
   const [blocked, setBlocked] = useState("");
-  const taskRefreshRequiredRef = useRef(false);
-  const [taskRefreshRequired, setTaskRefreshRequired] = useState(false);
+  const requirements = useRef<{ commit: CommitVerification | null; recheck: boolean }>({
+    commit: null,
+    recheck: false,
+  });
+  const [writesRequireVerification, setWritesRequireVerification] = useState(false);
+  const requireRecheck = useCallback(() => {
+    requirements.current.recheck = true;
+    setWritesRequireVerification(true);
+  }, []);
   const [connectionReady, setConnectionReady] = useState(false);
   const [authorizedGeneration, setAuthorizedGeneration] = useState<number | null>(null);
   const [data, setData] = useState<TableQueryResult | null>(null);
@@ -246,6 +261,8 @@ export function CollaborativeTablePage({
     const previous = retryLifetime.current;
     if (sameTableOwner(previous, currentOwner)) return;
     retryLifetime.current = currentOwner;
+    requirements.current = { commit: null, recheck: false };
+    setWritesRequireVerification(false);
     setMutationNotice((value) => (value === null ? value : null));
     setSaveExplanation(null);
     setRefreshStatus("");
@@ -315,7 +332,7 @@ export function CollaborativeTablePage({
   const active = useRef(true);
   const editable = Boolean(
     online &&
-    !taskRefreshRequired &&
+    !writesRequireVerification &&
     connectionReady &&
     (queryBase || authorizedGeneration === data?.generation) &&
     member.role !== "viewer" &&
@@ -330,7 +347,8 @@ export function CollaborativeTablePage({
       ownership.current.canEdit &&
       ownership.current.role !== "viewer" &&
       !busyRef.current &&
-      !taskRefreshRequiredRef.current &&
+      !requirements.current.commit &&
+      !requirements.current.recheck &&
       connectionPermit.current() &&
       sameTableOwner(queryOwner.current, currentOwner) &&
       (queryBase
@@ -349,6 +367,31 @@ export function CollaborativeTablePage({
     },
     [retireVerification],
   );
+  const settleVerification = useCallback((applied: AppliedTableRead | null, fresh = false) => {
+    if (
+      !applied ||
+      !sameTableOwner(applied.owner, retryLifetime.current) ||
+      applied.queryIdentity !== queryOwner.current.queryIdentity ||
+      applied.verification !== ownership.current.verification
+    )
+      return;
+    const pending = requirements.current;
+    if (fresh) pending.recheck = false;
+    const commit = pending.commit;
+    if (
+      commit &&
+      sameTableOwner(commit.operation.owner, applied.owner) &&
+      (commit.coverage
+        ? (commit.coverage.generation === applied.coverage.generation &&
+            applied.coverage.revision >= commit.coverage.revision) ||
+          (fresh && applied.coverage.generation > commit.coverage.generation)
+        : applied.request > commit.afterRequest)
+    ) {
+      pending.commit = null;
+      if (noticeSequence.current === commit.operation.sequence) setRefreshStatus("");
+    }
+    setWritesRequireVerification(Boolean(pending.commit || pending.recheck));
+  }, []);
   const fetchTable = useCallback(
     async function fetchTable({
       cursor,
@@ -371,8 +414,10 @@ export function CollaborativeTablePage({
         const prefix = canonicalPrefix.current;
         if (intent.queryIdentity !== queryIdentity || prefix.data?.generation !== intent.generation)
           return { state: "superseded" };
-        if (prefix.data.rows.length >= intent.target || !prefix.data.nextCursor)
+        if (prefix.data.rows.length >= intent.target || !prefix.data.nextCursor) {
+          if (context?.networkRequired && !network) return restart();
           return { state: "success", value: prefix.data, verification: network ? "network" : "buffer" };
+        }
         intent = { ...intent, cursor: prefix.data.nextCursor, prefix: prefix.id, revision: prefix.data.revision };
       }
       const ownsPrefix = () =>
@@ -410,6 +455,7 @@ export function CollaborativeTablePage({
               readPage,
               signal,
               queryIdentity,
+              context?.networkRequired && !network,
             )
           : null;
         const result = linked ? linked.window.data : await readPage(cursor);
@@ -434,10 +480,7 @@ export function CollaborativeTablePage({
         ownership.current.generation = result.generation;
         ownership.current.canEdit = result.canEdit !== false;
         if (fresh) {
-          ownership.current.revision = result.revision;
           ownership.current.verifiedQuery = true;
-          taskRefreshRequiredRef.current = false;
-          setTaskRefreshRequired(false);
         }
         if (!queryBase) {
           const current = canonicalPrefix.current.data;
@@ -459,6 +502,18 @@ export function CollaborativeTablePage({
             setData(result);
           }
         } else setData(result);
+        const coverage = network ? readTableCoverage(result) : undefined;
+        if (coverage) {
+          const applied = {
+            coverage,
+            owner: currentOwner,
+            queryIdentity,
+            verification,
+            request: owner,
+          };
+          ownership.current.applied = applied;
+          settleVerification(applied, fresh);
+        }
         if (fresh) {
           setError("");
           setBlocked("");
@@ -519,7 +574,19 @@ export function CollaborativeTablePage({
         return { state: "failure" };
       }
     },
-    [base, viewId, query, month, queryIdentity, discardDenied, queryBase, publishLinkedWindow, publishReadiness],
+    [
+      base,
+      viewId,
+      query,
+      month,
+      queryIdentity,
+      discardDenied,
+      queryBase,
+      publishLinkedWindow,
+      publishReadiness,
+      currentOwner,
+      settleVerification,
+    ],
   );
   const fetchRef = useRef(fetchTable);
   useLayoutEffect(() => {
@@ -534,21 +601,29 @@ export function CollaborativeTablePage({
     retireVerification(sameOwner ? "retire" : "denied");
     linkedReads.current?.reset(!queryBase && sameOwner);
   }, [queryIdentity, queryBase, currentOwner, retireVerification]);
-  useLayoutEffect(() => {
+  useEffect(() => {
     if (!page.id || (incarnation && incarnation.key !== account)) return undefined;
+    const owns = () => active.current && sameTableOwner(currentOwner, retryLifetime.current);
     const reads = linkedTableReads({
       // Canonical polling is driven by its authorized socket heartbeat.
       poll: Boolean(queryBase),
       coverage: (value: TableQueryResult) => ({ generation: value.generation, revision: value.revision }),
-      read: (intent, signal, context) => fetchRef.current({ signal, intent, context }),
+      read: (intent, signal, context) =>
+        owns() ? fetchRef.current({ signal, intent, context }) : Promise.resolve({ state: "superseded" }),
       unavailable: (reason) => {
+        if (!owns()) return;
         retireVerification(reason === "suspended" ? "suspend" : "invalidate");
         if (reason === "stale") setRefreshStatus("The table is changing. Refreshing the latest data…");
       },
     });
     linkedReads.current = reads;
     const unsubscribe = reads.subscribe((receipt) => {
-      if (receipt.state === "complete" || receipt.state === "generation-changed") setRefreshStatus("");
+      if (
+        owns() &&
+        !requirements.current.commit &&
+        (receipt.state === "complete" || receipt.state === "generation-changed")
+      )
+        setRefreshStatus("");
     });
     let connection: ReturnType<typeof tableConnection> | undefined;
     if (!queryBase) {
@@ -557,10 +632,14 @@ export function CollaborativeTablePage({
       connection = tableConnection({
         url: url.href,
         query: reads.verifyReceipt,
-        ready: publishReadiness,
-        invalidate: reads.refresh,
+        ready: (value) => {
+          if (owns()) publishReadiness(value);
+        },
+        invalidate: (coverage) => (owns() ? reads.refresh(coverage) : Promise.resolve({ state: "retired" })),
         subscribe: reads.subscribe,
-        verified: recordAuthorization,
+        verified: (generation) => {
+          if (owns()) recordAuthorization(generation);
+        },
       });
     }
     const permit = connection?.authorized ?? (() => linkedWindow.current?.verified === true);
@@ -573,7 +652,16 @@ export function CollaborativeTablePage({
       unsubscribe();
       reads.dispose();
     };
-  }, [queryBase, page.id, account, incarnation, retireVerification, publishReadiness, recordAuthorization]);
+  }, [
+    queryBase,
+    page.id,
+    account,
+    incarnation,
+    currentOwner,
+    retireVerification,
+    publishReadiness,
+    recordAuthorization,
+  ]);
   const load = useCallback((continuation?: CanonicalTableContinuation | LinkedTableContinuation) => {
     const reads = linkedReads.current;
     if (!reads) return Promise.resolve(null);
@@ -617,13 +705,21 @@ export function CollaborativeTablePage({
         )
           return;
       }
+      if (
+        !detail ||
+        !["task-list-invalidated", "projection-updated", "tasks-invalidated"].includes(detail.type) ||
+        (detail.type === "task-list-invalidated" && detail.forceRefresh)
+      ) {
+        requireRecheck();
+        retireVerification("invalidate");
+      }
       void linkedReads.current?.invalidate(
         detail?.type === "task-list-invalidated" && !detail.forceRefresh ? readTableCoverage(detail) : undefined,
       );
     };
     window.addEventListener("notes:workspace-event", invalidate);
     return () => window.removeEventListener("notes:workspace-event", invalidate);
-  }, [page.id, queryBase]);
+  }, [page.id, queryBase, requireRecheck, retireVerification]);
   const notice = mutationNotice && sameTableOwner(mutationNotice.owner, currentOwner) ? mutationNotice : null;
   useEffect(() => {
     if (!notice?.submission) return undefined;
@@ -658,11 +754,12 @@ export function CollaborativeTablePage({
     resolveMutation(operation);
     setSaveExplanation(message ? { ...operation, message } : null);
     setRefreshStatus("Saved. Refreshing the latest table data…");
-    taskRefreshRequiredRef.current = true;
-    setTaskRefreshRequired(true);
+    const coverage = readTableCoverage(result);
+    requirements.current.commit = { operation, coverage, afterRequest: ownership.current.request };
+    setWritesRequireVerification(true);
+    settleVerification(ownership.current.applied);
     const reads = linkedReads.current;
     if (!reads) return "committed-current";
-    const coverage = readTableCoverage(result);
     const changedGeneration = Boolean(coverage && coverage.generation !== ownership.current.generation);
     if (changedGeneration) retireVerification("invalidate");
     void reads.refresh(coverage, { fresh: changedGeneration }).then((receipt) => {
@@ -673,15 +770,7 @@ export function CollaborativeTablePage({
       )
         return;
       if (receipt.state === "complete" || receipt.state === "generation-changed") {
-        if (
-          ownership.current.verifiedQuery &&
-          ownership.current.generation === receipt.value.generation &&
-          ownership.current.revision >= receipt.value.revision
-        ) {
-          taskRefreshRequiredRef.current = false;
-          setTaskRefreshRequired(false);
-        }
-        setRefreshStatus("");
+        if (!requirements.current.commit) setRefreshStatus("");
       } else if (receipt.state === "failure")
         setRefreshStatus("Saved. The latest table data could not be refreshed. Retrying…");
       else if (receipt.state === "denied") setRefreshStatus("Saved. Access to the table could not be confirmed.");
@@ -751,8 +840,7 @@ export function CollaborativeTablePage({
           operation,
           apiErrorMessage(cause, "The table update was rejected. Refresh before saving again."),
         );
-        taskRefreshRequiredRef.current = true;
-        setTaskRefreshRequired(true);
+        requireRecheck();
         retireVerification("invalidate");
         const refreshed = await load();
         if (refreshed)
@@ -856,12 +944,11 @@ export function CollaborativeTablePage({
         if (cause.code === "table_revision_conflict" || cause.status === 404 || cause.status === 403) {
           if (submission)
             submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
-          taskRefreshRequiredRef.current = true;
-          setTaskRefreshRequired(true);
+          requireRecheck();
           retireVerification("invalidate");
         }
         const refreshed = await load();
-        if (refreshed && !taskRefreshRequiredRef.current)
+        if (refreshed && !requirements.current.recheck)
           reportMutation(
             operation,
             cause.status === 404 || cause.status === 403
