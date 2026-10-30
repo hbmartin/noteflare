@@ -42,7 +42,15 @@ export async function tableRegistry(env: Env, pageId: string) {
 }
 export async function collaborativeTable(env: Env, pageId: string) {
   const registry = await tableRegistry(env, pageId);
-  return registry?.state === "do" || registry?.state === "repairing";
+  return readableAuthorityState(registry?.state);
+}
+function readableAuthorityState(state: TableRegistry["state"] | undefined) {
+  return state === "do" || state === "repairing";
+}
+function validateTablePage(member: MemberContext, pageId: string, page: PageRow) {
+  if (page.id !== pageId || page.workspace_id !== member.workspace.id)
+    throw new HttpError(403, "table_forbidden", "Table is unavailable.");
+  if (page.kind !== "table") throw new HttpError(422, "table_required", "Choose a table.");
 }
 export type TableFetchExtras = {
   authorization?: { sql: string; binds: unknown[] };
@@ -76,13 +84,11 @@ async function fetchTable(
 ) {
   // Request-local construction inputs never replace the authority's live authorization.
   const page = construction?.page ?? (await pageForMember(env, member, pageId));
-  if (page.id !== pageId || page.workspace_id !== member.workspace.id)
-    throw new HttpError(403, "table_forbidden", "Table is unavailable.");
-  if (page.kind !== "table") throw new HttpError(422, "table_required", "Choose a table.");
+  validateTablePage(member, pageId, page);
   const write = method !== "GET" && !(method === "POST" && path === "/draft-rows");
   if (write) requirePageEditor(page);
   const registry = construction?.registry ?? (await tableRegistry(env, pageId));
-  if (!registry || !["do", "repairing"].includes(registry.state))
+  if (!registry || !readableAuthorityState(registry.state))
     throw new HttpError(409, "table_authority_required", "Enable collaboration for this table first.");
   if (write && registry.state === "repairing")
     throw new HttpError(503, "table_projection_repairing", "Table projection repair is running. Retry shortly.");
@@ -124,15 +130,7 @@ export async function tableCommand(
   member: MemberContext,
   pageId: string,
   command: TableCommand,
-  extras?: {
-    authorization?: { sql: string; binds: unknown[] };
-    effects?: ProjectionStatement[];
-    effectsAfter?: ProjectionStatement[];
-    detailPageId?: string;
-    allowDeleteDetail?: boolean;
-    cancelRowOnPublicationFailure?: string;
-    taskMutation?: true;
-  },
+  extras?: TableFetchExtras,
 ) {
   return decodeTableResponse<TableCommandResult>(
     await tableFetch(env, member, pageId, "/commands", "POST", command, extras),
@@ -153,8 +151,10 @@ export async function tableReceiptCoverage(
   operationId: string,
   options: { authorization?: { sql: string; binds: unknown[] }; page?: PageRow } = {},
 ) {
+  const page = options.page ?? (await pageForMember(env, member, pageId));
+  validateTablePage(member, pageId, page);
   const registry = await tableRegistry(env, pageId);
-  if (!registry || !["do", "repairing"].includes(registry.state)) return undefined;
+  if (!registry || !readableAuthorityState(registry.state)) return undefined;
   return readTableCoverage(
     await decodeTableResponse<unknown>(
       await fetchTable(
@@ -165,7 +165,7 @@ export async function tableReceiptCoverage(
         "GET",
         undefined,
         options.authorization ? { authorization: options.authorization } : {},
-        { ...(options.page ? { page: options.page } : {}), registry },
+        { page, registry },
       ),
     ),
   );
@@ -187,7 +187,7 @@ export async function tableTemplateSnapshot(env: Env, pageId: string): Promise<T
   const registry = await tableRegistry(env, pageId);
   if (registry && registry.state !== "d1" && registry.state !== "do" && registry.state !== "repairing")
     throw new HttpError(409, "table_seed_pending", "Resume table migration before cloning this table.");
-  const migrated = registry && ["do", "repairing"].includes(registry.state);
+  const migrated = readableAuthorityState(registry?.state);
   const revision = migrated
     ? null
     : ((

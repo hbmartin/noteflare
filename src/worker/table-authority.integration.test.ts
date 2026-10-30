@@ -4036,3 +4036,37 @@ it("preserves a committed task replay when optional receipt metadata cannot be r
     warning.mockRestore();
   }
 });
+
+it.each(["d1", "do", "missing"] as const)("checks receipt page access before %s registry state", async (state) => {
+  const { pageId, member } = await fixture();
+  if (state === "do") await enableTableAuthority(env, member, pageId);
+  if (state === "d1")
+    await env.DB.prepare(
+      "INSERT INTO table_authority(page_id,state,generation,seed_revision,projected_revision) VALUES(?,'d1',1,1,1)",
+    )
+      .bind(pageId)
+      .run();
+  const page = await pageForMember(env, member, pageId);
+  await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(page.space_id).run();
+  const outsider = { ...member, role: "editor" as const, user: { ...member.user, id: "not-a-member" } };
+  let registryReads = 0;
+  const bindings = {
+    ...env,
+    DB: new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            if (sql.includes("SELECT * FROM table_authority")) registryReads++;
+            return target.prepare(sql);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  } as Env;
+  await expect(tableReceiptCoverage(bindings, outsider, pageId, "unknown-operation")).rejects.toMatchObject({
+    status: 404,
+    code: "page_not_found",
+  });
+  expect(registryReads).toBe(0);
+});
