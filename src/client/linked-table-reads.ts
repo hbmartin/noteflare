@@ -344,12 +344,22 @@ export function linkedTableReads<T>(options: {
       ((intentKey(active.batch.intent) === name && (intent.kind !== "refresh" || joinActive)) ||
         (intent.kind === "verify" && !isContinuation(active.batch.intent)) ||
         (joinActive && intent.kind === "refresh" && active.batch.intent.kind === "verify"));
-    const batch = joining ? active!.batch : (queued.get(name) ?? makeBatch(intent));
+    const waitingVerification = intent.kind === "refresh" ? queued.get("verify") : undefined;
+    const batch = joining
+      ? active!.batch
+      : joinActive && waitingVerification
+        ? waitingVerification
+        : (queued.get(name) ?? makeBatch(intent));
+    if (!joining && waitingVerification && batch !== waitingVerification) {
+      batch.attempt = Math.max(batch.attempt, waitingVerification.attempt);
+      batch.retryAt = Math.max(batch.retryAt, waitingVerification.retryAt);
+      mergeVerification(batch);
+    }
     if (manual && !joining) {
       batch.retryAt = 0;
       batch.manual = true;
     }
-    if (!joining) queued.set(name, batch);
+    if (!joining) queued.set(intentKey(batch.intent), batch);
     if (manual && needsFreshness(batch)) {
       const refresh = prerequisite();
       if (refresh) {

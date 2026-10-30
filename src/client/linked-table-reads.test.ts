@@ -1094,3 +1094,38 @@ it.each(["stale", "superseded"] as const)("yields when independent verification 
   expect(read).toHaveBeenCalledTimes(6);
   expect(read.mock.calls[5]![0].kind).toBe("refresh");
 });
+
+it.each(["foreground", "content"] as const)(
+  "preserves failed verification backoff across %s checks",
+  async (change) => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    let hidden = false;
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    const value = { generation: 1, revision: 1 };
+    const read = vi.fn(async (_intent: TableReadIntent) =>
+      read.mock.calls.length === 1 || read.mock.calls.length > 4
+        ? { state: "success" as const, value, verification: "network" as const }
+        : { state: "failure" as const },
+    );
+    const c = linkedTableReads({ read, coverage: (result: typeof value) => result, unavailable: vi.fn(), poll: false });
+    controllers.push(c);
+    await c.request();
+    await c.request(continuation());
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(read).toHaveBeenCalledTimes(4);
+    if (change === "foreground") {
+      hidden = true;
+      document.dispatchEvent(new Event("visibilitychange"));
+      hidden = false;
+      document.dispatchEvent(new Event("visibilitychange"));
+    } else void c.invalidate();
+    await flushReads();
+    expect(read).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(read).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(read).toHaveBeenCalledTimes(5);
+    expect(read.mock.calls[4]![0].kind).toBe(change === "foreground" ? "verify" : "refresh");
+  },
+);
