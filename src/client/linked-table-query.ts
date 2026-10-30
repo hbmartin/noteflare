@@ -28,6 +28,7 @@ export async function readLinkedTable(
   read: (cursor?: string, limit?: number) => Promise<TableQueryResult>,
   signal?: AbortSignal,
   queryIdentity = "",
+  networkRequired = false,
 ): Promise<LinkedTableReadResult> {
   signal?.throwIfAborted();
   const current = previous?.queryIdentity === queryIdentity ? previous : null;
@@ -35,7 +36,12 @@ export async function readLinkedTable(
     intent.kind === "refresh" ||
     (intent.queryIdentity === queryIdentity && (!current || intent.generation === current.data.generation));
   if (!applicable && current) return { window: current, verification: "buffer" };
-  if (intent.kind === "append" && current?.verified && (intent.target <= current.data.rows.length || !current.hasMore))
+  if (
+    !networkRequired &&
+    intent.kind === "append" &&
+    current?.verified &&
+    (intent.target <= current.data.rows.length || !current.hasMore)
+  )
     return { window: current, verification: "buffer" };
   let target = current
     ? intent.kind === "append"
@@ -47,7 +53,13 @@ export async function readLinkedTable(
       signal?.throwIfAborted();
       let network = false;
       let data: TableQueryResult, rows: TableQueryResult["rows"], cursor: string | null, pageSize: number;
-      if (attempt === 0 && intent.kind === "append" && current?.verified) {
+      if (
+        attempt === 0 &&
+        intent.kind === "append" &&
+        current &&
+        (current.verified ||
+          (networkRequired && current.serverCursor && current.data.rows.length + current.buffered.length < target))
+      ) {
         data = current.data;
         rows = mergeRows(data.rows, current.buffered);
         cursor = current.serverCursor;

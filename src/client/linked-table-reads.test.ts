@@ -763,7 +763,7 @@ it("recovers a denied continuation even when another click required fresh covera
   expect(await c.request()).toEqual(value);
   expect(read).toHaveBeenCalledTimes(2);
 });
-it("queues prerequisite verification when a failed continuation is requested again", async () => {
+it("retries a failed continuation without discarding its accepted prefix", async () => {
   const value = { generation: 1, revision: 1 };
   const read = vi
     .fn()
@@ -775,7 +775,7 @@ it("queues prerequisite verification when a failed continuation is requested aga
   await c.refresh(value);
   expect(await c.request(continuation())).toBeNull();
   expect(await c.request(continuation())).toEqual(value);
-  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "append", "refresh", "append"]);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "append", "append"]);
 });
 it("replaces a superseded prerequisite instead of stranding its continuations", async () => {
   const value = { generation: 1, revision: 1 };
@@ -874,4 +874,43 @@ it("retains required verification after supersession even without a waiting cont
   await flushReads();
   expect(read).toHaveBeenCalledTimes(2);
   expect(observer).toHaveBeenLastCalledWith({ state: "complete", value });
+});
+
+it.each([false, true])("retries only the failed network page after earlier invalidation %s", async (invalidated) => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const value = { generation: 1, revision: 2 };
+  const contexts: boolean[] = [];
+  const read = vi.fn(async (_intent: TableReadIntent, _signal: AbortSignal, context: TableReadContext) => {
+    contexts.push(context.networkRequired);
+    if (read.mock.calls.length === 2) return { state: "failure" as const };
+    return { state: "success" as const, value, verification: "network" as const };
+  });
+  const c = linkedTableReads({ read, coverage: (result: typeof value) => result, unavailable: vi.fn(), poll: false });
+  controllers.push(c);
+  if (invalidated) await c.refresh(value);
+  else await c.request();
+  expect(await c.request(continuation(600))).toBeNull();
+  await vi.advanceTimersByTimeAsync(999);
+  expect(read).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "append", "append"]);
+  expect(contexts).toEqual([false, false, true]);
+});
+it("requires network verification after a refresh fails before any invalidation", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce({ state: "success", value: 1, verification: "network" })
+    .mockResolvedValueOnce({ state: "failure" })
+    .mockResolvedValue({ state: "success", value: 1, verification: "network" });
+  const c = linkedTableReads({ read, unavailable: vi.fn(), poll: false });
+  controllers.push(c);
+  await c.request();
+  expect(await c.request()).toBeNull();
+  const pending = c.request(continuation());
+  await flushReads();
+  expect(await pending).toBe(1);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "refresh", "refresh", "append"]);
 });
