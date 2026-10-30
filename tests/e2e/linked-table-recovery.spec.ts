@@ -735,3 +735,51 @@ for (const contentOnly of [false, true])
       await page.unrouteAll({ behavior: "wait" });
     }
   });
+
+test("canonical continuation failure retains 500 rows and retries only its page", async ({ page }) => {
+  const { source } = await linkedFixture(page);
+  await page.goto(`/?page=${source.id}`);
+  const table = page
+    .locator(".table-live")
+    .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
+  const cells = table.getByLabel("Linked title", { exact: true });
+  await expect(cells.first()).toBeEnabled();
+  const path = `/api/tables/${source.id}/query`;
+  const invalidated = page.waitForResponse((response) => new URL(response.url()).pathname === path);
+  await page.evaluate(
+    (pageId) =>
+      window.dispatchEvent(
+        new CustomEvent("notes:workspace-event", {
+          detail: { type: "projection-updated", pageId, backlinkTargetIds: [], mentionTargetUserIds: [] },
+        }),
+      ),
+    source.id,
+  );
+  expect((await invalidated).ok()).toBeTruthy();
+  for (const count of [200, 300, 400, 500]) {
+    await table.getByRole("button", { name: "Load more rows" }).click();
+    await expect(cells).toHaveCount(count);
+  }
+  const cursors: Array<string | null> = [];
+  let fail = true;
+  await page.route(`**${path}?**`, async (route) => {
+    const cursor = new URL(route.request().url()).searchParams.get("cursor");
+    cursors.push(cursor);
+    if (fail && cursor) {
+      fail = false;
+      await route.fulfill({
+        status: 503,
+        json: { error: { code: "temporary_read", message: "Continuation temporarily unavailable" } },
+      });
+    } else await route.continue();
+  });
+  await table.getByRole("button", { name: "Load more rows" }).click();
+  await expect(table.getByText("Continuation temporarily unavailable", { exact: true })).toBeVisible();
+  await expect(cells).toHaveCount(500);
+  await expect(cells.first()).toBeDisabled();
+  await expect(cells).toHaveCount(600);
+  await expect(cells.first()).toBeEnabled();
+  expect(cursors).toHaveLength(2);
+  expect(cursors[0]).toBeTruthy();
+  expect(cursors[1]).toBe(cursors[0]);
+});

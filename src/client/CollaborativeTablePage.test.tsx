@@ -2260,9 +2260,9 @@ it.each([
   },
 );
 
-it("retains 500 canonical rows and retries only the failed continuation after an earlier invalidation", async () => {
+it("retains the expanded canonical prefix and retries only the failed continuation after an earlier invalidation", async () => {
   const inputs = () => document.querySelectorAll<HTMLInputElement>('input[aria-label="Title"]');
-  const rows = Array.from({ length: 700 }, (_, index) => ({
+  const rows = Array.from({ length: 400 }, (_, index) => ({
     ...data.rows[0]!,
     id: `expanded-${index}`,
     cells: { Title: `Row ${index}` },
@@ -2293,7 +2293,7 @@ it("retains 500 canonical rows and retries only the failed continuation after an
       }),
     ),
   );
-  for (const count of [200, 300, 400, 500]) {
+  for (const count of [200]) {
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
     await waitFor(() => expect(inputs()).toHaveLength(count));
   }
@@ -2302,17 +2302,17 @@ it("retains 500 canonical rows and retries only the failed continuation after an
   calls.length = 0;
   fail = true;
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
-  expect(inputs()).toHaveLength(500);
+  expect(inputs()).toHaveLength(200);
   expect(inputs()[0]).toBeDisabled();
   expect(screen.getByText("Page unavailable")).toBeVisible();
   await act(async () => {
     await vi.advanceTimersByTimeAsync(999);
   });
-  expect(calls).toEqual(["500"]);
+  expect(calls).toEqual(["200"]);
   await act(async () => {
     await vi.advanceTimersByTimeAsync(1);
   });
-  expect(inputs()).toHaveLength(600);
+  expect(inputs()).toHaveLength(300);
   expect(inputs()[0]).toBeEnabled();
-  expect(calls).toEqual(["500", "500"]);
+  expect(calls).toEqual(["200", "200"]);
 });
