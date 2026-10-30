@@ -261,8 +261,92 @@ it("retries a failed linked network continuation without replacing its accepted 
   const retry = vi.fn().mockRejectedValueOnce(new TypeError("network down")).mockImplementation(read);
   await expect(query(append(window), window, retry)).rejects.toThrow("network down");
   const unavailable = { ...window, verified: false };
-  const result = await query(append(window), unavailable, retry, undefined, "", true);
+  const result = await query(append(window), unavailable, retry, undefined, "", { networkRequired: true });
   expect(result.window.data.rows).toHaveLength(600);
   expect(result.verification).toBe("network");
   expect(retry.mock.calls.map(([cursor]) => cursor)).toEqual([window.serverCursor, window.serverCursor]);
+});
+
+it("verifies matching loaded coverage without replacing the prefix, buffers or cursor chain", async () => {
+  const read = serverRows(1200);
+  let current = await readLinkedTable({ kind: "refresh" }, null, read);
+  current = await readLinkedTable(
+    { kind: "refresh" },
+    {
+      ...current,
+      data: {
+        ...current.data,
+        rows: Array.from({ length: 500 }, (_, i) => ({ id: String(i) })) as TableQueryResult["rows"],
+      },
+    },
+    read,
+  );
+  current = await readLinkedTable(append(current), current, read);
+  const calls = read.mock.calls.length;
+  const result = await query({ kind: "refresh" }, { ...current, verified: false }, read, undefined, "", {
+    verify: true,
+  });
+  expect(read).toHaveBeenCalledTimes(calls + 1);
+  expect(result.verification).toBe("network");
+  expect(result.window.data.rows).toBe(current.data.rows);
+  expect(result.window.buffered).toBe(current.buffered);
+  expect(result.window.serverCursor).toBe(current.serverCursor);
+  expect(result.window.pageSize).toBe(current.pageSize);
+  expect(result.window.continuation).toBe(current.continuation);
+  expect(result.window.verified).toBe(true);
+});
+
+it("assembles changed coverage through the previous visible extent before verification completes", async () => {
+  const current = loaded(page(["old-a", "old-b", "old-c", "old-d"], "old"));
+  let release!: (value: TableQueryResult) => void;
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce(page(["a", "b"], "fresh", 2))
+    .mockImplementationOnce(
+      () =>
+        new Promise<TableQueryResult>((resolve) => {
+          release = resolve;
+        }),
+    );
+  let applied = false;
+  const pending = query({ kind: "refresh" }, current, read, undefined, "", { verify: true, pageSize: 100 }).then(
+    (value) => {
+      applied = true;
+      return value;
+    },
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(applied).toBe(false);
+  expect(current.data.rows.map((row) => row.id)).toEqual(["old-a", "old-b", "old-c", "old-d"]);
+  release(page(["c"], null, 2));
+  const result = await pending;
+  expect(result.window.data.rows.map((row) => row.id)).toEqual(["a", "b", "c"]);
+  expect(result.window.verified).toBe(true);
+  expect(read.mock.calls).toEqual([
+    [undefined, 100],
+    ["fresh", 100],
+  ]);
+});
+
+it("retains a 500-row exhausted linked prefix during forced verification", async () => {
+  const current = loaded(
+    page(
+      Array.from({ length: 500 }, (_, i) => String(i)),
+      null,
+    ),
+  );
+  current.verified = false;
+  const read = serverRows(500);
+  const result = await query(
+    { kind: "append", queryIdentity: "", generation: 1, target: 600 },
+    current,
+    read,
+    undefined,
+    "",
+    { networkRequired: true },
+  );
+  expect(result.window.data.rows).toHaveLength(500);
+  expect(read.mock.calls).toEqual([[undefined, 500]]);
+  expect(result.verification).toBe("network");
 });

@@ -2362,3 +2362,282 @@ it("retires the old generation's permit immediately when newer content coverage 
   expect(screen.getByLabelText("Check")).toBeEnabled();
   expect(writes).toHaveLength(0);
 });
+
+it("keeps a focused changed cell editable during the actual forced projection broadcast", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const title = screen.getByLabelText("Title") as HTMLInputElement;
+  fireEvent.focus(title);
+  title.focus();
+  fireEvent.change(title, { target: { value: "Local unfinished edit" } });
+  title.setSelectionRange(3, 5);
+  const finishes: Array<(v: TableQueryResult) => void> = [];
+  vi.mocked(api).mockImplementation(() => new Promise<TableQueryResult>((resolve) => finishes.push(resolve)));
+  await act(async () =>
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", forceRefresh: true },
+      }),
+    ),
+  );
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+  expect(finishes).toHaveLength(1);
+  expect(title).toHaveFocus();
+  expect(title).toHaveValue("Local unfinished edit");
+  expect([title.selectionStart, title.selectionEnd]).toEqual([3, 5]);
+  expect(writes).toHaveLength(0);
+  await act(async () => finishes.shift()!({ ...data }));
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+});
+
+it("joins current network application when a cached save receipt belongs to a retired verification lifetime", async () => {
+  data = {
+    ...data,
+    nextCursor: "more",
+    rows: Array.from({ length: 100 }, (_, i) => ({ ...data.rows[0]!, id: "row-" + i })),
+  };
+  show();
+  const check = () => screen.getAllByLabelText("Check")[0]!;
+  await waitFor(() => expect(check()).toBeEnabled());
+  let releasePage!: () => void, releaseCommit!: () => void, releaseVerification!: () => void;
+  let pages = 0,
+    queries = 0;
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (path.endsWith("/commands")) {
+      data = { ...data, revision: 2 };
+      await new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      return { generation: 1, revision: 2, result: {}, projectionPending: false };
+    }
+    queries++;
+    if (new URL(path, "https://test").searchParams.get("cursor")) {
+      if (++pages === 1)
+        await new Promise<void>((resolve) => {
+          releasePage = resolve;
+        });
+      throw new ApiClientError(503, "unavailable", "Page unavailable");
+    }
+    if (pages >= 2)
+      await new Promise<void>((resolve) => {
+        releaseVerification = resolve;
+      });
+    return { ...data };
+  });
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
+  await act(async () => fireEvent.click(check()));
+  expect(releaseCommit).toBeTypeOf("function");
+  await act(async () => {
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", generation: 1, revision: 2 },
+      }),
+    );
+    releasePage();
+  });
+  expect(check()).toBeDisabled(); // mutation remains busy
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(pages).toBe(2);
+  const before = queries;
+  await act(async () => releaseCommit());
+  expect(queries).toBe(before);
+  expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
+  expect(check()).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  expect(releaseVerification).toBeTypeOf("function");
+  await act(async () => releaseVerification());
+  expect(check()).toBeEnabled();
+  expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+  expect(writes).toHaveLength(0); // custom command fixture returns the committed result directly
+});
+
+it("retains background freshness progress when applied coverage independently settles a save", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  const finishes: Array<(v: TableQueryResult) => void> = [];
+  vi.mocked(api).mockImplementation((path, init) =>
+    path.endsWith("/commands")
+      ? original(path, init)
+      : new Promise<TableQueryResult>((resolve) => finishes.push(resolve)),
+  );
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  await act(async () => fireEvent.click(screen.getByLabelText("Check")));
+  await act(async () => {
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", generation: 2, revision: 1 },
+      }),
+    );
+    finishes.shift()!({ ...data });
+  });
+  await act(async () => finishes.shift()!({ ...data }));
+  expect(screen.getByText("The table is changing. Refreshing the latest data…")).toBeVisible();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  await act(async () => {
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", generation: 2, revision: 3 },
+      }),
+    );
+    finishes.shift()!({ ...data, generation: 2, revision: 1 });
+  });
+  expect(screen.getByText("The table is changing. Refreshing the latest data…")).toBeVisible();
+  expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2000);
+  });
+  expect(finishes).toHaveLength(1);
+  await act(async () => finishes.shift()!({ ...data, generation: 2, revision: 3 }));
+  expect(screen.queryByText("The table is changing. Refreshing the latest data…")).toBeNull();
+});
+
+it.each([false, true])(
+  "restores loaded-row readiness after two broken page reads without losing the extent: canonical %s",
+  async (canonical) => {
+    const rows = Array.from({ length: 400 }, (_, i) => ({
+      ...data.rows[0]!,
+      id: `page-${i}`,
+      cells: { Title: `Row ${i}` },
+    }));
+    data = { ...data, columns: [column("Title", "text")], rows, rowCount: 400 };
+    const calls: string[] = [];
+    let fail = false;
+    vi.mocked(api).mockImplementation(async (path) => {
+      const params = new URL(path, "https://test").searchParams;
+      const cursor = params.get("cursor") ?? "0",
+        offset = Number(cursor),
+        limit = Number(params.get("limit"));
+      calls.push(cursor);
+      if (fail && cursor === "200") throw new ApiClientError(503, "unavailable", "Page unavailable");
+      return {
+        ...data,
+        rows: rows.slice(offset, offset + limit),
+        nextCursor: offset + limit < rows.length ? String(offset + limit) : null,
+      };
+    });
+    render(
+      <CollaborativeTablePage
+        page={{ id: "table", title: "Expanded" }}
+        member={member}
+        queryBase={canonical ? undefined : "/linked"}
+        onSelectPage={vi.fn()}
+      />,
+    );
+    const inputs = () => screen.getAllByLabelText("Title");
+    await waitFor(() => expect(inputs()[0]).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await waitFor(() => expect(inputs()).toHaveLength(200));
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    calls.length = 0;
+    fail = true;
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
+    expect(inputs()).toHaveLength(200);
+    expect(inputs()[0]).toBeDisabled();
+    expect(calls).toEqual(["200"]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(999);
+    });
+    expect(calls).toEqual(["200"]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(calls).toEqual(["200", "200", "0"]);
+    expect(inputs()).toHaveLength(200);
+    expect(inputs()[0]).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Load more rows" })).toBeEnabled();
+    expect(writes).toHaveLength(0);
+  },
+);
+
+it("forces a projection query after a covered own save without relocking the editor", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  fireEvent.click(screen.getByLabelText("Check"));
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeChecked());
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const finishes: Array<(value: TableQueryResult) => void> = [];
+  vi.mocked(api).mockImplementation(() => new Promise<TableQueryResult>((resolve) => finishes.push(resolve)));
+  await act(async () =>
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", forceRefresh: true },
+      }),
+    ),
+  );
+  expect(finishes).toHaveLength(1);
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+  expect(writes).toHaveLength(1);
+  await act(async () => finishes.shift()!({ ...data }));
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+  expect(writes).toHaveLength(1);
+});
+
+it("requires new network application after one failed continuation retires cached save coverage", async () => {
+  data = {
+    ...data,
+    nextCursor: "more",
+    rows: Array.from({ length: 100 }, (_, i) => ({ ...data.rows[0]!, id: `cached-${i}` })),
+  };
+  show();
+  const check = () => screen.getAllByLabelText("Check")[0]!;
+  await waitFor(() => expect(check()).toBeEnabled());
+  let releaseBackground!: () => void, releaseCommit!: () => void, releaseVerification!: () => void;
+  let queries = 0,
+    pages = 0,
+    commands = 0;
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (path.endsWith("/commands")) {
+      commands++;
+      data = { ...data, revision: 2 };
+      await new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      return { generation: 1, revision: 2, result: {}, projectionPending: false };
+    }
+    if (new URL(path, "https://test").searchParams.has("cursor")) {
+      pages++;
+      throw new ApiClientError(503, "unavailable", "Page unavailable");
+    }
+    queries++;
+    await new Promise<void>((resolve) => {
+      if (queries === 1) releaseBackground = resolve;
+      else releaseVerification = resolve;
+    });
+    return { ...data };
+  });
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  await act(async () =>
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", forceRefresh: true },
+      }),
+    ),
+  );
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
+  await act(async () => fireEvent.click(check()));
+  expect(commands).toBe(1);
+  await act(async () => releaseBackground());
+  expect(pages).toBe(1);
+  expect(queries).toBe(1);
+  await act(async () => releaseCommit());
+  // A first page failure has not installed second-failure recovery. Commit completion
+  // itself must replace the cached observation from the retired verification lifetime.
+  expect(pages).toBe(1);
+  expect(queries).toBe(2);
+  expect(check()).toBeDisabled();
+  expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
+  await act(async () => releaseVerification());
+  expect(check()).toBeEnabled();
+  expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+  expect(commands).toBe(1);
+});

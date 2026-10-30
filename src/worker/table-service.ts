@@ -5,7 +5,14 @@ import type { Env, MemberContext } from "./env";
 import type { Role } from "../shared/types";
 import { HttpError } from "./http";
 import { decodeTableResponse, tableReadPages } from "./table-transport";
-import { pageForMember, requirePageEditor, type PageRow } from "./page-access";
+import {
+  effectiveSpaceRole,
+  pageForMember,
+  pageReadableSql,
+  requirePageEditor,
+  spaceVisibleSql,
+  type PageRow,
+} from "./page-access";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import {
   normalizedColumnName,
@@ -53,6 +60,10 @@ function validateTablePage(member: MemberContext, pageId: string, page: PageRow)
     throw new HttpError(403, "table_forbidden", "Table is unavailable.");
   if (page.kind !== "table") throw new HttpError(422, "table_required", "Choose a table.");
 }
+function resolvedTableRequest(member: MemberContext, pageId: string, page: PageRow) {
+  validateTablePage(member, pageId, page);
+  return { member, pageId, page };
+}
 export type TableFetchExtras = {
   authorization?: { sql: string; binds: unknown[] };
   effects?: ProjectionStatement[];
@@ -71,24 +82,21 @@ export async function tableFetch(
   body?: unknown,
   extras?: TableFetchExtras,
 ) {
-  return fetchTable(env, member, pageId, path, method, body, extras);
+  const request = resolvedTableRequest(member, pageId, await pageForMember(env, member, pageId));
+  return fetchResolvedTable(env, request, await tableRegistry(env, pageId), path, method, body, extras);
 }
-async function fetchTable(
+async function fetchResolvedTable(
   env: Env,
-  member: MemberContext,
-  pageId: string,
+  { member, pageId, page }: ReturnType<typeof resolvedTableRequest>,
+  registry: TableRegistry | null,
   path: string,
   method = "GET",
   body?: unknown,
   extras?: TableFetchExtras,
-  construction?: { page?: PageRow; registry: TableRegistry },
 ) {
   // Request-local construction inputs never replace the authority's live authorization.
-  const page = construction?.page ?? (await pageForMember(env, member, pageId));
-  validateTablePage(member, pageId, page);
   const write = method !== "GET" && !(method === "POST" && path === "/draft-rows");
   if (write) requirePageEditor(page);
-  const registry = construction?.registry ?? (await tableRegistry(env, pageId));
   if (!registry || !readableAuthorityState(registry.state))
     throw new HttpError(409, "table_authority_required", "Enable collaboration for this table first.");
   if (write && registry.state === "repairing")
@@ -154,26 +162,33 @@ export async function tableReceiptCoverage(
 ) {
   let page = options.page;
   if (!page) {
-    const role = await env.DB.prepare("SELECT role FROM workspace_members WHERE workspace_id=? AND user_id=?")
-      .bind(member.workspace.id, member.user.id)
-      .first<Role>("role");
-    if (!role) throw new HttpError(404, "page_not_found", "Page not found.");
-    page = await pageForMember(env, { ...member, role }, pageId);
+    const row = await env.DB.prepare(
+      `SELECT p.*, s.visibility, sm.role space_role, wm.role workspace_role
+         FROM pages p
+         JOIN workspace_members wm ON wm.workspace_id=p.workspace_id AND wm.user_id=?
+         JOIN spaces s ON s.id=p.space_id AND s.workspace_id=p.workspace_id
+         LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=wm.user_id
+        WHERE p.id=? AND p.workspace_id=? AND ${pageReadableSql()}
+          AND ${spaceVisibleSql("wm.role")}`,
+    )
+      .bind(member.user.id, pageId, member.workspace.id)
+      .first<PageRow & { workspace_role: Role }>();
+    if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
+    page = { ...row, effective_role: effectiveSpaceRole(row.workspace_role, row.visibility!, row.space_role ?? null)! };
   }
-  validateTablePage(member, pageId, page);
+  const request = resolvedTableRequest(member, pageId, page);
   const registry = await tableRegistry(env, pageId);
   if (!registry || !readableAuthorityState(registry.state)) return undefined;
   return readTableCoverage(
     await decodeTableResponse<unknown>(
-      await fetchTable(
+      await fetchResolvedTable(
         env,
-        member,
-        pageId,
+        request,
+        registry,
         `/receipt?${new URLSearchParams({ operationId })}`,
         "GET",
         undefined,
         options.authorization ? { authorization: options.authorization } : {},
-        { page, registry },
       ),
     ),
   );
