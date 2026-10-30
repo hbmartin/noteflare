@@ -2580,3 +2580,64 @@ it("forces a projection query after a covered own save without relocking the edi
   expect(screen.getByLabelText("Check")).toBeEnabled();
   expect(writes).toHaveLength(1);
 });
+
+it("requires new network application after one failed continuation retires cached save coverage", async () => {
+  data = {
+    ...data,
+    nextCursor: "more",
+    rows: Array.from({ length: 100 }, (_, i) => ({ ...data.rows[0]!, id: `cached-${i}` })),
+  };
+  show();
+  const check = () => screen.getAllByLabelText("Check")[0]!;
+  await waitFor(() => expect(check()).toBeEnabled());
+  let releaseBackground!: () => void, releaseCommit!: () => void, releaseVerification!: () => void;
+  let queries = 0,
+    pages = 0,
+    commands = 0;
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (path.endsWith("/commands")) {
+      commands++;
+      data = { ...data, revision: 2 };
+      await new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      return { generation: 1, revision: 2, result: {}, projectionPending: false };
+    }
+    if (new URL(path, "https://test").searchParams.has("cursor")) {
+      pages++;
+      throw new ApiClientError(503, "unavailable", "Page unavailable");
+    }
+    queries++;
+    await new Promise<void>((resolve) => {
+      if (queries === 1) releaseBackground = resolve;
+      else releaseVerification = resolve;
+    });
+    return { ...data };
+  });
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  await act(async () =>
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", forceRefresh: true },
+      }),
+    ),
+  );
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
+  await act(async () => fireEvent.click(check()));
+  expect(commands).toBe(1);
+  await act(async () => releaseBackground());
+  expect(pages).toBe(1);
+  expect(queries).toBe(1);
+  await act(async () => releaseCommit());
+  // A first page failure has not installed second-failure recovery. Commit completion
+  // itself must replace the cached observation from the retired verification lifetime.
+  expect(pages).toBe(1);
+  expect(queries).toBe(2);
+  expect(check()).toBeDisabled();
+  expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
+  await act(async () => releaseVerification());
+  expect(check()).toBeEnabled();
+  expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+  expect(commands).toBe(1);
+});
