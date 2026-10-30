@@ -2206,9 +2206,14 @@ it("settles a disposed view mutation without invoking its parent success callbac
   expect(changed).not.toHaveBeenCalled();
 });
 
-it.each([false, true])(
-  "releases its committed coverage barrier while newer content refreshes: canonical %s",
-  async (canonical) => {
+it.each([
+  [false, false],
+  [true, false],
+  [false, true],
+  [true, true],
+])(
+  "releases its committed coverage barrier while newer content refreshes: canonical %s, recheck %s",
+  async (canonical, recheck) => {
     render(
       <CollaborativeTablePage
         page={{ id: "table", title: "Table" }}
@@ -2229,6 +2234,10 @@ it.each([false, true])(
     vi.spyOn(Math, "random").mockReturnValue(0);
     await act(async () => fireEvent.click(screen.getByLabelText("Check")));
     expect(screen.getByLabelText("Check")).toBeDisabled();
+    if (recheck)
+      await act(async () =>
+        window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type: "workspace-invalidated" } })),
+      );
     for (let pass = 0; pass < 2; pass++)
       await act(async () => {
         window.dispatchEvent(

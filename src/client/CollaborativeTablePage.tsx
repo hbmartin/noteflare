@@ -367,7 +367,7 @@ export function CollaborativeTablePage({
     },
     [retireVerification],
   );
-  const settleVerification = useCallback((applied: AppliedTableRead | null, fresh = false) => {
+  const settleVerification = useCallback((applied: AppliedTableRead | null, verified = false) => {
     if (
       !applied ||
       !sameTableOwner(applied.owner, retryLifetime.current) ||
@@ -376,7 +376,7 @@ export function CollaborativeTablePage({
     )
       return;
     const pending = requirements.current;
-    if (fresh) pending.recheck = false;
+    if (verified) pending.recheck = false;
     const commit = pending.commit;
     if (
       commit &&
@@ -384,7 +384,7 @@ export function CollaborativeTablePage({
       (commit.coverage
         ? (commit.coverage.generation === applied.coverage.generation &&
             applied.coverage.revision >= commit.coverage.revision) ||
-          (fresh && applied.coverage.generation > commit.coverage.generation)
+          (verified && applied.coverage.generation > commit.coverage.generation)
         : applied.request > commit.afterRequest)
     ) {
       pending.commit = null;
@@ -472,14 +472,20 @@ export function CollaborativeTablePage({
           if (restarts) return { state: "stale" };
           return restart();
         }
-        const fresh = (!linked || linked.verification === "network") && (context?.current(result) ?? true);
+        // Query/access evidence belongs to this verification lifetime. Later content watermarks
+        // remain the coordinator's background freshness obligation, not an authorization latch.
+        const verified =
+          (!linked || linked.verification === "network") && verification === ownership.current.verification;
         if (linked) {
-          const verified = navigator.onLine && !document.hidden && (fresh || linkedWindow.current?.verified === true);
-          publishLinkedWindow(linked.window.verified === verified ? linked.window : { ...linked.window, verified });
+          const available =
+            navigator.onLine && !document.hidden && (verified || linkedWindow.current?.verified === true);
+          publishLinkedWindow(
+            linked.window.verified === available ? linked.window : { ...linked.window, verified: available },
+          );
         }
         ownership.current.generation = result.generation;
         ownership.current.canEdit = result.canEdit !== false;
-        if (fresh) {
+        if (verified) {
           ownership.current.verifiedQuery = true;
         }
         if (!queryBase) {
@@ -512,13 +518,13 @@ export function CollaborativeTablePage({
             request: owner,
           };
           ownership.current.applied = applied;
-          settleVerification(applied, fresh);
+          settleVerification(applied, verified);
         }
-        if (fresh) {
+        if (verified) {
           setError("");
           setBlocked("");
         }
-        if (fresh)
+        if (verified)
           publishReadiness(
             navigator.onLine &&
               !document.hidden &&
