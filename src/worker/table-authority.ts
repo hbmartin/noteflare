@@ -678,7 +678,7 @@ export class TableAuthority extends DurableObject<Env> {
           operationId,
         )[0];
         const result = receipt ? (JSON.parse(receipt.result) as TableCommandResult) : null;
-        await this.authorize(request, false);
+        // No await separates the live authorization above from this local receipt read and response.
         return Response.json(result ? { generation: result.generation, revision: result.revision } : null);
       }
       if (path === "/draft-rows" && request.method === "POST") {

@@ -1084,3 +1084,63 @@ test("cleared receipt storage exposes local Retry without replaying a comment", 
   expect(await page.evaluate((key) => localStorage.getItem(key), name)).toBe("1");
   expect(mutations).toBe(0);
 });
+
+test("rapid task saves wait for committed data without keeping mutation busy", async ({ page }) => {
+  await signInOwner(page);
+  const { table, rows, query } = await taskFixture(page, "Rapid task saves", "First target");
+  await page.goto(`/?page=${table.id}`);
+  const input = page.getByLabel("Task", { exact: true }).first();
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveValue("First target");
+  const attempts: Array<{ operationId: string; expectedRevision: number }> = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "PATCH" &&
+      new URL(request.url()).pathname === `/api/task-lists/${table.id}/tasks/${rows[0]}`
+    )
+      attempts.push(request.postDataJSON());
+  });
+  const releases: Array<() => void> = [];
+  let draining = false;
+  await page.route(`**/api/tables/${table.id}/query?**`, async (route) => {
+    const response = await route.fetch();
+    if (!draining) await new Promise<void>((resolve) => releases.push(resolve));
+    await route.fulfill({ response });
+  });
+  try {
+    const committed = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PATCH" &&
+        new URL(response.url()).pathname === `/api/task-lists/${table.id}/tasks/${rows[0]}`,
+    );
+    await input.fill("First commit");
+    await input.press("Enter");
+    const first = await committed;
+    expect(first.ok()).toBeTruthy();
+    const receipt = await first.json();
+    await expect.poll(() => releases.length).toBeGreaterThanOrEqual(1);
+    await expect(input).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
+    expect(attempts).toHaveLength(1);
+    draining = true;
+    for (const release of releases.splice(0)) release();
+    await expect(input).toBeEnabled();
+    await expect(input).toHaveValue("First commit");
+    expect(attempts).toHaveLength(1);
+    await input.fill("Second commit");
+    await input.press("Enter");
+    await expect.poll(() => attempts.length).toBe(2);
+    expect(attempts[1]!.expectedRevision).toBe(receipt.revision);
+    expect(attempts[1]!.operationId).not.toBe(attempts[0]!.operationId);
+    await expect
+      .poll(
+        async () => (await query()).rows.find((row: { id: string }) => row.id === rows[0]).cells[`${table.id}-title`],
+      )
+      .toBe("Second commit");
+    await expect(page.getByText("The task list changed. Review the latest value before saving again.")).toHaveCount(0);
+  } finally {
+    draining = true;
+    for (const release of releases) release();
+    await page.unrouteAll({ behavior: "wait" });
+  }
+});

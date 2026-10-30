@@ -954,3 +954,122 @@ No measured median p95 regression exceeds 10%; reconnect p95 changes **+7.23%**,
 No paired p95 regression exceeds 10% in that run. These are local fixture timings, not production latency. The actor-scoped table receipt lookup introduced here adds an authenticated DO round trip on task replay only; unavailable legacy metadata keeps the committed response and requires a conservative client read.
 
 The existing production reload/highlighting release gate remains separate. Remote CI and Sonar results are reported independently from local checks. No deployment, remote migration, live Slack installation, receipt compatibility restoration, server-receipt pruning, portability/trust work or new recovery workflow is included. Relations remain disabled; unrelated working-tree changes remain untouched.
+
+## PR #277 follow-up: prerequisite recovery, committed saves, and receipt cost
+
+Starting main is `e5592604f36a7c41492a8c5f05290803b45658f5`. This pass keeps protocol 3, the receipt-format cutover, immediate draft persistence, per-view Property settings, fixed authorization deadlines, and connection-required editing. There is no D1 migration, browser-storage change, deployment, or feature activation. Relations remain disabled.
+
+### Recovery and completion contracts
+
+- Continuation eligibility derives from accepted network coverage. A missing prerequisite is queued centrally, and refreshes cannot inherit a continuation-only block. Denial creates an independent recovery refresh; superseded verification retains a current freshness obligation even with no continuation waiting. Repeated supersession yields through the existing jittered freshness scheduler rather than spinning.
+- A deliberate Load more advances its prerequisite refresh immediately. Equivalent clicks share active work, and a later failure starts normal backoff. Automatic invalidations retain deadlines. Failure, denial, and freshness churn keep separate progression; pending continuations retain their requested extent.
+- Confirmed commits release mutation busy immediately, while an owner-scoped write barrier waits for current network data. A proven already-applied result can satisfy coverage; missing metadata requires a post-commit read. Generation retirement forces a new read rather than joining an invalidated one. No stale rows are relabeled with the receipt revision, and reconnecting never submits drafts.
+- Captured draft versions acknowledge before visible-owner filtering. Committed-current and committed-retired outcomes are distinct: table/account replacement and full component disposal prevent selection, form, parent-callback, notice, busy, and readiness updates for a replacement owner. Purged or newer drafts cannot be recreated or cleared by late completion.
+- Refresh progress and committed-save explanations have separate state. Filter-hidden and projection explanations survive background verification and query changes until dismissal or a subsequent successful save. Conflict notices and saved-operation Retry remain separate.
+- Canonical sockets capture a concrete coordinator in the same owner lifetime. Cleanup stops transport before disposing the coordinator; query changes retain that transport lifetime. Recovery subscriptions and observer notification use shared helpers with exception isolation. Explicit denial wins over an overdue-expiry result; ordinary expiry remains immediate.
+- Fetch/restart context uses named options, one shared bounded refresh/rebind path, and retained network provenance. Initial pages remain 100 rows; linked refreshes still use larger requests and buffered continuations.
+
+### Task replay efficiency and authorization
+
+[Measured statement/request counts](pr-277-task-replay-measurements.json) use identical integration instrumentation against baseline and updated code. Measured simple, already-committed migrated-task replay falls from **10 total D1 statements to 6**, or **8 additional metadata statements to 4** after excluding the two existing page/task-receipt lookups. Both versions make **one authority request**.
+
+The updated path shares request-local registry and actor construction. A captured page is construction input, never a cached authorization grant. The authority performs one live authorization immediately before its synchronous local receipt read and response. Original generation/revision metadata remains authoritative; unavailable or legacy metadata leaves the known committed result intact and requires conservative client verification. A generation is never reconstructed from today's registry.
+
+The permanent count assertion passes on updated code. Running its instrumentation against baseline observes six service reads, four authority reads, and one authority request, then fails the new four-service-read assertion as intended. Membership removal, private-space grant removal, protected-session denial, original receipt replay, and optional metadata failure are covered independently. These are local call counts, not a production backend latency claim.
+
+### Validation qualifications
+
+The first full Worker coverage attempt passes 2,488 tests and fails one Notion SDK case during bootstrap enrollment (`setup-totp` returns `UNAUTHORIZED`), before the changed table paths execute. Its cause is not established. A focused diagnostic with coverage passes all 38 Notion tests; that single-file command does not meet repository-wide coverage thresholds and is not counted as acceptance. No authentication behavior, assertion, timeout, retry policy, or coverage threshold is changed to obtain a pass. Final full-suite results are recorded below, and the original failure remains part of this evidence.
+
+The initial desktop recovery matrix passes 90/90 at checkpoint `2a13aa5`. Final runtime `7233ef1` adds the standalone-supersession regression and static refinements; its five-repeat concurrency matrix passes 90/90 across Chromium, Firefox, and WebKit. Final commit `1496a80` only exports an internal type alias and has identical emitted runtime behavior. Unit coverage at the final runtime passes **2,971 tests plus one existing skip**, with statement/branch/function/line coverage **73.79 / 68.90 / 68.25 / 76.47%** in **66.40 seconds**. The first full fresh-state Chromium run passes **104/104**; the second and remaining acceptance results follow below.
+
+### Final acceptance
+
+All commands use Node **22.23.4**, pnpm **11.18.0**, normal unit concurrency, and the repository's existing two-worker integration configuration. Browser runs explicitly use `--retries=0`; no timeouts, assertions, policy exclusions, or coverage thresholds are weakened. The sole unit skip predates this pass.
+
+| Check                                                                                             | Actual result                                                                       |
+| ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Final unit/component coverage                                                                     | 2,971 passed + 1 existing skip; 167 passing files; Vitest 66.40 s / command 67.28 s |
+| Clean full Worker coverage                                                                        | 2,489/2,489; 37 files; Vitest 974.88 s / command 977.04 s                           |
+| Worker statement / branch / function / line coverage                                              | 83.33 / 76.94 / 89.85 / 86.65%                                                      |
+| Affected desktop matrix at `2a13aa5`                                                              | 90/90; 645.17 s command wall time                                                   |
+| Final-runtime concurrency matrix, five repetitions in three desktop engines                       | 90/90; 747.63 s                                                                     |
+| Two consecutive full fresh-state Chromium runs                                                    | 104/104 each; 567.91 s and 583.63 s                                                 |
+| Affected mobile scenarios                                                                         | 49/49; 303.94 s                                                                     |
+| Startup diagnostics                                                                               | 1/1; 2.99 s                                                                         |
+| Built production-policy browser coverage                                                          | 25/25; 88.54 s                                                                      |
+| Formatting, docs, lint, middleware/deployment rules, five TypeScript projects, generated bindings | Passed                                                                              |
+| Type-aware dead-code analysis                                                                     | No issues; 45.65 s in the clean validation checkout                                 |
+| Production build / Worker dry run                                                                 | Passed; 9.88 s / 1.60 s                                                             |
+
+The clean Worker run includes the previously failing Notion case under full-suite concurrency and coverage. Its success does not establish the cause of the earlier enrollment failure or claim an authentication fix. Today's production-policy pass likewise does not close the historical intermittent reload/highlighting release gate. Remote CI and Sonar status belong to the final pushed SHA and are reported separately.
+
+Representative commands (the two full Chromium commands each start a fresh local server state):
+
+```sh
+pnpm test:coverage
+pnpm test:worker:coverage
+pnpm format:check
+pnpm check:docs
+pnpm lint
+pnpm check:middleware
+pnpm check:deploy
+pnpm typecheck
+pnpm analyze
+pnpm cf-typegen:check
+pnpm build
+pnpm build:worker
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts \
+  --grep 'canonical|task|cell|linked|view|properties|property|continuous|pagination|generation' --retries=0
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts \
+  --grep 'rapid task saves|continuous invalidations|requested continuation extent|invalidation during|failed continuation|canonical cell drafts' \
+  --repeat-each=5 --retries=0
+pnpm exec playwright test --project=chromium --retries=0
+pnpm exec playwright test --project=chromium --retries=0
+pnpm exec playwright test --project=mobile-chromium \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts --retries=0
+pnpm test:e2e:diagnostics --retries=0
+pnpm test:e2e:production --retries=0
+```
+
+### Optimized before/after measurements
+
+[Raw browser measurements](pr-277-refresh-measurements.json) compare `e5592604f36a7c41492a8c5f05290803b45658f5` with updated/harness `1496a80a5044304ae963db713a873fc0afb98516` through the same existing corrected harness. All heavy tests finish before this quiet **45.24-second** run:
+
+```sh
+NOTES_BENCH_TYPING_EDITS=300 NOTES_BENCH_READ_RECOVERY=1 \
+  node scripts/measure-collaboration-recovery.mjs \
+  e5592604f36a7c41492a8c5f05290803b45658f5 /tmp/noteflare-277-measurements.json
+```
+
+Three fresh contexts per version use the optimized production-React bundle, 100 visible rows, 500 account drafts, 5,000 unrelated storage keys, 300 edits, twenty query/view/commit samples, five 500-row refreshes, 1,000 fulfilled continuations, ten churn samples, and twenty reconnecting clients. Values are medians of per-context p50/p95 except controlled read recovery, whose three context observations provide its p50/p95. Read-recovery jitter remains fixed at 0.5; reconnect jitter is randomized.
+
+| Metric                                                                | Starting main                 | Updated                       |
+| --------------------------------------------------------------------- | ----------------------------- | ----------------------------- |
+| Typing p50 / p95                                                      | 0.1 / 0.2 ms                  | 0.1 / 0.2 ms                  |
+| First edit, median of three individual observations                   | 0.6 ms                        | 0.7 ms                        |
+| Immediate writes / full enumeration / whole-table typing renders      | 300 / 0 / 0                   | 300 / 0 / 0                   |
+| Save/focus notifications                                              | 3                             | 3                             |
+| Receipt p95 / full enumeration                                        | 0.1 ms / 0                    | 0.1 ms / 0                    |
+| Receipt writes / removals; subscription changes over twenty renders   | 20 / 20; 0                    | 20 / 20; 0                    |
+| Query verification p50 / p95                                          | 16.6 / 18.2 ms                | 16.6 / 16.8 ms                |
+| Query renders / requests; toolbar replacements or missing controls    | 3 / 1; 0                      | 3 / 1; 0                      |
+| View round-trip p50 / p95                                             | 33.3 / 34.3 ms                | 33.3 / 33.8 ms                |
+| Restored view drafts / median renders / requests                      | 20 / 6 / 2                    | 20 / 6 / 2                    |
+| 500-row linked refresh p50 / p95                                      | 33.3 / 33.6 ms                | 33.3 / 33.4 ms                |
+| Requests per 500-row refresh / buffered expansion                     | 1 / 0                         | 1 / 0                         |
+| Unchanged fulfilled window/data/rows per 1,000 observations; requests | 1,000 / 1,000 / 1,000; 0      | 1,000 / 1,000 / 1,000; 0      |
+| Churn caller completion p50 / p95                                     | 16.5 / 16.9 ms                | 16.5 / 16.7 ms                |
+| Churn outcome / reads                                                 | pending / 2                   | pending / 2                   |
+| Continuation calls before the timer, safety cutoff 50                 | 1                             | 1                             |
+| Observed commit busy release p50 / p95                                | 17.9 / 18.8 ms                | 14.9 / 15.2 ms                |
+| Committed refresh completion p50 / p95; reads per commit              | 49.9 / 50.6 ms; 1             | 49.9 / 50.3 ms; 1             |
+| Controlled read recovery p50 / p95                                    | 1,516.4 / 1,518.3 ms          | 1,518.0 / 1,519.0 ms          |
+| Controlled recovery queries                                           | 3                             | 3                             |
+| Reconnect p50 / p95; sockets / queries                                | 1,422.7 / 1,948.8 ms; 40 / 40 | 1,446.2 / 1,808.8 ms; 40 / 40 |
+
+No measured median p95 regression exceeds 10%; controlled recovery p95 changes approximately **+0.05%**. Sub-millisecond first-edit observations do not form a p95 distribution. Fulfilled-buffer identity and request counts establish the no-op behavior; timers cannot resolve its execution cost reliably. The starvation fixture already passes on starting main and remains passing; permanent dependency/supersession regressions establish this pass's newly fixed stalls. Pending churn outcomes do not establish authorization. The held two-frame commit fixture distinguishes busy release from data readiness: updated writes remain gated until accepted rows arrive. Local frame timings and randomized reconnect observations do not demonstrate production server-speed improvements.
+
+Deployment, remote migrations, live Slack testing, receipt compatibility restoration, server-receipt pruning, portability/trust work, and new recovery workflows remain excluded. Unrelated working-tree changes remain unstaged and outside the PR.

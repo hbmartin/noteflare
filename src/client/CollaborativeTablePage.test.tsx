@@ -1827,7 +1827,8 @@ it.each(["saved", "conflict"] as const)("releases busy during continuous refresh
       finishes.shift()!({ ...data });
     });
   expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
-  expect(screen.getByLabelText("Check").hasAttribute("disabled")).toBe(mode === "conflict");
+  // Committed and rejected saves both require current data; neither keeps the mutation busy.
+  expect(screen.getByLabelText("Check")).toBeDisabled();
   expect(
     screen.getByText(mode === "saved" ? "Saved. Refreshing the latest table data…" : "Rejected edit"),
   ).toBeVisible();
@@ -1991,8 +1992,7 @@ it("turns a second canonical cursor churn into pending freshness with its extent
     cells: { Title: `Row ${i}` },
   }));
   data = { ...data, columns: [column("Title", "text")], rows, rowCount: rows.length };
-  let pages = 0,
-    refreshes = 0;
+  let pages = 0;
   let release!: () => void;
   vi.mocked(api).mockImplementation(async (path) => {
     const cursor = new URL(path, "https://test").searchParams.get("cursor");
@@ -2000,12 +2000,11 @@ it("turns a second canonical cursor churn into pending freshness with its extent
       pages++;
       return { ...data, revision: pages === 1 ? 2 : 3, rows: rows.slice(100), nextCursor: null };
     }
-    refreshes++;
-    if (refreshes === 3)
+    if (pages >= 2)
       await new Promise<void>((resolve) => {
         release = resolve;
       });
-    return { ...data, revision: Math.min(refreshes, 3), rows: rows.slice(0, 100), nextCursor: "100" };
+    return { ...data, revision: Math.min(pages + 1, 3), rows: rows.slice(0, 100), nextCursor: "100" };
   });
   render(<CollaborativeTablePage page={{ id: "table", title: "Table" }} member={member} onSelectPage={vi.fn()} />);
   await waitFor(() => expect(screen.getAllByLabelText("Title")[0]).toBeEnabled());
@@ -2042,4 +2041,159 @@ it("pauses the old generation's permit immediately after a rebuilt table commits
   expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
   await act(async () => release());
   expect(screen.getByLabelText("Check")).toBeEnabled();
+});
+
+it("blocks a second task save until committed rows arrive without retaining mutation busy", async () => {
+  const titleId = taskColumnFixture();
+  const original = vi.mocked(api).getMockImplementation()!;
+  const submissions: Array<{ operationId: string; expectedRevision: number; title: string }> = [];
+  let release!: () => void,
+    hold = false;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method && path.endsWith("/tasks/row")) {
+      const body = JSON.parse(String(init.body));
+      submissions.push(body);
+      if (body.expectedRevision !== data.revision)
+        throw new ApiClientError(409, "table_revision_conflict", "The task list changed.");
+      data = {
+        ...data,
+        revision: data.revision + 1,
+        rows: data.rows.map((row) => ({
+          ...row,
+          cells: { ...row.cells, [titleId]: body.title },
+          cellRevisions: { ...row.cellRevisions, [titleId]: data.revision + 1 },
+        })),
+      };
+      hold = submissions.length === 1;
+      return { generation: data.generation, revision: data.revision };
+    }
+    if (hold)
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    return original(path, init);
+  });
+  show("", member, vi.fn(), true);
+  const input = await screen.findByLabelText("Task");
+  await waitFor(() => expect(input).toBeEnabled());
+  await act(async () => {
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "First commit" } });
+    fireEvent.blur(input);
+  });
+  expect(submissions).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+  expect(input).toBeDisabled();
+  fireEvent.blur(input);
+  expect(submissions).toHaveLength(1);
+  hold = false;
+  await act(async () => release());
+  expect(input).toBeEnabled();
+  await act(async () => {
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "Second commit" } });
+    fireEvent.blur(input);
+  });
+  expect(submissions.map((body) => body.expectedRevision)).toEqual([1, 2]);
+  expect(submissions[0]!.operationId).not.toBe(submissions[1]!.operationId);
+  expect(screen.queryByText(/task list changed/i)).toBeNull();
+});
+it("queues a new linked verification after a generation-changing commit retires an active read", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  let release!: () => void,
+    reads = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method) {
+      data = { ...data, generation: 2, revision: 2 };
+      return { generation: 2, revision: 2, result: {} };
+    }
+    if (++reads === 1)
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    return original(path, init);
+  });
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh" })));
+  await act(async () => fireEvent.click(screen.getByLabelText("Check")));
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  await act(async () => release());
+  expect(reads).toBe(2);
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+  expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+});
+it("does not apply a retired Delete view completion to the replacement table", async () => {
+  const changed = vi.fn();
+  const component = render(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "First" }}
+      member={member}
+      queryBase="/linked"
+      initialViewId="board"
+      onSelectPage={vi.fn()}
+      onViewChanged={changed}
+    />,
+  );
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  const release = delayNextCommand();
+  fireEvent.click(screen.getByRole("button", { name: "Delete view" }));
+  await waitFor(() => expect(writes).toHaveLength(1));
+  component.rerender(
+    <CollaborativeTablePage
+      page={{ id: "replacement", title: "Other" }}
+      member={member}
+      queryBase="/replacement"
+      initialViewId="calendar"
+      onSelectPage={vi.fn()}
+      onViewChanged={changed}
+    />,
+  );
+  await waitFor(() => expect(screen.getByLabelText("Saved table view")).toHaveValue("calendar"));
+  await act(async () => release());
+  expect(screen.getByLabelText("Saved table view")).toHaveValue("calendar");
+  expect(changed).not.toHaveBeenCalled();
+});
+it("keeps a hidden-row outcome across verification and query changes until dismissal", async () => {
+  show();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    const value = await original(path, init);
+    return init?.method ? { ...(value as object), result: { visibleInView: false } } : value;
+  });
+  fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Hidden" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+  const message = "Saved. The new row is hidden by this view's filters. Open All rows to see it.";
+  await screen.findByText(message);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh" })));
+  await act(async () =>
+    fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "another query" } }),
+  );
+  expect(screen.getByText(message)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Dismiss saved notice" }));
+  expect(screen.queryByText(message)).toBeNull();
+});
+
+it("settles a disposed view mutation without invoking its parent success callback", async () => {
+  const changed = vi.fn();
+  const component = render(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "First" }}
+      member={member}
+      queryBase="/linked"
+      initialViewId="board"
+      onSelectPage={vi.fn()}
+      onViewChanged={changed}
+    />,
+  );
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  const release = delayNextCommand();
+  fireEvent.click(screen.getByRole("button", { name: "Delete view" }));
+  await waitFor(() => expect(writes).toHaveLength(1));
+  component.unmount();
+  await act(async () => release());
+  expect(changed).not.toHaveBeenCalled();
 });

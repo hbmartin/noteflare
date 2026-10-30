@@ -95,6 +95,11 @@ export function tableConnection(options: {
     renewNotBefore = retryAt;
     if (available()) retry = setTimeout(connect, retryAt - Date.now());
   };
+  const awaitVerification = (slot: Slot) => {
+    slot.waiting = true;
+    if (!slot.unsubscribe && options.subscribe)
+      slot.unsubscribe = options.subscribe((receipt) => void verify(slot, () => Promise.resolve(receipt)));
+  };
   const verify = async (slot: Slot, work: VerificationWork = options.query) => {
     if (slot.checking) {
       slot.trailing = work;
@@ -104,21 +109,18 @@ export function tableConnection(options: {
     try {
       const result = await work();
       if (stopped || slot.retired) return;
-      if (slot.deadline <= Date.now()) {
-        failed(slot, true);
-        return;
-      }
       if (result.state === "denied") {
         fenced();
         return;
       }
+      if (slot.deadline <= Date.now()) {
+        failed(slot, true);
+        return;
+      }
       if ((result.state !== "complete" && result.state !== "generation-changed") || !readTableCoverage(result.value)) {
         // The shared read coordinator owns recovery. A query outcome cannot revoke a live socket grant.
-        slot.waiting = true;
+        awaitVerification(slot);
         if (result.state !== "pending" && result.state !== "retired") options.ready(false);
-        if (!slot.unsubscribe && options.subscribe) {
-          slot.unsubscribe = options.subscribe((receipt) => void verify(slot, () => Promise.resolve(receipt)));
-        }
         return;
       }
       slot.waiting = false;
@@ -146,10 +148,8 @@ export function tableConnection(options: {
       }
     } catch {
       if (!stopped && !slot.retired) {
-        slot.waiting = true;
+        awaitVerification(slot);
         options.ready(false);
-        if (!slot.unsubscribe && options.subscribe)
-          slot.unsubscribe = options.subscribe((receipt) => void verify(slot, () => Promise.resolve(receipt)));
       }
     } finally {
       slot.checking = false;

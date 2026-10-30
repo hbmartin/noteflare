@@ -374,3 +374,26 @@ it("never promotes an initial grant from malformed query coverage", async () => 
   await settle();
   expect(stop.authorized()).toBe(true);
 });
+
+it("fences a denial observed after the grant deadline instead of reconnecting immediately", async () => {
+  Socket.all[0]!.ready(60_000, null);
+  await settle();
+  let release!: (receipt: TableSocketVerification) => void;
+  query.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+  );
+  Socket.all[0]!.ready(60_000, null);
+  await settle();
+  // Model an overdue timer: the result is processed before the expiry callback gets CPU time.
+  vi.setSystemTime(Date.now() + 60_001);
+  release({ state: "denied" });
+  await settle();
+  await vi.advanceTimersByTimeAsync(1999);
+  expect(Socket.all).toHaveLength(1);
+  expect(stop.authorized()).toBe(false);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(Socket.all).toHaveLength(2);
+});

@@ -23,6 +23,7 @@ import { mutateTask, taskListStatements, listTasks } from "./tasks";
 import { acceptPageDeletion, processDeletionJob } from "./cleanup";
 import { logger } from "./observability";
 import { HttpError } from "./http";
+import { pageForMember } from "./page-access";
 import { tableActorSignature } from "./table-authority";
 import type { ProjectionStatement, TableActor } from "./table-authority";
 
@@ -3894,4 +3895,144 @@ it("keeps the earliest projection deadline while allowing explicit repair retry 
       now.mockRestore();
     }
   });
+});
+
+it("replays committed tasks with four metadata D1 reads and one authority request", async () => {
+  const { pageId, member } = await fixture(true);
+  await enableTableAuthority(env, member, pageId);
+  const body = { operationId: "counted-task-replay", title: "Original", expectedRevision: 1 };
+  const first = await mutateTask(env, member, pageId, null, body);
+  const serviceSql: string[] = [],
+    authoritySql: string[] = [];
+  let rounds = 0,
+    original!: Env;
+  const stub = env.TABLE.getByName(pageId);
+  await runInDurableObject(stub, (instance) => {
+    const internal = instance as unknown as { env: Env };
+    original = internal.env;
+    internal.env = {
+      ...original,
+      DB: new Proxy(original.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              authoritySql.push(sql);
+              return target.prepare(sql);
+            };
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }),
+    };
+  });
+  const bindings = {
+    ...env,
+    DB: new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            serviceSql.push(sql);
+            return target.prepare(sql);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+    TABLE: new Proxy(env.TABLE, {
+      get(target, property) {
+        if (property === "getByName")
+          return (name: string) => {
+            rounds++;
+            return target.getByName(name);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  } as Env;
+  try {
+    const replay = await mutateTask(bindings, member, pageId, null, body);
+    expect(replay).toMatchObject({ generation: 1, revision: first.revision, replayed: true, rowId: first.rowId });
+    // The page and task-receipt reads predate metadata lookup; the remaining four are additional.
+    expect(serviceSql).toHaveLength(4);
+    expect(authoritySql).toHaveLength(2);
+    expect(serviceSql.filter((sql) => sql.includes("FROM table_authority"))).toHaveLength(1);
+    expect(rounds).toBe(1);
+  } finally {
+    await runInDurableObject(stub, (instance) => {
+      (instance as unknown as { env: Env }).env = original;
+    });
+  }
+});
+it.each(["membership", "space", "protected-session"] as const)(
+  "checks current %s authorization despite captured receipt construction data",
+  async (kind) => {
+    const { pageId, member } = await fixture(true);
+    await enableTableAuthority(env, member, pageId);
+    const operationId = `fresh-receipt-${kind}`;
+    await mutateTask(env, member, pageId, null, { operationId, title: "Private task", expectedRevision: 1 });
+    const backup = `backup-${member.user.id}`;
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES(?,'Backup',?,1,1)").bind(
+        backup,
+        `${backup}@example.test`,
+      ),
+      env.DB.prepare("INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES(?,?,'owner',1)").bind(
+        member.workspace.id,
+        backup,
+      ),
+    ]);
+    await env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE user_id=?").bind(member.user.id).run();
+    member.role = "editor";
+    const source = await pageForMember(env, member, pageId);
+    await env.DB.prepare("INSERT INTO space_members(space_id,user_id,role,created_at) VALUES(?,?,'editor',1)")
+      .bind(source.space_id, member.user.id)
+      .run();
+    await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(source.space_id).run();
+    const captured = await pageForMember(env, member, pageId);
+    if (kind === "membership")
+      await env.DB.prepare("DELETE FROM workspace_members WHERE user_id=?").bind(member.user.id).run();
+    if (kind === "space") await env.DB.prepare("DELETE FROM space_members WHERE user_id=?").bind(member.user.id).run();
+    await expect(
+      tableReceiptCoverage(env, member, pageId, operationId, {
+        page: captured,
+        ...(kind === "protected-session" ? { authorization: { sql: "0", binds: [] } } : {}),
+      }),
+    ).rejects.toMatchObject({ status: 403, code: "table_forbidden" });
+  },
+);
+it("preserves a committed task replay when optional receipt metadata cannot be read", async () => {
+  const { pageId, member } = await fixture(true);
+  await enableTableAuthority(env, member, pageId);
+  const body = { operationId: "unavailable-coverage", title: "Committed", expectedRevision: 1 };
+  const first = await mutateTask(env, member, pageId, null, body);
+  const warning = vi.spyOn(logger, "warn");
+  const bindings = {
+    ...env,
+    DB: new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            if (sql.includes("SELECT * FROM table_authority")) throw new Error("injected metadata failure");
+            return target.prepare(sql);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  } as Env;
+  try {
+    const replay = await mutateTask(bindings, member, pageId, null, body);
+    expect(replay).toMatchObject({ rowId: first.rowId, revision: first.revision, replayed: true });
+    expect(replay).not.toHaveProperty("generation");
+    expect(warning).toHaveBeenCalledWith(
+      "tasks.replay.coverage_unavailable",
+      "tasks",
+      expect.any(String),
+      { operationId: body.operationId, pageId },
+      expect.any(Error),
+    );
+  } finally {
+    warning.mockRestore();
+  }
 });

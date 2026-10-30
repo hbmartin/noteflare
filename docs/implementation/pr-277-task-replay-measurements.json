@@ -1,0 +1,30 @@
+{
+  "baseline": {
+    "revision": "e5592604f36a7c41492a8c5f05290803b45658f5",
+    "serviceD1": 6,
+    "authorityD1": 4,
+    "totalD1": 10,
+    "preExistingTaskD1": 2,
+    "additionalMetadataD1": 8,
+    "authorityRequests": 1,
+    "outcome": "Identical instrumentation fails the new four-service-read assertion as expected."
+  },
+  "updated": {
+    "revision": "7233ef1917742c300274426a2230f7a3f2956c86",
+    "serviceD1": 4,
+    "authorityD1": 2,
+    "totalD1": 6,
+    "preExistingTaskD1": 2,
+    "additionalMetadataD1": 4,
+    "authorityRequests": 1,
+    "outcome": "Permanent integration regression passes."
+  },
+  "harness": "fb4558d0fb5f4e250784f89189c7e53baae2bbac",
+  "scenario": "Committed migrated-task replay, original operation identity and body, one authority receipt request.",
+  "evidence": {
+    "test": "src/worker/table-authority.integration.test.ts: replays committed tasks with four metadata D1 reads and one authority request",
+    "command": "pnpm exec vitest run --config vitest.worker.config.ts src/worker/table-authority.integration.test.ts -t \"four metadata\" --reporter=verbose --silent=false --disableConsoleIntercept",
+    "baselineObservation": "TASK_REPLAY_NEGATIVE_CONTROL {\"serviceReads\":6,\"authorityReads\":4,\"rounds\":1}"
+  },
+  "limitations": "Counts are measured local D1/DO statement/request counts. No production backend latency claim; baseline failure is a deliberate regression negative control."
+}
