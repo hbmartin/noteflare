@@ -13,7 +13,11 @@ export type CanonicalTableContinuation = {
   target?: number;
 };
 export type TableReadIntent = LinkedTableReadIntent | ({ kind: "page" } & CanonicalTableContinuation);
-export type TableReadContext = { current: (coverage?: TableCoverage) => boolean; networkRequired: boolean };
+export type TableReadContext = {
+  current: (coverage?: TableCoverage) => boolean;
+  acceptsGeneration: (coverage: TableCoverage) => boolean;
+  networkRequired: boolean;
+};
 export type LinkedTableReadOutcome<T> =
   | { state: "success"; value: T; verification: "network" | "buffer" }
   | { state: "failure" | "denied" | "suspended" | "superseded" | "stale" };
@@ -209,6 +213,8 @@ export function linkedTableReads<T>(options: {
     try {
       outcome = await options.read(batch.intent, owner.controller.signal, {
         current: (coverage) => active === owner && covered(sequence, coverage) && !stopped,
+        acceptsGeneration: (coverage) =>
+          coverage.generation >= Math.max(completed?.coverage?.generation ?? 0, ...watermarks.keys()),
         networkRequired: Boolean(batch.networkRequired),
       });
     } catch {

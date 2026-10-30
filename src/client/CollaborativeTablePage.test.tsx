@@ -2316,3 +2316,49 @@ it("retains the expanded canonical prefix and retries only the failed continuati
   expect(inputs()[0]).toBeEnabled();
   expect(calls).toEqual(["200", "200"]);
 });
+
+it("does not release old-generation save coverage after a newer generation is announced", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  const finishes: Array<(result: TableQueryResult) => void> = [];
+  vi.mocked(api).mockImplementation(async (path, init) =>
+    path.endsWith("/commands")
+      ? original(path, init)
+      : new Promise<TableQueryResult>((resolve) => finishes.push(resolve)),
+  );
+  await act(async () => fireEvent.click(screen.getByLabelText("Check")));
+  await act(async () => {
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", generation: 2, revision: 1 },
+      }),
+    );
+    finishes.shift()!({ ...data });
+  });
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  expect(writes).toHaveLength(1);
+  await act(async () => finishes.shift()!({ ...data, generation: 2, revision: 1 }));
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+  expect(writes).toHaveLength(1);
+});
+
+it("retires the old generation's permit immediately when newer content coverage is announced", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const finishes: Array<(result: TableQueryResult) => void> = [];
+  vi.mocked(api).mockImplementation(() => new Promise<TableQueryResult>((resolve) => finishes.push(resolve)));
+  await act(async () =>
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", generation: 2, revision: 1 },
+      }),
+    ),
+  );
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  await act(async () => finishes.shift()!({ ...data }));
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  await act(async () => finishes.shift()!({ ...data, generation: 2, revision: 1 }));
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+  expect(writes).toHaveLength(0);
+});

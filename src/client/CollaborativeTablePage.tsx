@@ -186,6 +186,7 @@ export function CollaborativeTablePage({
     ready: false,
     verifiedQuery: false,
     generation: 0,
+    minimumGeneration: 0,
     applied: null as AppliedTableRead | null,
     authorizedGeneration: null as number | null,
     canEdit: false,
@@ -234,6 +235,11 @@ export function CollaborativeTablePage({
     ownership.current.authorizedGeneration = generation;
     setAuthorizedGeneration(generation);
   }, []);
+  const advanceGeneration = useCallback((coverage?: TableCoverage) => {
+    if (!coverage || coverage.generation <= ownership.current.minimumGeneration) return false;
+    ownership.current.minimumGeneration = coverage.generation;
+    return coverage.generation !== ownership.current.generation;
+  }, []);
   const retireVerification = useCallback(
     (mode: "invalidate" | "suspend" | "denied" | "retire") => {
       if (mode !== "suspend") {
@@ -261,6 +267,7 @@ export function CollaborativeTablePage({
     const previous = retryLifetime.current;
     if (sameTableOwner(previous, currentOwner)) return;
     retryLifetime.current = currentOwner;
+    ownership.current.minimumGeneration = 0;
     requirements.current = { commit: null, recheck: false };
     setWritesRequireVerification(false);
     setMutationNotice((value) => (value === null ? value : null));
@@ -465,6 +472,8 @@ export function CollaborativeTablePage({
         if (owner !== ownership.current.request)
           return queryBase ? { state: "superseded" } : { state: "success", value: result, verification: "network" };
         if (queryBase && verification !== ownership.current.verification) return { state: "superseded" };
+        if ((context && !context.acceptsGeneration(result)) || result.generation < ownership.current.minimumGeneration)
+          return { state: "stale" };
         if (
           intent?.kind === "page" &&
           (result.generation !== intent.generation || result.revision !== intent.revision)
@@ -510,6 +519,7 @@ export function CollaborativeTablePage({
         } else setData(result);
         const coverage = network ? readTableCoverage(result) : undefined;
         if (coverage) {
+          ownership.current.minimumGeneration = Math.max(ownership.current.minimumGeneration, coverage.generation);
           const applied = {
             coverage,
             owner: currentOwner,
@@ -641,7 +651,11 @@ export function CollaborativeTablePage({
         ready: (value) => {
           if (owns()) publishReadiness(value);
         },
-        invalidate: (coverage) => (owns() ? reads.refresh(coverage) : Promise.resolve({ state: "retired" })),
+        invalidate: (coverage) => {
+          if (!owns()) return Promise.resolve({ state: "retired" });
+          if (advanceGeneration(coverage)) retireVerification("invalidate");
+          return reads.refresh(coverage);
+        },
         subscribe: reads.subscribe,
         verified: (generation) => {
           if (owns()) recordAuthorization(generation);
@@ -667,6 +681,7 @@ export function CollaborativeTablePage({
     retireVerification,
     publishReadiness,
     recordAuthorization,
+    advanceGeneration,
   ]);
   const load = useCallback((continuation?: CanonicalTableContinuation | LinkedTableContinuation) => {
     const reads = linkedReads.current;
@@ -711,7 +726,11 @@ export function CollaborativeTablePage({
         )
           return;
       }
+      const changedGeneration = advanceGeneration(
+        detail?.type === "task-list-invalidated" ? readTableCoverage(detail) : undefined,
+      );
       if (
+        changedGeneration ||
         !detail ||
         !["task-list-invalidated", "projection-updated", "tasks-invalidated"].includes(detail.type) ||
         (detail.type === "task-list-invalidated" && detail.forceRefresh)
@@ -725,7 +744,7 @@ export function CollaborativeTablePage({
     };
     window.addEventListener("notes:workspace-event", invalidate);
     return () => window.removeEventListener("notes:workspace-event", invalidate);
-  }, [page.id, queryBase, requireRecheck, retireVerification]);
+  }, [page.id, queryBase, requireRecheck, retireVerification, advanceGeneration]);
   const notice = mutationNotice && sameTableOwner(mutationNotice.owner, currentOwner) ? mutationNotice : null;
   useEffect(() => {
     if (!notice?.submission) return undefined;
@@ -767,6 +786,7 @@ export function CollaborativeTablePage({
     const reads = linkedReads.current;
     if (!reads) return "committed-current";
     const changedGeneration = Boolean(coverage && coverage.generation !== ownership.current.generation);
+    advanceGeneration(coverage);
     if (changedGeneration) retireVerification("invalidate");
     void reads.refresh(coverage, { fresh: changedGeneration }).then((receipt) => {
       if (
