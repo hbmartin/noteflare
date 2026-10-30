@@ -2252,6 +2252,7 @@ it.each([false, true])(
 );
 
 it("retains 500 canonical rows and retries only the failed continuation after an earlier invalidation", async () => {
+  const inputs = () => document.querySelectorAll<HTMLInputElement>('input[aria-label="Title"]');
   const rows = Array.from({ length: 700 }, (_, index) => ({
     ...data.rows[0]!,
     id: `expanded-${index}`,
@@ -2275,7 +2276,7 @@ it("retains 500 canonical rows and retries only the failed continuation after an
     };
   });
   render(<CollaborativeTablePage page={{ id: "table", title: "Expanded" }} member={member} onSelectPage={vi.fn()} />);
-  await waitFor(() => expect(screen.getAllByLabelText("Title")[0]).toBeEnabled());
+  await waitFor(() => expect(inputs()[0]).toBeEnabled());
   await act(async () =>
     window.dispatchEvent(
       new CustomEvent("notes:workspace-event", {
@@ -2285,15 +2286,15 @@ it("retains 500 canonical rows and retries only the failed continuation after an
   );
   for (const count of [200, 300, 400, 500]) {
     fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    await waitFor(() => expect(screen.getAllByLabelText("Title")).toHaveLength(count));
+    await waitFor(() => expect(inputs()).toHaveLength(count));
   }
   vi.useFakeTimers();
   vi.spyOn(Math, "random").mockReturnValue(0);
   calls.length = 0;
   fail = true;
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
-  expect(screen.getAllByLabelText("Title")).toHaveLength(500);
-  expect(screen.getAllByLabelText("Title")[0]).toBeDisabled();
+  expect(inputs()).toHaveLength(500);
+  expect(inputs()[0]).toBeDisabled();
   expect(screen.getByText("Page unavailable")).toBeVisible();
   await act(async () => {
     await vi.advanceTimersByTimeAsync(999);
@@ -2302,7 +2303,7 @@ it("retains 500 canonical rows and retries only the failed continuation after an
   await act(async () => {
     await vi.advanceTimersByTimeAsync(1);
   });
-  expect(screen.getAllByLabelText("Title")).toHaveLength(600);
-  expect(screen.getAllByLabelText("Title")[0]).toBeEnabled();
+  expect(inputs()).toHaveLength(600);
+  expect(inputs()[0]).toBeEnabled();
   expect(calls).toEqual(["500", "500"]);
 });
