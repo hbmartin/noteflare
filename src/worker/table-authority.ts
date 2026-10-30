@@ -671,15 +671,7 @@ export class TableAuthority extends DurableObject<Env> {
       if (meta.pageId !== actor.pageId || meta.generation !== actor.generation || !meta.seeded)
         return fail("Table generation is not active.", 503);
       if (path === "/receipt" && request.method === "GET") {
-        const operationId = id(url.searchParams.get("operationId"), "Operation ID");
-        const receipt = this.rows<{ result: string }>(
-          "SELECT result FROM receipts WHERE actor_id=? AND operation_id=?",
-          actor.userId,
-          operationId,
-        )[0];
-        const result = receipt ? (JSON.parse(receipt.result) as TableCommandResult) : null;
-        // No await separates the live authorization above from this local receipt read and response.
-        return Response.json(result ? { generation: result.generation, revision: result.revision } : null);
+        return this.receiptResponse(actor, id(url.searchParams.get("operationId"), "Operation ID"));
       }
       if (path === "/draft-rows" && request.method === "POST") {
         const raw = await request.text();
@@ -918,6 +910,16 @@ export class TableAuthority extends DurableObject<Env> {
         { status: 500 },
       );
     }
+  }
+  /** Synchronous by contract: the receipt response immediately follows live authorization. */
+  private receiptResponse(actor: TableActor, operationId: string): Response {
+    const receipt = this.rows<{ result: string }>(
+      "SELECT result FROM receipts WHERE actor_id=? AND operation_id=?",
+      actor.userId,
+      operationId,
+    )[0];
+    const result = receipt ? (JSON.parse(receipt.result) as TableCommandResult) : null;
+    return Response.json(result ? { generation: result.generation, revision: result.revision } : null);
   }
   private relationEdges(targetId: string, targetRowId: string, after: string) {
     const meta = this.meta();

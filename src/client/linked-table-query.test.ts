@@ -253,3 +253,16 @@ it("retains network provenance when a restarted continuation reaches exhaustion"
   expect(result.window.hasMore).toBe(false);
   expect(result.verification).toBe("network");
 });
+
+it("retries a failed linked network continuation without replacing its accepted expanded prefix", async () => {
+  const read = serverRows(1000);
+  let window = await readLinkedTable({ kind: "refresh" }, null, read);
+  while (window.data.rows.length < 500) window = await readLinkedTable(append(window), window, read);
+  const retry = vi.fn().mockRejectedValueOnce(new TypeError("network down")).mockImplementation(read);
+  await expect(query(append(window), window, retry)).rejects.toThrow("network down");
+  const unavailable = { ...window, verified: false };
+  const result = await query(append(window), unavailable, retry, undefined, "", true);
+  expect(result.window.data.rows).toHaveLength(600);
+  expect(result.verification).toBe("network");
+  expect(retry.mock.calls.map(([cursor]) => cursor)).toEqual([window.serverCursor, window.serverCursor]);
+});

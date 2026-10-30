@@ -1304,10 +1304,10 @@ it("keeps recovery Save disabled when a successful invalidation precedes the bus
   fireEvent.change(input, { target: { value: "Preserved busy draft" } });
   fireEvent.blur(input);
   fireEvent.click(await screen.findByRole("button", { name: "Retry saved operation" }));
-  const save = await screen.findByRole("button", { name: "Save draft" });
   await waitFor(() => expect(reads).toBe(2));
-  expect(save).toBeDisabled();
-  fireEvent.click(save);
+  // An older read cannot clear the later conflict requirement, even while busy also guards dispatch.
+  expect(screen.queryByRole("button", { name: "Save draft" })).toBeNull();
+  expect(screen.getByText("Editing is unavailable. Your text is preserved.")).toBeVisible();
   expect(attempts).toHaveLength(2);
   await act(async () => {
     releaseRefresh();
@@ -1992,7 +1992,8 @@ it("turns a second canonical cursor churn into pending freshness with its extent
     cells: { Title: `Row ${i}` },
   }));
   data = { ...data, columns: [column("Title", "text")], rows, rowCount: rows.length };
-  let pages = 0;
+  let pages = 0,
+    refreshes = 0;
   let release!: () => void;
   vi.mocked(api).mockImplementation(async (path) => {
     const cursor = new URL(path, "https://test").searchParams.get("cursor");
@@ -2000,6 +2001,7 @@ it("turns a second canonical cursor churn into pending freshness with its extent
       pages++;
       return { ...data, revision: pages === 1 ? 2 : 3, rows: rows.slice(100), nextCursor: null };
     }
+    refreshes++;
     if (pages >= 2)
       await new Promise<void>((resolve) => {
         release = resolve;
@@ -2011,14 +2013,20 @@ it("turns a second canonical cursor churn into pending freshness with its extent
   vi.useFakeTimers();
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
   expect(pages).toBe(2);
+  expect(refreshes).toBe(4);
   expect(screen.getAllByLabelText("Title")).toHaveLength(100);
   expect(screen.getByText("The table is changing. Refreshing the latest data…")).toBeVisible();
   expect(screen.getAllByLabelText("Title")[0]).toBeDisabled();
   expect(screen.queryByRole("alert")).toBeNull();
   await act(async () => release());
   expect(pages).toBe(3);
+  expect(refreshes).toBe(4);
   expect(screen.getAllByLabelText("Title")).toHaveLength(200);
   expect(screen.getAllByLabelText("Title")[0]).toBeEnabled();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(pages + refreshes).toBe(7);
 });
 
 it("pauses the old generation's permit immediately after a rebuilt table commits", async () => {
@@ -2196,4 +2204,161 @@ it("settles a disposed view mutation without invoking its parent success callbac
   component.unmount();
   await act(async () => release());
   expect(changed).not.toHaveBeenCalled();
+});
+
+it.each([
+  [false, false],
+  [true, false],
+  [false, true],
+  [true, true],
+])(
+  "releases its committed coverage barrier while newer content refreshes: canonical %s, recheck %s",
+  async (canonical, recheck) => {
+    render(
+      <CollaborativeTablePage
+        page={{ id: "table", title: "Table" }}
+        member={member}
+        queryBase={canonical ? undefined : "/linked"}
+        onSelectPage={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+    const original = vi.mocked(api).getMockImplementation()!;
+    const finishes: Array<(value: TableQueryResult) => void> = [];
+    vi.mocked(api).mockImplementation(async (path, init) =>
+      path.endsWith("/commands")
+        ? original(path, init)
+        : new Promise<TableQueryResult>((resolve) => finishes.push(resolve)),
+    );
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    await act(async () => fireEvent.click(screen.getByLabelText("Check")));
+    expect(screen.getByLabelText("Check")).toBeDisabled();
+    if (recheck)
+      await act(async () =>
+        window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type: "workspace-invalidated" } })),
+      );
+    for (let pass = 0; pass < 2; pass++)
+      await act(async () => {
+        window.dispatchEvent(
+          new CustomEvent("notes:workspace-event", {
+            detail: { type: "task-list-invalidated", pageId: "table", generation: 1, revision: 3 + pass },
+          }),
+        );
+        finishes.shift()!({ ...data });
+      });
+    expect(screen.getByLabelText("Check")).toBeChecked();
+    expect(screen.getByLabelText("Check")).toBeEnabled();
+    expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+    expect(writes).toHaveLength(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(finishes).toHaveLength(1);
+    await act(async () => finishes.shift()!({ ...data, revision: 4 }));
+    expect(screen.getByLabelText("Check")).toBeEnabled();
+  },
+);
+
+it("retains the expanded canonical prefix and retries only the failed continuation after an earlier invalidation", async () => {
+  const inputs = () => document.querySelectorAll<HTMLInputElement>('input[aria-label="Title"]');
+  const rows = Array.from({ length: 400 }, (_, index) => ({
+    ...data.rows[0]!,
+    id: `expanded-${index}`,
+    cells: { Title: `Row ${index}` },
+  }));
+  data = { ...data, columns: [column("Title", "text")], rows, rowCount: rows.length };
+  const calls: string[] = [];
+  let fail = false;
+  vi.mocked(api).mockImplementation(async (path) => {
+    const cursor = new URL(path, "https://test").searchParams.get("cursor") ?? "0";
+    calls.push(cursor);
+    if (fail) {
+      fail = false;
+      throw new ApiClientError(503, "unavailable", "Page unavailable");
+    }
+    const offset = Number(cursor);
+    return {
+      ...data,
+      rows: rows.slice(offset, offset + 100),
+      nextCursor: offset + 100 < rows.length ? String(offset + 100) : null,
+    };
+  });
+  render(<CollaborativeTablePage page={{ id: "table", title: "Expanded" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(inputs()[0]).toBeEnabled());
+  await act(async () =>
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "projection-updated", pageId: "table", backlinkTargetIds: [], mentionTargetUserIds: [] },
+      }),
+    ),
+  );
+  for (const count of [200]) {
+    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+    await waitFor(() => expect(inputs()).toHaveLength(count));
+  }
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  calls.length = 0;
+  fail = true;
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
+  expect(inputs()).toHaveLength(200);
+  expect(inputs()[0]).toBeDisabled();
+  expect(screen.getByText("Page unavailable")).toBeVisible();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(999);
+  });
+  expect(calls).toEqual(["200"]);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+  });
+  expect(inputs()).toHaveLength(300);
+  expect(inputs()[0]).toBeEnabled();
+  expect(calls).toEqual(["200", "200"]);
+});
+
+it("does not release old-generation save coverage after a newer generation is announced", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  const finishes: Array<(result: TableQueryResult) => void> = [];
+  vi.mocked(api).mockImplementation(async (path, init) =>
+    path.endsWith("/commands")
+      ? original(path, init)
+      : new Promise<TableQueryResult>((resolve) => finishes.push(resolve)),
+  );
+  await act(async () => fireEvent.click(screen.getByLabelText("Check")));
+  await act(async () => {
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", generation: 2, revision: 1 },
+      }),
+    );
+    finishes.shift()!({ ...data });
+  });
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  expect(writes).toHaveLength(1);
+  await act(async () => finishes.shift()!({ ...data, generation: 2, revision: 1 }));
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+  expect(writes).toHaveLength(1);
+});
+
+it("retires the old generation's permit immediately when newer content coverage is announced", async () => {
+  show();
+  await waitFor(() => expect(screen.getByLabelText("Check")).toBeEnabled());
+  const finishes: Array<(result: TableQueryResult) => void> = [];
+  vi.mocked(api).mockImplementation(() => new Promise<TableQueryResult>((resolve) => finishes.push(resolve)));
+  await act(async () =>
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", generation: 2, revision: 1 },
+      }),
+    ),
+  );
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  await act(async () => finishes.shift()!({ ...data }));
+  expect(screen.getByLabelText("Check")).toBeDisabled();
+  await act(async () => finishes.shift()!({ ...data, generation: 2, revision: 1 }));
+  expect(screen.getByLabelText("Check")).toBeEnabled();
+  expect(writes).toHaveLength(0);
 });

@@ -258,6 +258,46 @@ globalThis.measureCommitCompletion=async()=>{
   return {samples:20,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),refreshP50Ms:percentile(refreshLatency,.5),refreshP95Ms:percentile(refreshLatency,.95),readsPerCommit:queries,heldReadFrames:2};
  }finally{globalThis.__holdReads=false;for(const release of globalThis.__heldReads.splice(0))release();tree.unmount();host.remove();}
 };
+globalThis.measureOwnCommitCoverage=async()=>{
+ const host=document.createElement('div');document.body.append(host);const tree=createRoot(host);
+ flushSync(()=>tree.render(createElement(CollaborativeTablePage,{page:{id:'table',title:'Own coverage'},member:{role:'editor',user:{id:'coverage-bench'},workspace:{id:'wiki'},features:{}},queryBase:'/linked',onSelectPage(){}})));
+ const input=()=>host.querySelector('input[aria-label="Done"]');
+ const refresh=()=>[...host.querySelectorAll('button')].find(button=>button.textContent.trim()==='Refresh');
+ const settle=async()=>{for(let i=0;i<100;i++){await frame();if(input()&&!input().disabled)return;}throw Error('Coverage fixture did not settle');};
+ const durations=[],waiting=[],reads=[];let editable=0;
+ try{
+  await settle();
+  for(let sample=0;sample<20;sample++){
+   const releases=[];let queryCount=0;
+   globalThis.__readHook=async()=>{queryCount++;const snapshot={...globalThis.__data};await new Promise(resolve=>releases.push(resolve));return snapshot;};
+   input().click();
+   for(let i=0;i<100&&!releases.length;i++)await frame();
+   if(!releases.length)throw Error('Save verification did not start');
+   const required=globalThis.__data.revision+1;
+   window.dispatchEvent(new CustomEvent('notes:workspace-event',{detail:{type:'task-list-invalidated',pageId:'table',generation:globalThis.__data.generation,revision:required}}));
+   const returnedAt=performance.now();releases.shift()();await frame();
+   if(!input().disabled){editable++;durations.push(performance.now()-returnedAt);}
+   waiting.push(host.textContent.includes('Saved. Refreshing the latest table data'));reads.push(queryCount);
+   globalThis.__readHook=null;globalThis.__data={...globalThis.__data,revision:required};
+   for(const release of releases.splice(0))release();
+   refresh().click();await settle();
+  }
+  return {samples:20,editableAfterOwnCoverage:editable,p50Ms:durations.length?percentile(durations,.5):null,p95Ms:durations.length?percentile(durations,.95):null,saveStillPending:waiting,networkReads:reads,meaning:'Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently.'};
+ }finally{globalThis.__readHook=null;tree.unmount();host.remove();}
+};
+globalThis.measurePageFailure=async()=>{
+ const value={generation:1,revision:1},calls=[];
+ const controller=linkedTableReads({poll:false,unavailable(){},coverage:value=>value,read:async intent=>{
+  calls.push(intent.kind);return calls.length===2?{state:'failure'}:{state:'success',value,verification:'network'};
+ }});
+ try{
+  receiptMeasurementState(await controller.refresh(value));
+  await controller.request({queryIdentity:'page-cost',generation:1,target:600});
+  const retried=await controller.request({queryIdentity:'page-cost',generation:1,target:600});
+  if(!retried)throw Error('Controlled continuation recovery did not finish');
+  return {calls,recoveryRefreshes:calls.slice(2).filter(kind=>kind==='refresh').length,meaning:'Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation.'};
+ }finally{controller.dispose();}
+};
 globalThis.measureReconnect=async()=>{
  const Native=globalThis.WebSocket,times=[],starts=new Map();let queries=0,created=0;
  class Socket extends EventTarget{
@@ -310,6 +350,7 @@ async function bundle(before) {
           builder.onLoad({ filter: /src\/client\/api\.ts$/ }, () => ({
             contents: `export class ApiClientError extends Error{}; export const isPageNotFoundError=e=>e instanceof ApiClientError&&e.code==='page_not_found'&&(e.status===404||e.status===410); export const json=JSON.stringify; export const apiErrorMessage=(e,f)=>f; export async function api(path,init){
               globalThis.__requests++;
+              if(globalThis.__readHook&&!init?.method)return globalThis.__readHook(path);
               if(globalThis.__holdReads&&!init?.method)await new Promise(resolve=>globalThis.__heldReads.push(resolve));
               if(globalThis.__failNextRead&&!init?.method){globalThis.__failNextRead=false;throw Error('Controlled read failure')}
               if(globalThis.__pagedRows&&!init?.method){
@@ -423,6 +464,8 @@ try {
         freshnessCompletion: await page.evaluate(() => globalThis.measureFreshnessCompletion()),
         schedulerProgress: await page.evaluate(() => globalThis.measureSchedulerProgress()),
         commitCompletion: await page.evaluate(() => globalThis.measureCommitCompletion()),
+        ownCommitCoverage: await page.evaluate(() => globalThis.measureOwnCommitCoverage()),
+        pageFailure: await page.evaluate(() => globalThis.measurePageFailure()),
         ...(measureReadRecovery ? { readRecovery: await page.evaluate(() => globalThis.measureReadRecovery()) } : {}),
       });
       await context.close();

@@ -1073,3 +1073,88 @@ Three fresh contexts per version use the optimized production-React bundle, 100 
 No measured median p95 regression exceeds 10%; controlled recovery p95 changes approximately **+0.05%**. Sub-millisecond first-edit observations do not form a p95 distribution. Fulfilled-buffer identity and request counts establish the no-op behavior; timers cannot resolve its execution cost reliably. The starvation fixture already passes on starting main and remains passing; permanent dependency/supersession regressions establish this pass's newly fixed stalls. Pending churn outcomes do not establish authorization. The held two-frame commit fixture distinguishes busy release from data readiness: updated writes remain gated until accepted rows arrive. Local frame timings and randomized reconnect observations do not demonstrate production server-speed improvements.
 
 Deployment, remote migrations, live Slack testing, receipt compatibility restoration, server-receipt pruning, portability/trust work, and new recovery workflows remain excluded. Unrelated working-tree changes remain unstaged and outside the PR.
+
+## PR #278 follow-up: applied save coverage and continuation verification
+
+Starting main is `44df8ff001922039fcd921f1bbb30c32416d5058`. This pass preserves protocol 3, receipt retirement, immediate draft persistence, per-view unfinished Property settings, fixed grants and connection-required editing. There is no wire/schema/storage migration or feature activation. Relations remain disabled. The existing CI recovery-test timeouts and Sonar duplication remediation are explicitly outside this pass.
+
+### Coverage and recovery contracts
+
+- Current-owner network applications record generation/revision together with query identity, request order and verification lifetime. A committed save waits for its own coverage, rather than every later content watermark. Missing receipt coverage requires a read dispatched after commit. Older generations are never compared numerically; authoritative generation replacement retires obsolete requirements.
+- Committed coverage, current query/capability verification and background data freshness are separate requirements. Known content invalidations continue coalesced background reads; unknown/access-wide invalidations advance the verification lifetime. A read started before such retirement cannot restore writes, even when it includes a committed value. A later read in the current lifetime may establish query/access evidence while newer content changes remain pending. Known newer authority generations immediately retire the old permit; older-generation responses cannot restore it. Socket grants, roles, availability and conflict ownership still gate writes.
+- Mutation busy releases on confirmed commit and captured acknowledgement. Only visible-owner completion changes its UI. Saved explanations retain their existing behavior: a subsequent confirmed success or dismissal can replace them; failed attempts do not erase a previous committed explanation.
+- Accepted prefix coverage survives an ordinary failed continuation. That intent retries its network cursor/extent under its own deadline while cached rows remain visible and writes stay paused. Historical invalidation counters alone do not require a first-page rebuild. Incompatible coverage and bounded cursor churn still refresh/rebind.
+- Failed refresh creates explicit verification debt even at invalidation zero. Buffered expansion cannot satisfy it, while a cold continuation can still make its first network attempt. Cached data alone cannot satisfy required verification. Common freshness recovery construction and per-pass eligibility preserve fairness, separate backoff histories and timer progress.
+- Coordinator/socket setup uses a passive effect with concrete owner lifetime and guarded callbacks. Layout-phase retirement remains synchronous; the socket stops before coordinator disposal. Same-table query changes retain transport ownership.
+- Optional receipt construction checks live workspace membership/role and page access before registry-dependent returns. Captured-page task replay keeps its optimized construction path and final live authority authorization. Receipt lookup/serialization is synchronously typed and protected by a structural no-await regression. Original/legacy replay metadata and optional failure behavior are unchanged.
+
+### Validation and measurements
+
+Raw paired results are in [pr-278-recovery-measurements.json](pr-278-recovery-measurements.json). The same harness at `e727c403679efeea9e776209ec2a8fd670ba166f` bundles starting main and updated sources into optimized, minified production-React fixtures. Each version uses three Chromium contexts; timings below are medians of per-context p50/p95 values, not production network or D1 latency.
+
+| Measurement                                          | Starting main p50 / p95 | Updated p50 / p95  |
+| ---------------------------------------------------- | ----------------------- | ------------------ |
+| Typing                                               | 0.1 / 0.2 ms            | 0.1 / 0.2 ms       |
+| Query verification                                   | 16.6 / 16.9 ms          | 16.6 / 16.9 ms     |
+| View round trip                                      | 33.2 / 34.7 ms          | 33.1 / 33.6 ms     |
+| 500-row linked refresh                               | 33.2 / 33.7 ms          | 33.2 / 33.5 ms     |
+| Commit busy release                                  | 15.3 / 15.7 ms          | 15.4 / 15.6 ms     |
+| Own-coverage editable observation                    | Remained blocked        | 17.7 / 17.8 ms     |
+| Controlled read recovery, three context observations | 1515.2 / 1515.4 ms      | 1515.4 / 1515.5 ms |
+| Socket reconnect                                     | 1506.0 / 1933.0 ms      | 1477.2 / 1949.6 ms |
+
+Own committed coverage restored editability in 60/60 updated observations while a later content watermark remained pending; the baseline remained blocked in 60/60. The baseline has no finite coverage-to-editable latency in this controlled phase, so no percentage speedup is claimed. The updated observation includes the harness’s one-frame wait after releasing the held response; it is not sub-frame or production latency. Controlled read-recovery p50/p95 uses the three context observations (middle/maximum), rather than twenty samples per context. Each ordinary failed-continuation recovery removed one redundant refresh (one to zero); the canonical browser regression separately asserts 500 retained rows and exactly the same failed/retried opaque cursor. Typing still performs 300 immediate writes per context, zero full storage enumeration and zero whole-table typing renders. Receipt registration/acknowledgement remains scan-free after initialization. A 500-row linked refresh uses one request; buffered expansion uses none. No comparable median p95 regression exceeds 10% in this run. Captured-page task replay retains the regression budget of four additional D1 statements and one authority request; optional uncaptured-page reads deliberately perform the new live-role lookup.
+
+```sh
+NOTES_BENCH_TYPING_EDITS=300 NOTES_BENCH_READ_RECOVERY=1 node scripts/measure-collaboration-recovery.mjs 44df8ff001922039fcd921f1bbb30c32416d5058 /tmp/noteflare-278-measurements.json
+```
+
+### Final local acceptance
+
+Runtime source is `e727c403679efeea9e776209ec2a8fd670ba166f`; the delivery commit adds only this ledger and the raw measurement artifact. All complete suites and browser commands use Node 22.23.4. Playwright acceptance explicitly uses `--retries=0`; no assertions, timeouts or coverage thresholds were weakened.
+
+- Changed client/read-query/component regressions: **184/184**. Receipt fallback/authorization targets: **12/12 selected**; the task replay budget target also passes. Complete Worker coverage: **2,496/2,496** across 37 files (1,095.14 s command). Worker statements/branches/functions/lines: **83.34% / 76.92% / 89.86% / 86.65%**. The later generation-only client commit changes no Worker/shared/package/config source.
+- Final complete unit/coverage command under normal suite concurrency: **2,981 passed, two failed, one existing skip**, exit 1 (73.34 s). Both failures are unchanged `CollaborativeTablePage.recovery.test.tsx` cases: “retires buffered and late rows after confirmed read denial” and “requires current network verification after a task conflict: success”. They remain part of the explicitly excluded existing CI timeout gate; the full unit gate is **not green**. Every new or changed regression passes. No final global unit coverage percentage is claimed from the failed run.
+- Formatting, documentation checks, lint, middleware/deployment policies, all five TypeScript projects, type-aware analysis, generated bindings, production client build and Worker dry run pass on the final runtime. The production build command takes 11.53 s; Worker dry run 1.70 s.
+
+| Browser acceptance | Result                                        |
+| ------------------ | --------------------------------------------- |
+| browser-probes     | 16 passed (4.4m); command 263.49 s, exit 0    |
+| browser-matrix     | 96 passed (15.0m); command 900.26 s, exit 0   |
+| browser-races      | 120 passed (21.2m); command 1275.55 s, exit 0 |
+| browser-full-1     | 106 passed (10.1m); command 607.21 s, exit 0  |
+| browser-full-2     | 106 passed (10.0m); command 601.27 s, exit 0  |
+| browser-mobile     | 51 passed (5.6m); command 335.32 s, exit 0    |
+| diagnostics        | 1 passed (2.4s); command 3.22 s, exit 0       |
+| production-browser | 25 passed (1.5m); command 89.95 s, exit 0     |
+
+Each full Chromium command starts a fresh local D1/DO state through the existing server runner. The repeated timing batch is five repetitions of eight scenarios in each desktop engine; the affected matrix and mobile runs retain explicit readiness, permission, server-read and draft assertions. The cursor-churn regression now bounds first-page, continuation and total reads and observes a bounded quiet period. Full-size canonical recovery keeps 500 rows in the browser; its unit state-transition companion uses 200 rows to keep ordinary jsdom coverage within the unchanged five-second limit.
+
+Representative exact browser commands (alongside the repository check/build commands listed in the preceding ledger entry):
+
+```sh
+pnpm test:coverage
+pnpm test:worker:coverage
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit --project=mobile-chromium \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts \
+  --grep 'rapid task saves|continuous .*invalidations|canonical continuation failure' --retries=0
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts \
+  --grep 'canonical|task|cell|linked|view|properties|property|continuous|pagination|generation' --retries=0
+pnpm exec playwright test --project=chromium --project=firefox --project=webkit \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts \
+  --grep 'rapid task saves|continuous .*invalidations|canonical continuation failure|requested continuation extent|invalidation during|failed continuation|canonical cell drafts' \
+  --repeat-each=5 --retries=0
+pnpm exec playwright test --project=chromium --retries=0
+pnpm exec playwright test --project=chromium --retries=0
+pnpm exec playwright test --project=mobile-chromium \
+  tests/e2e/linked-table-recovery.spec.ts tests/e2e/reconnect-drafts.spec.ts --retries=0
+pnpm test:e2e:diagnostics --retries=0
+pnpm test:e2e:production --retries=0
+```
+
+### Separate release gates and scope
+
+The existing [PR workflow unit timeouts](https://github.com/hbmartin/noteflare/actions/runs/40933369721/job/123657378469), [push workflow unit timeouts](https://github.com/hbmartin/noteflare/actions/runs/40933360876/job/123657346520), and [PR #278 Sonar Code Analysis](https://sonarcloud.io/dashboard?id=hbmartin_noteflare&pullRequest=278) result (5.2% new-code duplication against 3%) remain explicitly excluded. Local targeted passes neither establish the timeout root cause nor close that gate. This pass makes no remote Sonar disposition and does not claim its duplication gate resolved. Final delivery-SHA CI is reported separately from these local results. The historical intermittent production reload/highlighting gate remains separate even when the controlled production-policy suite passes.
+
+Initial probes and concurrent-check failures remain in `/tmp/noteflare-278-*` logs. The first Worker checkpoint was deliberately stopped when receipt fallback hardening superseded it. Acceptance uses the final runs above rather than relabeling those checkpoints. Deployment, remote migrations, live Slack installation, receipt compatibility restoration, server-receipt pruning, portability/trust work and new recovery workflows remain excluded. Unrelated working-tree changes remain untouched and outside this branch.

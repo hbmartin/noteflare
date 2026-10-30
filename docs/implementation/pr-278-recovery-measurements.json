@@ -1,0 +1,1196 @@
+{
+  "baselineRevision": "44df8ff001922039fcd921f1bbb30c32416d5058",
+  "updatedRevision": "e727c403679efeea9e776209ec2a8fd670ba166f",
+  "harnessRevision": "e727c403679efeea9e776209ec2a8fd670ba166f",
+  "command": "NOTES_BENCH_TYPING_EDITS=300 NOTES_BENCH_READ_RECOVERY=1 node scripts/measure-collaboration-recovery.mjs 44df8ff001922039fcd921f1bbb30c32416d5058 /tmp/noteflare-278-measurements.json",
+  "fixture": {
+    "readRecoverySamplesPerVersion": 3,
+    "corruptAccountDraft": false,
+    "rows": 100,
+    "columns": 3,
+    "accountDrafts": 500,
+    "unrelatedStorageKeys": 5000,
+    "typingEditsPerContext": 300,
+    "contextsPerVersion": 3,
+    "reconnectingClients": 20,
+    "readRecoveryRandomDraw": 0.5,
+    "paginationRows": 1200,
+    "paginationVisibleRowsBeforeRefresh": 500,
+    "paginationRefreshSamplesPerContext": 5,
+    "queryVerificationSamplesPerContext": 20,
+    "fulfilledContinuationSamplesPerContext": 1000,
+    "freshnessCompletionSamplesPerContext": 10,
+    "invalidationsPerFreshnessSample": 8
+  },
+  "limits": "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
+  "runs": {
+    "baseline": [
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 1.6000001430511475,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1506,
+          "p95Ms": 1972.4000000953674,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.10000014305115,
+          "p95Ms": 33.69999980926514,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.699999809265137,
+          "p95Ms": 17.299999952316284,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33,
+          "p95Ms": 34.700000047683716,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.5,
+          "p95Ms": 17,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.09999990463256836,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 15.299999952316284,
+          "p95Ms": 15.700000047683716,
+          "refreshP50Ms": 49.799999952316284,
+          "refreshP95Ms": 50.39999985694885,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 0,
+          "p50Ms": null,
+          "p95Ms": null,
+          "saveStillPending": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "refresh", "append"],
+          "recoveryRefreshes": 1,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1515.4000000953674,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.9000000953674316,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1431.7999999523163,
+          "p95Ms": 1913.1000001430511,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.200000047683716,
+          "p95Ms": 34.60000014305115,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.59999990463257,
+          "p95Ms": 16.90000009536743,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.200000047683716,
+          "p95Ms": 34.700000047683716,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.699999809265137,
+          "p95Ms": 18.100000143051147,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.09999990463256836,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 15.299999952316284,
+          "p95Ms": 16.100000143051147,
+          "refreshP50Ms": 49.799999952316284,
+          "refreshP95Ms": 50.700000047683716,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 0,
+          "p50Ms": null,
+          "p95Ms": null,
+          "saveStillPending": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "refresh", "append"],
+          "recoveryRefreshes": 1,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1515.2000000476837,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.7000000476837158,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1556.5,
+          "p95Ms": 1933,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.299999952316284,
+          "p95Ms": 33.69999980926514,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.59999990463257,
+          "p95Ms": 16.799999952316284,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.19999980926514,
+          "p95Ms": 33.59999990463257,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.600000143051147,
+          "p95Ms": 16.700000047683716,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.09999990463256836,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 15.299999952316284,
+          "p95Ms": 15.400000095367432,
+          "refreshP50Ms": 49.90000009536743,
+          "refreshP95Ms": 50.200000047683716,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 0,
+          "p50Ms": null,
+          "p95Ms": null,
+          "saveStillPending": [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "refresh", "append"],
+          "recoveryRefreshes": 1,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1515.2000000476837,
+          "queries": 3
+        }
+      }
+    ],
+    "updated": [
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.6000001430511475,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1365.7999999523163,
+          "p95Ms": 1907.2999999523163,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.10000014305115,
+          "p95Ms": 33.299999952316284,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.600000143051147,
+          "p95Ms": 18.299999952316284,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.200000047683716,
+          "p95Ms": 35,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.5,
+          "p95Ms": 17.899999856948853,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.20000004768371582,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 15.400000095367432,
+          "p95Ms": 17,
+          "refreshP50Ms": 49.90000009536743,
+          "refreshP95Ms": 51.40000009536743,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 20,
+          "p50Ms": 17.799999952316284,
+          "p95Ms": 19.5,
+          "saveStillPending": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "append"],
+          "recoveryRefreshes": 0,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1515.5,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.7000000476837158,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1644.5999999046326,
+          "p95Ms": 1949.5999999046326,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.299999952316284,
+          "p95Ms": 33.5,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.600000143051147,
+          "p95Ms": 16.90000009536743,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.10000014305115,
+          "p95Ms": 33.40000009536743,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.59999990463257,
+          "p95Ms": 16.700000047683716,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.20000004768371582,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 15.300000190734863,
+          "p95Ms": 15.5,
+          "refreshP50Ms": 49.89999985694885,
+          "refreshP95Ms": 50.200000047683716,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 20,
+          "p50Ms": 17.700000047683716,
+          "p95Ms": 17.800000190734863,
+          "saveStillPending": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "append"],
+          "recoveryRefreshes": 0,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1515.3999998569489,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.5999999046325684,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1477.1999998092651,
+          "p95Ms": 1966.7999999523163,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.19999980926514,
+          "p95Ms": 33.59999990463257,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.600000143051147,
+          "p95Ms": 16.899999856948853,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.10000014305115,
+          "p95Ms": 33.59999990463257,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.700000047683716,
+          "p95Ms": 16.700000047683716,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.10000014305114746,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 15.399999856948853,
+          "p95Ms": 15.600000143051147,
+          "refreshP50Ms": 49.89999985694885,
+          "refreshP95Ms": 50.299999952316284,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 20,
+          "p50Ms": 17.700000047683716,
+          "p95Ms": 17.799999952316284,
+          "saveStillPending": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "append"],
+          "recoveryRefreshes": 0,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1515.4000000953674,
+          "queries": 3
+        }
+      }
+    ]
+  }
+}
