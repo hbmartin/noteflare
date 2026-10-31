@@ -188,6 +188,35 @@ globalThis.measureViewSwitch=async()=>{
   return {samples:20,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),restored,renderCounts,queries};
  }finally{tree.unmount();host.remove();globalThis.__data=previous;}
 };
+globalThis.measureWindowVerification=async()=>{
+ const results={};
+ for(const kind of ['canonical','linked'])for(const changed of [false,true]){
+  const durations=[],requests=[],received=[],bytes=[];
+  for(let sample=0;sample<20;sample++){
+   const fixture=Array.from({length:1200},(_,i)=>({...globalThis.__data.rows[0],id:String(i),cells:{Title:'Verification row '+i}}));
+   const data={...globalThis.__data,generation:1,revision:1,rows:fixture.slice(0,500),nextCursor:'existing',rowCount:1200};
+   const current={data,buffered:[],serverCursor:'existing',pageSize:kind==='canonical'?100:500,queryIdentity:'verification-bench',verified:false,hasMore:true,continuation:{queryIdentity:'verification-bench',generation:1,target:600}};
+   const limits=[];let rowsReceived=0,bytesReceived=0;
+   const read=async(cursor,limit=100)=>{
+    const position=cursor?JSON.parse(cursor):{offset:0,limit};
+    if(position.limit!==limit)throw Error('Verification changed cursor page size');
+    const end=position.offset+limit;
+    const result={...data,revision:changed?2:1,rows:fixture.slice(position.offset,end),nextCursor:end<fixture.length?JSON.stringify({offset:end,limit}):null};
+    limits.push(limit);rowsReceived+=result.rows.length;bytesReceived+=JSON.stringify(result).length;
+    await frame();return result;
+   };
+   const started=performance.now();
+   // Both versions receive the same policy. The historical canonical adapter selected pageSize 100.
+   const result=await readLinkedTable({kind:'refresh'},current,read,undefined,'verification-bench',{verify:true,refresh:kind==='canonical'?'first-page':'visible',...(kind==='canonical'?{pageSize:100}:{})});
+   durations.push(performance.now()-started);requests.push(limits);received.push(rowsReceived);bytes.push(bytesReceived);
+   if(result.verification!=='network'||result.window.data.revision!==(changed?2:1)||result.window.data.rows.length!==500)throw Error('Invalid verification measurement outcome');
+   if(result.window.data.rows.some((row,i)=>row.id!==String(i)))throw Error('Verification lost or reordered prefix rows');
+   if(!changed&&(result.window.data.rows!==data.rows||result.window.serverCursor!=='existing'))throw Error('Unchanged probe replaced the cursor chain');
+  }
+  results[kind+(changed?'Changed':'Unchanged')]={samples:20,p50Ms:percentile(durations,.5),p95Ms:percentile(durations,.95),requests,rowsReceived:received,responseJsonCharacters:bytes};
+ }
+ return {...results,meaning:'Controlled window-reader verification with one animation-frame delay per response; not production network latency or the complete canonical renderer.'};
+};
 globalThis.measureFreshnessCompletion=async()=>{
  const durations=[],reads=[],outcomes=[];
  for(let sample=0;sample<10;sample++){
@@ -436,6 +465,7 @@ const results = {
     paginationVisibleRowsBeforeRefresh: 500,
     paginationRefreshSamplesPerContext: 5,
     queryVerificationSamplesPerContext: 20,
+    windowVerificationSamplesPerCasePerContext: 20,
     fulfilledContinuationSamplesPerContext: 1000,
     freshnessCompletionSamplesPerContext: 10,
     invalidationsPerFreshnessSample: 8,
@@ -461,6 +491,7 @@ try {
         queryVerification: await page.evaluate(() => globalThis.measureQueryVerification()),
         fulfilledContinuations: await page.evaluate(() => globalThis.measureFulfilledContinuations()),
         viewSwitch: await page.evaluate(() => globalThis.measureViewSwitch()),
+        windowVerification: await page.evaluate(() => globalThis.measureWindowVerification()),
         freshnessCompletion: await page.evaluate(() => globalThis.measureFreshnessCompletion()),
         schedulerProgress: await page.evaluate(() => globalThis.measureSchedulerProgress()),
         commitCompletion: await page.evaluate(() => globalThis.measureCommitCompletion()),
