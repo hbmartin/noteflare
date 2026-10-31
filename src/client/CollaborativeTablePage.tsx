@@ -471,6 +471,7 @@ export function CollaborativeTablePage({
             networkRequired: context?.networkRequired && !network,
             verify: verifying,
             refresh: queryBase ? "visible" : "first-page",
+            restart: Boolean(queryBase) || intent?.kind !== "page",
           },
         );
         const linked = queryBase ? checked : null;
@@ -576,8 +577,13 @@ export function CollaborativeTablePage({
         if (!navigator.onLine && !(cause instanceof ApiClientError)) {
           return { state: "suspended" };
         }
-        if (cause instanceof CursorChanged || (cause instanceof ApiClientError && cause.code === "table_cursor_stale"))
+        if (
+          cause instanceof CursorChanged ||
+          (cause instanceof ApiClientError && cause.code === "table_cursor_stale")
+        ) {
+          if (!queryBase && intent?.kind === "page" && !restarts) return restart();
           return { state: "stale" };
+        }
         setError(apiErrorMessage(cause, "The table could not be loaded."));
         return { state: "failure" };
       }

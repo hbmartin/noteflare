@@ -28,7 +28,7 @@ export async function readLinkedTable(
   read: (cursor?: string, limit?: number) => Promise<TableQueryResult>,
   signal?: AbortSignal,
   queryIdentity = "",
-  options: { networkRequired?: boolean; verify?: boolean; refresh?: "first-page" | "visible" } = {},
+  options: { networkRequired?: boolean; verify?: boolean; refresh?: "first-page" | "visible"; restart?: boolean } = {},
 ): Promise<LinkedTableReadResult> {
   const { networkRequired = false } = options;
   signal?.throwIfAborted();
@@ -121,6 +121,7 @@ export async function readLinkedTable(
       if (
         signal?.aborted ||
         attempt ||
+        options.restart === false ||
         !(error instanceof CursorChanged || (error instanceof ApiClientError && error.code === "table_cursor_stale"))
       )
         throw error;

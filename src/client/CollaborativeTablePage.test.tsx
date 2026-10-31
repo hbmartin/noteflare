@@ -2745,3 +2745,39 @@ it("classifies repeated canonical cursor churn as bounded freshness recovery", a
 
   expect(renderedRows()).toHaveLength(600);
 });
+
+it("restarts a stable canonical cursor change exactly once at the canonical page size", async () => {
+  const rows = Array.from({ length: 300 }, (_, i) => ({
+    ...data.rows[0]!,
+    id: `stable-${i}`,
+    cells: { Title: `Stable ${i}` },
+  }));
+  data = { ...data, columns: [], rows, rowCount: rows.length };
+  let changed = false;
+  const calls: Array<[string | null, number]> = [];
+  vi.mocked(api).mockImplementation(async (path) => {
+    const params = new URL(path, "https://test").searchParams;
+    const cursor = params.get("cursor"),
+      limit = Number(params.get("limit")),
+      offset = Number(cursor ?? 0);
+    calls.push([cursor, limit]);
+    if (cursor) changed = true;
+    return {
+      ...data,
+      revision: changed ? 2 : 1,
+      rows: rows.slice(offset, offset + limit),
+      nextCursor: offset + limit < rows.length ? String(offset + limit) : null,
+    };
+  });
+  render(<CollaborativeTablePage page={{ id: "table", title: "Canonical" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+  calls.length = 0;
+  fireEvent.click(screen.getByText("Load more rows", { selector: "button" }));
+  await waitFor(() => expect(document.querySelectorAll(".table-live tbody tr")).toHaveLength(200));
+  expect(calls).toEqual([
+    ["100", 100],
+    [null, 100],
+    ["100", 100],
+  ]);
+  expect(screen.getByText("Views", { selector: "button" })).toBeEnabled();
+});
