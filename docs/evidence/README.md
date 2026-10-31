@@ -9,6 +9,8 @@ Dated test and review records preserve the revision, environment, and limits of 
 - [AI writing verification](AI_WRITING_VERIFICATION.md)
 - [ChatGPT plugin verification](CHATGPT_PLUGIN_VERIFICATION.md)
 - [Mention target performance](MENTION_TARGET_PERFORMANCE.md)
+- [Free-plan CPU measurements](FREE_PLAN_CPU_BENCHMARK.md)
+- [Dedicated password hashing preview comparison](PASSWORD_CRYPTO_PREVIEW.md)
 - [Documentation and release audit: 12 October 2026](documentation-audit-2026-10-12.md)
 
 - [One-click deployment verification](ONE_CLICK_DEPLOYMENT_VERIFICATION.md): prepared flow, disposable installation and redeployment, and the unresolved native-form release gate.

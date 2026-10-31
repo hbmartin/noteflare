@@ -58,12 +58,17 @@ export async function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) 
     sources: "page_import_sources",
     artifacts: "attachments",
   };
-  const summarySql = Object.entries(supported)
+  const summaryStatements = Object.entries(supported)
     .filter(([, enabled]) => enabled)
-    .map(([key]) => `SELECT '${key}' source,count(*) rows FROM ${sourceTables[key]}`)
-    .join(" UNION ALL ");
+    .map(([key]) => `SELECT '${key}' source,count(*) rows FROM ${sourceTables[key]}`);
   const readCounts = async () => {
-    const counts = await query(summarySql, "integrity coverage counts");
+    // Remote D1 limits compound SELECTs to five terms. Keep full coverage while
+    // leaving room for additional metadata sources without exceeding that cap.
+    const counts = [];
+    for (let index = 0; index < summaryStatements.length; index += 5)
+      counts.push(
+        ...(await query(summaryStatements.slice(index, index + 5).join(" UNION ALL "), "integrity coverage counts")),
+      );
     if (
       counts.some((row) => !supported[row.source] || !Number.isSafeInteger(row.rows) || row.rows < 0) ||
       counts.length !== Object.values(supported).filter(Boolean).length ||

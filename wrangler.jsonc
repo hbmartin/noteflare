@@ -40,6 +40,7 @@
       { "name": "DOCUMENT", "class_name": "Document" },
       { "name": "TABLE", "class_name": "TableAuthority" },
       { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
+      { "name": "PASSWORD_CRYPTO", "class_name": "PasswordCrypto" },
     ],
   },
   "workflows": [
@@ -77,6 +78,7 @@
     { "tag": "v1", "new_sqlite_classes": ["Document"] },
     { "tag": "v2", "new_sqlite_classes": ["WorkspaceEvents"] },
     { "tag": "v3", "new_sqlite_classes": ["TableAuthority"] },
+    { "tag": "v4", "new_sqlite_classes": ["PasswordCrypto"] },
   ],
   "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
@@ -130,6 +132,7 @@
           { "name": "DOCUMENT", "class_name": "Document" },
           { "name": "TABLE", "class_name": "TableAuthority" },
           { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
+          { "name": "PASSWORD_CRYPTO", "class_name": "PasswordCrypto" },
         ],
       },
       "workflows": [
@@ -168,7 +171,7 @@
         "TABLE_BOARD_ENABLED": "false",
         "TABLE_CALENDAR_ENABLED": "false",
         "TABLE_RELATIONS_ENABLED": "false",
-        "NOTION_MARKDOWN_WRITES_ENABLED": "false",
+        "NOTION_MARKDOWN_WRITES_ENABLED": "true",
         "OFFLINE_EDITING_ENABLED": "false",
         "BLOCK_LINKS_ENABLED": "false",
         "LIVE_DIAGRAM_EMBEDS_ENABLED": "false",
@@ -204,6 +207,7 @@
           { "name": "DOCUMENT", "class_name": "Document" },
           { "name": "TABLE", "class_name": "TableAuthority" },
           { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
+          { "name": "PASSWORD_CRYPTO", "class_name": "PasswordCrypto" },
         ],
       },
       "workflows": [

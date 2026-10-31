@@ -1,5 +1,6 @@
 import { trackRealtimeUser, deleteRejectedSession } from "./realtime-access";
 import { betterAuth } from "better-auth";
+import { passwordService } from "./password-service";
 import type { GenericEndpointContext } from "@better-auth/core";
 import { passkey } from "@better-auth/passkey";
 import {
@@ -544,6 +545,7 @@ export function createAuth(env: Env, allowRegistration = false) {
       mandatorySecurity(env),
     ],
     emailAndPassword: {
+      password: passwordService(env),
       enabled: true,
       disableSignUp: !allowRegistration,
       minPasswordLength: 8,

@@ -1,0 +1,947 @@
+{
+  "timestamp": "2026-10-30T23:35:56.065Z",
+  "revision": "affbd477a66c59309a64888bf73ee7fa4a619d86",
+  "node": "v26.11.1",
+  "platform": "darwin",
+  "arch": "arm64",
+  "cpu": "Apple M2 Pro",
+  "samples": 20,
+  "warmups": 3,
+  "samplingIntervalUs": 100,
+  "captureProfiles": false,
+  "completed": true,
+  "method": "OS user+system CPU consumed by the entire local workerd process (macOS proc_pid_rusage, Mach ticks converted using mach_timebase_info), a conservative upper bound including emulated D1/R2/DO backends. Idle I/O is excluded. CPU profiling is off by default to avoid sampler overhead. Optional raw V8 profile durations are diagnostic only: local workerd can attribute unsampled idle gaps to active frames. Separate computeElapsedMs times synchronous production transformations inside the Worker (DOCX is async). Per-step production Workflow code uses an instrumented step.do shim; engine persistence/retry overhead excluded. Local hardware measurements, not Cloudflare metering or enforcement.",
+  "summary": [
+    {
+      "label": "calibration / no-op",
+      "n": 20,
+      "medianWallMs": 2.2563340000001517,
+      "medianProcessCpuMs": 0.286625,
+      "p95ProcessCpuMs": 0.423,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "calibration / 100ms I/O wait",
+      "n": 20,
+      "medianWallMs": 105.42716699999983,
+      "medianProcessCpuMs": 0.723,
+      "p95ProcessCpuMs": 1.192542,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "calibration / 30ms busy CPU",
+      "n": 20,
+      "medianWallMs": 32.79179199999999,
+      "medianProcessCpuMs": 30.144875,
+      "p95ProcessCpuMs": 30.47175,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / owner bootstrap (first call)",
+      "n": 1,
+      "medianWallMs": 95.12837499999932,
+      "medianProcessCpuMs": 97.773042,
+      "p95ProcessCpuMs": 97.773042,
+      "processCpuOver10ms": 1,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / enroll TOTP (password verification)",
+      "n": 1,
+      "medianWallMs": 70.82487499999934,
+      "medianProcessCpuMs": 70.591041,
+      "p95ProcessCpuMs": 70.591041,
+      "processCpuOver10ms": 1,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / confirm TOTP",
+      "n": 1,
+      "medianWallMs": 51.03058400000009,
+      "medianProcessCpuMs": 45.664792,
+      "p95ProcessCpuMs": 45.664792,
+      "processCpuOver10ms": 1,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / generate recovery codes",
+      "n": 1,
+      "medianWallMs": 16.023167000000285,
+      "medianProcessCpuMs": 14.910917,
+      "p95ProcessCpuMs": 14.910917,
+      "processCpuOver10ms": 1,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "compute / password hash (production scrypt)",
+      "n": 20,
+      "medianWallMs": 52.71595900000011,
+      "medianProcessCpuMs": 50.047334,
+      "p95ProcessCpuMs": 51.998792,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": 50,
+      "p95ComputeElapsedMs": 52
+    },
+    {
+      "label": "HTTP / password sign-in (TOTP challenge)",
+      "n": 20,
+      "medianWallMs": 76.76274999999987,
+      "medianProcessCpuMs": 74.688625,
+      "p95ProcessCpuMs": 77.99775,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / health",
+      "n": 20,
+      "medianWallMs": 2.8417090000002645,
+      "medianProcessCpuMs": 0.770792,
+      "p95ProcessCpuMs": 0.919792,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / authenticated session",
+      "n": 20,
+      "medianWallMs": 11.613750000000437,
+      "medianProcessCpuMs": 9.679833,
+      "p95ProcessCpuMs": 15.582833,
+      "processCpuOver10ms": 8,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / page metadata",
+      "n": 20,
+      "medianWallMs": 12.4968340000014,
+      "medianProcessCpuMs": 10.009458,
+      "p95ProcessCpuMs": 16.74075,
+      "processCpuOver10ms": 11,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / page tree (small workspace)",
+      "n": 20,
+      "medianWallMs": 14.82562500000131,
+      "medianProcessCpuMs": 11.014,
+      "p95ProcessCpuMs": 14.430083,
+      "processCpuOver10ms": 19,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / create page",
+      "n": 20,
+      "medianWallMs": 15.039082999999664,
+      "medianProcessCpuMs": 12.279458,
+      "p95ProcessCpuMs": 18.715166,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / page tree (1000 pages)",
+      "n": 20,
+      "medianWallMs": 18.69395799999984,
+      "medianProcessCpuMs": 15.344958,
+      "p95ProcessCpuMs": 21.899042,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "cron / maintenance (1000 pages)",
+      "n": 20,
+      "medianWallMs": 29.60216600000058,
+      "medianProcessCpuMs": 25.669208,
+      "p95ProcessCpuMs": 37.839042,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / load job",
+      "n": 20,
+      "medianWallMs": 2.972874999999476,
+      "medianProcessCpuMs": 0.843583,
+      "p95ProcessCpuMs": 1.00875,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / count pages",
+      "n": 20,
+      "medianWallMs": 3.343124999999418,
+      "medianProcessCpuMs": 1.367625,
+      "p95ProcessCpuMs": 1.993667,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 1",
+      "n": 20,
+      "medianWallMs": 26.07404200000019,
+      "medianProcessCpuMs": 23.925292,
+      "p95ProcessCpuMs": 24.663542,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 2",
+      "n": 20,
+      "medianWallMs": 26.188458000000537,
+      "medianProcessCpuMs": 23.824292,
+      "p95ProcessCpuMs": 39.211709,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 3",
+      "n": 20,
+      "medianWallMs": 26.368832999996812,
+      "medianProcessCpuMs": 24.128167,
+      "p95ProcessCpuMs": 24.9425,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 4",
+      "n": 20,
+      "medianWallMs": 26.140332999999373,
+      "medianProcessCpuMs": 23.819125,
+      "p95ProcessCpuMs": 25.531833,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 5",
+      "n": 20,
+      "medianWallMs": 26.417958,
+      "medianProcessCpuMs": 24.249083,
+      "p95ProcessCpuMs": 26.828417,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 6",
+      "n": 20,
+      "medianWallMs": 26.137000000000626,
+      "medianProcessCpuMs": 23.873125,
+      "p95ProcessCpuMs": 30.248125,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 7",
+      "n": 20,
+      "medianWallMs": 26.305374999999913,
+      "medianProcessCpuMs": 23.944083,
+      "p95ProcessCpuMs": 25.163417,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 8",
+      "n": 20,
+      "medianWallMs": 25.943624999999884,
+      "medianProcessCpuMs": 23.794958,
+      "p95ProcessCpuMs": 34.622541,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 9",
+      "n": 20,
+      "medianWallMs": 25.858791999999085,
+      "medianProcessCpuMs": 23.705458,
+      "p95ProcessCpuMs": 27.3235,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / reindex batch 10",
+      "n": 20,
+      "medianWallMs": 26.092916000001424,
+      "medianProcessCpuMs": 23.905708,
+      "p95ProcessCpuMs": 24.443167,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / reindex 1000 pages / complete job",
+      "n": 20,
+      "medianWallMs": 3.0000829999989946,
+      "medianProcessCpuMs": 0.893583,
+      "p95ProcessCpuMs": 1.296208,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "HTTP / search (1000 indexed pages)",
+      "n": 20,
+      "medianWallMs": 13.920249999999214,
+      "medianProcessCpuMs": 11.735208,
+      "p95ProcessCpuMs": 13.398959,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 2048 bytes / load job",
+      "n": 20,
+      "medianWallMs": 3.0863749999989523,
+      "medianProcessCpuMs": 0.879625,
+      "p95ProcessCpuMs": 1.050083,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 2048 bytes / inspect import",
+      "n": 20,
+      "medianWallMs": 3.3185000000012224,
+      "medianProcessCpuMs": 1.65675,
+      "p95ProcessCpuMs": 3.907084,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 2048 bytes / create staged resources",
+      "n": 20,
+      "medianWallMs": 3.800291000003199,
+      "medianProcessCpuMs": 1.750292,
+      "p95ProcessCpuMs": 2.188833,
+      "processCpuOver10ms": 1,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 2048 bytes / upload imported assets",
+      "n": 20,
+      "medianWallMs": 2.4367920000004233,
+      "medianProcessCpuMs": 0.553792,
+      "p95ProcessCpuMs": 0.718917,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 2048 bytes / write imported content",
+      "n": 20,
+      "medianWallMs": 21.015834000001632,
+      "medianProcessCpuMs": 21.518209,
+      "p95ProcessCpuMs": 27.370125,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 2048 bytes / verify imported content",
+      "n": 20,
+      "medianWallMs": 3.4500829999997222,
+      "medianProcessCpuMs": 1.377417,
+      "p95ProcessCpuMs": 2.327958,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 2048 bytes / publish import",
+      "n": 20,
+      "medianWallMs": 5.2097910000011325,
+      "medianProcessCpuMs": 3.166083,
+      "p95ProcessCpuMs": 4.02475,
+      "processCpuOver10ms": 1,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / markdown export 2048 bytes / load job",
+      "n": 20,
+      "medianWallMs": 2.829250000002503,
+      "medianProcessCpuMs": 0.79125,
+      "p95ProcessCpuMs": 0.946625,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / markdown export 2048 bytes / render export",
+      "n": 20,
+      "medianWallMs": 5.008750000000873,
+      "medianProcessCpuMs": 3.183375,
+      "p95ProcessCpuMs": 5.991292,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / markdown export 2048 bytes / publish export",
+      "n": 20,
+      "medianWallMs": 2.7195839999985765,
+      "medianProcessCpuMs": 0.861666,
+      "p95ProcessCpuMs": 0.974042,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / html export 2048 bytes / load job",
+      "n": 20,
+      "medianWallMs": 2.7939170000026934,
+      "medianProcessCpuMs": 0.789417,
+      "p95ProcessCpuMs": 0.968583,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / html export 2048 bytes / render export",
+      "n": 20,
+      "medianWallMs": 4.95966700000281,
+      "medianProcessCpuMs": 3.082416,
+      "p95ProcessCpuMs": 4.766708,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / html export 2048 bytes / publish export",
+      "n": 20,
+      "medianWallMs": 2.6694170000009763,
+      "medianProcessCpuMs": 0.806041,
+      "p95ProcessCpuMs": 0.930417,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / docx export 2048 bytes / load job",
+      "n": 20,
+      "medianWallMs": 2.9323330000006536,
+      "medianProcessCpuMs": 0.823625,
+      "p95ProcessCpuMs": 1.3705,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / docx export 2048 bytes / render export",
+      "n": 20,
+      "medianWallMs": 61.08124999999927,
+      "medianProcessCpuMs": 13.871625,
+      "p95ProcessCpuMs": 19.741791,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / docx export 2048 bytes / publish export",
+      "n": 20,
+      "medianWallMs": 2.963208000001032,
+      "medianProcessCpuMs": 1.00075,
+      "p95ProcessCpuMs": 1.220208,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "compute / parse Markdown 2048 bytes",
+      "n": 20,
+      "medianWallMs": 2.2194999999992433,
+      "medianProcessCpuMs": 0.378042,
+      "p95ProcessCpuMs": 0.625416,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": 0,
+      "p95ComputeElapsedMs": 1
+    },
+    {
+      "label": "compute / encode Yjs 2048 bytes",
+      "n": 20,
+      "medianWallMs": 2.267707999999402,
+      "medianProcessCpuMs": 0.670542,
+      "p95ProcessCpuMs": 1.163708,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": 0,
+      "p95ComputeElapsedMs": 1
+    },
+    {
+      "label": "compute / serialize Markdown and HTML 2048 bytes",
+      "n": 20,
+      "medianWallMs": 5.309000000001106,
+      "medianProcessCpuMs": 1.118916,
+      "p95ProcessCpuMs": 3.84075,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": 1,
+      "p95ComputeElapsedMs": 2
+    },
+    {
+      "label": "compute / project twice 2048 bytes",
+      "n": 20,
+      "medianWallMs": 2.1790000000000873,
+      "medianProcessCpuMs": 0.218625,
+      "p95ProcessCpuMs": 0.676084,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": 0,
+      "p95ComputeElapsedMs": 0
+    },
+    {
+      "label": "compute / write DOCX 2048 bytes",
+      "n": 20,
+      "medianWallMs": 67.89070800000263,
+      "medianProcessCpuMs": 12.033375,
+      "p95ProcessCpuMs": 16.107167,
+      "processCpuOver10ms": 18,
+      "medianComputeElapsedMs": 64,
+      "p95ComputeElapsedMs": 66
+    },
+    {
+      "label": "job / Markdown import 20480 bytes / load job",
+      "n": 20,
+      "medianWallMs": 2.8980000000010477,
+      "medianProcessCpuMs": 0.818125,
+      "p95ProcessCpuMs": 0.927334,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 20480 bytes / inspect import",
+      "n": 20,
+      "medianWallMs": 4.448292000000947,
+      "medianProcessCpuMs": 2.691875,
+      "p95ProcessCpuMs": 4.470459,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 20480 bytes / create staged resources",
+      "n": 20,
+      "medianWallMs": 3.4634169999990263,
+      "medianProcessCpuMs": 1.696959,
+      "p95ProcessCpuMs": 3.842708,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 20480 bytes / upload imported assets",
+      "n": 20,
+      "medianWallMs": 2.1314579999998386,
+      "medianProcessCpuMs": 0.511709,
+      "p95ProcessCpuMs": 0.553042,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 20480 bytes / write imported content",
+      "n": 20,
+      "medianWallMs": 41.83008400000108,
+      "medianProcessCpuMs": 54.779875,
+      "p95ProcessCpuMs": 86.437042,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 20480 bytes / verify imported content",
+      "n": 20,
+      "medianWallMs": 5.812333000001672,
+      "medianProcessCpuMs": 3.875292,
+      "p95ProcessCpuMs": 6.232542,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 20480 bytes / publish import",
+      "n": 20,
+      "medianWallMs": 5.3289999999979045,
+      "medianProcessCpuMs": 3.414292,
+      "p95ProcessCpuMs": 5.187542,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / markdown export 20480 bytes / load job",
+      "n": 20,
+      "medianWallMs": 2.914375000000291,
+      "medianProcessCpuMs": 0.858083,
+      "p95ProcessCpuMs": 1.483375,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / markdown export 20480 bytes / render export",
+      "n": 20,
+      "medianWallMs": 10.701375000000553,
+      "medianProcessCpuMs": 8.921458,
+      "p95ProcessCpuMs": 12.485291,
+      "processCpuOver10ms": 4,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / markdown export 20480 bytes / publish export",
+      "n": 20,
+      "medianWallMs": 2.8924999999981083,
+      "medianProcessCpuMs": 0.887417,
+      "p95ProcessCpuMs": 1.070792,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / html export 20480 bytes / load job",
+      "n": 20,
+      "medianWallMs": 2.914042000000336,
+      "medianProcessCpuMs": 0.816625,
+      "p95ProcessCpuMs": 1.164667,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / html export 20480 bytes / render export",
+      "n": 20,
+      "medianWallMs": 10.461584000000585,
+      "medianProcessCpuMs": 8.561209,
+      "p95ProcessCpuMs": 11.919459,
+      "processCpuOver10ms": 3,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / html export 20480 bytes / publish export",
+      "n": 20,
+      "medianWallMs": 2.6772499999970023,
+      "medianProcessCpuMs": 0.833042,
+      "p95ProcessCpuMs": 1.125791,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / docx export 20480 bytes / load job",
+      "n": 20,
+      "medianWallMs": 3.5865000000048894,
+      "medianProcessCpuMs": 1.089167,
+      "p95ProcessCpuMs": 1.402333,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / docx export 20480 bytes / render export",
+      "n": 20,
+      "medianWallMs": 109.6594159999986,
+      "medianProcessCpuMs": 40.964833,
+      "p95ProcessCpuMs": 54.067833,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / docx export 20480 bytes / publish export",
+      "n": 20,
+      "medianWallMs": 3.85654099999374,
+      "medianProcessCpuMs": 1.373459,
+      "p95ProcessCpuMs": 1.572542,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "compute / parse Markdown 20480 bytes",
+      "n": 20,
+      "medianWallMs": 4.006207999998878,
+      "medianProcessCpuMs": 1.932458,
+      "p95ProcessCpuMs": 2.851459,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": 2,
+      "p95ComputeElapsedMs": 2
+    },
+    {
+      "label": "compute / encode Yjs 20480 bytes",
+      "n": 20,
+      "medianWallMs": 4.561165999999503,
+      "medianProcessCpuMs": 3.091625,
+      "p95ProcessCpuMs": 8.162042,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": 2,
+      "p95ComputeElapsedMs": 3
+    },
+    {
+      "label": "compute / serialize Markdown and HTML 20480 bytes",
+      "n": 20,
+      "medianWallMs": 5.154541999996582,
+      "medianProcessCpuMs": 3.32525,
+      "p95ProcessCpuMs": 4.892,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": 3,
+      "p95ComputeElapsedMs": 4
+    },
+    {
+      "label": "compute / project twice 20480 bytes",
+      "n": 20,
+      "medianWallMs": 2.1363750000018626,
+      "medianProcessCpuMs": 0.383875,
+      "p95ProcessCpuMs": 0.412334,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": 0,
+      "p95ComputeElapsedMs": 1
+    },
+    {
+      "label": "compute / write DOCX 20480 bytes",
+      "n": 20,
+      "medianWallMs": 99.7431660000002,
+      "medianProcessCpuMs": 31.453708,
+      "p95ProcessCpuMs": 38.471083,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": 97,
+      "p95ComputeElapsedMs": 100
+    },
+    {
+      "label": "job / Markdown import 204800 bytes / load job",
+      "n": 20,
+      "medianWallMs": 6.734790999995312,
+      "medianProcessCpuMs": 1.388917,
+      "p95ProcessCpuMs": 3.754125,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 204800 bytes / inspect import",
+      "n": 20,
+      "medianWallMs": 31.422500000000582,
+      "medianProcessCpuMs": 21.397125,
+      "p95ProcessCpuMs": 40.696542,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 204800 bytes / create staged resources",
+      "n": 20,
+      "medianWallMs": 8.890375000002678,
+      "medianProcessCpuMs": 3.006667,
+      "p95ProcessCpuMs": 8.408666,
+      "processCpuOver10ms": 1,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 204800 bytes / upload imported assets",
+      "n": 20,
+      "medianWallMs": 5.2636249999995925,
+      "medianProcessCpuMs": 1.168833,
+      "p95ProcessCpuMs": 1.999375,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 204800 bytes / write imported content",
+      "n": 20,
+      "medianWallMs": 416.36162499999773,
+      "medianProcessCpuMs": 459.764291,
+      "p95ProcessCpuMs": 608.674666,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 204800 bytes / verify imported content",
+      "n": 20,
+      "medianWallMs": 47.15666699999565,
+      "medianProcessCpuMs": 38.6415,
+      "p95ProcessCpuMs": 58.869417,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / Markdown import 204800 bytes / publish import",
+      "n": 20,
+      "medianWallMs": 17.380917000002228,
+      "medianProcessCpuMs": 9.330208,
+      "p95ProcessCpuMs": 28.368459,
+      "processCpuOver10ms": 9,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / markdown export 204800 bytes / load job",
+      "n": 20,
+      "medianWallMs": 20.180374999996275,
+      "medianProcessCpuMs": 2.835042,
+      "p95ProcessCpuMs": 3.453542,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / markdown export 204800 bytes / render export",
+      "n": 20,
+      "medianWallMs": 375.69520800000464,
+      "medianProcessCpuMs": 97.334708,
+      "p95ProcessCpuMs": 124.456334,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / markdown export 204800 bytes / publish export",
+      "n": 20,
+      "medianWallMs": 20.479374999995343,
+      "medianProcessCpuMs": 2.671916,
+      "p95ProcessCpuMs": 4.049375,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / html export 204800 bytes / load job",
+      "n": 20,
+      "medianWallMs": 7.805416000002879,
+      "medianProcessCpuMs": 2.409833,
+      "p95ProcessCpuMs": 3.404625,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / html export 204800 bytes / render export",
+      "n": 20,
+      "medianWallMs": 106.58245899999747,
+      "medianProcessCpuMs": 93.081917,
+      "p95ProcessCpuMs": 113.197375,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / html export 204800 bytes / publish export",
+      "n": 20,
+      "medianWallMs": 7.855416999998852,
+      "medianProcessCpuMs": 2.175791,
+      "p95ProcessCpuMs": 3.8915,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / docx export 204800 bytes / load job",
+      "n": 20,
+      "medianWallMs": 4.96937499998603,
+      "medianProcessCpuMs": 1.418958,
+      "p95ProcessCpuMs": 5.342125,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / docx export 204800 bytes / render export",
+      "n": 20,
+      "medianWallMs": 577.9204590000008,
+      "medianProcessCpuMs": 375.141125,
+      "p95ProcessCpuMs": 474.403166,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "job / docx export 204800 bytes / publish export",
+      "n": 20,
+      "medianWallMs": 6.326832999999169,
+      "medianProcessCpuMs": 2.324667,
+      "p95ProcessCpuMs": 3.166167,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": null,
+      "p95ComputeElapsedMs": null
+    },
+    {
+      "label": "compute / parse Markdown 204800 bytes",
+      "n": 20,
+      "medianWallMs": 19.365749999997206,
+      "medianProcessCpuMs": 16.559042,
+      "p95ProcessCpuMs": 20.230375,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": 16,
+      "p95ComputeElapsedMs": 20
+    },
+    {
+      "label": "compute / encode Yjs 204800 bytes",
+      "n": 20,
+      "medianWallMs": 30.309166999999434,
+      "medianProcessCpuMs": 41.664542,
+      "p95ProcessCpuMs": 53.505917,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": 24,
+      "p95ComputeElapsedMs": 58
+    },
+    {
+      "label": "compute / serialize Markdown and HTML 204800 bytes",
+      "n": 20,
+      "medianWallMs": 34.89695800001209,
+      "medianProcessCpuMs": 32.781417,
+      "p95ProcessCpuMs": 37.851084,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": 32,
+      "p95ComputeElapsedMs": 37
+    },
+    {
+      "label": "compute / project twice 204800 bytes",
+      "n": 20,
+      "medianWallMs": 5.082666000002064,
+      "medianProcessCpuMs": 2.701209,
+      "p95ProcessCpuMs": 4.127958,
+      "processCpuOver10ms": 0,
+      "medianComputeElapsedMs": 2,
+      "p95ComputeElapsedMs": 3
+    },
+    {
+      "label": "compute / write DOCX 204800 bytes",
+      "n": 20,
+      "medianWallMs": 539.1758339999942,
+      "medianProcessCpuMs": 335.087292,
+      "p95ProcessCpuMs": 411.384583,
+      "processCpuOver10ms": 20,
+      "medianComputeElapsedMs": 535,
+      "p95ComputeElapsedMs": 575
+    }
+  ],
+  "measurementCount": 1784
+}

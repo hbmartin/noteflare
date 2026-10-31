@@ -37,6 +37,34 @@ function metadataFixture() {
   return db;
 }
 
+test("remote metadata counts respect D1's five-term compound SELECT limit", async () => {
+  let counted = 0;
+  const result = await metadataIntegrityCheck((sql) => {
+    if (sql.includes("sqlite_master"))
+      return [
+        "pages",
+        "spaces",
+        "workspaces",
+        "table_row_pages",
+        "table_rows",
+        "page_import_sources",
+        "attachments",
+      ].map((name) => ({ name }));
+    if (sql.includes("PRAGMA")) return INTEGRITY_PAGE_COLUMNS.split(",").map((name) => ({ name }));
+    if (sql.includes(" source,count(*) rows")) {
+      const statements = sql.split(" UNION ALL ");
+      assert.ok(statements.length <= 5);
+      counted += statements.length;
+      return statements.map((statement) => ({ source: statement.match(/SELECT '([^']+)'/)[1], rows: 0 }));
+    }
+    if (sql.includes("sum(revision)")) return [{ pages: 0, revisions: "0", epochs: "0", sequences: "0", updates: "0" }];
+    return [];
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.complete, true);
+  assert.ok(counted >= 12);
+});
+
 test("metadata pagination reads every page beyond the old 100000-row ceiling", async () => {
   const db = metadataFixture();
   try {

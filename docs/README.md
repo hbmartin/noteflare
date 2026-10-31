@@ -16,6 +16,7 @@ Choose the guide for your role. Feature availability depends on environment flag
 - [Operations](OPERATIONS.md): membership, secret rotation, queues, leases, imports, AI/plugin setup, and state ownership.
 - [Troubleshooting](TROUBLESHOOTING.md), [Login diagnostics](LOGIN_DIAGNOSTICS.md), and [Observability](OBSERVABILITY.md).
 - [Backup and recovery](BACKUP_AND_RECOVERY.md).
+- [Password cryptography](PASSWORD_CRYPTO.md): dedicated hashing objects and availability behavior.
 - [Continuous deployment](CONTINUOUS_DEPLOYMENT.md).
 
 ## Integrators
