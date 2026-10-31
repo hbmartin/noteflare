@@ -168,7 +168,7 @@
         "TABLE_BOARD_ENABLED": "false",
         "TABLE_CALENDAR_ENABLED": "false",
         "TABLE_RELATIONS_ENABLED": "false",
-        "NOTION_MARKDOWN_WRITES_ENABLED": "false",
+        "NOTION_MARKDOWN_WRITES_ENABLED": "true",
         "OFFLINE_EDITING_ENABLED": "false",
         "BLOCK_LINKS_ENABLED": "false",
         "LIVE_DIAGRAM_EMBEDS_ENABLED": "false",
