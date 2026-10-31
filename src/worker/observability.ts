@@ -1324,3 +1324,15 @@ export function traced<T>(
     return callback();
   });
 }
+
+// spanContext was added after our local workerd/type snapshot. Use it when
+// available to correlate invocation CPU with deployed Cloudflare traces.
+export function traceIdentifiers(tracing: ExecutionContext["tracing"] | undefined) {
+  const span = tracing?.getActiveSpan() as
+    | (Span & { spanContext?: () => { traceId: string; spanId: string } })
+    | undefined;
+  const context = span?.spanContext?.();
+  return context && /^[0-9a-f]{32}$/.test(context.traceId) && /^[0-9a-f]{16}$/.test(context.spanId)
+    ? { traceId: context.traceId, spanId: context.spanId }
+    : {};
+}

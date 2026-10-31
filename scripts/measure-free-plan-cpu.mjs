@@ -30,12 +30,12 @@ let cpuClock;
 let completed = false;
 
 const wrapper = `
-import app, { Document, TableAuthority, WorkspaceEvents, NotesJobWorkflow } from "./src/worker/index.ts";
+import app, { Document, TableAuthority, WorkspaceEvents, NotesJobWorkflow, PasswordCrypto } from "./src/worker/index.ts";
 import { markdownToDocument, documentToYjsUpdate } from "./src/shared/import-content.ts";
 import { serializeDocument, projectDocument } from "./src/shared/document-projection.ts";
 import { writeDocx } from "./src/worker/docx.ts";
 import { createAuth } from "./src/worker/auth.ts";
-export { Document, TableAuthority, WorkspaceEvents, NotesJobWorkflow };
+export { Document, TableAuthority, WorkspaceEvents, NotesJobWorkflow, PasswordCrypto };
 async function drain(ctx, fn) {
   const pending = [];
   const context = { waitUntil(p) { pending.push(p); }, passThroughOnException() {}, tracing: ctx.tracing, props: ctx.props };
@@ -342,6 +342,7 @@ try {
         ["DOCUMENT", "Document"],
         ["TABLE", "TableAuthority"],
         ["WORKSPACE_EVENTS", "WorkspaceEvents"],
+        ["PASSWORD_CRYPTO", "PasswordCrypto"],
       ].map(([name, className]) => [name, { className, scriptName: "cpu-rooms", useSQLite: true }]),
     ),
     queueProducers: { DELIVERY_QUEUE: "cpu-bench-delivery" },
@@ -588,7 +589,7 @@ int main(int argc, char **argv) {
     captureProfiles,
     completed,
     method:
-      "OS user+system CPU consumed by the entire local workerd process (macOS proc_pid_rusage, Mach ticks converted using mach_timebase_info), a conservative upper bound including emulated D1/R2/DO backends. Idle I/O is excluded. CPU profiling is off by default to avoid sampler overhead. Optional raw V8 profile durations are diagnostic only: local workerd can attribute unsampled idle gaps to active frames. Separate computeElapsedMs times synchronous production transformations inside the Worker (DOCX is async). Per-step production Workflow code uses an instrumented step.do shim; engine persistence/retry overhead excluded. Local hardware measurements, not Cloudflare metering or enforcement.",
+      "OS user+system CPU consumed by the entire local workerd process (macOS proc_pid_rusage, Mach ticks converted using mach_timebase_info), a conservative upper bound including emulated D1/R2/DO backends. These process totals cannot separate HTTP caller CPU from PasswordCrypto DO CPU. Idle I/O is excluded. CPU profiling is off by default to avoid sampler overhead. Optional raw V8 profile durations are diagnostic only: local workerd can attribute unsampled idle gaps to active frames. Separate computeElapsedMs measures wall time for production transformations, including async DOCX and password hashing RPC. Per-step production Workflow code uses an instrumented step.do shim; engine persistence/retry overhead excluded. Local hardware measurements, not Cloudflare metering or enforcement.",
     summary,
   };
   await writeFile(resolvePath(output, "results.json"), JSON.stringify({ ...metadata, records }, null, 2));

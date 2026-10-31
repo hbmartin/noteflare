@@ -10,6 +10,7 @@ import { COMMENT_PROTOCOL_VERSION } from "../shared/comment-submissions";
 import { runMaintenance } from "./maintenance";
 import { previewSlackLink } from "./slack-link-preview";
 import { TableAuthority } from "./table-authority";
+import { PasswordCrypto } from "./password-crypto";
 import {
   collaborativeTable,
   tableRegistry,
@@ -7672,4 +7673,4 @@ export default {
   },
 };
 
-export { Document, NotesJobWorkflow, WorkspaceEvents, TableAuthority };
+export { Document, NotesJobWorkflow, WorkspaceEvents, TableAuthority, PasswordCrypto };

@@ -2,6 +2,7 @@ import type { Document } from "./document";
 import type { TableAuthority } from "./table-authority";
 import type { WorkspaceEvents } from "./workspace-events";
 import type { JobWorkflowParams } from "./jobs";
+import type { PasswordCrypto } from "./password-crypto";
 
 export type { MemberContext } from "../shared/types";
 
@@ -11,6 +12,7 @@ export interface AppBindings {
   DOCUMENT: DurableObjectNamespace<Document>;
   TABLE: DurableObjectNamespace<TableAuthority>;
   WORKSPACE_EVENTS: DurableObjectNamespace<WorkspaceEvents>;
+  PASSWORD_CRYPTO: DurableObjectNamespace<PasswordCrypto>;
   NOTES_WORKFLOW: Workflow<Readonly<JobWorkflowParams>>;
   DELIVERY_QUEUE: Queue;
   API_SOURCE_BURST_LIMIT: RateLimit;
