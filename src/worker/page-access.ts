@@ -71,19 +71,34 @@ export async function spacesForMember(env: Env, member: MemberContext) {
   return rows.results;
 }
 
-export async function pageForMember(env: Env, member: MemberContext, pageId: string, includeArchived = false) {
+export async function pageForMember(
+  env: Env,
+  member: MemberContext,
+  pageId: string,
+  includeArchived = false,
+  membership: "captured" | "live" = "captured",
+) {
+  const live = membership === "live";
   const row = await env.DB.prepare(
-    `SELECT p.*, s.visibility, sm.role space_role
+    `SELECT p.*, s.visibility, sm.role space_role${live ? ", wm.role workspace_role" : ""}
        FROM pages p
+       ${live ? "JOIN workspace_members wm ON wm.workspace_id=p.workspace_id AND wm.user_id=?" : ""}
        JOIN spaces s ON s.id = p.space_id AND s.workspace_id = p.workspace_id
-       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ${live ? "wm.user_id" : "?"}
       WHERE p.id = ? AND p.workspace_id = ? AND ${pageReadableSql(includeArchived)}
-        AND ${spaceVisibleSql()}`,
+        AND ${spaceVisibleSql(live ? "wm.role" : "?")}`,
   )
-    .bind(member.user.id, pageId, member.workspace.id, member.role)
-    .first<PageRow>();
+    .bind(member.user.id, pageId, member.workspace.id, ...(live ? [] : [member.role]))
+    .first<PageRow & { workspace_role?: Role }>();
   if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
-  return { ...row, effective_role: effectiveSpaceRole(member.role, row.visibility!, row.space_role ?? null)! };
+  return {
+    ...row,
+    effective_role: effectiveSpaceRole(
+      live ? row.workspace_role! : member.role,
+      row.visibility!,
+      row.space_role ?? null,
+    )!,
+  };
 }
 
 export function effectiveSpaceRole(

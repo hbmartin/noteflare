@@ -49,7 +49,7 @@ import {
   type TableReadIntent,
   type LinkedTableReadOutcome,
 } from "./linked-table-reads";
-import { CursorChanged, readLinkedTable, type LinkedTableWindow } from "./linked-table-query";
+import { CursorChanged, readLinkedTable, type TableReadWindow } from "./linked-table-query";
 import { readTableCoverage, type TableCoverage } from "../shared/table-coverage";
 import { tableConnection } from "./table-connection";
 import { useRealtimeAccessAccount } from "./realtime-access-status";
@@ -195,7 +195,7 @@ export function CollaborativeTablePage({
   useLayoutEffect(() => {
     ownership.current.role = member.role;
   }, [member.role]);
-  const canonicalPrefix = useRef({ id: 0, data: null as TableQueryResult | null });
+  const canonicalPrefix = useRef({ id: 0, window: null as TableReadWindow | null });
   const connectionPermit = useRef<() => boolean>(() => true);
   const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
@@ -213,12 +213,12 @@ export function CollaborativeTablePage({
   const [data, setData] = useState<TableQueryResult | null>(null);
   const [panel, setPanel, acceptPanel] = useTableViewState<"view" | "properties" | null>("panel", null, viewState);
   const [savedRetry, setRetry] = useState<SavedRetry | null>(null);
-  const linkedWindow = useRef<LinkedTableWindow | null>(null);
-  const [linkedSnapshot, setLinkedSnapshot] = useState<LinkedTableWindow | null>(null);
+  const linkedWindow = useRef<TableReadWindow | null>(null);
+  const [readSnapshot, setReadSnapshot] = useState<TableReadWindow | null>(null);
   const linkedReads = useRef<ReturnType<typeof linkedTableReads<TableQueryResult>> | null>(null);
-  const publishLinkedWindow = useCallback((value: LinkedTableWindow | null) => {
+  const publishLinkedWindow = useCallback((value: TableReadWindow | null) => {
     linkedWindow.current = value;
-    setLinkedSnapshot(value);
+    setReadSnapshot(value);
   }, []);
   const publishReadiness = useCallback((value: boolean) => {
     const ready = value && ownership.current.verifiedQuery;
@@ -243,15 +243,17 @@ export function CollaborativeTablePage({
       publishReadiness(false);
       if (mode === "denied" || mode === "retire") {
         ownership.current.request++;
-        canonicalPrefix.current = { id: canonicalPrefix.current.id + 1, data: null };
+        canonicalPrefix.current = { id: canonicalPrefix.current.id + 1, window: null };
         publishLinkedWindow(null);
         if (mode === "denied") {
           ownership.current.canEdit = false;
           setData(null);
           setRetry(null);
         }
-      } else if (linkedWindow.current?.verified) {
-        publishLinkedWindow({ ...linkedWindow.current, verified: false });
+      } else {
+        if (linkedWindow.current?.verified) publishLinkedWindow({ ...linkedWindow.current, verified: false });
+        const prefix = canonicalPrefix.current;
+        if (prefix.window?.verified) prefix.window = { ...prefix.window, verified: false };
       }
     },
     [publishLinkedWindow, publishReadiness],
@@ -410,21 +412,22 @@ export function CollaborativeTablePage({
           : refreshed;
       };
       if (intent?.kind === "page" && intent.target !== undefined) {
-        const prefix = canonicalPrefix.current;
-        if (intent.queryIdentity !== queryIdentity || prefix.data?.generation !== intent.generation)
+        const prefix = canonicalPrefix.current,
+          current = prefix.window;
+        if (intent.queryIdentity !== queryIdentity || current?.data.generation !== intent.generation)
           return { state: "superseded" };
-        if (prefix.data.rows.length >= intent.target || !prefix.data.nextCursor) {
+        if (current.data.rows.length >= intent.target || !current.hasMore) {
           if (context?.networkRequired && !network) return restart();
-          return { state: "success", value: prefix.data, verification: network ? "network" : "buffer" };
+          return { state: "success", value: current.data, verification: network ? "network" : "buffer" };
         }
-        intent = { ...intent, cursor: prefix.data.nextCursor, prefix: prefix.id, revision: prefix.data.revision };
+        intent = { ...intent, cursor: current.serverCursor ?? "", prefix: prefix.id, revision: current.data.revision };
       }
       const ownsPrefix = () =>
         intent?.kind !== "page" ||
         (intent.queryIdentity === queryIdentity &&
           intent.prefix === canonicalPrefix.current.id &&
-          intent.generation === canonicalPrefix.current.data?.generation &&
-          intent.revision === canonicalPrefix.current.data?.revision);
+          intent.generation === canonicalPrefix.current.window?.data.generation &&
+          intent.revision === canonicalPrefix.current.window?.data.revision);
       if (!ownsPrefix()) return { state: "superseded" };
       if (intent?.kind === "page") cursor = intent.cursor;
       const owner = ++ownership.current.request;
@@ -448,41 +451,33 @@ export function CollaborativeTablePage({
           });
         };
         const verifying = intent?.kind === "verify";
-        const prefixData = canonicalPrefix.current.data;
-        const previous: LinkedTableWindow | null = queryBase
-          ? linkedWindow.current
-          : prefixData
+        const previous = queryBase ? linkedWindow.current : canonicalPrefix.current.window;
+        const checked = await readLinkedTable(
+          intent?.kind === "page"
             ? {
-                data: prefixData,
-                buffered: [],
-                serverCursor: prefixData.nextCursor,
-                pageSize: 100,
-                queryIdentity,
-                verified: ownership.current.verifiedQuery,
-                hasMore: Boolean(prefixData.nextCursor),
-                continuation: null,
+                kind: "append",
+                queryIdentity: intent.queryIdentity,
+                generation: intent.generation,
+                target: intent.target ?? (previous?.data.rows.length ?? 0) + 100,
               }
-            : null;
-        const checked =
-          queryBase || verifying
-            ? await readLinkedTable(
-                intent?.kind === "page" || intent?.kind === "verify"
-                  ? { kind: "refresh" }
-                  : (intent ?? { kind: "refresh" }),
-                previous,
-                readPage,
-                signal,
-                queryIdentity,
-                {
-                  networkRequired: context?.networkRequired && !network,
-                  verify: verifying,
-                  pageSize: queryBase ? undefined : 100,
-                },
-              )
-            : null;
+            : intent?.kind === "verify"
+              ? { kind: "refresh" }
+              : (intent ?? { kind: "refresh" }),
+          previous,
+          readPage,
+          signal,
+          queryIdentity,
+          {
+            networkRequired: context?.networkRequired && !network,
+            verify: verifying,
+            refresh: queryBase || context?.preserveExtent ? "visible" : "first-page",
+            // Canonical continuation cursors rebind here; verification and linked windows restart in the reader.
+            restart: Boolean(queryBase) || intent?.kind !== "page",
+          },
+        );
         const linked = queryBase ? checked : null;
-        const result = checked ? checked.window.data : await readPage(cursor);
-        network ||= !checked || checked.verification === "network";
+        const result = checked.window.data;
+        network ||= checked.verification === "network";
         if (!active.current || signal?.aborted || !ownsPrefix()) return { state: "superseded" };
         // Canonical transport queries retain their authorization result when only view data is superseded.
         if (owner !== ownership.current.request)
@@ -499,8 +494,7 @@ export function CollaborativeTablePage({
         }
         // Query/access evidence belongs to this verification lifetime. Later content watermarks
         // remain the coordinator's background freshness obligation, not an authorization latch.
-        const verified =
-          (!linked || linked.verification === "network") && verification === ownership.current.verification;
+        const verified = checked.verification === "network" && verification === ownership.current.verification;
         if (linked) {
           const available =
             navigator.onLine && !document.hidden && (verified || linkedWindow.current?.verified === true);
@@ -514,38 +508,21 @@ export function CollaborativeTablePage({
           ownership.current.verifiedQuery = true;
         }
         if (!queryBase) {
-          const current = canonicalPrefix.current.data;
-          if (
-            verifying &&
-            current &&
-            current.revision === result.revision &&
-            current.generation === result.generation
-          ) {
-            canonicalPrefix.current.data = result;
-            setData(result);
-          } else if (
-            cursor &&
-            current &&
-            current.revision === result.revision &&
-            current.generation === result.generation
-          ) {
-            const combined = {
-              ...result,
-              rows: [...new Map([...current.rows, ...result.rows].map((row) => [row.id, row])).values()],
-            };
-            canonicalPrefix.current.data = combined;
-            setData(combined);
-          } else {
-            canonicalPrefix.current = { id: canonicalPrefix.current.id + 1, data: result };
+          const prefix = canonicalPrefix.current;
+          const current = prefix.window?.data;
+          const sameCoverage = current?.revision === result.revision && current.generation === result.generation;
+          const retainPrefix = sameCoverage && (verifying || intent?.kind === "page");
+          canonicalPrefix.current = { id: retainPrefix ? prefix.id : prefix.id + 1, window: checked.window };
+          if (!retainPrefix)
             linkedReads.current?.retirePages(
               (pending) =>
                 pending.target !== undefined &&
                 pending.queryIdentity === queryIdentity &&
                 pending.generation === result.generation,
             );
-            setData(result);
-          }
-        } else setData(result);
+        }
+        if (!queryBase) setReadSnapshot(checked.window);
+        setData(result);
         const coverage = network ? readTableCoverage(result) : undefined;
         if (coverage) {
           advanceGeneration(coverage);
@@ -572,18 +549,18 @@ export function CollaborativeTablePage({
                 (connectionPermit.current() && ownership.current.authorizedGeneration === result.generation),
               ),
           );
-        const prefix = canonicalPrefix.current;
+        const prefix = canonicalPrefix.current.window;
         if (
           intent?.kind === "page" &&
           intent.target !== undefined &&
-          prefix.data &&
+          prefix &&
           prefix.data.rows.length < intent.target &&
-          prefix.data.nextCursor
+          prefix.hasMore
         )
           return fetchTable({ signal, intent, context, restarts, network });
         return {
           state: "success",
-          value: queryBase ? result : (prefix.data ?? result),
+          value: result,
           verification: network ? "network" : "buffer",
         };
       } catch (cause) {
@@ -603,19 +580,12 @@ export function CollaborativeTablePage({
         }
         if (
           cause instanceof CursorChanged ||
-          (cause instanceof ApiClientError && cause.code === "table_cursor_stale" && (queryBase || restarts))
-        )
-          return { state: "stale" };
-        setError(apiErrorMessage(cause, "The table could not be loaded."));
-        if (
-          cause instanceof ApiClientError &&
-          cause.code === "table_cursor_stale" &&
-          cursor &&
-          !queryBase &&
-          !restarts
+          (cause instanceof ApiClientError && cause.code === "table_cursor_stale")
         ) {
-          return restart();
+          if (!queryBase && intent?.kind === "page" && !restarts) return restart();
+          return { state: "stale" };
         }
+        setError(apiErrorMessage(cause, "The table could not be loaded."));
         return { state: "failure" };
       }
     },
@@ -1508,15 +1478,13 @@ export function CollaborativeTablePage({
             </table>
           </div>
         )}
-        {(queryBase
-          ? linkedSnapshot?.queryIdentity === queryIdentity && linkedSnapshot.continuation
-          : data.nextCursor) && (
+        {readSnapshot?.queryIdentity === queryIdentity && readSnapshot.continuation && (
           <button
             disabled={busy}
             onClick={() => {
               if (!queryBase)
                 void load({
-                  cursor: data.nextCursor!,
+                  cursor: canonicalPrefix.current.window?.serverCursor ?? "",
                   queryIdentity,
                   generation: data.generation,
                   revision: data.revision,

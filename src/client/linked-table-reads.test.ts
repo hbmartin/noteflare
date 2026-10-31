@@ -624,6 +624,8 @@ it("keeps append failures out of the first denial recovery deadline", async () =
   }) => void;
   const read = vi.fn(async (intent: TableReadIntent) => {
     if (intent.kind === "refresh") return { state: "denied" as const };
+    if (intent.kind === "verify")
+      return { state: "success" as const, value: { generation: 1, revision: 1 }, verification: "network" as const };
     if (++pages <= 5) return { state: "failure" as const };
     return new Promise<{ state: "success"; value: { generation: number; revision: number }; verification: "network" }>(
       (resolve) => {
@@ -631,7 +633,7 @@ it("keeps append failures out of the first denial recovery deadline", async () =
       },
     );
   });
-  const controller = linkedTableReads({ read, poll: false, coverage: (value) => value, unavailable: vi.fn() });
+  const controller = linkedTableReads({ read, poll: false, coverage: (value) => value!, unavailable: vi.fn() });
   controllers.push(controller);
   void controller.page({ queryIdentity: "query", generation: 1, revision: 1, prefix: 1, cursor: "next", target: 300 });
   await flushReads();
@@ -1052,7 +1054,8 @@ it("keeps a failed full query's deadline when it takes over independent verifica
   await flushReads();
   expect(await refresh).toBeNull();
   expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "append", "append", "verify", "refresh"]);
-  await vi.advanceTimersByTimeAsync(999);
+  // The failed independent verification is the first failure of this same chain.
+  await vi.advanceTimersByTimeAsync(1999);
   expect(read).toHaveBeenCalledTimes(5);
   await vi.advanceTimersByTimeAsync(1);
   expect(read.mock.calls[5]![0].kind).toBe("refresh");
@@ -1129,3 +1132,117 @@ it.each(["foreground", "content"] as const)(
     expect(read.mock.calls[4]![0].kind).toBe(change === "foreground" ? "verify" : "refresh");
   },
 );
+
+it("yields same-scope superseded verification to bounded recovery and a real timer", async () => {
+  const value = { generation: 1, revision: 1 };
+  let scope = 0;
+  const calls: string[] = [];
+  const read = vi.fn(async (intent: TableReadIntent) => {
+    calls.push(intent.kind);
+    if (calls.length === 1) return { state: "success" as const, value, verification: "network" as const };
+    if (calls.length > 12) throw new Error("Scheduler safety stop");
+    return { state: "superseded" as const };
+  });
+  const c = linkedTableReads({
+    read,
+    scope: () => scope,
+    coverage: (v: typeof value) => v,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(c);
+  await c.request();
+  scope++;
+  expect(await c.refresh(value)).toEqual({ state: "retired" });
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  expect(calls).toEqual(["refresh", "verify", "refresh"]);
+  expect(read).toHaveBeenCalledTimes(3);
+});
+
+it("preserves active independent-verification failure history during external denial", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const value = { generation: 1, revision: 1 };
+  let scope = 0;
+  const read = vi.fn(async (_intent: TableReadIntent) => {
+    if (read.mock.calls.length === 1) return { state: "success" as const, value, verification: "network" as const };
+    if (read.mock.calls.length <= 3) return { state: "failure" as const };
+    return new Promise<never>(() => {});
+  });
+  const c = linkedTableReads({
+    read,
+    scope: () => scope,
+    coverage: (v: typeof value) => v,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(c);
+  await c.request();
+  scope++;
+  await c.refresh(value);
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(read).toHaveBeenCalledTimes(4);
+  c.recoverDenied();
+  await vi.advanceTimersByTimeAsync(3999);
+  expect(read).toHaveBeenCalledTimes(4);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(5);
+  expect(read.mock.calls.at(-1)![0].kind).toBe("refresh");
+});
+
+it("uses an eligible queued full refresh instead of a redundant independent verification", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const value = { generation: 1, revision: 1 };
+  let release!: () => void,
+    appends = 0;
+  const read = vi.fn(async (intent: TableReadIntent) => {
+    if (intent.kind === "append") {
+      if (++appends === 2)
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      return { state: "failure" as const };
+    }
+    return { state: "success" as const, value, verification: "network" as const };
+  });
+  const c = linkedTableReads({ read, coverage: (v: typeof value) => v, unavailable: vi.fn(), poll: false });
+  controllers.push(c);
+  await c.request();
+  await c.request(continuation());
+  await vi.advanceTimersByTimeAsync(1000);
+  const refresh = c.request();
+  release();
+  await refresh;
+  await flushReads();
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "append", "append", "refresh"]);
+});
+
+it("retains failed verification history when supersession transfers its obligation to freshness recovery", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let scope = 0;
+  const value = { generation: 1, revision: 1 };
+  const read = vi.fn(async (_intent: TableReadIntent) => {
+    if (read.mock.calls.length === 1) return { state: "success" as const, value, verification: "network" as const };
+    if (read.mock.calls.length === 4) return { state: "superseded" as const };
+    return { state: "failure" as const };
+  });
+  const c = linkedTableReads({
+    read,
+    scope: () => scope,
+    coverage: (v: typeof value) => v,
+    unavailable: vi.fn(),
+    poll: false,
+  });
+  controllers.push(c);
+  await c.request();
+  scope++;
+  await c.refresh(value);
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["refresh", "verify", "verify", "verify", "refresh"]);
+  await vi.advanceTimersByTimeAsync(3999);
+  expect(read).toHaveBeenCalledTimes(5);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(6);
+});

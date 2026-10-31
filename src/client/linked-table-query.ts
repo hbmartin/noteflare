@@ -2,7 +2,7 @@ import { ApiClientError } from "./api";
 import { TABLE_PAGE_MAX } from "../shared/table-limits";
 import type { TableQueryResult } from "../shared/table-protocol";
 import type { LinkedTableContinuation, LinkedTableReadIntent } from "./linked-table-reads";
-export type LinkedTableWindow = {
+export type TableReadWindow = {
   data: TableQueryResult;
   buffered: TableQueryResult["rows"];
   serverCursor: string | null;
@@ -12,7 +12,7 @@ export type LinkedTableWindow = {
   hasMore: boolean;
   continuation: LinkedTableContinuation | null;
 };
-export type LinkedTableReadResult = { window: LinkedTableWindow; verification: "network" | "buffer" };
+export type LinkedTableReadResult = { window: TableReadWindow; verification: "network" | "buffer" };
 export class CursorChanged extends Error {
   constructor() {
     super("The table changed during pagination.");
@@ -24,11 +24,11 @@ const mergeRows = (left: TableQueryResult["rows"], right: TableQueryResult["rows
 /** Keep visible continuation intent separate from opaque, page-size-bound server cursors. */
 export async function readLinkedTable(
   intent: LinkedTableReadIntent,
-  previous: LinkedTableWindow | null,
+  previous: TableReadWindow | null,
   read: (cursor?: string, limit?: number) => Promise<TableQueryResult>,
   signal?: AbortSignal,
   queryIdentity = "",
-  options: { networkRequired?: boolean; verify?: boolean; pageSize?: number } = {},
+  options: { networkRequired?: boolean; verify?: boolean; refresh?: "first-page" | "visible"; restart?: boolean } = {},
 ): Promise<LinkedTableReadResult> {
   const { networkRequired = false } = options;
   signal?.throwIfAborted();
@@ -47,7 +47,9 @@ export async function readLinkedTable(
   let target = current
     ? intent.kind === "append"
       ? Math.max(current.data.rows.length, intent.target)
-      : current.data.rows.length || 100
+      : !options.verify && options.refresh === "first-page"
+        ? 100
+        : current.data.rows.length || 100
     : 100;
   for (let attempt = 0; ; attempt++) {
     try {
@@ -66,25 +68,22 @@ export async function readLinkedTable(
         cursor = current.serverCursor;
         pageSize = current.pageSize;
       } else {
-        pageSize = options.pageSize ?? Math.min(TABLE_PAGE_MAX, Math.max(100, target));
+        if (options.verify && current && attempt === 0) {
+          const probe = await read(undefined, 1);
+          signal?.throwIfAborted();
+          if (probe.generation === current.data.generation && probe.revision === current.data.revision)
+            return {
+              window: {
+                ...current,
+                data: { ...probe, rows: current.data.rows, nextCursor: current.data.nextCursor },
+                verified: true,
+              },
+              verification: "network",
+            };
+        }
+        pageSize = Math.min(TABLE_PAGE_MAX, Math.max(100, target));
         data = await read(undefined, pageSize);
         network = true;
-        if (
-          options.verify &&
-          current &&
-          data.generation === current.data.generation &&
-          data.revision === current.data.revision
-        ) {
-          signal?.throwIfAborted();
-          return {
-            window: {
-              ...current,
-              data: { ...data, rows: current.data.rows, nextCursor: current.data.nextCursor },
-              verified: true,
-            },
-            verification: "network",
-          };
-        }
         if (intent.kind === "append" && data.generation !== intent.generation) target = 100;
         rows = mergeRows([], data.rows);
         cursor = data.nextCursor;
@@ -122,6 +121,7 @@ export async function readLinkedTable(
       if (
         signal?.aborted ||
         attempt ||
+        options.restart === false ||
         !(error instanceof CursorChanged || (error instanceof ApiClientError && error.code === "table_cursor_stale"))
       )
         throw error;
