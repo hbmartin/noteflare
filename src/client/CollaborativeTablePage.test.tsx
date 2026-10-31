@@ -2737,7 +2737,7 @@ it("classifies repeated canonical cursor churn as bounded freshness recovery", a
     ["500", 500],
     ["0", 500],
     ["500", 500],
-    ["0", 1],
+    ["0", 500],
   ]);
   expect(screen.queryByText("Cursor changed during verification")).toBeNull();
   expect(screen.getByText("The table is changing. Refreshing the latest data…")).toBeVisible();

@@ -450,7 +450,7 @@ export function CollaborativeTablePage({
             signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
           });
         };
-        const verifying = intent?.kind === "verify" || context?.verifyLoaded === true;
+        const verifying = intent?.kind === "verify";
         const previous = queryBase ? linkedWindow.current : canonicalPrefix.current.window;
         const checked = await readLinkedTable(
           intent?.kind === "page"
@@ -470,7 +470,8 @@ export function CollaborativeTablePage({
           {
             networkRequired: context?.networkRequired && !network,
             verify: verifying,
-            refresh: queryBase ? "visible" : "first-page",
+            refresh: queryBase || context?.preserveExtent ? "visible" : "first-page",
+            // Canonical continuation cursors rebind here; verification and linked windows restart in the reader.
             restart: Boolean(queryBase) || intent?.kind !== "page",
           },
         );

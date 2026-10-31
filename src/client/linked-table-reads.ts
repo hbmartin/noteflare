@@ -19,7 +19,8 @@ export type TableReadIntent =
 export type TableReadContext = {
   acceptsGeneration: (coverage: TableCoverage) => boolean;
   networkRequired: boolean;
-  verifyLoaded?: boolean;
+  /** Full freshness recovery retains rows; it must not become a coverage-only probe. */
+  preserveExtent?: boolean;
 };
 export type LinkedTableReadOutcome<T> =
   | { state: "success"; value: T; verification: "network" | "buffer" }
@@ -40,7 +41,7 @@ type Batch<T> = {
   retryAt: number;
   manual: boolean;
   networkRequired?: boolean;
-  verifyLoaded?: boolean;
+  preserveExtent?: boolean;
   failures?: number;
   scope?: unknown;
 };
@@ -251,7 +252,7 @@ export function linkedTableReads<T>(options: {
   function queueFreshnessRecovery(batch: Batch<T>) {
     const existing = queued.get("refresh");
     const refresh = existing ?? freshBatch<T>();
-    if (!existing) refresh.verifyLoaded = batch.intent.kind === "verify" || batch.verifyLoaded;
+    if (!existing) refresh.preserveExtent = batch.intent.kind === "verify" || batch.preserveExtent;
     if (!isContinuation(batch.intent)) {
       refresh.attempt = Math.max(refresh.attempt, batch.attempt);
       if (!refresh.manual) refresh.retryAt = Math.max(refresh.retryAt, batch.retryAt);
@@ -274,7 +275,7 @@ export function linkedTableReads<T>(options: {
         acceptsGeneration: (coverage) =>
           coverage.generation >= Math.max(completed?.coverage?.generation ?? 0, ...watermarks.keys()),
         networkRequired: Boolean(batch.networkRequired),
-        verifyLoaded: batch.verifyLoaded,
+        preserveExtent: batch.preserveExtent,
       });
     } catch {
       outcome = { state: available() ? "failure" : "suspended" };
@@ -381,7 +382,7 @@ export function linkedTableReads<T>(options: {
     if (manual && !joining) {
       batch.retryAt = 0;
       batch.manual = true;
-      if (intent.kind === "refresh") batch.verifyLoaded = false;
+      if (intent.kind === "refresh") batch.preserveExtent = false;
     }
     if (!joining) queued.set(intentKey(batch.intent), batch);
     if (manual && needsFreshness(batch)) {
