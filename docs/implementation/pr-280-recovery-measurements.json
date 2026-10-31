@@ -1,0 +1,2013 @@
+{
+  "baselineRevision": "955d3f942b88965980faf47e33f24b6bc029d12d",
+  "updatedRevision": "7d9c947e0da9671940385de6bb7585489fe1fc50",
+  "harnessRevision": "7d9c947e0da9671940385de6bb7585489fe1fc50",
+  "command": "NOTES_BENCH_TYPING_EDITS=300 NOTES_BENCH_READ_RECOVERY=1 node scripts/measure-collaboration-recovery.mjs 955d3f942b88965980faf47e33f24b6bc029d12d /tmp/noteflare-280-measurements.json",
+  "fixture": {
+    "readRecoverySamplesPerVersion": 3,
+    "corruptAccountDraft": false,
+    "rows": 100,
+    "columns": 3,
+    "accountDrafts": 500,
+    "unrelatedStorageKeys": 5000,
+    "typingEditsPerContext": 300,
+    "contextsPerVersion": 3,
+    "reconnectingClients": 20,
+    "readRecoveryRandomDraw": 0.5,
+    "paginationRows": 1200,
+    "paginationVisibleRowsBeforeRefresh": 500,
+    "paginationRefreshSamplesPerContext": 5,
+    "queryVerificationSamplesPerContext": 20,
+    "windowVerificationSamplesPerCasePerContext": 20,
+    "fulfilledContinuationSamplesPerContext": 1000,
+    "freshnessCompletionSamplesPerContext": 10,
+    "invalidationsPerFreshnessSample": 8
+  },
+  "limits": "Local optimized/minified production-React bundle in Chromium; API and table socket transport are controlled fixtures, not production network or D1 latency.",
+  "runs": {
+    "baseline": [
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.7999999523162842,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1411.3999998569489,
+          "p95Ms": 1967.3999998569489,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 32.799999952316284,
+          "p95Ms": 33.80000019073486,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.5,
+          "p95Ms": 18.09999990463257,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.299999952316284,
+          "p95Ms": 35.09999990463257,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "windowVerification": {
+          "canonicalUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.40000009536743,
+            "p95Ms": 17.59999990463257,
+            "requests": [
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100]
+            ],
+            "rowsReceived": [
+              100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100
+            ],
+            "responseJsonCharacters": [
+              19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826,
+              19826, 19826, 19826, 19826, 19826
+            ]
+          },
+          "canonicalChanged": {
+            "samples": 20,
+            "p50Ms": 83,
+            "p95Ms": 84.59999990463257,
+            "requests": [
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100]
+            ],
+            "rowsReceived": [
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500
+            ],
+            "responseJsonCharacters": [
+              100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010,
+              100010, 100010, 100010, 100010, 100010, 100010, 100010
+            ]
+          },
+          "linkedUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.5,
+            "p95Ms": 17.700000047683716,
+            "requests": [
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500]
+            ],
+            "rowsReceived": [
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500
+            ],
+            "responseJsonCharacters": [
+              97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826,
+              97826, 97826, 97826, 97826, 97826
+            ]
+          },
+          "linkedChanged": {
+            "samples": 20,
+            "p50Ms": 16.59999990463257,
+            "p95Ms": 18,
+            "requests": [
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500]
+            ],
+            "rowsReceived": [
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500
+            ],
+            "responseJsonCharacters": [
+              97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826,
+              97826, 97826, 97826, 97826, 97826
+            ]
+          },
+          "meaning": "Controlled window-reader verification with one animation-frame delay per response; not production network latency or the complete canonical renderer."
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.299999952316284,
+          "p95Ms": 18.600000143051147,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.2999999523162842,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 14.900000095367432,
+          "p95Ms": 15.699999809265137,
+          "refreshP50Ms": 49.90000009536743,
+          "refreshP95Ms": 50.5,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 20,
+          "p50Ms": 18,
+          "p95Ms": 19.299999952316284,
+          "saveStillPending": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "append"],
+          "recoveryRefreshes": 0,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1515.7999999523163,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.6000001430511475,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1519.6999998092651,
+          "p95Ms": 1943.8999998569489,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.299999952316284,
+          "p95Ms": 33.40000009536743,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.600000143051147,
+          "p95Ms": 16.899999856948853,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.19999980926514,
+          "p95Ms": 33.90000009536743,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "windowVerification": {
+          "canonicalUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.59999990463257,
+            "p95Ms": 16.800000190734863,
+            "requests": [
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100]
+            ],
+            "rowsReceived": [
+              100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100
+            ],
+            "responseJsonCharacters": [
+              19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826,
+              19826, 19826, 19826, 19826, 19826
+            ]
+          },
+          "canonicalChanged": {
+            "samples": 20,
+            "p50Ms": 83.20000004768372,
+            "p95Ms": 83.69999980926514,
+            "requests": [
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100]
+            ],
+            "rowsReceived": [
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500
+            ],
+            "responseJsonCharacters": [
+              100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010,
+              100010, 100010, 100010, 100010, 100010, 100010, 100010
+            ]
+          },
+          "linkedUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.5,
+            "p95Ms": 16.800000190734863,
+            "requests": [
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500]
+            ],
+            "rowsReceived": [
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500
+            ],
+            "responseJsonCharacters": [
+              97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826,
+              97826, 97826, 97826, 97826, 97826
+            ]
+          },
+          "linkedChanged": {
+            "samples": 20,
+            "p50Ms": 16.40000009536743,
+            "p95Ms": 16.700000047683716,
+            "requests": [
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500]
+            ],
+            "rowsReceived": [
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500
+            ],
+            "responseJsonCharacters": [
+              97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826,
+              97826, 97826, 97826, 97826, 97826
+            ]
+          },
+          "meaning": "Controlled window-reader verification with one animation-frame delay per response; not production network latency or the complete canonical renderer."
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.59999990463257,
+          "p95Ms": 16.800000190734863,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.2999999523162842,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 14.900000095367432,
+          "p95Ms": 15.100000143051147,
+          "refreshP50Ms": 49.89999985694885,
+          "refreshP95Ms": 50.09999990463257,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 20,
+          "p50Ms": 18,
+          "p95Ms": 18.299999952316284,
+          "saveStillPending": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "append"],
+          "recoveryRefreshes": 0,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1518.5999999046326,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.5999999046325684,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1403.4000000953674,
+          "p95Ms": 1953.5999999046326,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.200000047683716,
+          "p95Ms": 33.40000009536743,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.59999990463257,
+          "p95Ms": 16.799999952316284,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.19999980926514,
+          "p95Ms": 52.09999990463257,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "windowVerification": {
+          "canonicalUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.5,
+            "p95Ms": 16.700000047683716,
+            "requests": [
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100],
+              [100]
+            ],
+            "rowsReceived": [
+              100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100
+            ],
+            "responseJsonCharacters": [
+              19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826, 19826,
+              19826, 19826, 19826, 19826, 19826
+            ]
+          },
+          "canonicalChanged": {
+            "samples": 20,
+            "p50Ms": 83.10000014305115,
+            "p95Ms": 83.20000004768372,
+            "requests": [
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100],
+              [100, 100, 100, 100, 100]
+            ],
+            "rowsReceived": [
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500
+            ],
+            "responseJsonCharacters": [
+              100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010, 100010,
+              100010, 100010, 100010, 100010, 100010, 100010, 100010
+            ]
+          },
+          "linkedUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.40000009536743,
+            "p95Ms": 16.700000047683716,
+            "requests": [
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500]
+            ],
+            "rowsReceived": [
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500
+            ],
+            "responseJsonCharacters": [
+              97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826,
+              97826, 97826, 97826, 97826, 97826
+            ]
+          },
+          "linkedChanged": {
+            "samples": 20,
+            "p50Ms": 16.5,
+            "p95Ms": 16.600000143051147,
+            "requests": [
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500],
+              [500]
+            ],
+            "rowsReceived": [
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500
+            ],
+            "responseJsonCharacters": [
+              97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826, 97826,
+              97826, 97826, 97826, 97826, 97826
+            ]
+          },
+          "meaning": "Controlled window-reader verification with one animation-frame delay per response; not production network latency or the complete canonical renderer."
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.600000143051147,
+          "p95Ms": 17.09999990463257,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.20000004768371582,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 14.899999856948853,
+          "p95Ms": 15.299999952316284,
+          "refreshP50Ms": 49.799999952316284,
+          "refreshP95Ms": 50.39999985694885,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 20,
+          "p50Ms": 17.799999952316284,
+          "p95Ms": 18.09999990463257,
+          "saveStillPending": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "append"],
+          "recoveryRefreshes": 0,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1519,
+          "queries": 3
+        }
+      }
+    ],
+    "updated": [
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.5999999046325684,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1583.5,
+          "p95Ms": 1990.6000001430511,
+          "maximumReadyIn100ms": 4,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.40000009536743,
+          "p95Ms": 34.09999990463257,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.5,
+          "p95Ms": 18.40000009536743,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.299999952316284,
+          "p95Ms": 35.200000047683716,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "windowVerification": {
+          "canonicalUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.40000009536743,
+            "p95Ms": 17.200000047683716,
+            "requests": [
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1]
+            ],
+            "rowsReceived": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "responseJsonCharacters": [
+              733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733
+            ]
+          },
+          "canonicalChanged": {
+            "samples": 20,
+            "p50Ms": 33,
+            "p95Ms": 33.69999980926514,
+            "requests": [
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500]
+            ],
+            "rowsReceived": [
+              501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501
+            ],
+            "responseJsonCharacters": [
+              98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559,
+              98559, 98559, 98559, 98559, 98559
+            ]
+          },
+          "linkedUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.59999990463257,
+            "p95Ms": 17.600000143051147,
+            "requests": [
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1]
+            ],
+            "rowsReceived": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "responseJsonCharacters": [
+              733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733
+            ]
+          },
+          "linkedChanged": {
+            "samples": 20,
+            "p50Ms": 33.10000014305115,
+            "p95Ms": 34.89999985694885,
+            "requests": [
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500]
+            ],
+            "rowsReceived": [
+              501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501
+            ],
+            "responseJsonCharacters": [
+              98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559,
+              98559, 98559, 98559, 98559, 98559
+            ]
+          },
+          "meaning": "Controlled window-reader verification with one animation-frame delay per response; not production network latency or the complete canonical renderer."
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 15.700000047683716,
+          "p95Ms": 17.600000143051147,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.2999999523162842,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 15,
+          "p95Ms": 16.299999952316284,
+          "refreshP50Ms": 49.5,
+          "refreshP95Ms": 51.700000047683716,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 20,
+          "p50Ms": 18,
+          "p95Ms": 19.40000009536743,
+          "saveStillPending": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "append"],
+          "recoveryRefreshes": 0,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1517.7000000476837,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.7000000476837158,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1419.7999999523163,
+          "p95Ms": 1801.5,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.200000047683716,
+          "p95Ms": 33.5,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.600000143051147,
+          "p95Ms": 16.800000190734863,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.19999980926514,
+          "p95Ms": 35.19999980926514,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "windowVerification": {
+          "canonicalUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.5,
+            "p95Ms": 17.700000047683716,
+            "requests": [
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1]
+            ],
+            "rowsReceived": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "responseJsonCharacters": [
+              733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733
+            ]
+          },
+          "canonicalChanged": {
+            "samples": 20,
+            "p50Ms": 33,
+            "p95Ms": 34.59999990463257,
+            "requests": [
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500]
+            ],
+            "rowsReceived": [
+              501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501
+            ],
+            "responseJsonCharacters": [
+              98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559,
+              98559, 98559, 98559, 98559, 98559
+            ]
+          },
+          "linkedUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.600000143051147,
+            "p95Ms": 17.700000047683716,
+            "requests": [
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1]
+            ],
+            "rowsReceived": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "responseJsonCharacters": [
+              733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733
+            ]
+          },
+          "linkedChanged": {
+            "samples": 20,
+            "p50Ms": 32.89999985694885,
+            "p95Ms": 34.700000047683716,
+            "requests": [
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500]
+            ],
+            "rowsReceived": [
+              501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501
+            ],
+            "responseJsonCharacters": [
+              98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559,
+              98559, 98559, 98559, 98559, 98559
+            ]
+          },
+          "meaning": "Controlled window-reader verification with one animation-frame delay per response; not production network latency or the complete canonical renderer."
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.59999990463257,
+          "p95Ms": 18.799999952316284,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.2999999523162842,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 14.700000047683716,
+          "p95Ms": 15.899999856948853,
+          "refreshP50Ms": 50,
+          "refreshP95Ms": 51.299999952316284,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 20,
+          "p50Ms": 18,
+          "p95Ms": 19.200000047683716,
+          "saveStillPending": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "append"],
+          "recoveryRefreshes": 0,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1517.6999998092651,
+          "queries": 3
+        }
+      },
+      {
+        "typing": {
+          "samples": 300,
+          "firstEditMs": 0.5999999046325684,
+          "p50Ms": 0.09999990463256836,
+          "p95Ms": 0.20000004768371582,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 300,
+            "wholeTableRenders": 0
+          },
+          "requests": 1,
+          "saveFocusNotifications": 3
+        },
+        "receipts": {
+          "samples": 20,
+          "p50Ms": 0,
+          "p95Ms": 0.10000014305114746,
+          "counts": {
+            "length": 0,
+            "key": 0,
+            "writes": 20,
+            "removes": 20
+          }
+        },
+        "receiptSubscriptions": {
+          "renders": 20,
+          "subscriptions": 0,
+          "unsubscriptions": 0
+        },
+        "reconnect": {
+          "samples": 20,
+          "p50Ms": 1627.7999999523163,
+          "p95Ms": 1867.9000000953674,
+          "maximumReadyIn100ms": 5,
+          "webSockets": 40,
+          "queries": 40
+        },
+        "pagination": {
+          "refreshSamples": 5,
+          "p50Ms": 33.200000047683716,
+          "p95Ms": 33.5,
+          "refreshQueries": [1, 1, 1, 1, 1],
+          "firstContinuationQueries": 1,
+          "bufferedContinuationQueries": 0,
+          "visibleRows": 700,
+          "requests": [
+            {
+              "limit": 100,
+              "cursor": null
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":100,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":200,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":300,\"limit\":100}"
+            },
+            {
+              "limit": 100,
+              "cursor": "{\"offset\":400,\"limit\":100}"
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": null
+            },
+            {
+              "limit": 500,
+              "cursor": "{\"offset\":500,\"limit\":500}"
+            }
+          ]
+        },
+        "queryVerification": {
+          "samples": 20,
+          "p50Ms": 16.600000143051147,
+          "p95Ms": 16.799999952316284,
+          "toolbarReplacements": 0,
+          "controlsMissingDuringVerification": 0,
+          "renderCounts": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "queries": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        },
+        "fulfilledContinuations": {
+          "samples": 1000,
+          "p50Ms": 0,
+          "p95Ms": 0,
+          "requests": 0,
+          "sameWindows": 1000,
+          "sameData": 1000,
+          "sameRows": 1000
+        },
+        "viewSwitch": {
+          "samples": 20,
+          "p50Ms": 33.299999952316284,
+          "p95Ms": 33.5,
+          "restored": 20,
+          "renderCounts": [7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+          "queries": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+        },
+        "windowVerification": {
+          "canonicalUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.5,
+            "p95Ms": 16.799999952316284,
+            "requests": [
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1]
+            ],
+            "rowsReceived": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "responseJsonCharacters": [
+              733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733
+            ]
+          },
+          "canonicalChanged": {
+            "samples": 20,
+            "p50Ms": 33.10000014305115,
+            "p95Ms": 33.299999952316284,
+            "requests": [
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500]
+            ],
+            "rowsReceived": [
+              501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501
+            ],
+            "responseJsonCharacters": [
+              98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559,
+              98559, 98559, 98559, 98559, 98559
+            ]
+          },
+          "linkedUnchanged": {
+            "samples": 20,
+            "p50Ms": 16.5,
+            "p95Ms": 16.600000143051147,
+            "requests": [
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1],
+              [1]
+            ],
+            "rowsReceived": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            "responseJsonCharacters": [
+              733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733, 733
+            ]
+          },
+          "linkedChanged": {
+            "samples": 20,
+            "p50Ms": 33.19999980926514,
+            "p95Ms": 33.40000009536743,
+            "requests": [
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500],
+              [1, 500]
+            ],
+            "rowsReceived": [
+              501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501, 501
+            ],
+            "responseJsonCharacters": [
+              98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559, 98559,
+              98559, 98559, 98559, 98559, 98559
+            ]
+          },
+          "meaning": "Controlled window-reader verification with one animation-frame delay per response; not production network latency or the complete canonical renderer."
+        },
+        "freshnessCompletion": {
+          "samples": 10,
+          "invalidationsPerSample": 8,
+          "p50Ms": 16.59999990463257,
+          "p95Ms": 16.899999856948853,
+          "reads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "outcomes": [
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending",
+            "pending"
+          ],
+          "meaning": "Caller completion under controlled invalidation churn; pending is not fresh verification."
+        },
+        "schedulerProgress": {
+          "callsBeforeTimer": 1,
+          "timerLatencyMs": 0.5999999046325684,
+          "safetyStop": 50
+        },
+        "commitCompletion": {
+          "samples": 20,
+          "p50Ms": 15.100000143051147,
+          "p95Ms": 15.400000095367432,
+          "refreshP50Ms": 49.89999985694885,
+          "refreshP95Ms": 50.19999980926514,
+          "readsPerCommit": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+          "heldReadFrames": 2
+        },
+        "ownCommitCoverage": {
+          "samples": 20,
+          "editableAfterOwnCoverage": 20,
+          "p50Ms": 18,
+          "p95Ms": 18.199999809265137,
+          "saveStillPending": [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "networkReads": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+          "meaning": "Later content watermark stays uncovered when own committed data is applied; access and conflict gates are tested independently."
+        },
+        "pageFailure": {
+          "calls": ["refresh", "append", "append"],
+          "recoveryRefreshes": 0,
+          "meaning": "Same accepted prefix, ordinary failed network continuation, deliberate retry after historical invalidation."
+        },
+        "readRecovery": {
+          "latencyMs": 1517.7000000476837,
+          "queries": 3
+        }
+      }
+    ]
+  }
+}
