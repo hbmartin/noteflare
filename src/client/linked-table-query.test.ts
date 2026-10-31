@@ -1,13 +1,13 @@
 // @vitest-environment jsdom
 import { expect, it, vi } from "vitest";
-import { readLinkedTable as query, type LinkedTableWindow } from "./linked-table-query";
+import { readLinkedTable as query, type TableReadWindow } from "./linked-table-query";
 import { ApiClientError } from "./api";
 import type { TableQueryResult } from "../shared/table-protocol";
 const readLinkedTable = async (...args: Parameters<typeof query>) => (await query(...args)).window;
-const append = (window: LinkedTableWindow) => ({ kind: "append" as const, ...window.continuation! });
+const append = (window: TableReadWindow) => ({ kind: "append" as const, ...window.continuation! });
 const page = (ids: string[], nextCursor: string | null, revision = 1) =>
   ({ generation: 1, revision, rows: ids.map((id) => ({ id })), nextCursor }) as TableQueryResult;
-const loaded = (data: TableQueryResult): LinkedTableWindow => ({
+const loaded = (data: TableQueryResult): TableReadWindow => ({
   data,
   buffered: [],
   serverCursor: data.nextCursor,
@@ -301,6 +301,7 @@ it("assembles changed coverage through the previous visible extent before verifi
   let release!: (value: TableQueryResult) => void;
   const read = vi
     .fn()
+    .mockResolvedValueOnce(page(["probe"], "probe", 2))
     .mockResolvedValueOnce(page(["a", "b"], "fresh", 2))
     .mockImplementationOnce(
       () =>
@@ -309,12 +310,10 @@ it("assembles changed coverage through the previous visible extent before verifi
         }),
     );
   let applied = false;
-  const pending = query({ kind: "refresh" }, current, read, undefined, "", { verify: true, pageSize: 100 }).then(
-    (value) => {
-      applied = true;
-      return value;
-    },
-  );
+  const pending = query({ kind: "refresh" }, current, read, undefined, "", { verify: true }).then((value) => {
+    applied = true;
+    return value;
+  });
   await Promise.resolve();
   await Promise.resolve();
   expect(applied).toBe(false);
@@ -324,6 +323,7 @@ it("assembles changed coverage through the previous visible extent before verifi
   expect(result.window.data.rows.map((row) => row.id)).toEqual(["a", "b", "c"]);
   expect(result.window.verified).toBe(true);
   expect(read.mock.calls).toEqual([
+    [undefined, 1],
     [undefined, 100],
     ["fresh", 100],
   ]);
@@ -349,4 +349,93 @@ it("retains a 500-row exhausted linked prefix during forced verification", async
   expect(result.window.data.rows).toHaveLength(500);
   expect(read.mock.calls).toEqual([[undefined, 500]]);
   expect(result.verification).toBe("network");
+});
+
+it("uses one authorized row to verify unchanged coverage without replacing the cursor chain", async () => {
+  const current = loaded(
+    page(
+      Array.from({ length: 500 }, (_, i) => String(i)),
+      "existing",
+    ),
+  );
+  const read = vi.fn().mockResolvedValue({ ...page(["0"], "probe-only"), canEdit: false });
+  const result = await query({ kind: "refresh" }, current, read, undefined, "", { verify: true });
+  expect(read).toHaveBeenCalledExactlyOnceWith(undefined, 1);
+  expect(result.window.data.canEdit).toBe(false);
+  expect(result.window.data.rows).toBe(current.data.rows);
+  expect(result.window.data.nextCursor).toBe("existing");
+  expect(result.window.serverCursor).toBe("existing");
+  expect(result.window.pageSize).toBe(current.pageSize);
+});
+
+it("probes changed coverage then rebuilds 500 rows in one cursor-bound request", async () => {
+  const current = loaded(
+    page(
+      Array.from({ length: 500 }, (_, i) => `old-${i}`),
+      "old",
+    ),
+  );
+  const read = serverRows(1200);
+  const changed = vi.fn(async (...args: Parameters<typeof read>) => ({ ...(await read(...args)), revision: 2 }));
+  const result = await query({ kind: "refresh" }, current, changed, undefined, "", { verify: true });
+  expect(changed.mock.calls).toEqual([
+    [undefined, 1],
+    [undefined, 500],
+  ]);
+  expect(result.window.data.rows).toHaveLength(500);
+  expect(result.window.pageSize).toBe(500);
+  expect(result.window.serverCursor).toBe(JSON.stringify({ offset: 500, limit: 500 }));
+});
+
+it("retains nonaligned verification surplus and exposes it before advancing its opaque cursor", async () => {
+  const current = loaded(
+    page(
+      Array.from({ length: 750 }, (_, i) => `old-${i}`),
+      "old",
+    ),
+  );
+  const read = serverRows(1200);
+  const changed = vi.fn(async (...args: Parameters<typeof read>) => ({ ...(await read(...args)), revision: 2 }));
+  let result = await query({ kind: "refresh" }, current, changed, undefined, "", { verify: true });
+  expect(changed.mock.calls.map(([, limit]) => limit)).toEqual([1, 500, 500]);
+  expect(result.window.data.rows.map((row) => row.id)).toEqual(Array.from({ length: 750 }, (_, i) => String(i)));
+  expect(result.window.buffered.map((row) => row.id)).toEqual(Array.from({ length: 250 }, (_, i) => String(i + 750)));
+  const requests = changed.mock.calls.length;
+  result = await query(append(result.window), result.window, changed);
+  expect(result.window.data.rows.at(-1)!.id).toBe("849");
+  expect(changed).toHaveBeenCalledTimes(requests);
+  while (result.window.hasMore) result = await query(append(result.window), result.window, changed);
+  expect(result.window.data.rows.map((row) => row.id)).toEqual(Array.from({ length: 1200 }, (_, i) => String(i)));
+  expect(changed.mock.calls.at(-1)).toEqual([JSON.stringify({ offset: 1000, limit: 500 }), 500]);
+});
+
+it("starts rebuild coverage from the full response rather than a superseded probe", async () => {
+  const current = loaded(page(["old"], null));
+  const read = vi
+    .fn()
+    .mockResolvedValueOnce(page(["probe"], "probe", 2))
+    .mockResolvedValueOnce(page(["latest"], null, 3));
+  const result = await query({ kind: "refresh" }, current, read, undefined, "", { verify: true });
+  expect(result.window.data.revision).toBe(3);
+  expect(result.window.data.rows.map((row) => row.id)).toEqual(["latest"]);
+  expect(read.mock.calls).toEqual([
+    [undefined, 1],
+    [undefined, 100],
+  ]);
+});
+
+it("keeps canonical first-page refresh policy distinct from verification and linked refresh", async () => {
+  const current = loaded(
+    page(
+      Array.from({ length: 500 }, (_, i) => String(i)),
+      "old",
+    ),
+  );
+  const read = serverRows(1200);
+  const refreshed = await query({ kind: "refresh" }, current, read, undefined, "", { refresh: "first-page" });
+  expect(refreshed.window.data.rows).toHaveLength(100);
+  expect(read).toHaveBeenCalledExactlyOnceWith(undefined, 100);
+  const initial = await query({ kind: "refresh" }, null, read, undefined, "", { verify: true });
+  expect(initial.window.data.rows).toHaveLength(100);
+  expect(read.mock.calls.at(-1)).toEqual([undefined, 100]);
 });

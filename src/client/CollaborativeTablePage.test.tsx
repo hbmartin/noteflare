@@ -2641,3 +2641,107 @@ it("requires new network application after one failed continuation retires cache
   expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
   expect(commands).toBe(1);
 });
+
+it("retains the specific task rejection when verification fails", async () => {
+  taskColumnFixture();
+  show("", member, vi.fn(), true);
+  const input = await screen.findByLabelText("Task");
+  await waitFor(() => expect(input).toBeEnabled());
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (path === "/api/task-lists/table/tasks/row")
+      throw new ApiClientError(409, "row_revision_conflict", "Specific task rejection");
+    throw new TypeError("Refresh unavailable");
+  });
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Preserved text" } });
+  fireEvent.blur(input);
+  await screen.findByText("The table could not be loaded.");
+  expect(screen.getByText("Specific task rejection")).toBeVisible();
+  expect(screen.queryByText("The task list changed. Review the latest value before saving again.")).toBeNull();
+  expect(input).toBeDisabled();
+});
+
+async function canonicalWindowVerification(mode: "changed" | "stale") {
+  const rows = Array.from({ length: 1000 }, (_, i) => ({
+    ...data.rows[0]!,
+    id: `window-${i}`,
+    cells: { Title: `Window ${i}` },
+    detailPageId: `detail-${i}`,
+  }));
+  data = { ...data, columns: [], rows, rowCount: rows.length };
+  const calls: Array<[string, number]> = [];
+  let fail = false;
+  vi.mocked(api).mockImplementation(async (path) => {
+    const params = new URL(path, "https://test").searchParams;
+    const cursor = params.get("cursor") ?? "0",
+      offset = Number(cursor),
+      limit = Number(params.get("limit"));
+    calls.push([cursor, limit]);
+    if (mode === "stale" && calls.length > 7 && fail) return new Promise<never>(() => {});
+    if (fail && cursor === "600") throw new ApiClientError(503, "unavailable", "Broken next page");
+    if (fail && mode === "stale" && cursor === "500")
+      throw new ApiClientError(409, "table_cursor_stale", "Cursor changed during verification");
+    return {
+      ...data,
+      revision: fail ? 2 : 1,
+      rows: rows.slice(offset, offset + limit),
+      nextCursor: offset + limit < rows.length ? String(offset + limit) : null,
+    };
+  });
+  const selected = vi.fn();
+  render(<CollaborativeTablePage page={{ id: "table", title: "Canonical" }} member={member} onSelectPage={selected} />);
+  const renderedRows = () => document.querySelectorAll(".table-live tbody tr");
+  const ready = () => screen.getByText("Views", { selector: "button" });
+  await waitFor(() => expect(ready()).toBeEnabled());
+  for (let target = 200; target <= 600; target += 100) {
+    fireEvent.click(screen.getByText("Load more rows", { selector: "button" }));
+    await waitFor(() => expect(renderedRows()).toHaveLength(target));
+  }
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  calls.length = 0;
+  fail = true;
+  await act(async () => fireEvent.click(screen.getByText("Load more rows", { selector: "button" })));
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(renderedRows()).toHaveLength(600);
+  return { calls, renderedRows, ready, selected };
+}
+
+it("keeps canonical rebuilt surplus for gap-free buffered continuation", async () => {
+  const { calls, renderedRows, ready, selected } = await canonicalWindowVerification("changed");
+  expect(calls).toEqual([
+    ["600", 100],
+    ["600", 100],
+    ["0", 1],
+    ["0", 500],
+    ["500", 500],
+  ]);
+  expect(ready()).toBeEnabled();
+  const requests = calls.length;
+  await act(async () => fireEvent.click(screen.getByText("Load more rows", { selector: "button" })));
+  expect(renderedRows()).toHaveLength(700);
+  fireEvent.click(within(renderedRows()[699] as HTMLElement).getByRole("button", { name: "Open" }));
+  expect(selected).toHaveBeenLastCalledWith("detail-699");
+  expect(calls).toHaveLength(requests);
+});
+
+it("classifies repeated canonical cursor churn as bounded freshness recovery", async () => {
+  const { calls, renderedRows, ready } = await canonicalWindowVerification("stale");
+  expect(calls).toEqual([
+    ["600", 100],
+    ["600", 100],
+    ["0", 1],
+    ["0", 500],
+    ["500", 500],
+    ["0", 500],
+    ["500", 500],
+    ["0", 1],
+  ]);
+  expect(screen.queryByText("Cursor changed during verification")).toBeNull();
+  expect(screen.getByText("The table is changing. Refreshing the latest data…")).toBeVisible();
+  expect(ready()).toBeDisabled();
+
+  expect(renderedRows()).toHaveLength(600);
+});

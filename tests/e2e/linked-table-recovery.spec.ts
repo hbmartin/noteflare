@@ -915,3 +915,67 @@ test("two broken linked pages independently verify loaded rows without losing pe
     await page.unrouteAll({ behavior: "wait" });
   }
 });
+
+test("canonical verification probes coverage and keeps rebuilt surplus for buffered Load more", async ({ page }) => {
+  const { source } = await linkedFixture(page);
+  await page.goto(`/?page=${source.id}`);
+  const table = page
+    .locator(".table-live")
+    .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
+  const cells = table.getByLabel("Linked title", { exact: true });
+  await expect(cells).toHaveCount(100);
+  await expect(cells.first()).toBeEnabled();
+  for (const count of [200, 300, 400, 500, 600]) {
+    await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+    await expect(cells).toHaveCount(count);
+  }
+  const expectedResponse = await page.request.get(`/api/tables/${source.id}/query?limit=500`);
+  expect(expectedResponse.ok()).toBeTruthy();
+  const first = await expectedResponse.json();
+  const remainderResponse = await page.request.get(
+    `/api/tables/${source.id}/query?${new URLSearchParams({ limit: "500", cursor: first.nextCursor })}`,
+  );
+  expect(remainderResponse.ok()).toBeTruthy();
+  const expected = [...first.rows, ...(await remainderResponse.json()).rows].map(
+    (row: { cells: Record<string, unknown> }) => String(Object.values(row.cells)[0]),
+  );
+  await page.clock.install();
+  await page.evaluate(() => {
+    Math.random = () => 0;
+  });
+  const reads: number[] = [];
+  let failures = 0;
+  await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    const limit = Number(params.get("limit"));
+    reads.push(limit);
+    if (params.has("cursor") && limit === 100 && failures < 2) {
+      failures++;
+      await route.fulfill({
+        status: 503,
+        json: { error: { code: "temporary", message: "Continuation temporarily unavailable" } },
+      });
+      return;
+    }
+    const response = await route.fetch();
+    const result = await response.json();
+    // Controlled changed coverage exercises rebuilding; the server still authorizes every request.
+    await route.fulfill({ response, json: { ...result, revision: result.revision + 1 } });
+  });
+  await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+  await expect(table.getByText("Continuation temporarily unavailable", { exact: true })).toBeVisible();
+  await expect(cells.first()).toBeDisabled();
+  await page.clock.runFor(1000);
+  await expect.poll(() => failures).toBe(2);
+  await expect(cells.first()).toBeEnabled();
+  await expect(cells).toHaveCount(600);
+  expect(reads).toEqual([100, 100, 1, 500, 500]);
+  const before = reads.length;
+  await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+  await expect(cells).toHaveCount(700);
+  expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
+    expected.slice(0, 700),
+  );
+  expect(reads).toHaveLength(before);
+  await page.unrouteAll({ behavior: "wait" });
+});
