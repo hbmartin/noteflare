@@ -494,7 +494,15 @@ test("linked views remember presentation and unfinished settings without submitt
 
 test("canonical invalidation during an older read performs a trailing fresh read", async ({ page }) => {
   const { source, columnId } = await linkedFixture(page);
-  await page.goto(`/?page=${source.id}`);
+  const [initial] = await Promise.all([
+    page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === `/api/tables/${source.id}/query` && !url.searchParams.has("cursor");
+    }),
+    page.goto(`/?page=${source.id}`),
+  ]);
+  expect(initial.ok()).toBeTruthy();
+  expect((await initial.json()).rows).toHaveLength(100);
   const table = page
     .locator(".table-live")
     .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
