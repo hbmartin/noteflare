@@ -36,19 +36,27 @@ const source = `
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { tracing } from "cloudflare:workers";
 import { passwordService } from ${JSON.stringify(resolve("src/worker/password-service.ts"))};
+import { PASSWORD_CRYPTO_PREFIX } from ${JSON.stringify(resolve("src/worker/password-format.ts"))};
 import { traceIdentifiers } from ${JSON.stringify(resolve("src/worker/observability.ts"))};
 export default class extends WorkerEntrypoint {
   fetch() { return new Response(null, {status:404}); }
   async run(operation) {
     if (operation !== "hash" && operation !== "verify") throw Error("Invalid operation");
     const started = performance.now();
-    const service = passwordService(this.env);
+    let shard, attempts = 0;
+    const service = passwordService({ ...this.env, PASSWORD_CRYPTO: {
+      getByName: (name) => {
+        shard = Number(name.slice(PASSWORD_CRYPTO_PREFIX.length));
+        attempts++;
+        return this.env.PASSWORD_CRYPTO.getByName(name);
+      }
+    }});
     try {
       const result = operation === "hash" ? await service.hash("synthetic-capacity-password") : await service.verify({
         hash:${JSON.stringify(fixture)}, password:"legacy-password-123"
       });
-      return {ok: operation === "hash" ? typeof result === "string" : result === true, rpcWallMs:performance.now()-started, ...traceIdentifiers(tracing)};
-    } catch { return {ok:false, code:"unavailable", ...traceIdentifiers(tracing)}; }
+      return {ok: operation === "hash" ? typeof result === "string" : result === true, shard, attempts, rpcWallMs:performance.now()-started, ...traceIdentifiers(tracing)};
+    } catch { return {ok:false, code:"unavailable", shard, attempts, ...traceIdentifiers(tracing)}; }
   }
 }`;
 // Use the fixed synthetic legacy fixture, never live account credentials.
@@ -114,6 +122,7 @@ const fd = openSync(`${root}/proxy.log`, "w", 0o600);
 const invocations = [],
   stages = [],
   warmups = [];
+const startedAt = Date.now();
 try {
   run(["deploy", "--config", `${root}/helper.json`, "--env", ""]);
   await writeFile(`${root}/resource.json`, JSON.stringify({ helper, preview }));
@@ -209,7 +218,7 @@ try {
       );
       await writeFile(
         `${root}/results.json`,
-        JSON.stringify({ helper, preview, warmups, stages, invocations }, null, 2),
+        JSON.stringify({ helper, preview, startedAt, warmups, stages, invocations }, null, 2),
       );
       if (stop) break;
     }
@@ -219,12 +228,29 @@ try {
 } finally {
   proxy?.kill("SIGTERM");
   closeSync(fd);
-  for (const socket of sockets) socket.close();
-  for (const tail of tails) await api(`/workers/scripts/${tail.scriptName}/tails/${tail.id}`, { method: "DELETE" });
-  await api(`/workers/scripts/${helper}`, { method: "DELETE", allowMissing: true });
-  helperRemoved = true;
+  for (const socket of sockets) socket.terminate();
+  const cleanup = await Promise.allSettled([
+    ...tails.map((tail) =>
+      api(`/workers/scripts/${tail.scriptName}/tails/${tail.id}`, { method: "DELETE", allowMissing: true }),
+    ),
+    api(`/workers/scripts/${helper}`, { method: "DELETE", allowMissing: true }).then(() => {
+      helperRemoved = true;
+    }),
+  ]);
+  if (proxy?.exitCode === null) {
+    await Promise.race([once(proxy, "exit"), delay(2000)]);
+    if (proxy.exitCode === null) proxy.kill("SIGKILL");
+  }
   await writeFile(
     `${root}/results.json`,
-    JSON.stringify({ helper, preview, warmups, stages, invocations, helperRemoved }, null, 2),
+    JSON.stringify(
+      { helper, preview, startedAt, finishedAt: Date.now(), warmups, stages, invocations, helperRemoved },
+      null,
+      2,
+    ),
   );
+  if (cleanup.some((result) => result.status === "rejected")) {
+    console.error("Private driver cleanup incomplete; inspect the saved resource identifiers.");
+    process.exitCode = 1;
+  }
 }
