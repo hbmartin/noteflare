@@ -22,6 +22,8 @@ The [31 October preview comparison](evidence/PASSWORD_CRYPTO_PREVIEW.md) records
 
 The [1 November review-fix evidence](evidence/REVIEW_RECOVERY_AUTH_FIXES.md) covers retry and outage regressions, stored-format audits, repeated preview sign-ins, and private 16-shard capacity measurements, including incomplete high-concurrency live-tail observations.
 
+The [PR #283 follow-up evidence](evidence/PR283_FOLLOW_UP.md) records generation-race response tests and normal/interrupted private-driver smoke cleanup on preview. The capacity and sign-in studies were not repeated.
+
 ## Private preview capacity driver
 
 Run `node scripts/measure-password-crypto-capacity.mjs <compiled-preview-config> --smoke` for one hash warmup, one measured hash and one verify. Omitting `--smoke` retains 32 warmups and 64 operations per operation/concurrency stage (1, 4, 8, 16 and 32). The import-safe runner also supports injected process/network dependencies for local lifecycle tests.

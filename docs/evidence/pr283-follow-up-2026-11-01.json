@@ -1,0 +1,349 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-01",
+  "baseRevision": "bb03980507623a2c78152bbffd4ac7266794c939",
+  "applicationRevision": "532f5fa2204c5ee9f67053c450d95099d1cc10ec",
+  "runtimeCommit": "6ae93a2",
+  "toolingCommit": "532f5fa",
+  "local": {
+    "fullGate": {
+      "command": "VITEST_MAX_WORKERS=2 pnpm check",
+      "exitStatus": 0,
+      "unitPassed": 3060,
+      "unitSkipped": 1,
+      "workerPassed": 2538,
+      "workerFiles": 39
+    },
+    "finalUnitCoverage": {
+      "passed": 3063,
+      "skipped": 1
+    },
+    "focused": {
+      "client": 82,
+      "worker": 39,
+      "driver": 30
+    },
+    "chromiumRecovery": {
+      "passed": 19
+    },
+    "finalStatic": "passed",
+    "mutations": [
+      {
+        "name": "verification-waiter-transfer",
+        "detected": true,
+        "assertion": "receipt settled at completion publication"
+      },
+      {
+        "name": "recovery-visible-extent",
+        "detected": true,
+        "assertion": "600 exact row IDs instead of 100"
+      },
+      {
+        "name": "rebuilt-window-verification",
+        "detected": true,
+        "assertion": "verified is true"
+      }
+    ]
+  },
+  "preview": {
+    "preview": "noteflare-one-click-cli-20261012",
+    "database": "72e4bf95-cb79-47a9-ae48-63612cbc17bf",
+    "account": "940db9a80e285cf3f700d5d903d8e182",
+    "version": [
+      {
+        "version_id": "c7ebd328-df28-46df-b3ec-7b0ff2debd9f",
+        "percentage": 100
+      }
+    ],
+    "bindingsPreserved": true,
+    "bindingCount": 39,
+    "health": {
+      "status": 200,
+      "ok": true
+    },
+    "integrity": {
+      "ok": true,
+      "complete": true,
+      "checkedPages": 1
+    },
+    "backup": {
+      "bytes": 93489,
+      "sha256": "d584afdf2382a416c44e94fb9f9c6a04b1ddca6780c25679fe4f01d7453c2d2a"
+    },
+    "cleanup": [
+      {
+        "helper": "noteflare-crypto-load-c5a4cd15",
+        "absent": true,
+        "cleanupCompleted": true,
+        "helperState": "removed",
+        "tails": [
+          {
+            "scriptName": "noteflare-one-click-cli-20261012",
+            "id": "1fb77ab6c19e4760a28c69d7ae60fe7b",
+            "removed": true
+          },
+          {
+            "scriptName": "noteflare-crypto-load-c5a4cd15",
+            "id": "f71be91827034fcdb78d6768cf181a11",
+            "removed": true
+          }
+        ],
+        "cleanupErrors": []
+      },
+      {
+        "helper": "noteflare-crypto-load-93587fd6",
+        "absent": true,
+        "cleanupCompleted": true,
+        "helperState": "removed",
+        "tails": [
+          {
+            "scriptName": "noteflare-one-click-cli-20261012",
+            "id": "752bbd264f0c4b94a7469bba47e02d6c",
+            "removed": true
+          }
+        ],
+        "cleanupErrors": []
+      }
+    ],
+    "beforeVersions": [
+      {
+        "version_id": "89ab773b-ac3e-48b0-8cf2-fab3aa691783",
+        "percentage": 100
+      }
+    ],
+    "buildHashes": {
+      "dist/noteflare/index.js": "66dd8f5cb19ad7ed2fd48d10a9634f7b6a8a2cf8237d557560eec9253836c92c",
+      "dist/noteflare/wrangler.json": "3c18cb2299b75e2328033c0e2e11896793cfc5830a8ed7f5a000cf567e32e23f"
+    },
+    "sourceHashes": {
+      "src/worker/table-authority.ts": "b89cfb8fd419c40d39744dcd684618df1ad4209d8f61f8d8727e4f326f8659f7",
+      "src/worker/security.ts": "1a5abf19f28a76ef55c5c86114325ae1df5f2d3de3c7a12fa9ff16bbeff5583c",
+      "src/client/linked-table-query.ts": "4e51a57de17032b1e84b3f659b4ea6f0055014d5854b5d6ab3bf144a7f6f15ad",
+      "src/client/CollaborativeTablePage.tsx": "c5bdc3b34e81607ff3f630b3cae1e8c3d741cc54d8fc1638d7f87510bfdf2b03",
+      "scripts/measure-password-crypto-capacity.mjs": "4230a9561cf63dfda83e94dde98abd36ae462aa83eafd9008ef92bb58bcdb8e6"
+    },
+    "migrationsApplied": 0,
+    "syntheticDatabaseFixturesCreated": 0,
+    "settingsPreserved": true,
+    "preservedSettingKeys": [
+      "placement",
+      "compatibility_date",
+      "compatibility_flags",
+      "usage_model",
+      "tags",
+      "tail_consumers",
+      "logpush",
+      "observability",
+      "annotations"
+    ]
+  },
+  "normalSmoke": {
+    "helper": "noteflare-crypto-load-c5a4cd15",
+    "startedAt": 1793562423654,
+    "finishedAt": 1793562444401,
+    "outcome": "success",
+    "exitStatus": 0,
+    "warmups": [
+      {
+        "ok": true,
+        "shard": 15,
+        "attempts": 1,
+        "rpcWallMs": 1140,
+        "traceId": "d7749b682e44607ca0b44b283458914c",
+        "spanId": "b3830e9e7098340b",
+        "wallMs": 1367.7813340000012
+      }
+    ],
+    "stages": [
+      {
+        "concurrency": 1,
+        "operation": "hash",
+        "elapsedMs": 1049.5216660000006,
+        "samples": [
+          {
+            "ok": true,
+            "shard": 12,
+            "attempts": 1,
+            "rpcWallMs": 886,
+            "traceId": "be506ef30fd3ab5423a7c99a72348e6b",
+            "spanId": "abd8f72008e44ccd",
+            "wallMs": 1049.4105419999996
+          }
+        ],
+        "stopped": false
+      },
+      {
+        "concurrency": 1,
+        "operation": "verify",
+        "elapsedMs": 1045.76375,
+        "samples": [
+          {
+            "ok": true,
+            "shard": 4,
+            "attempts": 1,
+            "rpcWallMs": 866,
+            "traceId": "bf192f68a7a8bd4d5575a74519a29410",
+            "spanId": "1ec94fabef57e0cf",
+            "wallMs": 1045.7494160000006
+          }
+        ],
+        "stopped": false
+      }
+    ],
+    "invocations": [
+      {
+        "scriptName": "noteflare-crypto-load-c5a4cd15",
+        "cpuMs": 4,
+        "wallMs": 1143,
+        "outcome": "ok",
+        "logs": [
+          {
+            "event": "auth.crypto.rpc",
+            "operation": "hash",
+            "shard": 15,
+            "outcome": "success",
+            "traceId": "d7749b682e44607ca0b44b283458914c",
+            "spanId": "b3830e9e7098340b",
+            "attempts": 1,
+            "category": "",
+            "durationMs": 1140
+          }
+        ]
+      },
+      {
+        "scriptName": "noteflare-one-click-cli-20261012",
+        "entrypoint": "PasswordCrypto",
+        "cpuMs": 186,
+        "wallMs": 416,
+        "outcome": "ok",
+        "logs": [
+          {
+            "event": "auth.crypto.completed",
+            "operation": "hash",
+            "shard": 15,
+            "outcome": "success",
+            "traceId": "d7749b682e44607ca0b44b283458914c",
+            "spanId": "10bdcb7d5e103ca6"
+          }
+        ]
+      },
+      {
+        "scriptName": "noteflare-one-click-cli-20261012",
+        "entrypoint": "PasswordCrypto",
+        "cpuMs": 151,
+        "wallMs": 181,
+        "outcome": "ok",
+        "logs": [
+          {
+            "event": "auth.crypto.completed",
+            "operation": "hash",
+            "shard": 12,
+            "outcome": "success",
+            "traceId": "be506ef30fd3ab5423a7c99a72348e6b",
+            "spanId": "72d87598bd229787"
+          }
+        ]
+      },
+      {
+        "scriptName": "noteflare-crypto-load-c5a4cd15",
+        "cpuMs": 4,
+        "wallMs": 889,
+        "outcome": "ok",
+        "logs": [
+          {
+            "event": "auth.crypto.rpc",
+            "operation": "hash",
+            "shard": 12,
+            "outcome": "success",
+            "traceId": "be506ef30fd3ab5423a7c99a72348e6b",
+            "spanId": "abd8f72008e44ccd",
+            "attempts": 1,
+            "category": "",
+            "durationMs": 886
+          }
+        ]
+      },
+      {
+        "scriptName": "noteflare-crypto-load-c5a4cd15",
+        "cpuMs": 3,
+        "wallMs": 868,
+        "outcome": "ok",
+        "logs": [
+          {
+            "event": "auth.crypto.rpc",
+            "operation": "verify",
+            "shard": 4,
+            "outcome": "success",
+            "traceId": "bf192f68a7a8bd4d5575a74519a29410",
+            "spanId": "1ec94fabef57e0cf",
+            "attempts": 1,
+            "category": "",
+            "durationMs": 866
+          }
+        ]
+      },
+      {
+        "scriptName": "noteflare-one-click-cli-20261012",
+        "entrypoint": "PasswordCrypto",
+        "cpuMs": 168,
+        "wallMs": 199,
+        "outcome": "ok",
+        "logs": [
+          {
+            "event": "auth.crypto.completed",
+            "operation": "verify",
+            "shard": 4,
+            "outcome": "success",
+            "traceId": "bf192f68a7a8bd4d5575a74519a29410",
+            "spanId": "6cbbbe597b4ea878"
+          }
+        ]
+      }
+    ],
+    "telemetryErrors": {
+      "malformed": 0,
+      "socket": 0
+    },
+    "cleanupCompleted": true,
+    "helperRemoved": true
+  },
+  "interruptedSmoke": {
+    "helper": "noteflare-crypto-load-93587fd6",
+    "startedAt": 1793562454691,
+    "finishedAt": 1793562459543,
+    "outcome": "SIGTERM",
+    "exitStatus": 143,
+    "signaled": true,
+    "signalPhase": "deploying",
+    "watchdogFired": false,
+    "warmups": 0,
+    "stages": 0,
+    "cleanupCompleted": true,
+    "helperRemoved": true,
+    "tailCount": 1,
+    "tailsRemoved": true
+  },
+  "sonar": {
+    "alert": "https://github.com/hbmartin/noteflare/security/code-scanning/40",
+    "rule": "jssecurity:S8707",
+    "assessment": "False positive under the explicit trusted operator-argument contract; no untrusted application/workflow path into the CLI was demonstrated.",
+    "scannerStateChanged": false,
+    "suppressionsAdded": false,
+    "baseCheck": {
+      "conclusion": "failure",
+      "url": "https://github.com/hbmartin/noteflare/runs/124914046547",
+      "conditions": ["C security rating on new code", "E reliability rating on new code"]
+    }
+  },
+  "boundaries": {
+    "productionAccessed": false,
+    "productionDeployed": false,
+    "C6": "skipped/incomplete at user request",
+    "fullCapacityStudyRepeated": false,
+    "signInStudyRepeated": false,
+    "poolSize": 16,
+    "freePlanCompatibilityEstablished": false,
+    "persistedTraceAccess": "previous 403 limitation retained",
+    "automaticMerge": false
+  }
+}
