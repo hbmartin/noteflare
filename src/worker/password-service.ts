@@ -2,13 +2,31 @@ import { APIError } from "better-auth/api";
 import { tracing } from "cloudflare:workers";
 import type { Env } from "./env";
 import { logger, recordMetric, traceIdentifiers } from "./observability";
+import {
+  cryptoTelemetry,
+  PASSWORD_CRYPTO_PREFIX,
+  PASSWORD_CRYPTO_SHARDS,
+  PASSWORD_MAX_LENGTH,
+  validPasswordHash,
+} from "./password-format";
+export { PASSWORD_CRYPTO_PREFIX, PASSWORD_CRYPTO_SHARDS } from "./password-format";
 
-export const PASSWORD_CRYPTO_SHARDS = 16;
-export const PASSWORD_CRYPTO_PREFIX = "password-crypto-v1-";
-export const PASSWORD_MAX_LENGTH = 1_000;
+function validatePassword(password: unknown): asserts password is string {
+  if (typeof password !== "string" || password.length > PASSWORD_MAX_LENGTH)
+    throw new APIError("BAD_REQUEST", { code: "INVALID_PASSWORD_INPUT", message: "Invalid password input." });
+}
 
-// The HTTP isolate never imports or runs the password KDF. Binding errors and
-// native failures are availability errors, including unknown-account dummy work.
+function failureCategory(error: unknown) {
+  const flags = error as { overloaded?: boolean; retryable?: boolean; remote?: boolean } | null;
+  return flags?.overloaded === true
+    ? "overloaded"
+    : flags?.retryable === true
+      ? "retryable"
+      : flags?.remote === true
+        ? "remote"
+        : "unavailable";
+}
+
 export function passwordService(env: Env) {
   async function invoke<T>(
     operation: "hash" | "verify",
@@ -16,55 +34,74 @@ export function passwordService(env: Env) {
   ) {
     const shard = crypto.getRandomValues(new Uint8Array(1))[0]! % PASSWORD_CRYPTO_SHARDS;
     const started = performance.now();
-    let outcome = "error";
+    let outcome = "error",
+      category = "",
+      attempts = 0;
     try {
-      const result = await run(env.PASSWORD_CRYPTO.getByName(`${PASSWORD_CRYPTO_PREFIX}${shard}`));
-      outcome = result === false ? "mismatch" : "success";
-      return result;
-    } catch {
+      for (;;) {
+        attempts++;
+        try {
+          const result = await run(env.PASSWORD_CRYPTO.getByName(`${PASSWORD_CRYPTO_PREFIX}${shard}`));
+          outcome = result === false ? "mismatch" : "success";
+          return result;
+        } catch (error) {
+          category = failureCategory(error);
+          if (attempts !== 1 || category !== "retryable") break;
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, 100 + (crypto.getRandomValues(new Uint8Array(1))[0]! % 101)),
+          );
+        }
+      }
       throw new APIError("SERVICE_UNAVAILABLE", {
         code: "PASSWORD_CRYPTO_UNAVAILABLE",
         message: "Password authentication is temporarily unavailable.",
       });
     } finally {
       const durationMs = performance.now() - started;
-      logger.info("auth.crypto.rpc", "auth-crypto", "Password service operation completed", {
-        ...traceIdentifiers(tracing),
-        operation,
-        shard,
-        outcome,
-        durationMs,
-      });
-      recordMetric(env, {
-        event: "auth.crypto.rpc",
-        component: "auth-crypto",
-        operation,
-        subtype: String(shard),
-        outcome,
-        durationMs,
-      });
+      cryptoTelemetry(() =>
+        logger.info("auth.crypto.rpc", "auth-crypto", "Password service operation completed", {
+          ...traceIdentifiers(tracing),
+          operation,
+          shard,
+          outcome,
+          attempts,
+          category,
+          durationMs,
+        }),
+      );
+      cryptoTelemetry(() =>
+        recordMetric(env, {
+          event: "auth.crypto.rpc",
+          component: "auth-crypto",
+          operation,
+          subtype: String(shard),
+          outcome,
+          attempts,
+          code: category,
+          durationMs,
+        }),
+      );
     }
   }
   return {
-    hash: (password: string) =>
-      invoke("hash", async (stub) => {
-        if (typeof password !== "string" || password.length > PASSWORD_MAX_LENGTH)
-          throw new Error("Invalid password input");
+    hash: async (password: string) => {
+      validatePassword(password);
+      return invoke("hash", async (stub) => {
         const result = await stub.hash(password);
-        if (typeof result !== "string" || !/^[0-9a-f]{32}:[0-9a-f]{128}$/.test(result))
-          throw new Error("Invalid password service response");
+        if (!validPasswordHash(result, true)) throw new Error("Invalid password service response");
         return result;
-      }),
-    verify: (input: { hash: string; password: string }) =>
-      invoke("verify", async (stub) => {
-        if (typeof input.password !== "string" || input.password.length > PASSWORD_MAX_LENGTH)
-          throw new Error("Invalid password input");
+      });
+    },
+    verify: async (input: { hash: string; password: string }) => {
+      validatePassword(input?.password);
+      return invoke("verify", async (stub) => {
         const result = await stub.verify({
           password: input.password,
-          hash: typeof input.hash === "string" && input.hash.length === 161 ? input.hash : "",
+          hash: validPasswordHash(input.hash) ? input.hash : "",
         });
         if (typeof result !== "boolean") throw new Error("Invalid password service response");
         return result;
-      }),
+      });
+    },
   };
 }
