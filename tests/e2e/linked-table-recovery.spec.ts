@@ -885,23 +885,36 @@ test("two broken linked pages independently verify loaded rows without losing pe
     release = resolve;
   });
   const cursors: Array<string | null> = [];
-  await page.route(`**${path}?**`, async (route) => {
-    const cursor = new URL(route.request().url()).searchParams.get("cursor");
-    cursors.push(cursor);
-    if (cursor && broken) {
-      failures++;
-      await route.fulfill({
-        status: 503,
-        json: { error: { code: "temporary_read", message: "Page temporarily unavailable" } },
-      });
-    } else {
-      if (!cursor && failures >= 2) {
-        verifying = true;
-        await verified;
+  let coverageProofs = 0;
+  await page.route(
+    (url) => url.pathname === path || url.pathname === `${path}/coverage`,
+    async (route) => {
+      if (new URL(route.request().url()).pathname.endsWith("/coverage")) {
+        coverageProofs++;
+        if (failures >= 2) {
+          verifying = true;
+          await verified;
+        }
+        await route.continue();
+        return;
       }
-      await route.continue();
-    }
-  });
+      const cursor = new URL(route.request().url()).searchParams.get("cursor");
+      cursors.push(cursor);
+      if (cursor && broken) {
+        failures++;
+        await route.fulfill({
+          status: 503,
+          json: { error: { code: "temporary_read", message: "Page temporarily unavailable" } },
+        });
+      } else {
+        if (!cursor && failures >= 2) {
+          verifying = true;
+          await verified;
+        }
+        await route.continue();
+      }
+    },
+  );
   try {
     await linked.getByRole("button", { name: "Load more rows" }).click();
     await expect(linked.getByText("Page temporarily unavailable", { exact: true })).toBeVisible();
@@ -909,7 +922,8 @@ test("two broken linked pages independently verify loaded rows without losing pe
     await expect(cells.first()).toBeDisabled();
     await expect.poll(() => verifying).toBe(true);
     expect(failures).toBe(2);
-    expect(cursors).toEqual([cursors[0], cursors[0], null]);
+    expect(cursors).toEqual([cursors[0], cursors[0]]);
+    expect(coverageProofs).toBe(2);
     expect(cursors[0]).toBeTruthy();
     release();
     await expect(cells.first()).toBeEnabled();
@@ -953,11 +967,18 @@ test("canonical verification probes coverage and keeps rebuilt surplus for buffe
   });
   const reads: number[] = [];
   let failures = 0;
+  let proofs = 0;
+  await page.route(`**/api/tables/${source.id}/coverage?**`, async (route) => {
+    proofs++;
+    const response = await route.fetch();
+    const metadata = await response.json();
+    await route.fulfill({ response, json: { ...metadata, revision: metadata.revision + 1 } });
+  });
   await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
     const params = new URL(route.request().url()).searchParams;
     const limit = Number(params.get("limit"));
     reads.push(limit);
-    if (params.has("cursor") && limit === 100 && failures < 2) {
+    if (params.has("cursor") && limit === 100 && failures < 1) {
       failures++;
       await route.fulfill({
         status: 503,
@@ -974,15 +995,16 @@ test("canonical verification probes coverage and keeps rebuilt surplus for buffe
   await expect(table.getByText("Continuation temporarily unavailable", { exact: true })).toBeVisible();
   await expect(cells.first()).toBeDisabled();
   await page.clock.runFor(1000);
-  await expect.poll(() => failures).toBe(2);
+  await expect.poll(() => failures).toBe(1);
+  await expect.poll(() => proofs).toBe(1);
   await expect(cells.first()).toBeEnabled();
-  await expect(cells).toHaveCount(600);
-  expect(reads).toEqual([100, 100, 1, 500, 500]);
+  await expect(cells).toHaveCount(700);
+  expect(reads).toEqual([100, 500, 500]);
   const before = reads.length;
   await table.getByRole("button", { name: "Load more rows", exact: true }).click();
-  await expect(cells).toHaveCount(700);
+  await expect(cells).toHaveCount(800);
   expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
-    expected.slice(0, 700),
+    expected.slice(0, 800),
   );
   expect(reads).toHaveLength(before);
   await page.unrouteAll({ behavior: "wait" });
