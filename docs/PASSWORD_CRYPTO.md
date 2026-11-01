@@ -17,3 +17,5 @@ Run worker integration tests with `pnpm test:worker`. The compatibility tests in
 Deployment registers the class and required namespace in portable, production and E2E configurations. A rollback must retain the additive class, binding and migration history; never down-migrate D1 or delete the namespace to roll back authentication code.
 
 The [31 October preview comparison](evidence/PASSWORD_CRYPTO_PREVIEW.md) records separate caller/DO CPU and the remaining 10 ms budget and latency limits.
+
+The [1 November review-fix evidence](evidence/REVIEW_RECOVERY_AUTH_FIXES.md) covers retry and outage regressions, stored-format audits, repeated preview sign-ins, and private 16-shard capacity measurements, including incomplete high-concurrency live-tail observations.
