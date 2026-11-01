@@ -450,7 +450,7 @@ it("retains cached data but requires successful verification after an unknown it
   expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
   expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
 });
-it("accepts successful hidden-tab reads without creating failure backoff", async () => {
+it("retires successful hidden-tab reads without publishing data or creating failure backoff", async () => {
   const { data } = fixture();
   const input = await screen.findByLabelText("Title");
   await waitFor(() => expect(input).toBeEnabled());
@@ -478,7 +478,7 @@ it("accepts successful hidden-tab reads without creating failure backoff", async
       releases.shift()!();
     });
     expect(input).toBeDisabled();
-    expect(input).toHaveValue("Remote " + cycle);
+    expect(input).toHaveValue("Original");
     const before = started;
     await act(async () => {
       hidden = false;

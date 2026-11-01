@@ -75,7 +75,7 @@ export function linkedTableReads<T>(options: {
     invalidation = 0,
     unscoped = 0,
     freshnessAttempt = 0;
-  let verification: { fullQuery: boolean; scope: unknown; batch?: Batch<T> } | undefined;
+  let verification: { fullQuery: boolean } | undefined;
   let active: { batch: Batch<T>; controller: AbortController } | undefined;
   let completed: { value: T; sequence: number; coverage?: TableCoverage; scope?: unknown } | undefined;
   const watermarks = new Map<number, { revision: number; sequence: number }>();
@@ -136,7 +136,7 @@ export function linkedTableReads<T>(options: {
     )
       return undefined;
     let refresh = queued.get("refresh");
-    if (!refresh) queued.set("refresh", (refresh = freshBatch<T>()));
+    if (!refresh) queued.set("refresh", (refresh = { ...freshBatch<T>(), preserveExtent: true }));
     return refresh;
   };
   function bindVerification(batch: Batch<T>) {
@@ -148,23 +148,16 @@ export function linkedTableReads<T>(options: {
       if (!batch.manual) batch.retryAt = Math.max(batch.retryAt, previous.retryAt);
       queued.delete("verify");
     }
-    verification.batch = batch;
-    verification.scope = options.scope?.();
   }
   function requireVerification(fullQuery = false, batch?: Batch<T>) {
-    verification ??= { fullQuery, scope: options.scope?.() };
+    verification ??= { fullQuery };
     verification.fullQuery ||= fullQuery;
     if (batch) bindVerification(batch);
   }
   const ensureVerification = () => {
     if (!verification) return;
-    verification.scope = options.scope?.();
-    if (active && !isContinuation(active.batch.intent) && active.batch.scope === verification.scope) return;
-    // A full query can satisfy verification too; its existing genuine deadline owns the chain.
-    const assigned = verification.batch;
-    let batch =
-      queued.get("refresh") ??
-      (assigned && queued.get(intentKey(assigned.intent)) === assigned ? assigned : queued.get("verify"));
+    if (active && !isContinuation(active.batch.intent) && active.batch.scope === options.scope?.()) return;
+    let batch = queued.get("refresh") ?? queued.get("verify");
     if (!batch || (verification.fullQuery && batch.intent.kind === "verify")) {
       batch = freshBatch<T>({ kind: verification.fullQuery ? "refresh" : "verify" });
       bindVerification(batch);
@@ -227,12 +220,14 @@ export function linkedTableReads<T>(options: {
   }
   function scheduleDenied(batch?: Batch<T>) {
     retireAppends();
-    const recovery = batch ?? freshBatch<T>();
+    const recovery = batch && !isContinuation(batch.intent) ? batch : freshBatch<T>();
     if (!batch || isContinuation(batch.intent)) {
-      // A page denial starts its own access chain, not a queued independent check's history.
+      // Keep verification history while leaving unrelated continuation history behind.
       const pending = queued.get("verify");
       if (pending) {
         recovery.waiters.push(...pending.waiters.splice(0));
+        recovery.attempt = Math.max(recovery.attempt, pending.attempt);
+        recovery.retryAt = Math.max(recovery.retryAt, pending.retryAt);
         queued.delete("verify");
       }
     }
@@ -252,7 +247,7 @@ export function linkedTableReads<T>(options: {
   function queueFreshnessRecovery(batch: Batch<T>) {
     const existing = queued.get("refresh");
     const refresh = existing ?? freshBatch<T>();
-    if (!existing) refresh.preserveExtent = batch.intent.kind === "verify" || batch.preserveExtent;
+    if (!refresh.manual) refresh.preserveExtent = true;
     if (!isContinuation(batch.intent)) {
       refresh.attempt = Math.max(refresh.attempt, batch.attempt);
       if (!refresh.manual) refresh.retryAt = Math.max(refresh.retryAt, batch.retryAt);
@@ -308,7 +303,11 @@ export function linkedTableReads<T>(options: {
       return;
     }
     if (outcome.state === "success" && outcome.verification === "network") {
-      bindVerification(batch);
+      const pending = queued.get("verify");
+      if (pending) {
+        batch.waiters.push(...pending.waiters.splice(0));
+        queued.delete("verify");
+      }
       verification = undefined;
     }
     const receipt: TableReadReceipt<T> =
@@ -346,7 +345,11 @@ export function linkedTableReads<T>(options: {
       options.unavailable("suspended");
       enqueueRetry(batch);
     } else if (outcome.state === "superseded") {
-      if (verification || freshnessPending() || (scopeRetired && !isContinuation(batch.intent))) {
+      if (
+        verification?.fullQuery ||
+        freshnessPending() ||
+        ((verification || scopeRetired) && !isContinuation(batch.intent))
+      ) {
         const refresh = queueFreshnessRecovery(batch);
         if (!isContinuation(batch.intent)) bindVerification(refresh);
       }
@@ -384,7 +387,10 @@ export function linkedTableReads<T>(options: {
       batch.manual = true;
       if (intent.kind === "refresh") batch.preserveExtent = false;
     }
-    if (!joining) queued.set(intentKey(batch.intent), batch);
+    if (!joining) {
+      if (intent.kind === "refresh" && !manual && !batch.manual) batch.preserveExtent = true;
+      queued.set(intentKey(batch.intent), batch);
+    }
     if (manual && needsFreshness(batch)) {
       const refresh = prerequisite();
       if (refresh) {
@@ -485,7 +491,6 @@ export function linkedTableReads<T>(options: {
       observers.add(observer);
       if (
         available() &&
-        !verification?.fullQuery &&
         !verification &&
         completed &&
         completed.scope === options.scope?.() &&

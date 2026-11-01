@@ -1,6 +1,6 @@
 import { ApiClientError } from "./api";
 import { TABLE_PAGE_MAX } from "../shared/table-limits";
-import type { TableQueryResult } from "../shared/table-protocol";
+import type { TableQueryResult, TableQueryCoverage } from "../shared/table-protocol";
 import type { LinkedTableContinuation, LinkedTableReadIntent } from "./linked-table-reads";
 export type TableReadWindow = {
   data: TableQueryResult;
@@ -28,7 +28,12 @@ export async function readLinkedTable(
   read: (cursor?: string, limit?: number) => Promise<TableQueryResult>,
   signal?: AbortSignal,
   queryIdentity = "",
-  options: { networkRequired?: boolean; verify?: boolean; refresh?: "first-page" | "visible"; restart?: boolean } = {},
+  options: {
+    networkRequired?: boolean;
+    verify?: boolean;
+    refresh?: "first-page" | "visible";
+    verifyCoverage?: () => Promise<TableQueryCoverage>;
+  } = {},
 ): Promise<LinkedTableReadResult> {
   const { networkRequired = false } = options;
   signal?.throwIfAborted();
@@ -55,32 +60,51 @@ export async function readLinkedTable(
     try {
       signal?.throwIfAborted();
       let network = false;
-      let data: TableQueryResult, rows: TableQueryResult["rows"], cursor: string | null, pageSize: number;
+      let reusable = attempt === 0 ? current : null;
       if (
-        attempt === 0 &&
-        intent.kind === "append" &&
-        current &&
-        (current.verified ||
-          (networkRequired && current.serverCursor && current.data.rows.length + current.buffered.length < target))
+        reusable &&
+        options.verifyCoverage &&
+        (options.verify || (intent.kind === "append" && (!reusable.verified || networkRequired)))
       ) {
-        data = current.data;
-        rows = mergeRows(data.rows, current.buffered);
-        cursor = current.serverCursor;
-        pageSize = current.pageSize;
+        const probe = await options.verifyCoverage();
+        signal?.throwIfAborted();
+        network = true;
+        if (probe.generation === reusable.data.generation && probe.revision === reusable.data.revision) {
+          reusable = {
+            ...reusable,
+            data: {
+              ...reusable.data,
+              ...Object.fromEntries(
+                [
+                  "protocolVersion",
+                  "taskList",
+                  "canEdit",
+                  "pageId",
+                  "generation",
+                  "revision",
+                  "projectedRevision",
+                  "columns",
+                  "views",
+                  "view",
+                  "invalidView",
+                  "people",
+                ]
+                  .filter((key) => key in probe)
+                  .map((key) => [key, probe[key as keyof TableQueryCoverage]]),
+              ),
+            },
+            verified: true,
+          };
+          if (options.verify) return { window: reusable, verification: "network" };
+        } else reusable = null;
+      }
+      let data: TableQueryResult, rows: TableQueryResult["rows"], cursor: string | null, pageSize: number;
+      if (intent.kind === "append" && reusable?.verified && (!networkRequired || network)) {
+        data = reusable.data;
+        rows = mergeRows(data.rows, reusable.buffered);
+        cursor = reusable.serverCursor;
+        pageSize = reusable.pageSize;
       } else {
-        if (options.verify && current && attempt === 0) {
-          const probe = await read(undefined, 1);
-          signal?.throwIfAborted();
-          if (probe.generation === current.data.generation && probe.revision === current.data.revision)
-            return {
-              window: {
-                ...current,
-                data: { ...probe, rows: current.data.rows, nextCursor: current.data.nextCursor },
-                verified: true,
-              },
-              verification: "network",
-            };
-        }
         pageSize = Math.min(TABLE_PAGE_MAX, Math.max(100, target));
         data = await read(undefined, pageSize);
         network = true;
@@ -121,7 +145,6 @@ export async function readLinkedTable(
       if (
         signal?.aborted ||
         attempt ||
-        options.restart === false ||
         !(error instanceof CursorChanged || (error instanceof ApiClientError && error.code === "table_cursor_stale"))
       )
         throw error;

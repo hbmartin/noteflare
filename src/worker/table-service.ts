@@ -11,6 +11,7 @@ import {
   type TableCommand,
   type TableCommandResult,
   type TableQueryResult,
+  type TableQueryCoverage,
   type TableView,
 } from "../shared/table-protocol";
 import {
@@ -140,6 +141,13 @@ export async function tableCommand(
 export async function queryTable(env: Env, member: MemberContext, pageId: string, query = "") {
   const result = await decodeTableResponse<TableQueryResult>(
     await tableFetch(env, member, pageId, `/query${query ? `?${query}` : ""}`),
+  );
+  const page = await pageForMember(env, member, pageId);
+  return { ...result, taskList: Boolean(page.is_task_list), canEdit: page.effective_role !== "viewer" };
+}
+export async function queryTableCoverage(env: Env, member: MemberContext, pageId: string, query = "") {
+  const result = await decodeTableResponse<TableQueryCoverage>(
+    await tableFetch(env, member, pageId, `/coverage${query ? `?${query}` : ""}`),
   );
   const page = await pageForMember(env, member, pageId);
   return { ...result, taskList: Boolean(page.is_task_list), canEdit: page.effective_role !== "viewer" };

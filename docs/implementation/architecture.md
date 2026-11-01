@@ -52,3 +52,19 @@ Diagram cards keep their node identity, explicit alias, `linkedPageId` and optio
 Editor clients advertise schema capabilities, and existing unsupported structures make older clients read-only. New insertion uses `EDITOR_BLOCKS_V2_ENABLED`; disabling insertion keeps existing structures readable and exportable. Portable exports flatten tabs into labelled sections, export status labels as text, and use stable footnote references and anchors. Writable Markdown protects structures until a lossless mapping exists.
 
 Table migration remains explicit and fenced. The mixed deployment supports legacy D1 tables and migrated DO tables concurrently. A DO outage never reopens D1 writes. Lease retirement follows the release closeout in [Phase 7](../roadmap/07-collaborative-tables.md), and saved views follow [Phase 8](../roadmap/08-table-views-properties.md).
+
+## Table coverage verification
+
+Canonical tables expose `GET /api/tables/:pageId/coverage`; linked hosts expose
+`GET /api/pages/:id/linked-tables/:tableId/coverage`. Both enforce current authorization
+before and after the authority call, including the linked host and selected view.
+The response contains protocol/page identity, generation/revision, current columns,
+views, people and edit permission. It omits rows, cursors, counts, calculations,
+grouping results and relations, and performs no row-query evaluation. Query metadata
+and calendar parameter validation match normal reads.
+
+A matching proof refreshes metadata and permits reuse of the existing window. A
+changed proof rebuilds its visible extent with a consistent cursor chain. Automatic
+recovery preserves extent; an explicit Refresh starts from the first page. Retired,
+hidden or offline completions cannot restore verification. The shared reader owns
+one cursor restart; further churn returns to bounded coordinator recovery.

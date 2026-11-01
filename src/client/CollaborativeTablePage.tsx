@@ -70,12 +70,9 @@ type TaskSaveResult =
   | { state: "rejected"; code?: string }
   | { state: "uncertain" };
 type TableFetchOptions = {
-  cursor?: string;
   signal?: AbortSignal;
   intent?: TableReadIntent;
   context?: TableReadContext;
-  restarts?: number;
-  network?: boolean;
 };
 type TableOwner = { account: string; incarnation: unknown; host: string; tableId: string };
 const sameTableOwner = (left: TableOwner, right: TableOwner) =>
@@ -394,32 +391,14 @@ export function CollaborativeTablePage({
     setCommitNeedsCoverage(Boolean(commitRequirement.current));
   }, []);
   const fetchTable = useCallback(
-    async function fetchTable({
-      cursor,
-      signal,
-      intent,
-      context,
-      restarts = 0,
-      network = false,
-    }: TableFetchOptions = {}): Promise<LinkedTableReadOutcome<TableQueryResult>> {
-      const restart = async () => {
-        const refreshed = await fetchTable({ signal, context, restarts: 1, network });
-        return intent?.kind === "page" &&
-          intent.target !== undefined &&
-          refreshed.state === "success" &&
-          refreshed.value.generation === intent.generation
-          ? fetchTable({ signal, intent, context, restarts: 1, network: true })
-          : refreshed;
-      };
+    async function fetchTable({ signal, intent, context }: TableFetchOptions = {}): Promise<
+      LinkedTableReadOutcome<TableQueryResult>
+    > {
       if (intent?.kind === "page" && intent.target !== undefined) {
         const prefix = canonicalPrefix.current,
           current = prefix.window;
         if (intent.queryIdentity !== queryIdentity || current?.data.generation !== intent.generation)
           return { state: "superseded" };
-        if (current.data.rows.length >= intent.target || !current.hasMore) {
-          if (context?.networkRequired && !network) return restart();
-          return { state: "success", value: current.data, verification: network ? "network" : "buffer" };
-        }
         intent = { ...intent, cursor: current.serverCursor ?? "", prefix: prefix.id, revision: current.data.revision };
       }
       const ownsPrefix = () =>
@@ -429,7 +408,6 @@ export function CollaborativeTablePage({
           intent.generation === canonicalPrefix.current.window?.data.generation &&
           intent.revision === canonicalPrefix.current.window?.data.revision);
       if (!ownsPrefix()) return { state: "superseded" };
-      if (intent?.kind === "page") cursor = intent.cursor;
       const owner = ++ownership.current.request;
       const verification = ownership.current.verification;
       const params = new URLSearchParams({ limit: "100" });
@@ -439,7 +417,6 @@ export function CollaborativeTablePage({
       params.set("month", month);
       params.set("includeUnscheduled", "true");
       params.set("timeZone", Intl.DateTimeFormat().resolvedOptions().timeZone);
-      if (cursor) params.set("cursor", cursor);
       try {
         const readPage = (nextCursor?: string, limit = 100) => {
           const pageParams = new URLSearchParams(params);
@@ -468,30 +445,29 @@ export function CollaborativeTablePage({
           signal,
           queryIdentity,
           {
-            networkRequired: context?.networkRequired && !network,
+            networkRequired: context?.networkRequired,
             verify: verifying,
             refresh: queryBase || context?.preserveExtent ? "visible" : "first-page",
-            // Canonical continuation cursors rebind here; verification and linked windows restart in the reader.
-            restart: Boolean(queryBase) || intent?.kind !== "page",
+            verifyCoverage: () =>
+              api(`${queryBase ? `${base}/coverage` : base.replace(/\/query$/, "/coverage")}?${params}`, {
+                signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+              }),
           },
         );
         const linked = queryBase ? checked : null;
         const result = checked.window.data;
-        network ||= checked.verification === "network";
+        const network = checked.verification === "network";
         if (!active.current || signal?.aborted || !ownsPrefix()) return { state: "superseded" };
-        // Canonical transport queries retain their authorization result when only view data is superseded.
-        if (owner !== ownership.current.request)
-          return queryBase ? { state: "superseded" } : { state: "success", value: result, verification: "network" };
-        if (queryBase && verification !== ownership.current.verification) return { state: "superseded" };
+        if (
+          owner !== ownership.current.request ||
+          verification !== ownership.current.verification ||
+          queryOwner.current.queryIdentity !== queryIdentity ||
+          !navigator.onLine ||
+          document.hidden
+        )
+          return { state: "superseded" };
         if ((context && !context.acceptsGeneration(result)) || result.generation < ownership.current.minimumGeneration)
           return { state: "stale" };
-        if (
-          intent?.kind === "page" &&
-          (result.generation !== intent.generation || result.revision !== intent.revision)
-        ) {
-          if (restarts) return { state: "stale" };
-          return restart();
-        }
         // Query/access evidence belongs to this verification lifetime. Later content watermarks
         // remain the coordinator's background freshness obligation, not an authorization latch.
         const verified = checked.verification === "network" && verification === ownership.current.verification;
@@ -549,15 +525,6 @@ export function CollaborativeTablePage({
                 (connectionPermit.current() && ownership.current.authorizedGeneration === result.generation),
               ),
           );
-        const prefix = canonicalPrefix.current.window;
-        if (
-          intent?.kind === "page" &&
-          intent.target !== undefined &&
-          prefix &&
-          prefix.data.rows.length < intent.target &&
-          prefix.hasMore
-        )
-          return fetchTable({ signal, intent, context, restarts, network });
         return {
           state: "success",
           value: result,
@@ -568,7 +535,7 @@ export function CollaborativeTablePage({
           signal?.aborted ||
           owner !== ownership.current.request ||
           !active.current ||
-          (queryBase && verification !== ownership.current.verification)
+          verification !== ownership.current.verification
         )
           return { state: "superseded" };
         if (discardDenied(cause, true)) {
@@ -582,7 +549,6 @@ export function CollaborativeTablePage({
           cause instanceof CursorChanged ||
           (cause instanceof ApiClientError && cause.code === "table_cursor_stale")
         ) {
-          if (!queryBase && intent?.kind === "page" && !restarts) return restart();
           return { state: "stale" };
         }
         setError(apiErrorMessage(cause, "The table could not be loaded."));
