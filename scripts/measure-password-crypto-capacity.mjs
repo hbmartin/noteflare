@@ -38,6 +38,7 @@ import { tracing } from "cloudflare:workers";
 import { passwordService } from ${JSON.stringify(resolve("src/worker/password-service.ts"))};
 import { traceIdentifiers } from ${JSON.stringify(resolve("src/worker/observability.ts"))};
 export default class extends WorkerEntrypoint {
+  fetch() { return new Response(null, {status:404}); }
   async run(operation) {
     if (operation !== "hash" && operation !== "verify") throw Error("Invalid operation");
     const started = performance.now();
@@ -106,7 +107,7 @@ const sample = async (operation) => {
   }
 };
 let proxy,
-  deployed = false;
+  helperRemoved = false;
 const tails = [],
   sockets = [];
 const fd = openSync(`${root}/proxy.log`, "w", 0o600);
@@ -115,7 +116,6 @@ const invocations = [],
   warmups = [];
 try {
   run(["deploy", "--config", `${root}/helper.json`, "--env", ""]);
-  deployed = true;
   await writeFile(`${root}/resource.json`, JSON.stringify({ helper, preview }));
   for (const scriptName of [preview, helper]) {
     const tail = await api(`/workers/scripts/${scriptName}/tails`, { method: "POST", body: { filters: [] } });
@@ -221,9 +221,10 @@ try {
   closeSync(fd);
   for (const socket of sockets) socket.close();
   for (const tail of tails) await api(`/workers/scripts/${tail.scriptName}/tails/${tail.id}`, { method: "DELETE" });
-  if (deployed) await api(`/workers/scripts/${helper}`, { method: "DELETE" });
+  await api(`/workers/scripts/${helper}`, { method: "DELETE", allowMissing: true });
+  helperRemoved = true;
   await writeFile(
     `${root}/results.json`,
-    JSON.stringify({ helper, preview, warmups, stages, invocations, helperRemoved: deployed }, null, 2),
+    JSON.stringify({ helper, preview, warmups, stages, invocations, helperRemoved }, null, 2),
   );
 }
