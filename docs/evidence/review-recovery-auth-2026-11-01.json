@@ -14303,8 +14303,10 @@
   ],
   "productionPilot": {
     "step": "C6",
-    "status": "blocked",
-    "reason": "Production browser remains at owner sign-in; no owner session is available.",
+    "status": "skipped",
+    "reason": "User requested skipping production.",
+    "priorBlocker": "Production browser remained at owner sign-in; no owner session was available.",
+    "complete": false,
     "markdownWritesEnabled": true,
     "productionCodeDeployed": false,
     "resourcesCreated": false

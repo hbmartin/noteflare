@@ -2,7 +2,7 @@
 
 On 1 November 2026, the review fixes were validated locally and deployed only to the existing preview. Password-service outages no longer consume persistent account attempts, eligible RPC failures receive one bounded same-shard retry, and retired table reads cannot publish verified buffered rows. Automatic table recovery preserves the visible extent and uses an authenticated metadata proof instead of evaluating a one-row query.
 
-The feature remains deployed on preview as `89ab773b-ac3e-48b0-8cf2-fab3aa691783`. **Caller CPU still exceeds 10 ms frequently. Production C6 remains blocked by unavailable owner access.** No production code was deployed.
+The feature remains deployed on preview as `89ab773b-ac3e-48b0-8cf2-fab3aa691783`. **Caller CPU still exceeds 10 ms frequently. The production C6 pilot was skipped at the user's request and remains incomplete.** No production code was deployed.
 
 ## Sign-in comparison
 
@@ -69,6 +69,6 @@ Before claiming current stored-hash compatibility, aggregate-only format audits 
 
 All preview bindings, secret names, origin and saved flags match the before snapshot. The preview Markdown flag remains false. The temporary viewer, credential account, sessions, security state and verification challenges were removed. Exactly 54 attributed rate-limit records (47 password-account buckets plus seven route buckets) were removed; the four preexisting rows and original user set remain. Credentials were deleted locally. Final preview health and complete metadata integrity checks passed.
 
-Production bindings and deployment history remain unchanged at version `93ea9be3-7f8d-4305-a789-8393354cf17e`. Its existing Markdown-write flag is true and remains true in source. C6's production browser was opened but stayed at owner sign-in; no owner session was available. Therefore SDK retrieval, all four Markdown commands, failure/permission cases, async completion, concurrent browser edits and convergence were **not executed in production**. No pilot page or integration was created, and C6 stays incomplete. Production owner access is the concrete prerequisite for finishing that separate live exit matrix.
+Production bindings and deployment history remain unchanged at version `93ea9be3-7f8d-4305-a789-8393354cf17e`. Its existing Markdown-write flag is true and remains true in source. C6's production browser was opened but stayed at owner sign-in; no owner session was available. The user subsequently requested skipping production, so the pilot is intentionally excluded from this work. SDK retrieval, all four Markdown commands, failure/permission cases, async completion, concurrent browser edits and convergence were **not executed in production**. No pilot page or integration was created, and C6 stays incomplete.
 
 There was no production deployment, pool redesign, subscription change, automatic merge, database down-migration or namespace deletion.
