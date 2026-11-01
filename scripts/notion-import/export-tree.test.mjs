@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { notionIdOf, readExport, resolveLink, stripNotionId, walkExport } from "./export-tree.mjs";
@@ -21,7 +22,10 @@ describe("notion export naming", () => {
 
 describe("reading an export", () => {
   it("skips archive noise and the sitemap", () => {
+    expect(existsSync(join(root, "__MACOSX", "archive-noise.txt"))).toBe(true);
+    expect(existsSync(join(root, ".hidden-noise"))).toBe(true);
     const { files } = walkExport(root);
+    expect(files.some((path) => path.includes(".hidden-noise"))).toBe(false);
     expect(files.some((path) => path.includes("__MACOSX"))).toBe(false);
 
     const index = readExport(root);

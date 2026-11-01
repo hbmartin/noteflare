@@ -26,7 +26,7 @@
     "test:watch": "pnpm build:plugin-ui && vitest",
     "lint": "oxlint --deny-warnings --report-unused-disable-directives .",
     "lint:fix": "oxlint --fix .",
-    "check:middleware": "semgrep scan --strict --no-git-ignore --error --config .semgrep/middleware.yml --exclude='**/*.test.ts' --exclude='**/*.integration.test.ts' src/worker && semgrep test --strict --config .semgrep/middleware.yml .semgrep/middleware.test.ts",
+    "check:middleware": "semgrep scan --strict --no-git-ignore --error --timeout 30 --config .semgrep/middleware.yml --exclude='**/*.test.ts' --exclude='**/*.integration.test.ts' src/worker && semgrep test --strict --config .semgrep/middleware.yml .semgrep/middleware.test.ts",
     "check:deploy": "semgrep scan --strict --no-git-ignore --error --config .semgrep/deploy.yml scripts/deploy.mjs && semgrep test --strict --config .semgrep/deploy.yml .semgrep/deploy.test.ts",
     "format": "oxfmt",
     "format:check": "oxfmt --check",

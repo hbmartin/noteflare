@@ -13,12 +13,7 @@ test("missing core schema and incomplete query coverage never pass", async () =>
   const result = await metadataIntegrityCheck((sql) => {
     if (sql.includes("sqlite_master")) return ["pages", "spaces", "workspaces"].map((name) => ({ name }));
     if (sql.includes("PRAGMA")) return INTEGRITY_PAGE_COLUMNS.split(",").map((name) => ({ name }));
-    if (sql.includes(" UNION ALL "))
-      return [
-        { source: "pages", rows: 10 },
-        { source: "spaces", rows: 0 },
-        { source: "workspaces", rows: 0 },
-      ];
+    if (sql.startsWith("SELECT (SELECT count(*)")) return [{ pages: 10, spaces: 0, workspaces: 0 }];
     if (sql.includes("sum(revision)")) return [{ pages: 10, revisions: 10, epochs: 10, updates: 10 }];
     return [];
   });
@@ -37,7 +32,7 @@ function metadataFixture() {
   return db;
 }
 
-test("remote metadata counts respect D1's five-term compound SELECT limit", async () => {
+test("remote metadata counts share one statement snapshot without compound SELECTs", async () => {
   let counted = 0;
   const result = await metadataIntegrityCheck((sql) => {
     if (sql.includes("sqlite_master"))
@@ -51,11 +46,12 @@ test("remote metadata counts respect D1's five-term compound SELECT limit", asyn
         "attachments",
       ].map((name) => ({ name }));
     if (sql.includes("PRAGMA")) return INTEGRITY_PAGE_COLUMNS.split(",").map((name) => ({ name }));
-    if (sql.includes(" source,count(*) rows")) {
-      const statements = sql.split(" UNION ALL ");
-      assert.ok(statements.length <= 5);
-      counted += statements.length;
-      return statements.map((statement) => ({ source: statement.match(/SELECT '([^']+)'/)[1], rows: 0 }));
+    if (sql.startsWith("SELECT (SELECT count(*)")) {
+      assert.ok(!sql.includes(" UNION ALL "));
+      const names = [...sql.matchAll(/\) AS (\w+)/g)].map((match) => match[1]);
+      assert.equal(names.length, 6);
+      counted += names.length;
+      return [Object.fromEntries(names.map((name) => [name, 0]))];
     }
     if (sql.includes("sum(revision)")) return [{ pages: 0, revisions: "0", epochs: "0", sequences: "0", updates: "0" }];
     return [];
