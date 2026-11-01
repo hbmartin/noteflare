@@ -462,7 +462,7 @@ int main(int argc, char **argv) {
       });
     console.log(`Measured ${label}`);
   }
-  await computeSeries("hash password", password, "compute / password hash (production scrypt)");
+  await computeSeries("hash password", password, "compute / password-service RPC (scrypt in DO)");
   await repeated(
     "HTTP / password sign-in (TOTP challenge)",
     () => request("/api/auth/sign-in/email", { body: { email: "cpu@example.test", password, callbackURL: "/" } }),

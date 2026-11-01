@@ -7,12 +7,16 @@ import {
   runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
+import { Buffer } from "node:buffer";
+import { scryptSync } from "node:crypto";
+import { logger } from "./observability";
+import * as observability from "./observability";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "./index";
 import type { Env } from "./env";
 import { passwordService, PASSWORD_CRYPTO_PREFIX, PASSWORD_CRYPTO_SHARDS } from "./password-service";
-import { otpFromUri, responseCookies } from "../../tests/helpers/security";
+import { enrollAccount as enroll, responseCookies } from "../../tests/helpers/security";
 
 // Generated with Node scrypt and the installed administrative reset utility's
 // better-auth/crypto export. These fixtures must survive runtime/refactor changes.
@@ -43,22 +47,12 @@ async function bootstrap() {
   return response;
 }
 
-async function enrollAccount(response: Response) {
+function enrollAccount(response: Response) {
   const { request } = instrument();
-  let cookie = responseCookies(response);
-  const setup = await request("/api/security/setup-totp", { password: "password123" }, cookie);
-  expect(setup.status).toBe(200);
-  const { totpURI } = await setup.json<{ totpURI: string }>();
-  const confirmed = await request("/api/security/confirm-totp", { code: await otpFromUri(totpURI) }, cookie);
-  expect(confirmed.status).toBe(200);
-  cookie = responseCookies(confirmed, cookie);
-  const codes = await request("/api/security/recovery-codes", {}, cookie);
-  const { receipt } = await codes.json<{ receipt: string }>();
-  expect((await request("/api/security/acknowledge-codes", { receipt }, cookie)).status).toBe(200);
-  return cookie;
+  return enroll(response, undefined, (cookie, path, body) => request(path, body ?? {}, cookie));
 }
 
-function instrument(fail = false) {
+function instrument(fail: boolean | (() => Promise<void>) = false) {
   const calls: { operation: "hash" | "verify"; shard: string }[] = [];
   const bindings = {
     ...env,
@@ -68,12 +62,14 @@ function instrument(fail = false) {
         return {
           async hash(password: string) {
             calls.push({ operation: "hash", shard: name });
-            if (fail) throw new Error("Synthetic private failure");
+            if (typeof fail === "function") await fail();
+            else if (fail) throw new Error("Synthetic private failure");
             return stub.hash(password);
           },
           async verify(input: { hash: string; password: string }) {
             calls.push({ operation: "verify", shard: name });
-            if (fail) throw new Error("Synthetic private failure");
+            if (typeof fail === "function") await fail();
+            else if (fail) throw new Error("Synthetic private failure");
             return stub.verify(input);
           },
         };
@@ -271,4 +267,167 @@ describe("password cryptography RPC", () => {
     expect((await request("/api/auth/sign-in/email", body)).status).toBe(429);
     expect(calls).toHaveLength(count);
   });
+});
+
+describe("password service recovery", () => {
+  it("accepts verbatim noncanonical salts but rejects malformed and oversized stored hashes", async () => {
+    const service = passwordService(env),
+      password = "compatibility-password";
+    for (const salt of ["short", "A".repeat(32), "盐K"]) {
+      const key = Buffer.from(scryptSync(password, salt, 64, { N: 16384, r: 16, p: 1, maxmem: 67108864 })).toString(
+        "hex",
+      );
+      const hash = `${salt}:${key}`;
+      expect(await verifyPassword({ hash, password })).toBe(true);
+      expect(await service.verify({ hash, password })).toBe(true);
+      expect(await service.verify({ hash, password: "incorrect" })).toBe(false);
+    }
+    for (const hash of [legacy + ":extra", "x".repeat(4097), legacy.toUpperCase()])
+      expect(await service.verify({ hash, password })).toBe(false);
+  });
+
+  it.each(["success", "exhausted", "overloaded", "remote", "invalid-response", "mismatch"] as const)(
+    "bounds retries for %s",
+    async (mode) => {
+      const names: string[] = [],
+        stubs: object[] = [];
+      const bindings = {
+        ...env,
+        PASSWORD_CRYPTO: {
+          getByName(name: string) {
+            names.push(name);
+            const stub = {
+              verify: async () => {
+                if (mode === "overloaded")
+                  throw Object.assign(new Error("private"), { retryable: true, overloaded: true });
+                if (mode === "remote") throw Object.assign(new Error("private"), { remote: true });
+                if (mode === "invalid-response") return "invalid";
+                if (mode === "mismatch") return false;
+                if (names.length === 1 || mode === "exhausted")
+                  throw Object.assign(new Error("private"), { retryable: true });
+                return true;
+              },
+            };
+            stubs.push(stub);
+            return stub;
+          },
+        },
+      } as unknown as Env;
+      const result = await passwordService(bindings)
+        .verify({ hash: legacy, password: "legacy-password-123" })
+        .then(
+          (value) => ({ value }),
+          (error) => ({ statusCode: error.statusCode, code: error.body?.code }),
+        );
+      const expected =
+        mode === "success" || mode === "mismatch"
+          ? { value: mode === "success" }
+          : { statusCode: 503, code: "PASSWORD_CRYPTO_UNAVAILABLE" };
+      expect(result).toEqual(expected);
+      expect(names.length).toBe(mode === "success" || mode === "exhausted" ? 2 : 1);
+      expect(new Set(names).size).toBe(1);
+      expect(new Set(stubs).size).toBe(stubs.length);
+    },
+  );
+
+  it("validates before binding access and isolates throwing telemetry from correct and failed results", async () => {
+    const getByName = vi.fn(() => {
+      throw new Error("Unavailable");
+    });
+    const unavailable = passwordService({ ...env, PASSWORD_CRYPTO: { getByName } } as unknown as Env);
+    await expect(unavailable.hash("x".repeat(1001))).rejects.toMatchObject({ statusCode: 400 });
+    expect(getByName).not.toHaveBeenCalled();
+    vi.spyOn(logger, "info").mockImplementation(() => {
+      throw new Error("Logging unavailable");
+    });
+    const brokenMetrics = {
+      ...env,
+      OBSERVABILITY: {
+        writeDataPoint() {
+          throw new Error("Metrics unavailable");
+        },
+      },
+    } as unknown as Env;
+    expect(await passwordService(brokenMetrics).verify({ hash: legacy, password: "legacy-password-123" })).toBe(true);
+    await expect(unavailable.verify({ hash: legacy, password: "legacy-password-123" })).rejects.toMatchObject({
+      statusCode: 503,
+    });
+    const stub = env.PASSWORD_CRYPTO.getByName(`${PASSWORD_CRYPTO_PREFIX}0`);
+    await runInDurableObject(stub, async (instance) => {
+      // The DO's logger also throws in this isolate; its successful proof must survive.
+      expect(await instance.verify({ hash: legacy, password: "legacy-password-123" })).toBe(true);
+    });
+  });
+
+  it("does not turn repeated crypto outages into account lockouts, including recovery resumption", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const { request: healthy } = instrument();
+    const codes = await (
+      await healthy("/api/security/recovery-codes", {}, cookie)
+    ).json<{ codes: string[]; receipt: string }>();
+    await healthy("/api/security/acknowledge-codes", { receipt: codes.receipt }, cookie);
+    let recoveryCookie = cookie;
+    for (const path of ["/api/security/setup-totp", "/api/security/recover", "/api/security/resume-recovery"]) {
+      if (path.endsWith("resume-recovery")) {
+        const response = await healthy(
+          "/api/security/recover",
+          { password: "password123", code: codes.codes[0] },
+          cookie,
+        );
+        if (response.status !== 200) throw new Error("Could not establish recovery fixture");
+        recoveryCookie = responseCookies(response, cookie);
+      }
+      const failed = instrument(true);
+      const before = await env.DB.prepare("SELECT failed_attempts,locked_until FROM account_security").first();
+      for (let i = 0; i < 11; i++) {
+        const response = await failed.request(path, { password: "password123", code: "invalid" }, recoveryCookie);
+        expect(response.status).toBe(503);
+      }
+      expect(await env.DB.prepare("SELECT failed_attempts,locked_until FROM account_security").first()).toEqual(before);
+    }
+  });
+
+  it.each(["lock", "generation"] as const)("rechecks account %s after concurrent hashing", async (change) => {
+    const cookie = await enrollAccount(await bootstrap());
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const { request, calls } = instrument(async () => {
+      entered();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    const pending = request("/api/security/setup-totp", { password: "password123" }, cookie);
+    await started;
+    if (change === "lock")
+      await env.DB.prepare("UPDATE account_security SET failed_attempts=10,locked_until=?")
+        .bind(Date.now() + 900000)
+        .run();
+    else await env.DB.prepare("UPDATE account_security SET generation=generation+1").run();
+    release();
+    expect((await pending).status).not.toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM pending_totp").first()).toEqual({ count: 0 });
+    const blocked =
+      change === "lock" ? await request("/api/security/setup-totp", { password: "password123" }, cookie) : undefined;
+    expect(blocked?.status).toBe(change === "lock" ? 429 : undefined);
+    expect(calls).toHaveLength(1);
+  });
+});
+
+it.each(["before", "after"])("keeps a proof when tracing fails %s starting work", async (phase) => {
+  const spy = vi.spyOn(logger, "info");
+  vi.spyOn(observability, "traced").mockImplementation((_tracing, _name, _attributes, callback) => {
+    if (phase === "after") callback();
+    throw new Error("Trace sink unavailable");
+  });
+  expect(
+    await env.PASSWORD_CRYPTO.getByName(`${PASSWORD_CRYPTO_PREFIX}0`).verify({
+      hash: legacy,
+      password: "legacy-password-123",
+    }),
+  ).toBe(true);
+  expect(spy.mock.calls.filter(([event]) => event === "auth.crypto.completed")).toHaveLength(1);
 });

@@ -35,6 +35,7 @@ import {
   type TableCommandResult,
   type TableFilter,
   type TableQueryResult,
+  type TableQueryCoverage,
   type TableValue,
   type TableView,
 } from "../shared/table-protocol";
@@ -859,6 +860,11 @@ export class TableAuthority extends DurableObject<Env> {
             "table_revision_conflict",
           );
         return Response.json({ ...snapshot, targets });
+      }
+      if (path === "/coverage") {
+        const result = { ...this.queryCoverage(url, actor), people: await this.people(actor) };
+        await this.authorize(request, false);
+        return Response.json(result);
       }
       if (path === "/query") {
         const result = { ...this.query(new URL(request.url), actor), people: await this.people(actor) };
@@ -2148,6 +2154,37 @@ export class TableAuthority extends DurableObject<Env> {
     return {
       sql: compiled.sql.replaceAll("?", () => `json_extract(?1,'$[${parameter++}]')`),
       binds: [JSON.stringify(compiled.binds)],
+    };
+  }
+  private queryCoverage(url: URL, actor: TableActor): TableQueryCoverage {
+    const meta = this.meta(),
+      columns = this.columns(),
+      views = this.views(actor);
+    const viewId = url.searchParams.get("viewId"),
+      view = viewId ? this.view(viewId, actor) : null;
+    const invalidView = Boolean(view?.invalid);
+    // Compile validation only. Never execute row filters, counts, calculations, or hydration.
+    this.filterSql(invalidView ? null : (view?.filters ?? null));
+    if (url.searchParams.has("month") && view?.kind === "calendar" && view.columnId && !invalidView) {
+      if (!/^\d{4}-\d{2}$/.test(url.searchParams.get("month")!)) return fail("Invalid calendar month.");
+      try {
+        validateCalendarZone(url.searchParams.get("timeZone") ?? "UTC");
+      } catch {
+        return fail("Choose a valid calendar display timezone.");
+      }
+    }
+    const limit = Math.min(TABLE_PAGE_MAX, Math.max(1, Number(url.searchParams.get("limit") ?? 100)));
+    if (!Number.isSafeInteger(limit)) return fail("Invalid page size.");
+    return {
+      protocolVersion: TABLE_PROTOCOL_VERSION,
+      pageId: meta.pageId,
+      generation: meta.generation,
+      revision: meta.revision,
+      projectedRevision: meta.projectedRevision,
+      columns,
+      views,
+      view,
+      invalidView,
     };
   }
   private query(url: URL, actor: TableActor): TableQueryResult {

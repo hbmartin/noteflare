@@ -2,7 +2,7 @@ import { trackRealtimeUser } from "./realtime-access";
 import type { GenericEndpointContext } from "@better-auth/core";
 import { createOTP } from "@better-auth/utils/otp";
 import type { BetterAuthPlugin } from "better-auth";
-import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
+import { APIError, createAuthEndpoint, createAuthMiddleware, getSessionFromCtx, isAPIError } from "better-auth/api";
 import { expireCookie, setSessionCookie } from "better-auth/cookies";
 import { generateRandomString, symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import type { SecurityStatus } from "../shared/security";
@@ -261,13 +261,13 @@ async function requireEnrollment(ctx: GenericEndpointContext, env: Env) {
   return { ...id, security };
 }
 
-async function attempt(env: Env, userId: string) {
+async function attempt(env: Env, userId: string, generation?: number) {
   const time = Date.now();
   const result = await env.DB.prepare(`UPDATE account_security SET
     failed_attempts = CASE WHEN locked_until > 0 THEN 1 ELSE failed_attempts + 1 END,
     locked_until = CASE WHEN locked_until = 0 AND failed_attempts >= 9 THEN ? ELSE 0 END
-    WHERE user_id = ? AND locked_until <= ? RETURNING failed_attempts`)
-    .bind(time + 15 * 60_000, userId, time)
+    WHERE user_id = ? AND locked_until <= ? AND (? IS NULL OR generation=?) RETURNING failed_attempts`)
+    .bind(time + 15 * 60_000, userId, time, generation ?? null, generation ?? null)
     .first();
   if (!result)
     throw new APIError("TOO_MANY_REQUESTS", {
@@ -307,6 +307,26 @@ async function primaryFactor(ctx: GenericEndpointContext, env: Env, id: Identity
   if (!credential?.password || !(await ctx.context.password.verify({ hash: credential.password, password: value }))) {
     throw deny("The password or Slack sign-in is invalid.");
   }
+}
+
+/** No persistent failure is charged until the primary proof has a definitive result. */
+async function primaryFactorAttempt(ctx: GenericEndpointContext, env: Env, id: Identity, generation: number) {
+  const current = await securityAccount(env, id.userId);
+  if (current.generation !== generation) throw deny("Security settings changed. Sign in again.");
+  if (current.locked_until > Date.now())
+    throw new APIError("TOO_MANY_REQUESTS", {
+      code: "ACCOUNT_TEMPORARILY_LOCKED",
+      message: "Too many attempts. Try again in 15 minutes.",
+    });
+  try {
+    await primaryFactor(ctx, env, id);
+  } catch (error) {
+    // Admission limits already ran. Storage/RPC outages are not incorrect proofs.
+    if (isAPIError(error) && error.statusCode === 403) await attempt(env, id.userId, generation);
+    throw error;
+  }
+  // Concurrent requests can hash before this atomic gate; a losing request cannot mutate credentials.
+  await attempt(env, id.userId, generation);
 }
 
 async function stamp(
@@ -661,8 +681,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
       }),
       setupTotp: post("/security/setup-totp", async (ctx) => {
         const id = await requireEnrollment(ctx, env);
-        await attempt(env, id.userId);
-        await primaryFactor(ctx, env, id);
+        await primaryFactorAttempt(ctx, env, id, id.security.account.generation);
         const secret = Array.from(
           crypto.getRandomValues(new Uint8Array(32)),
           (byte) => "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"[byte & 31],
@@ -920,8 +939,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
                 )
                 .first()
             : null;
-        await attempt(env, id.userId);
-        await primaryFactor(ctx, env, id);
+        await primaryFactorAttempt(ctx, env, id, account.generation);
         const suppliedKey = ctx.body?.resumeKey;
         const keyHash =
           typeof suppliedKey === "string" && suppliedKey.length <= 1000 ? await sha256(suppliedKey) : null;
@@ -1121,8 +1139,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
       recoverSecurity: post("/security/recover", async (ctx) => {
         const id = await requireIdentity(ctx);
         const account = await securityAccount(env, id.userId);
-        await attempt(env, id.userId);
-        await primaryFactor(ctx, env, id);
+        await primaryFactorAttempt(ctx, env, id, account.generation);
         const hash = await sha256(field(ctx, "code"));
         const reset = ctx.body?.reset === true;
         const receipt = crypto.randomUUID();

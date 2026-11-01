@@ -2272,6 +2272,7 @@ it("retains the expanded canonical prefix and retries only the failed continuati
   let fail = false;
   vi.mocked(api).mockImplementation(async (path) => {
     const cursor = new URL(path, "https://test").searchParams.get("cursor") ?? "0";
+    if (path.includes("/coverage?")) return { ...data };
     calls.push(cursor);
     if (fail) {
       fail = false;
@@ -2515,6 +2516,7 @@ it.each([false, true])(
       const cursor = params.get("cursor") ?? "0",
         offset = Number(cursor),
         limit = Number(params.get("limit"));
+      if (path.includes("/coverage?")) return { ...data };
       calls.push(cursor);
       if (fail && cursor === "200") throw new ApiClientError(503, "unavailable", "Page unavailable");
       return {
@@ -2550,7 +2552,7 @@ it.each([false, true])(
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1);
     });
-    expect(calls).toEqual(["200", "200", "0"]);
+    expect(calls).toEqual(["200", "200"]);
     expect(inputs()).toHaveLength(200);
     expect(inputs()[0]).toBeEnabled();
     expect(screen.getByRole("button", { name: "Load more rows" })).toBeEnabled();
@@ -2676,6 +2678,7 @@ async function canonicalWindowVerification(mode: "changed" | "stale") {
     const cursor = params.get("cursor") ?? "0",
       offset = Number(cursor),
       limit = Number(params.get("limit"));
+    if (path.includes("/coverage?")) return { ...data, revision: fail ? 2 : 1 };
     calls.push([cursor, limit]);
     if (mode === "stale" && calls.length > 7 && fail) return new Promise<never>(() => {});
     if (fail && cursor === "600") throw new ApiClientError(503, "unavailable", "Broken next page");
@@ -2705,7 +2708,7 @@ async function canonicalWindowVerification(mode: "changed" | "stale") {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(1000);
   });
-  expect(renderedRows()).toHaveLength(600);
+  expect(renderedRows()).toHaveLength(mode === "changed" ? 700 : 600);
   return { calls, renderedRows, ready, selected };
 }
 
@@ -2713,17 +2716,16 @@ it("keeps canonical rebuilt surplus for gap-free buffered continuation", async (
   const { calls, renderedRows, ready, selected } = await canonicalWindowVerification("changed");
   expect(calls).toEqual([
     ["600", 100],
-    ["600", 100],
-    ["0", 1],
+
     ["0", 500],
     ["500", 500],
   ]);
   expect(ready()).toBeEnabled();
   const requests = calls.length;
   await act(async () => fireEvent.click(screen.getByText("Load more rows", { selector: "button" })));
-  expect(renderedRows()).toHaveLength(700);
-  fireEvent.click(within(renderedRows()[699] as HTMLElement).getByRole("button", { name: "Open" }));
-  expect(selected).toHaveBeenLastCalledWith("detail-699");
+  expect(renderedRows()).toHaveLength(800);
+  fireEvent.click(within(renderedRows()[799] as HTMLElement).getByRole("button", { name: "Open" }));
+  expect(selected).toHaveBeenLastCalledWith("detail-799");
   expect(calls).toHaveLength(requests);
 });
 
@@ -2731,8 +2733,9 @@ it("classifies repeated canonical cursor churn as bounded freshness recovery", a
   const { calls, renderedRows, ready } = await canonicalWindowVerification("stale");
   expect(calls).toEqual([
     ["600", 100],
-    ["600", 100],
-    ["0", 1],
+
+    ["0", 500],
+    ["500", 500],
     ["0", 500],
     ["500", 500],
     ["0", 500],
@@ -2746,7 +2749,7 @@ it("classifies repeated canonical cursor churn as bounded freshness recovery", a
   expect(renderedRows()).toHaveLength(600);
 });
 
-it("restarts a stable canonical cursor change exactly once at the canonical page size", async () => {
+it("restarts a stable canonical cursor change once using a rebuilt extent", async () => {
   const rows = Array.from({ length: 300 }, (_, i) => ({
     ...data.rows[0]!,
     id: `stable-${i}`,
@@ -2776,8 +2779,69 @@ it("restarts a stable canonical cursor change exactly once at the canonical page
   await waitFor(() => expect(document.querySelectorAll(".table-live tbody tr")).toHaveLength(200));
   expect(calls).toEqual([
     ["100", 100],
-    [null, 100],
-    ["100", 100],
+    [null, 200],
   ]);
   expect(screen.getByText("Views", { selector: "button" })).toBeEnabled();
 });
+
+it.each(["hidden", "offline", "verification"] as const)(
+  "does not publish retired canonical continuation rows after %s",
+  async (retirement) => {
+    const rows = Array.from({ length: 1000 }, (_, i) => ({
+      ...data.rows[0]!,
+      id: `retired-${i}`,
+      cells: { Title: `Row ${i}` },
+    }));
+    data = { ...data, columns: [], rows, rowCount: 1000 };
+    let hold = false;
+    const releases: Array<() => void> = [];
+    vi.mocked(api).mockImplementation(async (path) => {
+      const params = new URL(path, "https://test").searchParams;
+      if (hold) await new Promise<void>((resolve) => releases.push(resolve));
+      const offset = Number(params.get("cursor") ?? 0),
+        limit = Number(params.get("limit") ?? 100);
+      return {
+        ...data,
+        rows: rows.slice(offset, offset + limit),
+        nextCursor: offset + limit < rows.length ? String(offset + limit) : null,
+      };
+    });
+    render(
+      <CollaborativeTablePage page={{ id: "table", title: "Retirement" }} member={member} onSelectPage={vi.fn()} />,
+    );
+    const renderedRows = () => document.querySelectorAll(".table-live tbody tr");
+    await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+    for (let target = 200; target <= 600; target += 100) {
+      fireEvent.click(screen.getByText("Load more rows", { selector: "button" }));
+      await waitFor(() => expect(renderedRows()).toHaveLength(target));
+    }
+    hold = true;
+    fireEvent.click(screen.getByText("Load more rows", { selector: "button" }));
+    await waitFor(() => expect(releases).toHaveLength(1));
+    let hidden = false,
+      online = true;
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    vi.spyOn(navigator, "onLine", "get").mockImplementation(() => online);
+    await act(async () => {
+      if (retirement === "hidden") {
+        hidden = true;
+        document.dispatchEvent(new Event("visibilitychange"));
+      } else if (retirement === "offline") {
+        online = false;
+        window.dispatchEvent(new Event("offline"));
+      } else
+        window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type: "workspace-invalidated" } }));
+      releases.shift()!();
+    });
+    expect(renderedRows()).toHaveLength(600);
+    // A fresh read is held before it can restore the window; the old completion must not expose row 700.
+    hold = false;
+    await act(async () => {
+      hidden = false;
+      online = true;
+      document.dispatchEvent(new Event("visibilitychange"));
+      for (const release of releases.splice(0)) release();
+    });
+    await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+  },
+);

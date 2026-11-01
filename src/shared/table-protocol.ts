@@ -173,6 +173,22 @@ export type TableQueryResult = {
   calculations?: Record<string, CalculationResult>;
   people?: Array<{ id: string; name: string; active: boolean }>;
 };
+/** A current authorization/metadata proof, without evaluating the row query. */
+export type TableQueryCoverage = Pick<
+  TableQueryResult,
+  | "protocolVersion"
+  | "taskList"
+  | "canEdit"
+  | "pageId"
+  | "generation"
+  | "revision"
+  | "projectedRevision"
+  | "columns"
+  | "views"
+  | "view"
+  | "invalidView"
+  | "people"
+>;
 export type TableDraftRows = Pick<TableQueryResult, "pageId" | "generation" | "revision" | "columns" | "rows"> & {
   missingRowIds: string[];
 };

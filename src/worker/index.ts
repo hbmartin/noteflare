@@ -17,6 +17,7 @@ import {
   tableFetch,
   tableCommand,
   queryTable,
+  queryTableCoverage,
   enableTableAuthority,
   repairTableProjection,
   tableRepairStatus,
@@ -5133,6 +5134,20 @@ app.get("/api/pages/:id/linked-tables/:tableId", async (c) => {
   await pageForMember(c.env, current, c.req.param("tableId"));
   return c.json(table);
 });
+app.get("/api/pages/:id/linked-tables/:tableId/coverage", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await pageForMember(c.env, member, c.req.param("id"));
+  const result = await queryTableCoverage(
+    c.env,
+    member,
+    c.req.param("tableId"),
+    new URL(c.req.url).searchParams.toString(),
+  );
+  const current = await requireMember(c.req.raw, c.env);
+  await pageForMember(c.env, current, c.req.param("id"));
+  await pageForMember(c.env, current, c.req.param("tableId"));
+  return c.json(result);
+});
 app.post("/api/pages/:id/linked-tables/:tableId/draft-rows", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   await pageForMember(c.env, member, c.req.param("id"));
@@ -6173,6 +6188,17 @@ app.get("/api/tables/:pageId/relation-inputs", async (c) => {
 app.get("/api/tables/:pageId/query", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const result = await queryTable(c.env, member, c.req.param("pageId"), new URL(c.req.url).searchParams.toString());
+  await pageForMember(c.env, await requireMember(c.req.raw, c.env), c.req.param("pageId"));
+  return c.json(result);
+});
+app.get("/api/tables/:pageId/coverage", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const result = await queryTableCoverage(
+    c.env,
+    member,
+    c.req.param("pageId"),
+    new URL(c.req.url).searchParams.toString(),
+  );
   await pageForMember(c.env, await requireMember(c.req.raw, c.env), c.req.param("pageId"));
   return c.json(result);
 });

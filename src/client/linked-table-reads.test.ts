@@ -325,33 +325,36 @@ it("verifies on foreground independently of an append deadline without replaying
   expect(read.mock.calls[2]![0].kind).toBe("append");
 });
 
-it.each(["read", "mutation"])("starts %s denial recovery independently of repeated append failures", async (source) => {
-  vi.useFakeTimers();
-  vi.spyOn(Math, "random").mockReturnValue(0);
-  const read = vi.fn().mockResolvedValue({ state: "failure" });
-  const controller = linkedTableReads<number>({ read, unavailable: vi.fn() });
-  controllers.push(controller);
-  for (let count = 0; count < 5; count++) await controller.request(continuation());
-  if (source === "read") {
-    read.mockResolvedValueOnce({ state: "denied" });
-    await controller.request(continuation());
-  } else {
-    read.mockImplementationOnce(() => new Promise(() => {}));
-    void controller.request(continuation());
-    controller.recoverDenied();
-  }
-  const before = read.mock.calls.length;
-  read.mockResolvedValue({ state: "denied" });
-  await vi.advanceTimersByTimeAsync(999);
-  expect(read).toHaveBeenCalledTimes(before);
-  await vi.advanceTimersByTimeAsync(1);
-  expect(read).toHaveBeenCalledTimes(before + 1);
-  expect(read.mock.calls.at(-1)![0]).toEqual({ kind: "refresh" });
-  await vi.advanceTimersByTimeAsync(1999);
-  expect(read).toHaveBeenCalledTimes(before + 1);
-  await vi.advanceTimersByTimeAsync(1);
-  expect(read).toHaveBeenCalledTimes(before + 2);
-});
+it.each(["read", "mutation"])(
+  "preserves verification backoff during %s denial independently of append failures",
+  async (source) => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const read = vi.fn().mockResolvedValue({ state: "failure" });
+    const controller = linkedTableReads<number>({ read, unavailable: vi.fn() });
+    controllers.push(controller);
+    for (let count = 0; count < 5; count++) await controller.request(continuation());
+    if (source === "read") {
+      read.mockResolvedValueOnce({ state: "denied" });
+      await controller.request(continuation());
+    } else {
+      read.mockImplementationOnce(() => new Promise(() => {}));
+      void controller.request(continuation());
+      controller.recoverDenied();
+    }
+    const before = read.mock.calls.length;
+    read.mockResolvedValue({ state: "denied" });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(read).toHaveBeenCalledTimes(before);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(read).toHaveBeenCalledTimes(before + 1);
+    expect(read.mock.calls.at(-1)![0]).toEqual({ kind: "refresh" });
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(read).toHaveBeenCalledTimes(before + 1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(read).toHaveBeenCalledTimes(before + 2);
+  },
+);
 
 it("coalesces canonical verification with an equivalent active read", async () => {
   let release!: (value: number) => void;
@@ -1029,7 +1032,7 @@ it("does not join retired active verification or approve newer invalidations fro
   expect(await invalidation).toEqual({ state: "complete", value });
 });
 
-it("keeps a failed full query's deadline when it takes over independent verification", async () => {
+it("preserves cumulative failure backoff when a full query takes over independent verification", async () => {
   vi.useFakeTimers();
   vi.spyOn(Math, "random").mockReturnValue(0);
   const value = { generation: 1, revision: 1 };
@@ -1245,4 +1248,120 @@ it("retains failed verification history when supersession transfers its obligati
   expect(read).toHaveBeenCalledTimes(5);
   await vi.advanceTimersByTimeAsync(1);
   expect(read).toHaveBeenCalledTimes(6);
+});
+
+it.each([0, 1, 2, 3, 4])(
+  "does not promote a superseded continuation's coverage-only obligation: schedule %s",
+  async () => {
+    const value = { generation: 1, revision: 1 };
+    let scope = 0,
+      release!: (outcome: { state: "superseded" }) => void;
+    const intents: string[] = [];
+    const c = linkedTableReads({
+      poll: false,
+      scope: () => scope,
+      coverage: (v: typeof value) => v,
+      unavailable: vi.fn(),
+      read: async (intent) => {
+        intents.push(intent.kind);
+        if (intent.kind === "append")
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        return { state: "success", value, verification: "network" };
+      },
+    });
+    controllers.push(c);
+    await c.request();
+    const page = c.request(continuation(700));
+    scope++;
+    const verification = c.refresh(value);
+    release({ state: "superseded" });
+    await flushReads();
+    await verification;
+    await page;
+    expect(intents).toEqual(["refresh", "append", "verify"]);
+  },
+);
+
+it("upgrades an existing automatic refresh to preserve the visible extent", async () => {
+  const value = { generation: 1, revision: 1 };
+  let scope = 0,
+    release!: (outcome: { state: "stale" }) => void;
+  const contexts: TableReadContext[] = [];
+  const c = linkedTableReads({
+    poll: false,
+    scope: () => scope,
+    coverage: (v: typeof value) => v,
+    unavailable: vi.fn(),
+    read: async (intent, _signal, context) => {
+      contexts.push(context);
+      if (intent.kind === "verify")
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      return { state: "success", value, verification: "network" };
+    },
+  });
+  controllers.push(c);
+  await c.request();
+  scope++;
+  void c.refresh(value);
+  const recovery = c.refresh(undefined, { fresh: true });
+  release({ state: "stale" });
+  await recovery;
+  expect(contexts.at(-1)?.preserveExtent).toBe(true);
+});
+
+it("settles queued verification before notifying continuation success", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const value = { generation: 1, revision: 1 };
+  let appends = 0;
+  const read = vi.fn(async (intent: TableReadIntent) =>
+    intent.kind === "verify" || (intent.kind === "append" && ++appends < 3)
+      ? { state: "failure" as const }
+      : { state: "success" as const, value, verification: "network" as const },
+  );
+  const unavailable = vi.fn();
+  const c = linkedTableReads({ read, poll: false, coverage: (v: typeof value) => v, unavailable });
+  controllers.push(c);
+  await c.request();
+  await c.request(continuation());
+  await vi.advanceTimersByTimeAsync(1000);
+  await c.request(continuation());
+  const count = read.mock.calls.length,
+    failures = unavailable.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(read).toHaveBeenCalledTimes(count);
+  expect(unavailable).toHaveBeenCalledTimes(failures);
+});
+
+it("retains an idle independent verification deadline when denial recovery takes over", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const value = { generation: 1, revision: 1 };
+  let scope = 0;
+  const read = vi.fn(async (_intent: TableReadIntent) =>
+    read.mock.calls.length === 1
+      ? { state: "success" as const, value, verification: "network" as const }
+      : { state: "failure" as const },
+  );
+  const c = linkedTableReads({
+    read,
+    poll: false,
+    scope: () => scope,
+    coverage: (v: typeof value) => v,
+    unavailable: vi.fn(),
+  });
+  controllers.push(c);
+  await c.request();
+  scope++;
+  await c.refresh(value);
+  await vi.advanceTimersByTimeAsync(1000);
+  c.recoverDenied();
+  await vi.advanceTimersByTimeAsync(3999);
+  expect(read).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read.mock.calls.at(-1)![0]).toEqual({ kind: "refresh" });
 });

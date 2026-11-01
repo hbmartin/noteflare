@@ -58,24 +58,20 @@ export async function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) 
     sources: "page_import_sources",
     artifacts: "attachments",
   };
-  const summaryStatements = Object.entries(supported)
-    .filter(([, enabled]) => enabled)
-    .map(([key]) => `SELECT '${key}' source,count(*) rows FROM ${sourceTables[key]}`);
+  const sources = Object.keys(supported).filter((key) => supported[key]);
+  // Scalar subqueries share one SQLite statement snapshot and avoid D1's compound SELECT limit.
+  const summarySql = `SELECT ${sources.map((key) => `(SELECT count(*) FROM ${sourceTables[key]}) AS ${key}`).join(",")}`;
   const readCounts = async () => {
-    // Remote D1 limits compound SELECTs to five terms. Keep full coverage while
-    // leaving room for additional metadata sources without exceeding that cap.
-    const counts = [];
-    for (let index = 0; index < summaryStatements.length; index += 5)
-      counts.push(
-        ...(await query(summaryStatements.slice(index, index + 5).join(" UNION ALL "), "integrity coverage counts")),
-      );
+    const rows = await query(summarySql, "integrity coverage counts");
+    const counts = rows[0];
     if (
-      counts.some((row) => !supported[row.source] || !Number.isSafeInteger(row.rows) || row.rows < 0) ||
-      counts.length !== Object.values(supported).filter(Boolean).length ||
-      new Set(counts.map((row) => row.source)).size !== Object.values(supported).filter(Boolean).length
+      rows.length !== 1 ||
+      !counts ||
+      Object.keys(counts).length !== sources.length ||
+      sources.some((key) => !Number.isSafeInteger(counts[key]) || counts[key] < 0)
     )
       throw new Error("Invalid integrity coverage counts.");
-    return Object.fromEntries(counts.map((row) => [row.source, row.rows]));
+    return counts;
   };
   const keys = {
     workspaces: "id",

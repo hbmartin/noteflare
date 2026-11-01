@@ -48,21 +48,21 @@ export function otpFromUri(uri: string, offset = 0) {
   return createOTP(secret).hotp(Math.floor(Date.now() / 30_000) + offset);
 }
 
-export async function enrollAccount(response: Response, inviteToken?: string) {
+export async function enrollAccount(response: Response, inviteToken?: string, request = securityRequest) {
   let cookie = responseCookies(response);
-  const setup = await securityRequest(cookie, "/api/security/setup-totp", { password: "password123" });
+  const setup = await request(cookie, "/api/security/setup-totp", { password: "password123" });
   if (!setup.ok) throw new Error(`Setup failed: ${await setup.text()}`);
   const { totpURI } = await setup.json<{ totpURI: string }>();
-  const verified = await securityRequest(cookie, "/api/security/confirm-totp", { code: await otpFromUri(totpURI) });
+  const verified = await request(cookie, "/api/security/confirm-totp", { code: await otpFromUri(totpURI) });
   if (!verified.ok) throw new Error(`Confirmation failed: ${await verified.text()}`);
   cookie = responseCookies(verified, cookie);
-  const codes = await securityRequest(cookie, "/api/security/recovery-codes", {});
+  const codes = await request(cookie, "/api/security/recovery-codes", {});
   if (!codes.ok) throw new Error(`Recovery setup failed: ${await codes.text()}`);
   const { receipt } = await codes.json<{ receipt: string }>();
-  const acknowledged = await securityRequest(cookie, "/api/security/acknowledge-codes", { receipt });
+  const acknowledged = await request(cookie, "/api/security/acknowledge-codes", { receipt });
   if (!acknowledged.ok) throw new Error(`Acknowledgment failed: ${await acknowledged.text()}`);
   if (inviteToken) {
-    const complete = await securityRequest(cookie, "/api/invites/complete", { token: inviteToken });
+    const complete = await request(cookie, "/api/invites/complete", { token: inviteToken });
     if (!complete.ok) throw new Error(`Invite completion failed: ${await complete.text()}`);
   }
   return cookie;
