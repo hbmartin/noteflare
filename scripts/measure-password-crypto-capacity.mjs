@@ -106,9 +106,9 @@ const sample = async (operation) => {
   }
 };
 let proxy,
-  tail,
-  socket,
   deployed = false;
+const tails = [],
+  sockets = [];
 const fd = openSync(`${root}/proxy.log`, "w", 0o600);
 const invocations = [],
   stages = [];
@@ -116,34 +116,45 @@ try {
   run(["deploy", "--config", `${root}/helper.json`, "--env", ""]);
   deployed = true;
   await writeFile(`${root}/resource.json`, JSON.stringify({ helper, preview }));
-  tail = await api(`/workers/scripts/${preview}/tails`, { method: "POST", body: { filters: [] } });
-  socket = new WebSocket(tail.url, "trace-v1");
-  socket.on("message", (raw) => {
-    const event = JSON.parse(raw.toString());
-    if (event.entrypoint !== "PasswordCrypto") return;
-    const logs = (event.logs ?? [])
-      .flatMap((item) => item.message ?? [])
-      .flatMap((value) => {
-        if (typeof value === "string") {
-          try {
-            value = JSON.parse(value);
-          } catch {
-            return [];
+  for (const scriptName of [preview, helper]) {
+    const tail = await api(`/workers/scripts/${scriptName}/tails`, { method: "POST", body: { filters: [] } });
+    tails.push({ scriptName, id: tail.id });
+    const socket = new WebSocket(tail.url, "trace-v1");
+    sockets.push(socket);
+    socket.on("message", (raw) => {
+      const event = JSON.parse(raw.toString());
+      if (scriptName === preview && event.entrypoint !== "PasswordCrypto") return;
+      const logs = (event.logs ?? [])
+        .flatMap((item) => item.message ?? [])
+        .flatMap((value) => {
+          if (typeof value === "string") {
+            try {
+              value = JSON.parse(value);
+            } catch {
+              return [];
+            }
           }
-        }
-        if (value?.event !== "auth.crypto.completed") return [];
-        return [
-          Object.fromEntries(
-            ["event", "operation", "shard", "outcome", "traceId", "spanId"]
-              .filter((key) => value[key] !== undefined)
-              .map((key) => [key, value[key]]),
-          ),
-        ];
+          if (!["auth.crypto.completed", "auth.crypto.rpc"].includes(value?.event)) return [];
+          return [
+            Object.fromEntries(
+              ["event", "operation", "shard", "outcome", "traceId", "spanId", "attempts", "category", "durationMs"]
+                .filter((key) => value[key] !== undefined)
+                .map((key) => [key, value[key]]),
+            ),
+          ];
+        });
+      invocations.push({
+        scriptName,
+        entrypoint: event.entrypoint,
+        cpuMs: event.cpuTime,
+        wallMs: event.wallTime,
+        outcome: event.outcome,
+        logs,
       });
-    invocations.push({ cpuMs: event.cpuTime, wallMs: event.wallTime, outcome: event.outcome, logs });
-  });
-  await once(socket, "open");
-  socket.send(JSON.stringify({ debug: true }));
+    });
+    await once(socket, "open");
+    socket.send(JSON.stringify({ debug: true }));
+  }
   proxy = spawn(
     process.execPath,
     [
@@ -200,8 +211,8 @@ try {
 } finally {
   proxy?.kill("SIGTERM");
   closeSync(fd);
-  socket?.close();
-  if (tail) await api(`/workers/scripts/${preview}/tails/${tail.id}`, { method: "DELETE" });
+  for (const socket of sockets) socket.close();
+  for (const tail of tails) await api(`/workers/scripts/${tail.scriptName}/tails/${tail.id}`, { method: "DELETE" });
   if (deployed) await api(`/workers/scripts/${helper}`, { method: "DELETE" });
   await writeFile(
     `${root}/results.json`,
