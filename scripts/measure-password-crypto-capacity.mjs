@@ -111,7 +111,8 @@ const tails = [],
   sockets = [];
 const fd = openSync(`${root}/proxy.log`, "w", 0o600);
 const invocations = [],
-  stages = [];
+  stages = [],
+  warmups = [];
 try {
   run(["deploy", "--config", `${root}/helper.json`, "--env", ""]);
   deployed = true;
@@ -181,7 +182,11 @@ try {
       throw new Error("Private driver did not start; inspect its local log.");
     await delay(100);
   }
-  for (let warmup = 0; warmup < 32; warmup++) if (!(await sample("hash")).ok) throw new Error("Warmup failed");
+  for (let warmup = 0; warmup < 32; warmup++) {
+    const result = await sample("hash");
+    warmups.push(result);
+    if (!result.ok) throw new Error("Warmup failed");
+  }
   let stop = false;
   for (const concurrency of [1, 4, 8, 16, 32]) {
     for (const operation of ["hash", "verify"]) {
@@ -202,7 +207,10 @@ try {
       console.log(
         `${operation}: concurrency ${concurrency}, ${samples.length} completed, ${samples.filter((value) => !value.ok).length} errors`,
       );
-      await writeFile(`${root}/results.json`, JSON.stringify({ helper, preview, stages, invocations }, null, 2));
+      await writeFile(
+        `${root}/results.json`,
+        JSON.stringify({ helper, preview, warmups, stages, invocations }, null, 2),
+      );
       if (stop) break;
     }
     if (stop) break;
@@ -216,6 +224,6 @@ try {
   if (deployed) await api(`/workers/scripts/${helper}`, { method: "DELETE" });
   await writeFile(
     `${root}/results.json`,
-    JSON.stringify({ helper, preview, stages, invocations, helperRemoved: deployed }, null, 2),
+    JSON.stringify({ helper, preview, warmups, stages, invocations, helperRemoved: deployed }, null, 2),
   );
 }
