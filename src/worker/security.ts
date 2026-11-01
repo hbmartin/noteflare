@@ -269,11 +269,14 @@ async function attempt(env: Env, userId: string, generation?: number) {
     WHERE user_id = ? AND locked_until <= ? AND (? IS NULL OR generation=?) RETURNING failed_attempts`)
     .bind(time + 15 * 60_000, userId, time, generation ?? null, generation ?? null)
     .first();
-  if (!result)
+  if (!result) {
+    if (generation !== undefined && (await securityAccount(env, userId)).generation !== generation)
+      throw deny("Security settings changed. Sign in again.");
     throw new APIError("TOO_MANY_REQUESTS", {
       code: "ACCOUNT_TEMPORARILY_LOCKED",
       message: "Too many attempts. Try again in 15 minutes.",
     });
+  }
 }
 
 async function resetAttempts(env: Env, userId: string, generation: number) {

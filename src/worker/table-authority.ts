@@ -864,6 +864,9 @@ export class TableAuthority extends DurableObject<Env> {
       if (path === "/coverage") {
         const result = { ...this.queryCoverage(url, actor), people: await this.people(actor) };
         await this.authorize(request, false);
+        const current = this.meta();
+        if (current.generation !== result.generation || current.revision !== result.revision)
+          return fail("The table changed. Retry coverage verification.", 409, "table_revision_conflict");
         return Response.json(result);
       }
       if (path === "/query") {

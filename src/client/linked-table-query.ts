@@ -145,7 +145,10 @@ export async function readLinkedTable(
       if (
         signal?.aborted ||
         attempt ||
-        !(error instanceof CursorChanged || (error instanceof ApiClientError && error.code === "table_cursor_stale"))
+        !(
+          error instanceof CursorChanged ||
+          (error instanceof ApiClientError && ["table_cursor_stale", "table_revision_conflict"].includes(error.code))
+        )
       )
         throw error;
     }
