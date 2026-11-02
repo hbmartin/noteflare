@@ -65,6 +65,7 @@ and calendar parameter validation match normal reads.
 
 A matching proof refreshes metadata and permits reuse of the existing window. A
 changed proof rebuilds its visible extent with a consistent cursor chain. Automatic
-recovery preserves extent; an explicit Refresh starts from the first page. Retired,
+recovery preserves extent. An explicit canonical Refresh starts from the first page;
+an explicit linked Refresh preserves the visible extent. Retired,
 hidden or offline completions cannot restore verification. The shared reader owns
 one cursor restart; further churn returns to bounded coordinator recovery.

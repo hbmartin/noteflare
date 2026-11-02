@@ -547,7 +547,7 @@ export function CollaborativeTablePage({
         }
         if (
           cause instanceof CursorChanged ||
-          (cause instanceof ApiClientError && cause.code === "table_cursor_stale")
+          (cause instanceof ApiClientError && ["table_cursor_stale", "table_revision_conflict"].includes(cause.code))
         ) {
           return { state: "stale" };
         }

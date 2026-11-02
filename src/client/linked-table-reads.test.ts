@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from "vitest";
 import { linkedTableReads, type TableReadContext, type TableReadIntent } from "./linked-table-reads";
+import { readLinkedTable, type TableReadWindow } from "./linked-table-query";
+import type { TableQueryResult } from "../shared/table-protocol";
 const continuation = (target = 200) => ({ queryIdentity: "query", generation: 1, target });
 const controllers: ReturnType<typeof linkedTableReads>[] = [];
 const flushReads = async () => {
@@ -1251,7 +1253,7 @@ it("retains failed verification history when supersession transfers its obligati
 });
 
 it.each([0, 1, 2, 3, 4])(
-  "does not promote a superseded continuation's coverage-only obligation: schedule %s",
+  "does not promote a superseded continuation's coverage-only obligation: repetition %s",
   async () => {
     const value = { generation: 1, revision: 1 };
     let scope = 0,
@@ -1284,52 +1286,97 @@ it.each([0, 1, 2, 3, 4])(
   },
 );
 
-it("upgrades an existing automatic refresh to preserve the visible extent", async () => {
+it("preserves 600 visible rows when stale verification joins an automatic refresh", async () => {
   const value = { generation: 1, revision: 1 };
   let scope = 0,
     release!: (outcome: { state: "stale" }) => void;
-  const contexts: TableReadContext[] = [];
+  let window: TableReadWindow | null = null;
+  const rows = Array.from({ length: 1000 }, (_, i) => ({ id: String(i) }));
+  const readPage = async (cursor?: string, limit = 100) => {
+    const start = Number(cursor ?? 0),
+      end = start + limit;
+    return {
+      ...value,
+      rows: rows.slice(start, end),
+      nextCursor: end < rows.length ? String(end) : null,
+    } as TableQueryResult;
+  };
   const c = linkedTableReads({
     poll: false,
     scope: () => scope,
     coverage: (v: typeof value) => v,
     unavailable: vi.fn(),
-    read: async (intent, _signal, context) => {
-      contexts.push(context);
+    read: async (intent, signal, context) => {
       if (intent.kind === "verify")
         return new Promise((resolve) => {
           release = resolve;
         });
-      return { state: "success", value, verification: "network" };
+      const result = await readLinkedTable(
+        intent.kind === "append" ? intent : { kind: "refresh" },
+        window,
+        readPage,
+        signal,
+        "query",
+        {
+          refresh: context.preserveExtent ? "visible" : "first-page",
+        },
+      );
+      window = result.window;
+      return { state: "success", value, verification: result.verification };
     },
   });
   controllers.push(c);
   await c.request();
+  await c.request(continuation(600));
+  const visible = () => window?.data.rows.map((row) => row.id);
+  expect(visible()).toEqual(Array.from({ length: 600 }, (_, i) => String(i)));
   scope++;
   void c.refresh(value);
   const recovery = c.refresh(undefined, { fresh: true });
   release({ state: "stale" });
   await recovery;
-  expect(contexts.at(-1)?.preserveExtent).toBe(true);
+  expect(visible()).toEqual(Array.from({ length: 600 }, (_, i) => String(i)));
 });
 
 it("settles queued verification before notifying continuation success", async () => {
   vi.useFakeTimers();
   vi.spyOn(Math, "random").mockReturnValue(0);
   const value = { generation: 1, revision: 1 };
-  let appends = 0;
-  const read = vi.fn(async (intent: TableReadIntent) =>
-    intent.kind === "verify" || (intent.kind === "append" && ++appends < 3)
-      ? { state: "failure" as const }
-      : { state: "success" as const, value, verification: "network" as const },
-  );
+  let appends = 0,
+    release!: () => void,
+    entered!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const read = vi.fn(async (intent: TableReadIntent) => {
+    if (intent.kind === "verify" || (intent.kind === "append" && ++appends < 3)) return { state: "failure" as const };
+    if (intent.kind === "append") {
+      entered();
+      await gate;
+    }
+    return { state: "success" as const, value, verification: "network" as const };
+  });
   const unavailable = vi.fn();
   const c = linkedTableReads({ read, poll: false, coverage: (v: typeof value) => v, unavailable });
   controllers.push(c);
+  let verification: ReturnType<typeof c.refresh> | undefined;
+  const observed: Array<Promise<unknown>> = [];
+  c.subscribe(() => {
+    if (verification) observed.push(Promise.race([verification, Promise.resolve({ state: "unsettled" })]));
+  });
   await c.request();
   await c.request(continuation());
   await vi.advanceTimersByTimeAsync(1000);
-  await c.request(continuation());
+  const page = c.request(continuation());
+  await started;
+  verification = c.refresh(value);
+  release();
+  await page;
+  expect(await Promise.all(observed)).toEqual([{ state: "complete", value }]);
+  expect(await verification).toEqual({ state: "complete", value });
   const count = read.mock.calls.length,
     failures = unavailable.mock.calls.length;
   await vi.advanceTimersByTimeAsync(10000);

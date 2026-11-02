@@ -387,34 +387,77 @@ describe("password service recovery", () => {
     }
   });
 
-  it.each(["lock", "generation"] as const)("rechecks account %s after concurrent hashing", async (change) => {
-    const cookie = await enrollAccount(await bootstrap());
-    let release!: () => void, entered!: () => void;
-    const started = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
-    const { request, calls } = instrument(async () => {
-      entered();
-      await new Promise<void>((resolve) => {
+  it.each(
+    (["setup-totp", "recover", "resume-recovery"] as const).flatMap((route) =>
+      (["lock", "generation", "missing"] as const).map((change) => ({ route, change })),
+    ),
+  )(
+    "reports $change accurately after hashing in $route",
+    async ({ route, change }) => {
+      let cookie = await enrollAccount(await bootstrap());
+      const { request: healthy } = instrument();
+      const codes = await (
+        await healthy("/api/security/recovery-codes", {}, cookie)
+      ).json<{ codes: string[]; receipt: string }>();
+      expect((await healthy("/api/security/acknowledge-codes", { receipt: codes.receipt }, cookie)).status).toBe(200);
+      if (route === "resume-recovery") {
+        const recovered = await healthy(
+          "/api/security/recover",
+          { password: "password123", code: codes.codes[0] },
+          cookie,
+        );
+        if (!recovered.ok) throw new Error("Recovery fixture failed");
+        cookie = responseCookies(recovered, cookie);
+      }
+      let release!: () => void, entered!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
         release = resolve;
       });
-    });
-    const pending = request("/api/security/setup-totp", { password: "password123" }, cookie);
-    await started;
-    if (change === "lock")
-      await env.DB.prepare("UPDATE account_security SET failed_attempts=10,locked_until=?")
-        .bind(Date.now() + 900000)
-        .run();
-    else await env.DB.prepare("UPDATE account_security SET generation=generation+1").run();
-    release();
-    expect((await pending).status).not.toBe(200);
-    expect(calls).toHaveLength(1);
-    expect(await env.DB.prepare("SELECT COUNT(*) count FROM pending_totp").first()).toEqual({ count: 0 });
-    const blocked =
-      change === "lock" ? await request("/api/security/setup-totp", { password: "password123" }, cookie) : undefined;
-    expect(blocked?.status).toBe(change === "lock" ? 429 : undefined);
-    expect(calls).toHaveLength(1);
-  });
+      const { request, calls } = instrument(async () => {
+        entered();
+        await gate;
+      });
+      const path = `/api/security/${route}`;
+      const pending = request(path, { password: "password123", code: codes.codes[0] }, cookie);
+      await started;
+      if (change === "lock")
+        await env.DB.prepare("UPDATE account_security SET failed_attempts=10,locked_until=?")
+          .bind(Date.now() + 900000)
+          .run();
+      else if (change === "generation")
+        await env.DB.prepare("UPDATE account_security SET generation=generation+1").run();
+      else await env.DB.prepare("DELETE FROM account_security").run();
+      const snapshot = async () =>
+        Promise.all([
+          env.DB.prepare("SELECT * FROM account_security").all(),
+          env.DB.prepare("SELECT id,password FROM account ORDER BY id").all(),
+          env.DB.prepare("SELECT * FROM pending_totp ORDER BY session_id").all(),
+          env.DB.prepare("SELECT * FROM recovery_codes ORDER BY code_hash").all(),
+        ]).then((results) => results.map((result) => result.results));
+      const before = await snapshot();
+      release();
+      const response = await pending;
+      expect(response.status).toBe(change === "lock" ? 429 : 403);
+      expect(await response.json()).toMatchObject({
+        code: change === "lock" ? "ACCOUNT_TEMPORARILY_LOCKED" : "SECURITY_REQUIRED",
+        message:
+          change === "lock"
+            ? "Too many attempts. Try again in 15 minutes."
+            : change === "generation"
+              ? "Security settings changed. Sign in again."
+              : "Sign in again.",
+      });
+      expect(calls).toHaveLength(1);
+      expect(await snapshot()).toEqual(before);
+      const blocked = change === "lock" ? await request(path, { password: "password123" }, cookie) : undefined;
+      expect(blocked?.status).toBe(change === "lock" ? 429 : undefined);
+      expect(calls).toHaveLength(1);
+    },
+    10000,
+  );
 });
 
 it.each(["before", "after"])("keeps a proof when tracing fails %s starting work", async (phase) => {

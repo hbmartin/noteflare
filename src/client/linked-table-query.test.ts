@@ -316,7 +316,9 @@ it("waits for every row page after a changed metadata proof before publishing", 
   for (let i = 0; i < 5; i++) await Promise.resolve();
   expect(current.data.rows.map((row) => row.id)).toEqual(["old-a", "old-b", "old-c", "old-d"]);
   release(page(["c"], null, 2));
-  expect((await pending).window.data.rows.map((row) => row.id)).toEqual(["a", "b", "c"]);
+  const result = await pending;
+  expect(result.window.data.rows.map((row) => row.id)).toEqual(["a", "b", "c"]);
+  expect(result.window.verified).toBe(true);
   expect(read.mock.calls).toEqual([
     [undefined, 100],
     ["fresh", 100],
@@ -340,6 +342,8 @@ it("rebuilds a changed 2000-row canonical continuation once using five pages", a
   expect(read.mock.calls.map(([, limit]) => limit)).toEqual([500, 500, 500, 500, 500]);
   expect(result.window.data.rows).toHaveLength(2100);
   expect(result.window.buffered).toHaveLength(400);
+  expect(result.window.data.rows.map((row) => row.id)).toEqual(Array.from({ length: 2100 }, (_, i) => String(i)));
+  expect(result.window.buffered.map((row) => row.id)).toEqual(Array.from({ length: 400 }, (_, i) => String(i + 2100)));
   expect(result.window.data.revision).toBe(2);
 });
 
@@ -381,4 +385,29 @@ it("keeps canonical first-page refresh policy distinct from verification and lin
   const initial = await query({ kind: "refresh" }, null, read, undefined, "", { verify: true });
   expect(initial.window.data.rows).toHaveLength(100);
   expect(read.mock.calls.at(-1)).toEqual([undefined, 100]);
+});
+
+it("rebuilds once after a conflicted coverage proof without accepting the old window", async () => {
+  const current = loaded(page(["old-a", "old-b"], "old"));
+  current.verified = false;
+  const verifyCoverage = vi.fn().mockRejectedValue(new ApiClientError(409, "table_revision_conflict", "changed"));
+  const read = vi.fn().mockResolvedValue(page(["new-a", "new-b"], null, 2));
+  const result = await query(append(current), current, read, undefined, "", { verifyCoverage });
+  expect(verifyCoverage).toHaveBeenCalledOnce();
+  expect(read).toHaveBeenCalledExactlyOnceWith(undefined, 102);
+  expect(result.window.data.rows.map((row) => row.id)).toEqual(["new-a", "new-b"]);
+  expect(result.window.verified).toBe(true);
+});
+
+it("returns a second coverage conflict to coordinator recovery without further restarts", async () => {
+  const current = loaded(page(["old"], "old"));
+  const conflict = new ApiClientError(409, "table_revision_conflict", "changed");
+  const verifyCoverage = vi.fn().mockRejectedValue(conflict);
+  const read = vi.fn().mockRejectedValue(conflict);
+  await expect(query({ kind: "refresh" }, current, read, undefined, "", { verify: true, verifyCoverage })).rejects.toBe(
+    conflict,
+  );
+  expect(verifyCoverage).toHaveBeenCalledOnce();
+  expect(read).toHaveBeenCalledOnce();
+  expect(current.data.rows.map((row) => row.id)).toEqual(["old"]);
 });

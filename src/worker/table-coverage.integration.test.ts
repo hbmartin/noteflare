@@ -143,3 +143,60 @@ it.each(["host", "source"])("rechecks %s page access for linked coverage", async
   expect((await request(`/api/pages/${f.host}/linked-tables/${f.table}/coverage`, f.cookie)).status).toBe(404);
   expect((await request(`/api/tables/${f.table}/coverage`, f.cookie)).status).toBe(target === "host" ? 200 : 404);
 });
+
+it.each(
+  (["people", "authorize"] as const).flatMap((phase) =>
+    (["generation", "revision"] as const).flatMap((field) =>
+      (["canonical", "linked"] as const).map((route) => ({ phase, field, route })),
+    ),
+  ),
+)(
+  "rejects $route coverage when $field changes during $phase I/O",
+  async ({ phase, field, route }) => {
+    const f = await fixture();
+    await runInDurableObject(env.TABLE.getByName(f.table), async (instance, state) => {
+      const authority = instance as unknown as {
+        people(actor: unknown): Promise<unknown>;
+        authorize(request: Request, write: boolean): Promise<unknown>;
+      };
+      let entered!: () => void, release!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let calls = 0;
+      const original = authority[phase].bind(authority);
+      const spy = vi.spyOn(authority, phase).mockImplementation(async (...args: unknown[]) => {
+        const result = await (original as (...values: unknown[]) => Promise<unknown>)(...args);
+        if (++calls === (phase === "authorize" ? 2 : 1)) {
+          entered();
+          await gate;
+        }
+        return result;
+      });
+      const path =
+        route === "canonical"
+          ? `/api/tables/${f.table}/coverage`
+          : `/api/pages/${f.host}/linked-tables/${f.table}/coverage`;
+      const pending = request(path, f.cookie);
+      try {
+        await started;
+        state.storage.sql.exec(
+          "UPDATE meta SET value=json_set(value,?,json_extract(value,?)+1) WHERE id=1",
+          `$.${field}`,
+          `$.${field}`,
+        );
+        release();
+        const response = await pending;
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({ error: { code: "table_revision_conflict" } });
+      } finally {
+        release();
+        spy.mockRestore();
+      }
+    });
+  },
+  10000,
+);
