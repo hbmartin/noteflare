@@ -399,7 +399,7 @@ it("rebuilds once after a conflicted coverage proof without accepting the old wi
   expect(result.window.verified).toBe(true);
 });
 
-it("returns a second coverage conflict to coordinator recovery without further restarts", async () => {
+it("returns a conflict from the rebuilt page read to coordinator recovery without further restarts", async () => {
   const current = loaded(page(["old"], "old"));
   const conflict = new ApiClientError(409, "table_revision_conflict", "changed");
   const verifyCoverage = vi.fn().mockRejectedValue(conflict);
