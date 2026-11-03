@@ -49,7 +49,7 @@ import {
   type TableReadIntent,
   type LinkedTableReadOutcome,
 } from "./linked-table-reads";
-import { CursorChanged, readLinkedTable, type TableReadWindow } from "./linked-table-query";
+import { isTableReadConflict, readLinkedTable, type TableReadWindow } from "./linked-table-query";
 import { readTableCoverage, type TableCoverage } from "../shared/table-coverage";
 import { tableConnection } from "./table-connection";
 import { useRealtimeAccessAccount } from "./realtime-access-status";
@@ -394,12 +394,12 @@ export function CollaborativeTablePage({
     async function fetchTable({ signal, intent, context }: TableFetchOptions = {}): Promise<
       LinkedTableReadOutcome<TableQueryResult>
     > {
-      if (intent?.kind === "page" && intent.target !== undefined) {
+      if (intent?.kind === "page") {
         const prefix = canonicalPrefix.current,
           current = prefix.window;
         if (intent.queryIdentity !== queryIdentity || current?.data.generation !== intent.generation)
           return { state: "superseded" };
-        intent = { ...intent, cursor: current.serverCursor ?? "", prefix: prefix.id, revision: current.data.revision };
+        intent = { ...intent, prefix: prefix.id, revision: current.data.revision };
       }
       const ownsPrefix = () =>
         intent?.kind !== "page" ||
@@ -420,7 +420,6 @@ export function CollaborativeTablePage({
       try {
         const readPage = (nextCursor?: string, limit = 100) => {
           const pageParams = new URLSearchParams(params);
-          pageParams.delete("cursor");
           pageParams.set("limit", String(limit));
           if (nextCursor) pageParams.set("cursor", nextCursor);
           return api<TableQueryResult>(`${base}?${pageParams}`, {
@@ -461,19 +460,17 @@ export function CollaborativeTablePage({
         if (
           owner !== ownership.current.request ||
           verification !== ownership.current.verification ||
-          queryOwner.current.queryIdentity !== queryIdentity ||
-          !navigator.onLine ||
-          document.hidden
+          queryOwner.current.queryIdentity !== queryIdentity
         )
           return { state: "superseded" };
+        if (!navigator.onLine || document.hidden) return { state: "suspended" };
         if ((context && !context.acceptsGeneration(result)) || result.generation < ownership.current.minimumGeneration)
           return { state: "stale" };
         // Query/access evidence belongs to this verification lifetime. Later content watermarks
         // remain the coordinator's background freshness obligation, not an authorization latch.
-        const verified = checked.verification === "network" && verification === ownership.current.verification;
+        const verified = network;
         if (linked) {
-          const available =
-            navigator.onLine && !document.hidden && (verified || linkedWindow.current?.verified === true);
+          const available = verified || linkedWindow.current?.verified === true;
           publishLinkedWindow(
             linked.window.verified === available ? linked.window : { ...linked.window, verified: available },
           );
@@ -491,10 +488,7 @@ export function CollaborativeTablePage({
           canonicalPrefix.current = { id: retainPrefix ? prefix.id : prefix.id + 1, window: checked.window };
           if (!retainPrefix)
             linkedReads.current?.retirePages(
-              (pending) =>
-                pending.target !== undefined &&
-                pending.queryIdentity === queryIdentity &&
-                pending.generation === result.generation,
+              (pending) => pending.queryIdentity === queryIdentity && pending.generation === result.generation,
             );
         }
         if (!queryBase) setReadSnapshot(checked.window);
@@ -518,12 +512,9 @@ export function CollaborativeTablePage({
         }
         if (verified)
           publishReadiness(
-            navigator.onLine &&
-              !document.hidden &&
-              Boolean(
-                queryBase ||
-                (connectionPermit.current() && ownership.current.authorizedGeneration === result.generation),
-              ),
+            Boolean(
+              queryBase || (connectionPermit.current() && ownership.current.authorizedGeneration === result.generation),
+            ),
           );
         return {
           state: "success",
@@ -545,12 +536,7 @@ export function CollaborativeTablePage({
         if (!navigator.onLine && !(cause instanceof ApiClientError)) {
           return { state: "suspended" };
         }
-        if (
-          cause instanceof CursorChanged ||
-          (cause instanceof ApiClientError && ["table_cursor_stale", "table_revision_conflict"].includes(cause.code))
-        ) {
-          return { state: "stale" };
-        }
+        if (isTableReadConflict(cause)) return { state: "stale" };
         setError(apiErrorMessage(cause, "The table could not be loaded."));
         return { state: "failure" };
       }
@@ -648,7 +634,7 @@ export function CollaborativeTablePage({
   const load = useCallback((continuation?: CanonicalTableContinuation | LinkedTableContinuation) => {
     const reads = linkedReads.current;
     if (!reads) return Promise.resolve(null);
-    return continuation && "cursor" in continuation ? reads.page(continuation) : reads.request(continuation);
+    return continuation && "kind" in continuation ? reads.page(continuation) : reads.request(continuation);
   }, []);
   useEffect(() => {
     if (!retry?.submission) return undefined;
@@ -1450,7 +1436,7 @@ export function CollaborativeTablePage({
             onClick={() => {
               if (!queryBase)
                 void load({
-                  cursor: canonicalPrefix.current.window?.serverCursor ?? "",
+                  kind: "page",
                   queryIdentity,
                   generation: data.generation,
                   revision: data.revision,
