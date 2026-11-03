@@ -2159,25 +2159,33 @@ export class TableAuthority extends DurableObject<Env> {
       binds: [JSON.stringify(compiled.binds)],
     };
   }
-  private queryCoverage(url: URL, actor: TableActor): TableQueryCoverage {
+  private queryInputs(url: URL, actor: TableActor) {
     const meta = this.meta(),
       columns = this.columns(),
       views = this.views(actor);
     const viewId = url.searchParams.get("viewId"),
       view = viewId ? this.view(viewId, actor) : null;
     const invalidView = Boolean(view?.invalid);
-    // Compile validation only. Never execute row filters, counts, calculations, or hydration.
-    this.filterSql(invalidView ? null : (view?.filters ?? null));
+    // Compilation validates references; execution belongs exclusively to query().
+    const filter = this.filterSql(invalidView ? null : (view?.filters ?? null));
+    let calendar: { month: string; zone: string; columnId: string } | null = null;
     if (url.searchParams.has("month") && view?.kind === "calendar" && view.columnId && !invalidView) {
-      if (!/^\d{4}-\d{2}$/.test(url.searchParams.get("month")!)) return fail("Invalid calendar month.");
+      const month = url.searchParams.get("month")!;
+      if (!/^\d{4}-\d{2}$/.test(month)) return fail("Invalid calendar month.");
+      let zone: string;
       try {
-        validateCalendarZone(url.searchParams.get("timeZone") ?? "UTC");
+        zone = validateCalendarZone(url.searchParams.get("timeZone") ?? "UTC");
       } catch {
         return fail("Choose a valid calendar display timezone.");
       }
+      calendar = { month, zone, columnId: view.columnId };
     }
     const limit = Math.min(TABLE_PAGE_MAX, Math.max(1, Number(url.searchParams.get("limit") ?? 100)));
     if (!Number.isSafeInteger(limit)) return fail("Invalid page size.");
+    return { meta, columns, views, viewId, view, invalidView, filter, calendar, limit };
+  }
+  private queryCoverage(url: URL, actor: TableActor): TableQueryCoverage {
+    const { meta, columns, views, view, invalidView } = this.queryInputs(url, actor);
     return {
       protocolVersion: TABLE_PROTOCOL_VERSION,
       pageId: meta.pageId,
@@ -2191,13 +2199,7 @@ export class TableAuthority extends DurableObject<Env> {
     };
   }
   private query(url: URL, actor: TableActor): TableQueryResult {
-    const meta = this.meta(),
-      columns = this.columns(),
-      views = this.views(actor),
-      viewId = url.searchParams.get("viewId"),
-      view = viewId ? this.view(viewId, actor) : null,
-      invalidView = Boolean(view?.invalid);
-    const filter = this.filterSql(invalidView ? null : (view?.filters ?? null));
+    const { meta, columns, views, viewId, view, invalidView, filter, calendar, limit } = this.queryInputs(url, actor);
     const q = url.searchParams.get("q")?.trim().slice(0, 200);
     if (q) {
       const matchedOptions = columns.flatMap((column) =>
@@ -2215,26 +2217,16 @@ export class TableAuthority extends DurableObject<Env> {
       filter.sql += ` AND ${this.expression(view.columnId)} IS ?`;
       filter.binds.push(url.searchParams.get("groupId") || null);
     }
-    if (url.searchParams.has("month") && view?.kind === "calendar" && view.columnId && !invalidView) {
-      const month = url.searchParams.get("month")!;
-      if (!/^\d{4}-\d{2}$/.test(month)) return fail("Invalid calendar month.");
-      let zone: string;
-      try {
-        zone = validateCalendarZone(url.searchParams.get("timeZone") ?? "UTC");
-      } catch {
-        return fail("Choose a valid calendar display timezone.");
-      }
+    if (calendar) {
       const matching = this.rows<StoredRow>(`SELECT r.* FROM rows r WHERE ${filter.sql}`, ...filter.binds).filter(
         (row) => {
-          const day = calendarDay(this.rowValue(row).cells[view.columnId!], zone);
-          return day ? day.startsWith(month) : url.searchParams.get("includeUnscheduled") === "true";
+          const day = calendarDay(this.rowValue(row).cells[calendar.columnId], calendar.zone);
+          return day ? day.startsWith(calendar.month) : url.searchParams.get("includeUnscheduled") === "true";
         },
       );
       filter.sql += " AND r.id IN (SELECT value FROM json_each(?))";
       filter.binds.push(JSON.stringify(matching.map((row) => row.id)));
     }
-    const limit = Math.min(TABLE_PAGE_MAX, Math.max(1, Number(url.searchParams.get("limit") ?? 100)));
-    if (!Number.isSafeInteger(limit)) return fail("Invalid page size.");
     const cursor = url.searchParams.get("cursor"),
       decoded = cursor
         ? (unbase64(cursor) as { revision: number; offset: number; viewId: string | null; query: string })

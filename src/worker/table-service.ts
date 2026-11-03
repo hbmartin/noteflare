@@ -138,19 +138,24 @@ export async function tableCommand(
     await tableFetch(env, member, pageId, "/commands", "POST", command, extras),
   );
 }
-export async function queryTable(env: Env, member: MemberContext, pageId: string, query = "") {
-  const result = await decodeTableResponse<TableQueryResult>(
-    await tableFetch(env, member, pageId, `/query${query ? `?${query}` : ""}`),
+async function queryTableRead<T extends TableQueryCoverage>(
+  env: Env,
+  member: MemberContext,
+  pageId: string,
+  path: "/query" | "/coverage",
+  query: string,
+) {
+  const result = await decodeTableResponse<T>(
+    await tableFetch(env, member, pageId, `${path}${query ? `?${query}` : ""}`),
   );
   const page = await pageForMember(env, member, pageId);
   return { ...result, taskList: Boolean(page.is_task_list), canEdit: page.effective_role !== "viewer" };
 }
+export async function queryTable(env: Env, member: MemberContext, pageId: string, query = "") {
+  return queryTableRead<TableQueryResult>(env, member, pageId, "/query", query);
+}
 export async function queryTableCoverage(env: Env, member: MemberContext, pageId: string, query = "") {
-  const result = await decodeTableResponse<TableQueryCoverage>(
-    await tableFetch(env, member, pageId, `/coverage${query ? `?${query}` : ""}`),
-  );
-  const page = await pageForMember(env, member, pageId);
-  return { ...result, taskList: Boolean(page.is_task_list), canEdit: page.effective_role !== "viewer" };
+  return queryTableRead<TableQueryCoverage>(env, member, pageId, "/coverage", query);
 }
 /** Original authority receipt only: a later rebuild cannot relabel an old mutation. */
 export async function tableReceiptCoverage(

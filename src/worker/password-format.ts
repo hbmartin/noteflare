@@ -1,6 +1,9 @@
 export const PASSWORD_CRYPTO_SHARDS = 16;
 export const PASSWORD_CRYPTO_PREFIX = "password-crypto-v1-";
 export const PASSWORD_MAX_LENGTH = 1_000;
+export function validPasswordInput(value: unknown): value is string {
+  return typeof value === "string" && value.length <= PASSWORD_MAX_LENGTH;
+}
 const PASSWORD_HASH_MAX_LENGTH = 4_096;
 const SALT_HEX_LENGTH = 32;
 const KEY_HEX_LENGTH = 128;

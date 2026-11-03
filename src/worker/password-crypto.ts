@@ -2,7 +2,7 @@ import { DurableObject, tracing } from "cloudflare:workers";
 import { hashPassword, verifyPassword } from "better-auth/crypto";
 import type { Env } from "./env";
 import { logger, recordMetric, traced, traceIdentifiers, withObservabilityContext } from "./observability";
-import { cryptoTelemetry, passwordShard, PASSWORD_MAX_LENGTH, validPasswordHash } from "./password-format";
+import { cryptoTelemetry, passwordShard, validPasswordInput, validPasswordHash } from "./password-format";
 
 // Stateless, private binding-only RPC. Never persist credentials or cache results.
 export class PasswordCrypto extends DurableObject<Env> {
@@ -25,8 +25,7 @@ export class PasswordCrypto extends DurableObject<Env> {
   }
 
   #validatePassword(password: string) {
-    if (typeof password !== "string" || password.length > PASSWORD_MAX_LENGTH)
-      throw new Error("Invalid password input");
+    if (!validPasswordInput(password)) throw new Error("Invalid password input");
   }
 
   async #run<T>(operation: "hash" | "verify", callback: () => Promise<T>): Promise<T> {

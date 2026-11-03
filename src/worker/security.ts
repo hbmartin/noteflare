@@ -1,3 +1,4 @@
+import { validPasswordInput } from "./password-format";
 import { trackRealtimeUser } from "./realtime-access";
 import type { GenericEndpointContext } from "@better-auth/core";
 import { createOTP } from "@better-auth/utils/otp";
@@ -261,6 +262,13 @@ async function requireEnrollment(ctx: GenericEndpointContext, env: Env) {
   return { ...id, security };
 }
 
+function accountLocked() {
+  return new APIError("TOO_MANY_REQUESTS", {
+    code: "ACCOUNT_TEMPORARILY_LOCKED",
+    message: "Too many attempts. Try again in 15 minutes.",
+  });
+}
+
 async function attempt(env: Env, userId: string, generation?: number) {
   const time = Date.now();
   const result = await env.DB.prepare(`UPDATE account_security SET
@@ -272,10 +280,7 @@ async function attempt(env: Env, userId: string, generation?: number) {
   if (!result) {
     if (generation !== undefined && (await securityAccount(env, userId)).generation !== generation)
       throw deny("Security settings changed. Sign in again.");
-    throw new APIError("TOO_MANY_REQUESTS", {
-      code: "ACCOUNT_TEMPORARILY_LOCKED",
-      message: "Too many attempts. Try again in 15 minutes.",
-    });
+    throw accountLocked();
   }
 }
 
@@ -304,7 +309,7 @@ async function primaryFactor(ctx: GenericEndpointContext, env: Env, id: Identity
     if (slack) return;
     throw deny("Enter your password or sign in with Slack again.");
   }
-  if (value.length > 1000) throw deny("The password or Slack sign-in is invalid.");
+  if (!validPasswordInput(value)) throw deny("The password or Slack sign-in is invalid.");
   const accounts = await ctx.context.internalAdapter.findAccounts(id.userId);
   const credential = accounts.find((account) => account.providerId === "credential");
   if (!credential?.password || !(await ctx.context.password.verify({ hash: credential.password, password: value }))) {
@@ -316,11 +321,7 @@ async function primaryFactor(ctx: GenericEndpointContext, env: Env, id: Identity
 async function primaryFactorAttempt(ctx: GenericEndpointContext, env: Env, id: Identity, generation: number) {
   const current = await securityAccount(env, id.userId);
   if (current.generation !== generation) throw deny("Security settings changed. Sign in again.");
-  if (current.locked_until > Date.now())
-    throw new APIError("TOO_MANY_REQUESTS", {
-      code: "ACCOUNT_TEMPORARILY_LOCKED",
-      message: "Too many attempts. Try again in 15 minutes.",
-    });
+  if (current.locked_until > Date.now()) throw accountLocked();
   try {
     await primaryFactor(ctx, env, id);
   } catch (error) {
