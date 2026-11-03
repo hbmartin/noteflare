@@ -1,6 +1,10 @@
 import { EventEmitter } from "node:events";
+import { once } from "node:events";
+import { spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import { writeFile, mkdir } from "node:fs/promises";
 import { CAPACITY_TARGET, measurePasswordCryptoCapacity } from "../measure-password-crypto-capacity.mjs";
+import { groupStopped } from "../capacity-process.mjs";
 
 /** Synthetic process/network boundary shared by unit and OS-signal tests. */
 export async function capacityHarness(directory, options = {}) {
@@ -19,6 +23,7 @@ export async function capacityHarness(directory, options = {}) {
     sockets = [];
   const signals = options.signals ?? new EventEmitter();
   const proxy = new EventEmitter();
+  proxy.pid = 421337;
   proxy.exitCode = null;
   proxy.signalCode = null;
   proxy.kill = (signal) => {
@@ -41,7 +46,16 @@ export async function capacityHarness(directory, options = {}) {
     time = 0;
   const token = "synthetic-local-proof-never-persist";
   const deps = {
+    platform: "linux",
     environment: options.environment ?? {},
+    portReleased: async () => true,
+    processes: {
+      spawn: () => proxy,
+      signalGroup: (_pgid, signal) => proxy.kill(signal),
+      groupStopped: async () => proxy.exitCode !== null || Boolean(proxy.signalCode),
+      now: () => ++time * 10,
+      delay: async () => {},
+    },
     outputRoot: directory,
     signals,
     token: () => token,
@@ -61,17 +75,17 @@ export async function capacityHarness(directory, options = {}) {
         calls.push({ path, method });
         if (method === "GET") return options.settings ?? settings;
         if (method === "POST") {
-          await options.onTail?.();
-          return { id: String(++tails), url: "ws://signed-synthetic-url-not-for-journal" };
+          const response = await options.onTail?.(input);
+          return response ?? { id: String(++tails), url: "ws://signed-synthetic-url-not-for-journal" };
         }
         await options.cleanup?.(path);
         return null;
       },
     }),
     allocatePort: async () => 4389,
-    startProxy: () => {
+    startProxy: ({ processes }) => {
       options.onProxy?.(proxy);
-      return proxy;
+      return processes.start("proxy", "synthetic-proxy", []);
     },
     createSocket: () => {
       const socket = new EventEmitter();
@@ -111,8 +125,40 @@ if (import.meta.main) {
 
   const harness = await capacityHarness(directory, {
     signals: process,
-    ...(scenario === "deploy" ? { onDeploy: hold } : { onSample: hold }),
+    ...(scenario === "deploy" ? { onDeploy: hold } : scenario === "load" ? { onSample: hold } : {}),
   });
+  if (scenario === "group-deploy") {
+    const fake = harness.deps.processes;
+    harness.deps.limits.proxy = 200;
+    harness.deps.limits.force = 200;
+    harness.deps.processes = {
+      spawn: (executable, args, options) =>
+        executable === "synthetic-proxy" ? fake.spawn() : spawn(executable, args, options),
+      signalGroup: (pgid, signal) =>
+        pgid === harness.proxy.pid ? fake.signalGroup(pgid, signal) : process.kill(-pgid, signal),
+      groupStopped: (pgid, options) => (pgid === harness.proxy.pid ? fake.groupStopped() : groupStopped(pgid, options)),
+      delay,
+    };
+    harness.deps.notify = (event) => console.log(JSON.stringify(event));
+    harness.deps.runCommand = async (_args, { processes }) => {
+      const child = await processes.start(
+        "deployment",
+        process.execPath,
+        ["-e", 'process.on("message",()=>process.exit(0));console.log("child-ready");'],
+        { stdio: ["ignore", "pipe", "ignore", "ipc"] },
+      );
+      await once(child.child.stdout, "data");
+      const finish = () => child.child.send("finish");
+      process.once("SIGINT", finish);
+      console.log("ready");
+      try {
+        const { code } = await child.exited;
+        if (code !== 0) throw Error("Test deployment interrupted");
+      } finally {
+        process.off("SIGINT", finish);
+      }
+    };
+  }
   const result = await measurePasswordCryptoCapacity({ configPath: harness.configPath, smoke: true }, harness.deps);
   console.log(JSON.stringify({ directory: result.directory, exitStatus: result.exitStatus }));
   process.exitCode = result.exitStatus;

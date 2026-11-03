@@ -4,7 +4,8 @@ import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
+import { cloudflare } from "./deploy.mjs";
 import {
   measurePasswordCryptoCapacity as run,
   parseCapacityArguments,
@@ -181,7 +182,9 @@ it("isolates generated files across concurrent runs", async () => {
   expect(results[0].directory).not.toBe(results[1].directory);
   expect(results.every((result) => result.cleanupCompleted)).toBe(true);
 });
-it.each(["SIGINT", "SIGTERM"].flatMap((signal) => ["deploy", "load"].map((phase) => ({ signal, phase }))))(
+it
+  .runIf(["darwin", "linux"].includes(process.platform))
+  .each(["SIGINT", "SIGTERM"].flatMap((signal) => ["deploy", "load"].map((phase) => ({ signal, phase }))))(
   "cleans up after OS $signal during $phase",
   async ({ signal, phase }) => {
     const f = await fixture();
@@ -279,4 +282,301 @@ it("rejects an actual unrelated loopback listener before any run request", async
   } finally {
     await new Promise((done) => server.close(done));
   }
+});
+
+it.each(["win32", "freebsd"])("rejects unsupported %s before config, credentials or network I/O", async (platform) => {
+  let called = false;
+  await expect(
+    run(
+      { configPath: "missing.json" },
+      {
+        platform,
+        connect: () => {
+          called = true;
+        },
+      },
+    ),
+  ).rejects.toThrow("unsupported_platform");
+  expect(called).toBe(false);
+});
+it("accepts verified forced cleanup with an escalation warning", async () => {
+  const f = await fixture();
+  const kill = f.proxy.kill;
+  f.proxy.kill = (signal) => (signal === "SIGTERM" ? false : kill(signal));
+  const result = await execute(f);
+  const journal = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(result).toMatchObject({ exitStatus: 0, outcome: "success", cleanupCompleted: true });
+  expect(journal.cleanupWarnings).toEqual(["process_stop_escalated"]);
+  expect(journal.cleanupErrors).toEqual([]);
+  expect(journal.localProcesses).toMatchObject([
+    { role: "proxy", exitObserved: true, groupStopped: true, escalated: true, state: "stopped" },
+  ]);
+});
+it("reports residual local processes when both stop signals are refused", async () => {
+  const f = await fixture();
+  f.proxy.kill = () => false;
+  const result = await execute(f);
+  const journal = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(result).toMatchObject({
+    exitStatus: 1,
+    cleanupCompleted: false,
+    outcome: "cleanup_failed",
+    helperRemoved: true,
+  });
+  expect(journal.cleanupErrors).toContain("process_stop_unverified");
+  expect(journal.localProcesses[0]).toMatchObject({ exitObserved: false, groupStopped: false, state: "unknown" });
+});
+it("preserves signal exit status when local shutdown cannot be verified", async () => {
+  let f;
+  f = await fixture({ onSample: () => f.signals.emit("SIGTERM") });
+  f.proxy.kill = () => false;
+  const result = await execute(f);
+  expect(result).toMatchObject({ exitStatus: 143, outcome: "SIGTERM", cleanupCompleted: false });
+});
+it("refuses cleanup certification for an occupied proxy port without killing its owner", async () => {
+  const f = await fixture();
+  f.deps.portReleased = async () => false;
+  const result = await execute(f);
+  expect(result.cleanupCompleted).toBe(false);
+  expect(result.exitStatus).toBe(1);
+  expect(JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8")).cleanupErrors).toContain(
+    "proxy_port_in_use_or_unknown",
+  );
+});
+it("waits for a held tail response after SIGINT, records its ID, then cleans it", async () => {
+  let release, entered;
+  const started = new Promise((done) => {
+    entered = done;
+  });
+  const held = new Promise((done) => {
+    release = done;
+  });
+  const f = await fixture({
+    onTail: async () => {
+      entered();
+      await held;
+    },
+  });
+  const pending = execute(f);
+  await started;
+  f.signals.emit("SIGINT");
+  expect(f.calls.filter((c) => c.method === "DELETE")).toEqual([]);
+  release();
+  const result = await pending;
+  expect(result).toMatchObject({ exitStatus: 130, outcome: "SIGINT", cleanupCompleted: true });
+  expect(f.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  expect(f.calls.filter((c) => c.method === "DELETE")).toHaveLength(2);
+  expect(f.operations).toEqual([]);
+});
+it("bounds tail creation and preserves unknown outcome with independent cleanup", async () => {
+  const f = await fixture({ onTail: () => new Promise(() => {}) });
+  f.deps.limits.deploy = 20;
+  const result = await execute(f);
+  const journal = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(result).toMatchObject({
+    exitStatus: 1,
+    outcome: "tail_provision_deadline",
+    cleanupCompleted: false,
+    helperRemoved: true,
+  });
+  expect(journal.cleanupErrors).toContain("tail_outcome_unknown");
+  expect(f.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  expect(f.calls.filter((c) => c.method === "DELETE")).toHaveLength(1);
+});
+it("removes a known tail ID even when the response has no valid socket URL", async () => {
+  const f = await fixture({ onTail: async () => ({ id: "known-tail", url: null }) });
+  const result = await execute(f);
+  expect(result).toMatchObject({ exitStatus: 1, outcome: "invalid_tail_response", cleanupCompleted: true });
+  expect(f.calls.some((c) => c.method === "DELETE" && c.path.endsWith("/tails/known-tail"))).toBe(true);
+});
+it("uses one abortable tail budget across OAuth renewal and fresh cleanup credentials", async () => {
+  const f = await fixture();
+  f.deps.limits.deploy = 60;
+  f.deps.limits.cleanup = 100;
+  let reads = 0,
+    renewalSignal,
+    postSignal;
+  const deleted = [];
+  f.deps.connect = cloudflare;
+  f.deps.readCredentials = async ({ signal }) => {
+    reads++;
+    if (reads === 2) {
+      renewalSignal = signal;
+      await new Promise(() => {});
+    }
+    return { type: "oauth", token: reads === 1 ? "synthetic-old-credential" : "synthetic-fresh-credential" };
+  };
+  f.deps.remoteFetch = async (url, options) => {
+    if (options.method === "POST") {
+      postSignal = options.signal;
+      return Response.json({ success: false, errors: [{ code: 10000, message: "auth" }] }, { status: 403 });
+    }
+    if (options.method === "DELETE") {
+      deleted.push(options.headers.Authorization);
+      return Response.json({ success: true, result: null });
+    }
+    return Response.json({
+      success: true,
+      result: {
+        bindings: [
+          { name: "DB", type: "d1", id: CAPACITY_TARGET.database },
+          {
+            name: "PASSWORD_CRYPTO",
+            type: "durable_object_namespace",
+            class_name: "PasswordCrypto",
+            namespace_id: CAPACITY_TARGET.namespace,
+          },
+        ],
+      },
+    });
+  };
+  const result = await execute(f);
+  expect(result).toMatchObject({
+    outcome: "tail_provision_deadline",
+    exitStatus: 1,
+    helperRemoved: true,
+    cleanupCompleted: false,
+  });
+  expect(reads).toBe(3);
+  expect(postSignal.aborted).toBe(true);
+  expect(renewalSignal.aborted).toBe(true);
+  expect(deleted).toEqual(["Bearer synthetic-fresh-credential"]);
+  const journal = await readFile(`${result.directory}/resource.json`, "utf8");
+  expect(journal).not.toMatch(/synthetic-(?:old|fresh)-credential/);
+  expect(JSON.stringify(result)).not.toMatch(/synthetic-(?:old|fresh)-credential/);
+});
+it.runIf(["darwin", "linux"].includes(process.platform)).each(Array.from({ length: 5 }, (_, i) => i + 1))(
+  "lets an isolated deployment settle after terminal group SIGINT: repetition %s",
+  async (repetition) => {
+    const f = await fixture();
+    const child = spawn(
+      process.execPath,
+      [
+        resolve("scripts/__fixtures__/password-capacity-driver.mjs"),
+        resolve(f.configPath, "..", `group-${repetition}`),
+        "group-deploy",
+      ],
+      { detached: true, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const driverPid = child.pid;
+    if (!driverPid) throw Error("Test driver did not spawn");
+    let stdout = "",
+      signaled = false,
+      runDirectory = "";
+    const deadline = setTimeout(() => {
+      try {
+        process.kill(-driverPid, "SIGKILL");
+      } catch {}
+    }, 5000);
+    try {
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        for (const line of stdout.split("\n")) {
+          try {
+            const event = JSON.parse(line);
+            if (event.event === "capacity.started") runDirectory = event.directory;
+          } catch {}
+        }
+        if (!signaled && stdout.split("\n").includes("ready")) {
+          signaled = true;
+          process.kill(-driverPid, "SIGINT");
+        }
+      });
+      const [code] = await once(child, "exit");
+      expect(signaled).toBe(true);
+      expect(code).toBe(130);
+      const journal = JSON.parse(await readFile(`${runDirectory}/resource.json`, "utf8"));
+      expect(journal).toMatchObject({ deploymentSettled: true, helperState: "removed", cleanupCompleted: true });
+      expect(journal.localProcesses).toMatchObject([
+        { role: "deployment", exitObserved: true, groupStopped: true, state: "stopped" },
+      ]);
+      expect(journal.localProcesses[0].pgid).not.toBe(child.pid);
+    } finally {
+      clearTimeout(deadline);
+      try {
+        process.kill(-driverPid, "SIGKILL");
+      } catch {}
+      if (runDirectory) {
+        const journal = JSON.parse(await readFile(`${runDirectory}/resource.json`, "utf8"));
+        for (const record of journal.localProcesses)
+          if (record.role === "deployment") {
+            try {
+              process.kill(-record.pgid, "SIGKILL");
+            } catch {}
+          }
+      }
+    }
+  },
+  7000,
+);
+it("cancels read-only credential preflight on SIGINT without remote provisioning", async () => {
+  const f = await fixture();
+  f.deps.connect = cloudflare;
+  f.deps.readCredentials = async () => {
+    f.signals.emit("SIGINT");
+    return new Promise(() => {});
+  };
+  f.deps.remoteFetch = () => {
+    throw Error("Unexpected remote call");
+  };
+  const result = await execute(f);
+  expect(result).toMatchObject({ exitStatus: 130, outcome: "SIGINT", cleanupCompleted: true, helperRemoved: false });
+  expect(f.operations).toEqual([]);
+  expect(f.signals.listenerCount("SIGINT")).toBe(0);
+});
+it("bounds cleanup credential renewal with its own fresh budget", async () => {
+  const f = await fixture();
+  let connects = 0;
+  const connect = f.deps.connect;
+  f.deps.connect = async (...args) => {
+    connects++;
+    if (connects === 2) {
+      return new Promise(() => {});
+    }
+    return connect(...args);
+  };
+  const result = await execute(f);
+  const journal = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(result).toMatchObject({ exitStatus: 1, cleanupCompleted: false, helperRemoved: false });
+  expect(journal.cleanupErrors).toContain("cleanup_deadline");
+  expect(connects).toBe(2);
+});
+it("starts cleanup exactly at the tail operation deadline, without resetting its budget", async () => {
+  let entered;
+  const started = new Promise((done) => {
+    entered = done;
+  });
+  const f = await fixture({
+    onTail: () => {
+      entered();
+      return new Promise(() => {});
+    },
+  });
+  f.deps.limits.deploy = 20;
+  vi.useFakeTimers();
+  const pending = execute(f);
+  try {
+    await started;
+    await vi.advanceTimersByTimeAsync(19);
+    expect(f.calls.filter((call) => call.method === "DELETE")).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.calls.filter((call) => call.method === "DELETE")).toHaveLength(1);
+    expect(await pending).toMatchObject({
+      outcome: "tail_provision_deadline",
+      helperRemoved: true,
+      cleanupCompleted: false,
+    });
+  } finally {
+    await vi.runAllTimersAsync();
+    await pending;
+    vi.useRealTimers();
+  }
+});
+it("stops owned local processes before remote deletion and verifies cleanup children afterward", async () => {
+  let f;
+  const signals = [];
+  f = await fixture({ cleanup: () => signals.push(f.proxy.signalCode) });
+  const result = await execute(f);
+  expect(result).toMatchObject({ exitStatus: 0, cleanupCompleted: true, helperRemoved: true });
+  expect(signals).toEqual(["SIGTERM", "SIGTERM", "SIGTERM"]);
 });

@@ -1,5 +1,5 @@
 import { build } from "esbuild";
-import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -10,6 +10,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { once } from "node:events";
 import WebSocket from "ws";
 import { cloudflare } from "./deploy.mjs";
+import { CapacityError, bounded, abortable, createProcessManager, portReleased } from "./capacity-process.mjs";
 
 export const CAPACITY_TARGET = Object.freeze({
   account: "940db9a80e285cf3f700d5d903d8e182",
@@ -26,26 +27,8 @@ const limits = {
   drain: 10000,
   cleanup: 30000,
   proxy: 2000,
+  force: 2000,
 };
-class CapacityError extends Error {
-  constructor(code) {
-    super(code);
-    this.code = code;
-  }
-}
-async function bounded(promise, milliseconds, code) {
-  let timer;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new CapacityError(code)), milliseconds);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 async function freePort() {
   const server = createServer();
   server.listen(0, "127.0.0.1");
@@ -54,21 +37,22 @@ async function freePort() {
   await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   return port;
 }
-async function runWrangler(args, { directory, timeout }) {
+async function wranglerCommand(processes, role, args, { directory, signal }) {
   const fd = openSync(`${directory}/deploy.log`, "w", 0o600);
-  const child = spawn(process.execPath, [require.resolve("wrangler"), ...args], { stdio: ["ignore", fd, fd] });
   try {
-    const [code] = await bounded(once(child, "exit"), timeout, "deployment_deadline");
-    if (code !== 0) throw new CapacityError("deployment_failed");
+    return await processes.run(role, process.execPath, [require.resolve("wrangler"), ...args], {
+      signal,
+      stdio: ["ignore", fd, fd],
+    });
   } finally {
-    if (child.exitCode === null) child.kill("SIGKILL");
     closeSync(fd);
   }
 }
-function startWranglerProxy({ config, port, directory }) {
+async function startWranglerProxy(processes, { config, port, directory }) {
   const fd = openSync(`${directory}/proxy.log`, "w", 0o600);
   try {
-    return spawn(
+    return await processes.start(
+      "proxy",
       process.execPath,
       [
         require.resolve("wrangler"),
@@ -127,6 +111,8 @@ export default class extends WorkerEntrypoint {
 
 /** Private, disposable binding-only load driver. Importing it performs no I/O. */
 export async function measurePasswordCryptoCapacity({ configPath, smoke = false }, dependencies = {}) {
+  if (!["darwin", "linux"].includes(dependencies.platform ?? process.platform))
+    throw new CapacityError("unsupported_platform");
   const environment = dependencies.environment ?? process.env;
   // This is an explicit, trusted operator-supplied configuration path, not application input.
   const config = JSON.parse(await readFile(configPath, "utf8"));
@@ -137,28 +123,6 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     (environment.CLOUDFLARE_ACCOUNT_ID && environment.CLOUDFLARE_ACCOUNT_ID !== CAPACITY_TARGET.account)
   )
     throw new CapacityError("preview_account_mismatch");
-  let cleanupSignal;
-  const remoteFetch = dependencies.remoteFetch ?? fetch;
-  const { account, api } = await (dependencies.connect ?? cloudflare)(CAPACITY_TARGET.account, {
-    request: (url, options) =>
-      remoteFetch(url, {
-        ...options,
-        signal: cleanupSignal ? AbortSignal.any([options.signal, cleanupSignal]) : options.signal,
-      }),
-  });
-  if (account !== CAPACITY_TARGET.account) throw new CapacityError("preview_account_mismatch");
-  const settings = await api(`/workers/scripts/${CAPACITY_TARGET.worker}/settings`);
-  const database = settings?.bindings?.find((binding) => binding.name === "DB" && binding.type === "d1");
-  const crypto = settings?.bindings?.find(
-    (binding) => binding.name === "PASSWORD_CRYPTO" && binding.type === "durable_object_namespace",
-  );
-  if (
-    (database?.id ?? database?.database_id) !== CAPACITY_TARGET.database ||
-    crypto?.class_name !== "PasswordCrypto" ||
-    crypto?.namespace_id !== CAPACITY_TARGET.namespace
-  )
-    throw new CapacityError("preview_binding_mismatch");
-
   const timing = { ...limits, ...dependencies.limits };
   const signals = dependencies.signals ?? process;
   const request = dependencies.request ?? fetch;
@@ -173,7 +137,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
   const result = {
     helper,
     preview: CAPACITY_TARGET.worker,
-    account,
+    account: CAPACITY_TARGET.account,
     smoke,
     directory,
     startedAt: Date.now(),
@@ -187,7 +151,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
   const journal = {
     helper,
     preview: CAPACITY_TARGET.worker,
-    account,
+    account: CAPACITY_TARGET.account,
     database: CAPACITY_TARGET.database,
     phase: "planned",
     deploymentStarted: false,
@@ -196,17 +160,26 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     tailCreations: [],
     deploymentSettled: false,
     cleanupErrors: [],
+    cleanupWarnings: [],
+    localProcesses: [],
+    proxyPortReleased: null,
   };
   const save = async (name, value) => {
     const target = `${directory}/${name}.json`;
     await writeFile(`${target}.tmp`, JSON.stringify(value, null, 2), { mode: 0o600 });
     await rename(`${target}.tmp`, target);
   };
-  const persist = () => save("resource", journal);
+  let writes = Promise.resolve();
+  const persist = () => {
+    writes = writes.catch(() => {}).then(() => save("resource", journal));
+    return writes;
+  };
   let reason,
     proxy,
     cleaning = false;
   const sockets = [];
+  const cancellable = new Set();
+  let api, proxyPort, preflightError;
   let stopped;
   const stopEvent = new Promise((resolve) => {
     stopped = resolve;
@@ -216,6 +189,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     reason = code;
     result.exitStatus = status;
     stopped();
+    for (const controller of cancellable) controller.abort(new CapacityError(code));
   };
   const check = () => {
     if (reason) throw new CapacityError(reason);
@@ -224,11 +198,92 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     terminate = () => stop("SIGTERM", 143);
   signals.on("SIGINT", interrupt);
   signals.on("SIGTERM", terminate);
-  const alive = () => proxy && proxy.exitCode === null && !proxy.signalCode;
+  const processes = createProcessManager(journal.localProcesses, {
+    ...dependencies.processes,
+    grace: timing.proxy,
+    force: timing.force,
+    persist,
+  });
+  const contexts = new AsyncLocalStorage();
+  const scoped = async (code, budget, operation, cancelOnStop = false) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new CapacityError(code)), budget);
+    if (cancelOnStop) cancellable.add(controller);
+    try {
+      if (cancelOnStop) check();
+      return await contexts.run({ signal: controller.signal }, () =>
+        abortable(
+          Promise.resolve().then(() => operation(controller.signal)),
+          controller.signal,
+        ),
+      );
+    } finally {
+      clearTimeout(timer);
+      cancellable.delete(controller);
+    }
+  };
+  const connect = async () => {
+    const client = await (dependencies.connect ?? cloudflare)(CAPACITY_TARGET.account, {
+      readCredentials: () => {
+        const { signal } = contexts.getStore();
+        signal.throwIfAborted();
+        return abortable(
+          (
+            dependencies.readCredentials ??
+            (async () =>
+              JSON.parse(
+                await processes.run(
+                  "credentials",
+                  process.execPath,
+                  [require.resolve("wrangler"), "auth", "token", "--json"],
+                  { signal, capture: true },
+                ),
+              ))
+          )({ signal, processes }),
+          signal,
+        );
+      },
+      request: (url, options) => {
+        const { signal } = contexts.getStore();
+        signal.throwIfAborted();
+        return abortable(
+          (dependencies.remoteFetch ?? fetch)(url, {
+            ...options,
+            signal: AbortSignal.any([options.signal, signal]),
+          }),
+          signal,
+        );
+      },
+    });
+    if (client.account !== CAPACITY_TARGET.account) throw new CapacityError("preview_account_mismatch");
+    return client;
+  };
+  const alive = () => proxy && proxy.child.exitCode === null && !proxy.child.signalCode;
   try {
     await persist();
     notify({ event: "capacity.started", directory, helper, smoke });
     check();
+    await scoped(
+      "preflight_deadline",
+      timing.deploy,
+      async () => {
+        ({ api } = await connect());
+        const settings = await api(`/workers/scripts/${CAPACITY_TARGET.worker}/settings`);
+        const database = settings?.bindings?.find((binding) => binding.name === "DB" && binding.type === "d1");
+        const crypto = settings?.bindings?.find(
+          (binding) => binding.name === "PASSWORD_CRYPTO" && binding.type === "durable_object_namespace",
+        );
+        if (
+          (database?.id ?? database?.database_id) !== CAPACITY_TARGET.database ||
+          crypto?.class_name !== "PasswordCrypto" ||
+          crypto?.namespace_id !== CAPACITY_TARGET.namespace
+        )
+          throw new CapacityError("preview_binding_mismatch");
+      },
+      true,
+    );
+    check();
+    const account = CAPACITY_TARGET.account;
     await (dependencies.bundle ?? build)({
       stdin: { contents: source, resolveDir: process.cwd() },
       outfile: `${directory}/helper.mjs`,
@@ -268,13 +323,11 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     check();
     journal.deploymentStarted = true;
     journal.helperState = "unknown";
-    await bounded(
-      (dependencies.runCommand ?? runWrangler)(["deploy", "--config", `${directory}/helper.json`, "--env", ""], {
-        directory,
-        timeout: timing.deploy,
-      }),
-      timing.deploy,
-      "deployment_deadline",
+    await scoped("deployment_deadline", timing.deploy, (signal) =>
+      (dependencies.runCommand ?? ((args, options) => wranglerCommand(processes, "deployment", args, options)))(
+        ["deploy", "--config", `${directory}/helper.json`, "--env", ""],
+        { directory, timeout: timing.deploy, signal, processes },
+      ),
     );
     journal.helperState = "created";
     journal.deploymentSettled = true;
@@ -287,12 +340,14 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
       notify({ event: "capacity.provisioning", resource: "tail" });
       check();
       creation.state = "unknown";
-      const tail = await api(`/workers/scripts/${scriptName}/tails`, { method: "POST", body: { filters: [] } });
-      if (typeof tail?.id !== "string" || typeof tail?.url !== "string")
-        throw new CapacityError("invalid_tail_response");
+      const tail = await scoped("tail_provision_deadline", timing.deploy, () =>
+        api(`/workers/scripts/${scriptName}/tails`, { method: "POST", body: { filters: [] } }),
+      );
+      if (typeof tail?.id !== "string") throw new CapacityError("invalid_tail_response");
       journal.tails.push({ scriptName, id: tail.id, removed: false });
       creation.state = "created";
       await persist();
+      if (typeof tail.url !== "string") throw new CapacityError("invalid_tail_response");
       check();
       const socket = (dependencies.createSocket ?? ((url) => new WebSocket(url, "trace-v1")))(tail.url);
       sockets.push(socket);
@@ -348,6 +403,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     }
     check();
     const port = await (dependencies.allocatePort ?? freePort)();
+    proxyPort = port;
     const origin = `http://127.0.0.1:${port}`;
     await writeFile(
       `${directory}/proxy.mjs`,
@@ -367,11 +423,16 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     );
     notify({ event: "capacity.provisioning", resource: "proxy" });
     check();
-    proxy = (dependencies.startProxy ?? startWranglerProxy)({ config: `${directory}/proxy.json`, directory, port });
-    proxy.on("error", () => {
+    proxy = await (dependencies.startProxy ?? ((options) => startWranglerProxy(processes, options)))({
+      config: `${directory}/proxy.json`,
+      directory,
+      port,
+      processes,
+    });
+    proxy.child.on("error", () => {
       if (!cleaning) stop("proxy_error");
     });
-    proxy.on("exit", () => {
+    proxy.child.on("exit", () => {
       if (!cleaning) stop("proxy_exit");
     });
     const readyAt = clock();
@@ -458,44 +519,64 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     await Promise.race([pause(timing.drain), stopEvent]);
     check();
   } catch (error) {
+    if (error instanceof CapacityError && error.code.startsWith("preview_")) preflightError = error;
     stop(error instanceof CapacityError ? error.code : "driver_failed");
   } finally {
     cleaning = true;
     journal.phase = "cleanup";
     for (const socket of sockets) socket.terminate();
-    cleanupSignal = AbortSignal.timeout(timing.cleanup);
-    const tasks = journal.tails.map((tail) =>
-      Promise.resolve()
-        .then(() =>
-          api(`/workers/scripts/${tail.scriptName}/tails/${tail.id}`, { method: "DELETE", allowMissing: true }),
-        )
-        .then(() => {
-          tail.removed = true;
-        }),
-    );
-    if (journal.deploymentStarted)
-      tasks.push(
-        Promise.resolve()
-          .then(() => api(`/workers/scripts/${helper}`, { method: "DELETE", allowMissing: true }))
-          .then(() => {
-            result.helperRemoved = true;
-            journal.helperState = "removed";
-          }),
-      );
-    try {
-      const cleanup = await bounded(Promise.allSettled(tasks), timing.cleanup, "cleanup_deadline");
-      if (cleanup.some((item) => item.status === "rejected")) journal.cleanupErrors.push("remote_cleanup_failed");
-    } catch {
-      journal.cleanupErrors.push("cleanup_deadline");
-    }
-    if (proxy) {
-      const exit = alive() ? once(proxy, "exit") : Promise.resolve();
-      if (alive()) proxy.kill("SIGTERM");
+    // Quiesce provisioning before deleting its resources. Cleanup can start new
+    // credential children, so stopAll() is checked again after remote cleanup.
+    await processes.stopAll();
+    const hasRemoteResources = journal.deploymentStarted || journal.tails.length > 0;
+    if (hasRemoteResources) {
       try {
-        await bounded(exit, timing.proxy, "proxy_stop_deadline");
-      } catch {
-        proxy.kill("SIGKILL");
+        await scoped("cleanup_deadline", timing.cleanup, async () => {
+          const cleanupClient = await connect();
+          const tasks = journal.tails.map((tail) =>
+            Promise.resolve()
+              .then(() =>
+                cleanupClient.api(`/workers/scripts/${tail.scriptName}/tails/${tail.id}`, {
+                  method: "DELETE",
+                  allowMissing: true,
+                }),
+              )
+              .then(() => {
+                tail.removed = true;
+              }),
+          );
+          if (journal.deploymentStarted)
+            tasks.push(
+              Promise.resolve()
+                .then(() => cleanupClient.api(`/workers/scripts/${helper}`, { method: "DELETE", allowMissing: true }))
+                .then(() => {
+                  result.helperRemoved = true;
+                  journal.helperState = "removed";
+                }),
+            );
+          const cleanup = await Promise.allSettled(tasks);
+          if (cleanup.some((item) => item.status === "rejected")) journal.cleanupErrors.push("remote_cleanup_failed");
+        });
+      } catch (error) {
+        journal.cleanupErrors.push(
+          error instanceof CapacityError && error.code === "cleanup_deadline"
+            ? "cleanup_deadline"
+            : "remote_cleanup_failed",
+        );
       }
+    }
+    if (!(await processes.stopAll())) journal.cleanupErrors.push("process_stop_unverified");
+    if (journal.localProcesses.some((record) => record.escalated))
+      journal.cleanupWarnings.push("process_stop_escalated");
+    if (proxy) {
+      try {
+        await scoped("proxy_port_deadline", timing.force, async (signal) => {
+          journal.proxyPortReleased = await (dependencies.portReleased ?? portReleased)(proxyPort, { signal });
+        });
+      } catch {
+        journal.proxyPortReleased = false;
+      }
+      if (!journal.proxyPortReleased) journal.cleanupErrors.push("proxy_port_in_use_or_unknown");
     }
     if (journal.deploymentStarted && !journal.deploymentSettled)
       journal.cleanupErrors.push("deployment_outcome_unknown");
@@ -519,6 +600,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
       signals.off("SIGTERM", terminate);
     }
   }
+  if (preflightError) throw preflightError;
   return result;
 }
 
