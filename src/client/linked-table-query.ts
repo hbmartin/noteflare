@@ -13,7 +13,7 @@ export type TableReadWindow = {
   continuation: LinkedTableContinuation | null;
 };
 export type LinkedTableReadResult = { window: TableReadWindow; verification: "network" | "buffer" };
-export class CursorChanged extends Error {
+class CursorChanged extends Error {
   constructor() {
     super("The table changed during pagination.");
   }
