@@ -26,6 +26,7 @@ const limits = {
   operation: 10000,
   drain: 10000,
   cleanup: 30000,
+  credentials: 5000,
   proxy: 2000,
   force: 2000,
 };
@@ -79,6 +80,10 @@ export function parseCapacityArguments(args) {
   return { configPath, smoke: flags.includes("--smoke") };
 }
 
+class PreviewTargetError extends CapacityError {}
+
+const shardValid = (shard) => Number.isInteger(shard) && shard >= 0 && shard < 16;
+
 const fixture =
   "0123456789abcdef0123456789abcdef:8582d1a409fb81869c9f080d49ce2d8839d611a9905642ce9e7b9e5c1cf7e7b71add2af990c5095edf0733f174780d62b2f7ff2fb42cd07a5edf561bef26dc34";
 const source = `
@@ -117,12 +122,12 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
   // This is an explicit, trusted operator-supplied configuration path, not application input.
   const config = JSON.parse(await readFile(configPath, "utf8"));
   if (config.name !== CAPACITY_TARGET.worker || config.d1_databases?.[0]?.database_id !== CAPACITY_TARGET.database)
-    throw new CapacityError("preview_target_mismatch");
+    throw new PreviewTargetError("preview_target_mismatch");
   if (
     (config.account_id && config.account_id !== CAPACITY_TARGET.account) ||
     (environment.CLOUDFLARE_ACCOUNT_ID && environment.CLOUDFLARE_ACCOUNT_ID !== CAPACITY_TARGET.account)
   )
-    throw new CapacityError("preview_account_mismatch");
+    throw new PreviewTargetError("preview_account_mismatch");
   const timing = { ...limits, ...dependencies.limits };
   const signals = dependencies.signals ?? process;
   const request = dependencies.request ?? fetch;
@@ -148,21 +153,25 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     helperRemoved: false,
     exitStatus: 0,
   };
+  const helperResource = { kind: "helper", scriptName: helper, creation: "planned", removal: "pending" };
   const journal = {
+    version: 2,
     helper,
     preview: CAPACITY_TARGET.worker,
     account: CAPACITY_TARGET.account,
     database: CAPACITY_TARGET.database,
     phase: "planned",
-    deploymentStarted: false,
-    helperState: "planned",
-    tails: [],
-    tailCreations: [],
-    deploymentSettled: false,
+    resources: [helperResource],
     cleanupErrors: [],
     cleanupWarnings: [],
     localProcesses: [],
     proxyPortReleased: null,
+  };
+  const addError = (code) => {
+    if (!journal.cleanupErrors.includes(code)) journal.cleanupErrors.push(code);
+  };
+  const warn = (code) => {
+    if (!journal.cleanupWarnings.includes(code)) journal.cleanupWarnings.push(code);
   };
   const save = async (name, value) => {
     const target = `${directory}/${name}.json`;
@@ -171,7 +180,8 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
   };
   let writes = Promise.resolve();
   const persist = () => {
-    writes = writes.catch(() => {}).then(() => save("resource", journal));
+    const snapshot = structuredClone(journal);
+    writes = writes.catch(() => {}).then(() => save("resource", snapshot));
     return writes;
   };
   let reason,
@@ -179,12 +189,24 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     cleaning = false;
   const sockets = [];
   const cancellable = new Set();
-  let api, proxyPort, preflightError;
+  let api,
+    proxyPort,
+    proxyAttempted = false,
+    preflightError,
+    skipDrain = false;
+  let cancelDrain;
+  const drainCancelled = new Promise((resolve) => {
+    cancelDrain = resolve;
+  });
   let stopped;
   const stopEvent = new Promise((resolve) => {
     stopped = resolve;
   });
   const stop = (code, status = 1) => {
+    if (["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "tail_error", "tail_closed"].includes(code)) {
+      skipDrain = true;
+      cancelDrain();
+    }
     if (reason) return;
     reason = code;
     result.exitStatus = status;
@@ -194,10 +216,10 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
   const check = () => {
     if (reason) throw new CapacityError(reason);
   };
-  const interrupt = () => stop("SIGINT", 130),
-    terminate = () => stop("SIGTERM", 143);
-  signals.on("SIGINT", interrupt);
-  signals.on("SIGTERM", terminate);
+  const signalHandlers = Object.entries({ SIGINT: 130, SIGTERM: 143, SIGHUP: 129, SIGQUIT: 131 }).map(
+    ([signal, status]) => [signal, () => stop(signal, status)],
+  );
+  for (const [signal, handler] of signalHandlers) signals.on(signal, handler);
   const processes = createProcessManager(journal.localProcesses, {
     ...dependencies.processes,
     grace: timing.proxy,
@@ -207,17 +229,29 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
   const contexts = new AsyncLocalStorage();
   const scoped = async (code, budget, operation, cancelOnStop = false) => {
     const controller = new AbortController();
+    const parent = contexts.getStore()?.signal;
+    const signal = parent ? AbortSignal.any([parent, controller.signal]) : controller.signal;
     const timer = setTimeout(() => controller.abort(new CapacityError(code)), budget);
+    let active = true;
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      if (!active) throw new CapacityError("operation_retired");
+    };
     if (cancelOnStop) cancellable.add(controller);
     try {
       if (cancelOnStop) check();
-      return await contexts.run({ signal: controller.signal }, () =>
+      return await contexts.run({ signal }, () =>
         abortable(
-          Promise.resolve().then(() => operation(controller.signal)),
-          controller.signal,
+          Promise.resolve().then(() => {
+            assertCurrent();
+            return operation(signal, assertCurrent);
+          }),
+          signal,
         ),
       );
     } finally {
+      active = false;
+      controller.abort(new CapacityError("operation_retired"));
       clearTimeout(timer);
       cancellable.delete(controller);
     }
@@ -255,7 +289,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
         );
       },
     });
-    if (client.account !== CAPACITY_TARGET.account) throw new CapacityError("preview_account_mismatch");
+    if (client.account !== CAPACITY_TARGET.account) throw new PreviewTargetError("preview_account_mismatch");
     return client;
   };
   const alive = () => proxy && proxy.child.exitCode === null && !proxy.child.signalCode;
@@ -263,6 +297,8 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     await persist();
     notify({ event: "capacity.started", directory, helper, smoke });
     check();
+    journal.phase = "preflight";
+    await persist();
     await scoped(
       "preflight_deadline",
       timing.deploy,
@@ -278,11 +314,12 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
           crypto?.class_name !== "PasswordCrypto" ||
           crypto?.namespace_id !== CAPACITY_TARGET.namespace
         )
-          throw new CapacityError("preview_binding_mismatch");
+          throw new PreviewTargetError("preview_binding_mismatch");
       },
       true,
     );
     check();
+    journal.phase = "bundle";
     const account = CAPACITY_TARGET.account;
     await (dependencies.bundle ?? build)({
       stdin: { contents: source, resolveDir: process.cwd() },
@@ -321,31 +358,33 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     await persist();
     notify({ event: "capacity.provisioning", resource: "helper" });
     check();
-    journal.deploymentStarted = true;
-    journal.helperState = "unknown";
+    helperResource.creation = "creating";
+    await persist();
+    check();
     await scoped("deployment_deadline", timing.deploy, (signal) =>
       (dependencies.runCommand ?? ((args, options) => wranglerCommand(processes, "deployment", args, options)))(
         ["deploy", "--config", `${directory}/helper.json`, "--env", ""],
-        { directory, timeout: timing.deploy, signal, processes },
+        { directory, signal, processes },
       ),
     );
-    journal.helperState = "created";
-    journal.deploymentSettled = true;
+    helperResource.creation = "created";
     await persist();
     check();
     for (const scriptName of [CAPACITY_TARGET.worker, helper]) {
-      const creation = { scriptName, state: "planned" };
-      journal.tailCreations.push(creation);
+      const creation = { kind: "tail", scriptName, creation: "planned", removal: "pending" };
+      journal.resources.push(creation);
       await persist();
       notify({ event: "capacity.provisioning", resource: "tail" });
       check();
-      creation.state = "unknown";
+      creation.creation = "creating";
+      await persist();
+      check();
       const tail = await scoped("tail_provision_deadline", timing.deploy, () =>
         api(`/workers/scripts/${scriptName}/tails`, { method: "POST", body: { filters: [] } }),
       );
       if (typeof tail?.id !== "string") throw new CapacityError("invalid_tail_response");
-      journal.tails.push({ scriptName, id: tail.id, removed: false });
-      creation.state = "created";
+      creation.id = tail.id;
+      creation.creation = "created";
       await persist();
       if (typeof tail.url !== "string") throw new CapacityError("invalid_tail_response");
       check();
@@ -361,6 +400,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
         if (!cleaning) stop("tail_closed");
       });
       socket.on("message", (raw) => {
+        if (cleaning) return;
         try {
           const event = JSON.parse(raw.toString());
           if (!event || typeof event !== "object" || (event.logs !== undefined && !Array.isArray(event.logs)))
@@ -423,6 +463,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     );
     notify({ event: "capacity.provisioning", resource: "proxy" });
     check();
+    proxyAttempted = true;
     proxy = await (dependencies.startProxy ?? ((options) => startWranglerProxy(processes, options)))({
       config: `${directory}/proxy.json`,
       directory,
@@ -454,35 +495,53 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     async function sample(operation) {
       const started = clock();
       try {
-        if (!alive()) throw new CapacityError("proxy_exit");
-        const response = await request(`${origin}/run`, {
-          method: "POST",
-          body: operation,
-          signal: AbortSignal.timeout(timing.operation),
+        return await scoped("operation_deadline", timing.operation, async (signal, assertCurrent) => {
+          if (!alive()) throw new CapacityError("proxy_exit");
+          const response = await request(`${origin}/run`, { method: "POST", body: operation, signal });
+          assertCurrent();
+          if (!response.ok) {
+            const error = new CapacityError("proxy_http_error");
+            error.status = response.status;
+            throw error;
+          }
+          let body;
+          try {
+            body = await response.json();
+          } catch {
+            throw new CapacityError("invalid_proxy_json");
+          }
+          assertCurrent();
+          const value = body?.result;
+          if (
+            body?.runToken !== token ||
+            typeof value?.ok !== "boolean" ||
+            (value.ok
+              ? !shardValid(value.shard) || ![1, 2].includes(value.attempts)
+              : (value.shard !== undefined && !shardValid(value.shard)) ||
+                (value.attempts !== undefined && ![0, 1, 2].includes(value.attempts)))
+          )
+            throw new CapacityError("invalid_proxy_response");
+          const safe = { ok: value.ok };
+          if (value.shard !== undefined) safe.shard = value.shard;
+          if (value.attempts !== undefined) safe.attempts = value.attempts;
+          if (Number.isFinite(value.rpcWallMs) && value.rpcWallMs >= 0) safe.rpcWallMs = value.rpcWallMs;
+          if (/^[a-f0-9]{32}$/.test(value.traceId)) safe.traceId = value.traceId;
+          if (/^[a-f0-9]{16}$/.test(value.spanId)) safe.spanId = value.spanId;
+          if (!value.ok) {
+            safe.code = value.code === "unavailable" ? "unavailable" : "operation_failed";
+            stop("operation_failed");
+          }
+          return { ...safe, wallMs: clock() - started };
         });
-        const body = await response.json(),
-          value = body?.result;
-        if (
-          !response.ok ||
-          body.runToken !== token ||
-          typeof value?.ok !== "boolean" ||
-          !Number.isInteger(value.shard) ||
-          value.shard < 0 ||
-          value.shard >= 16 ||
-          ![1, 2].includes(value.attempts)
-        )
-          throw new CapacityError("invalid_proxy_response");
-        const safe = Object.fromEntries(
-          ["ok", "code", "shard", "attempts", "rpcWallMs", "traceId", "spanId"]
-            .filter((key) => value[key] !== undefined)
-            .map((key) => [key, value[key]]),
-        );
-        if (!value.ok) stop("operation_failed");
-        return { ...safe, wallMs: clock() - started };
       } catch (error) {
-        const code = error instanceof CapacityError ? error.code : "deadline_or_transport";
+        const code = error instanceof CapacityError ? error.code : "transport_failed";
         stop(code);
-        return { ok: false, code, wallMs: clock() - started };
+        return {
+          ok: false,
+          code,
+          ...(Number.isInteger(error?.status) ? { status: error?.status } : {}),
+          wallMs: clock() - started,
+        };
       }
     }
     for (let i = 0; i < (smoke ? 1 : 32); i++) {
@@ -516,77 +575,102 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
       }
     }
     check();
-    await Promise.race([pause(timing.drain), stopEvent]);
-    check();
   } catch (error) {
-    if (error instanceof CapacityError && error.code.startsWith("preview_")) preflightError = error;
-    stop(error instanceof CapacityError ? error.code : "driver_failed");
+    if (error instanceof PreviewTargetError) preflightError = error;
+    for (const resource of journal.resources) if (resource.creation === "creating") resource.creation = "unknown";
+    const category = error instanceof CapacityError ? error.code : "driver_failed";
+    if (!reason || reason === category) {
+      result.failure = { stage: journal.phase, category };
+      if (["EACCES", "EPERM", "ENOENT", "ENOSPC", "EIO", "EROFS", "EMFILE"].includes(error?.code))
+        result.failure.code = error?.code;
+      if (Number.isInteger(error?.status)) result.failure.status = error?.status;
+    }
+    stop(category);
   } finally {
+    // Sample failures still need delayed invocation frames. Signals and broken streams skip this wait.
+    if (sockets.length && !skipDrain) {
+      const drainController = new AbortController();
+      try {
+        await Promise.race([pause(timing.drain, undefined, { signal: drainController.signal }), drainCancelled]);
+      } finally {
+        drainController.abort();
+      }
+    }
     cleaning = true;
     journal.phase = "cleanup";
     for (const socket of sockets) socket.terminate();
-    // Quiesce provisioning before deleting its resources. Cleanup can start new
-    // credential children, so stopAll() is checked again after remote cleanup.
     await processes.stopAll();
-    const hasRemoteResources = journal.deploymentStarted || journal.tails.length > 0;
-    if (hasRemoteResources) {
+    const resources = journal.resources.filter(
+      (resource) => resource.creation !== "planned" && (resource.kind === "helper" || resource.id),
+    );
+    if (resources.length) {
       try {
-        await scoped("cleanup_deadline", timing.cleanup, async () => {
-          const cleanupClient = await connect();
-          const tasks = journal.tails.map((tail) =>
-            Promise.resolve()
-              .then(() =>
-                cleanupClient.api(`/workers/scripts/${tail.scriptName}/tails/${tail.id}`, {
-                  method: "DELETE",
-                  allowMissing: true,
-                }),
-              )
-              .then(() => {
-                tail.removed = true;
-              }),
-          );
-          if (journal.deploymentStarted)
-            tasks.push(
-              Promise.resolve()
-                .then(() => cleanupClient.api(`/workers/scripts/${helper}`, { method: "DELETE", allowMissing: true }))
-                .then(() => {
-                  result.helperRemoved = true;
-                  journal.helperState = "removed";
-                }),
+        await scoped("cleanup_deadline", timing.cleanup, async (_signal, assertCurrent) => {
+          let cleanupApi = api;
+          try {
+            const fresh = await scoped(
+              "cleanup_credentials_deadline",
+              Math.min(timing.credentials, timing.cleanup),
+              () => connect(),
             );
-          const cleanup = await Promise.allSettled(tasks);
-          if (cleanup.some((item) => item.status === "rejected")) journal.cleanupErrors.push("remote_cleanup_failed");
+            assertCurrent();
+            cleanupApi = fresh.api;
+          } catch {
+            assertCurrent();
+            warn("fresh_credentials_unavailable");
+          }
+          const cleanup = await Promise.allSettled(
+            resources.map(async (resource) => {
+              try {
+                const path =
+                  resource.kind === "helper"
+                    ? `/workers/scripts/${resource.scriptName}`
+                    : `/workers/scripts/${resource.scriptName}/tails/${resource.id}`;
+                await cleanupApi(path, { method: "DELETE", allowMissing: true });
+                assertCurrent();
+                resource.removal = "removed";
+              } catch (error) {
+                assertCurrent();
+                resource.removal = "failed";
+                throw error;
+              }
+            }),
+          );
+          assertCurrent();
+          if (cleanup.some((item) => item.status === "rejected")) addError("remote_cleanup_failed");
         });
       } catch (error) {
-        journal.cleanupErrors.push(
+        for (const resource of resources) if (resource.removal === "pending") resource.removal = "unknown";
+        addError(
           error instanceof CapacityError && error.code === "cleanup_deadline"
             ? "cleanup_deadline"
             : "remote_cleanup_failed",
         );
       }
     }
-    if (!(await processes.stopAll())) journal.cleanupErrors.push("process_stop_unverified");
-    if (journal.localProcesses.some((record) => record.escalated))
-      journal.cleanupWarnings.push("process_stop_escalated");
-    if (proxy) {
+    if (!(await processes.stopAll())) addError("process_stop_unverified");
+    if (journal.localProcesses.some((record) => record.escalated)) warn("process_stop_escalated");
+    if (proxyAttempted) {
       try {
-        await scoped("proxy_port_deadline", timing.force, async (signal) => {
-          journal.proxyPortReleased = await (dependencies.portReleased ?? portReleased)(proxyPort, { signal });
+        await scoped("proxy_port_deadline", timing.force, async (signal, assertCurrent) => {
+          const released = await (dependencies.portReleased ?? portReleased)(proxyPort, { signal });
+          assertCurrent();
+          journal.proxyPortReleased = released;
         });
       } catch {
         journal.proxyPortReleased = false;
       }
-      if (!journal.proxyPortReleased) journal.cleanupErrors.push("proxy_port_in_use_or_unknown");
+      if (!journal.proxyPortReleased) addError("proxy_port_in_use_or_unknown");
     }
-    if (journal.deploymentStarted && !journal.deploymentSettled)
-      journal.cleanupErrors.push("deployment_outcome_unknown");
-    if (journal.tailCreations.some((creation) => creation.state === "unknown"))
-      journal.cleanupErrors.push("tail_outcome_unknown");
+    if (helperResource.creation === "unknown") addError("deployment_outcome_unknown");
+    if (journal.resources.some((resource) => resource.kind === "tail" && resource.creation === "unknown"))
+      addError("tail_outcome_unknown");
     journal.cleanupCompleted =
-      (!journal.deploymentStarted || (journal.deploymentSettled && result.helperRemoved)) &&
-      journal.tailCreations.every((creation) => creation.state === "created" || creation.state === "planned") &&
-      journal.tails.every((tail) => tail.removed) &&
-      journal.cleanupErrors.length === 0;
+      journal.resources.every(
+        (resource) =>
+          resource.creation === "planned" || (resource.creation === "created" && resource.removal === "removed"),
+      ) && journal.cleanupErrors.length === 0;
+    result.helperRemoved = helperResource.removal === "removed";
     if (!journal.cleanupCompleted && result.exitStatus === 0) result.exitStatus = 1;
     journal.phase = "finished";
     result.outcome = reason ?? (journal.cleanupCompleted ? "success" : "cleanup_failed");
@@ -596,12 +680,11 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
       await persist();
       await save("results", result);
     } finally {
-      signals.off("SIGINT", interrupt);
-      signals.off("SIGTERM", terminate);
+      for (const [signal, handler] of signalHandlers) signals.off(signal, handler);
     }
   }
   if (preflightError) throw preflightError;
-  return result;
+  return structuredClone(result);
 }
 
 if (import.meta.main) {

@@ -17,6 +17,7 @@ function fake(mode = "graceful") {
     signals = [];
   const dependencies = {
     spawn: vi.fn(() => child),
+    initialProbe: 20,
     grace: 20,
     force: 20,
     now: () => time,
@@ -56,13 +57,17 @@ it("cannot certify a proxy that refuses both stop signals", async () => {
   expect(await f.manager.stopAll()).toBe(false);
   expect(f.records[0]).toMatchObject({ escalated: true, exitObserved: false, groupStopped: false, state: "unknown" });
 });
-it("continues group cleanup after the direct parent has already exited", async () => {
+it("does not signal an ambiguous group after the original leader exits", async () => {
   const f = fake();
-  await f.manager.start("proxy", "test", []);
+  const handle = await f.manager.start("proxy", "test", []);
+  f.child.unref = vi.fn();
   f.child.exitCode = 0;
   f.child.emit("exit", 0, null);
-  expect(await f.manager.stopAll()).toBe(true);
-  expect(f.signals).toHaveLength(1);
+  expect(await handle.finalized).toBe(false);
+  expect(f.child.unref).toHaveBeenCalledOnce();
+  expect(await f.manager.stopAll()).toBe(false);
+  expect(f.signals).toEqual([]);
+  expect(f.records[0].state).toBe("unknown");
 });
 it.each(["permission", "hanging"])(
   "fails closed for a %s group probe",
@@ -126,7 +131,7 @@ it("does not accept a listener owned by another process as released", async () =
 const supported = ["darwin", "linux"].includes(process.platform);
 it.runIf(supported)("captures credential output in memory while journaling identities only", async () => {
   const records = [];
-  const manager = createProcessManager(records, { grace: 100, force: 100 });
+  const manager = createProcessManager(records, { grace: 500, force: 500 });
   disposals.push(() => manager.stopAll());
   const controller = new AbortController();
   const output = await manager.run(
@@ -141,7 +146,7 @@ it.runIf(supported)("captures credential output in memory while journaling ident
 });
 it.runIf(supported)("aborts a hung credential child and verifies its group was stopped", async () => {
   const records = [];
-  const manager = createProcessManager(records, { grace: 100, force: 100 });
+  const manager = createProcessManager(records, { grace: 500, force: 500 });
   disposals.push(() => manager.stopAll());
   const controller = new AbortController();
   const pending = manager.run("credentials", process.execPath, ["-e", "setInterval(()=>{},1000)"], {
@@ -154,16 +159,17 @@ it.runIf(supported)("aborts a hung credential child and verifies its group was s
   expect(records[0]).toMatchObject({ exitObserved: true, groupStopped: true });
 });
 it.runIf(supported).each(Array.from({ length: 5 }, (_, i) => i + 1))(
-  "kills the remaining grandchild group after parent exit: repetition %s",
+  "stops descendants while the owned leader is live: repetition %s",
   async () => {
     const records = [];
-    const manager = createProcessManager(records, { grace: 100, force: 200 });
+    const manager = createProcessManager(records, { grace: 500, force: 500 });
     disposals.push(() => manager.stopAll());
-    const code = `const {spawn}=require('node:child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});c.once('spawn',()=>{console.log('ready');c.unref();});`;
+    const code = `const {spawn}=require('node:child_process');const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});c.once('spawn',()=>{console.log('ready');c.unref();});setInterval(()=>{},1000);`;
     const handle = await manager.start("proxy", process.execPath, ["-e", code], {
       stdio: ["ignore", "pipe", "ignore"],
     });
-    await bounded(handle.exited, 2000, "parent_deadline");
+    await bounded(once(handle.child.stdout, "data"), 2000, "parent_deadline");
+    expect(handle.record.exitObserved).toBe(false);
     expect(await groupStopped(handle.record.pgid)).toBe(false);
     expect(await manager.stopAll()).toBe(true);
     expect(await groupStopped(handle.record.pgid)).toBe(true);
@@ -190,7 +196,7 @@ it("waits for delayed exit evidence instead of treating a sent signal as complet
 });
 it.runIf(supported)("bounds credential output and stops the producer without journaling its data", async () => {
   const records = [];
-  const manager = createProcessManager(records, { grace: 100, force: 200 });
+  const manager = createProcessManager(records, { grace: 500, force: 500 });
   disposals.push(() => manager.stopAll());
   await expect(
     manager.run(
@@ -203,3 +209,111 @@ it.runIf(supported)("bounds credential output and stops the producer without jou
   expect(await manager.stopAll()).toBe(true);
   expect(records[0].state).toBe("stopped");
 });
+
+it("retires a successful command immediately and never probes a later reused group", async () => {
+  const f = fake();
+  const probe = vi.fn(async () => true);
+  const manager = createProcessManager(f.records, { ...f.dependencies, groupStopped: probe });
+  const running = manager.run("credentials", "test", [], { signal: new AbortController().signal });
+  f.child.exitCode = 0;
+  f.child.emit("exit", 0, null);
+  expect(await running).toBe("");
+  expect(f.records[0].state).toBe("stopped");
+  const count = probe.mock.calls.length;
+  probe.mockResolvedValue(false); // The OS may now reuse this number.
+  expect(await manager.stopAll()).toBe(true);
+  expect(probe).toHaveBeenCalledTimes(count);
+  expect(f.signals).toEqual([]);
+});
+it("finalizes on exit independently of stdout and decodes split UTF-8 once", async () => {
+  const { PassThrough } = await import("node:stream");
+  const f = fake();
+  f.child.stdout = new PassThrough();
+  const manager = createProcessManager(f.records, { ...f.dependencies, groupStopped: async () => true });
+  const pending = manager.run("credentials", "test", [], { signal: new AbortController().signal, capture: true });
+  f.child.stdout.write(Buffer.from([0xe2]));
+  f.child.stdout.write(Buffer.from([0x82, 0xac]));
+  f.child.exitCode = 0;
+  f.child.emit("exit", 0, null);
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  expect(f.records[0].state).toBe("stopped");
+  f.child.stdout.end();
+  expect(await pending).toBe("€");
+});
+it("gives SIGTERM a full allowance after a slow initial probe", async () => {
+  const f = fake();
+  let time = 0,
+    first = true,
+    living = true,
+    sentAt;
+  const sent = [];
+  const manager = createProcessManager(f.records, {
+    ...f.dependencies,
+    grace: 100,
+    now: () => time,
+    groupStopped: async () => {
+      if (first) {
+        first = false;
+        time += 100;
+      }
+      return !living;
+    },
+    signalGroup: (_pgid, signal) => {
+      sent.push(signal);
+      sentAt = time;
+    },
+    delay: async (ms) => {
+      time += ms;
+      if (time - sentAt >= 50) {
+        living = false;
+        f.child.emit("exit", null, "SIGTERM");
+      }
+    },
+  });
+  await manager.start("proxy", "test", []);
+  expect(await manager.stopAll()).toBe(true);
+  expect(sent).toEqual(["SIGTERM"]);
+  expect(time).toBeGreaterThanOrEqual(150);
+});
+it.each([0, -1, null, 1.5])("never signals invalid identity %s", async (pid) => {
+  const f = fake();
+  f.child.pid = pid;
+  await f.manager.start("proxy", "test", []);
+  expect(await f.manager.stopAll()).toBe(false);
+  expect(f.signals).toEqual([]);
+});
+it("preserves spawn failure diagnostics", async () => {
+  const f = fake();
+  delete f.child.pid;
+  const started = f.manager.start("proxy", "missing", []);
+  f.child.emit("error", Error("missing"));
+  await started;
+  expect(await f.manager.stopAll()).toBe(true);
+  expect(f.records[0].state).toBe("spawn_failed");
+});
+it("stops a registered child if persistence rejects and preserves the original error", async () => {
+  const f = fake();
+  const manager = createProcessManager(f.records, {
+    ...f.dependencies,
+    persist: async () => {
+      throw Error("journal unavailable");
+    },
+  });
+  await expect(manager.start("proxy", "test", [])).rejects.toThrow("journal unavailable");
+  expect(await manager.stopAll()).toBe(true);
+});
+
+it("rejects uncertain command completion without waiting for a descendant-held stdout pipe", async () => {
+  const { PassThrough } = await import("node:stream");
+  const f = fake();
+  f.child.stdout = new PassThrough();
+  f.child.unref = vi.fn();
+  disposals.push(() => f.manager.stopAll());
+  const pending = f.manager.run("credentials", "test", [], { signal: new AbortController().signal, capture: true });
+  f.child.exitCode = 0;
+  f.child.emit("exit", 0, null);
+  await expect(pending).rejects.toThrow("process_stop_unverified");
+  expect(f.child.stdout.destroyed).toBe(true);
+  expect(f.child.unref).toHaveBeenCalledOnce();
+  expect(f.signals).toEqual([]);
+}, 3000);
