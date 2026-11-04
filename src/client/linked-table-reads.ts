@@ -5,17 +5,14 @@ export type { TableCoverage } from "../shared/table-coverage";
 export type LinkedTableContinuation = { queryIdentity: string; generation: number; target: number };
 export type LinkedTableReadIntent = { kind: "refresh" } | ({ kind: "append" } & LinkedTableContinuation);
 export type CanonicalTableContinuation = {
-  cursor: string;
+  kind: "page";
   queryIdentity: string;
   generation: number;
   revision: number;
   prefix: number;
-  target?: number;
+  target: number;
 };
-export type TableReadIntent =
-  | LinkedTableReadIntent
-  | { kind: "verify" }
-  | ({ kind: "page" } & CanonicalTableContinuation);
+export type TableReadIntent = LinkedTableReadIntent | { kind: "verify" } | CanonicalTableContinuation;
 export type TableReadContext = {
   acceptsGeneration: (coverage: TableCoverage) => boolean;
   networkRequired: boolean;
@@ -51,7 +48,7 @@ const intentKey = (intent: TableReadIntent) =>
   !isContinuation(intent)
     ? intent.kind
     : intent.kind === "page"
-      ? JSON.stringify(["page", intent.queryIdentity, intent.generation, intent.target ?? intent.cursor])
+      ? JSON.stringify(["page", intent.queryIdentity, intent.generation, intent.target])
       : JSON.stringify([intent.queryIdentity, intent.generation, intent.target]);
 const freshBatch = <T>(intent: TableReadIntent = { kind: "refresh" }): Batch<T> => ({
   intent,
@@ -221,23 +218,9 @@ export function linkedTableReads<T>(options: {
   function scheduleDenied(batch?: Batch<T>) {
     retireAppends();
     const recovery = batch && !isContinuation(batch.intent) ? batch : freshBatch<T>();
-    if (!batch || isContinuation(batch.intent)) {
-      // Keep verification history while leaving unrelated continuation history behind.
-      const pending = queued.get("verify");
-      if (pending) {
-        recovery.waiters.push(...pending.waiters.splice(0));
-        recovery.attempt = Math.max(recovery.attempt, pending.attempt);
-        recovery.retryAt = Math.max(recovery.retryAt, pending.retryAt);
-        queued.delete("verify");
-      }
-    }
     requireVerification(true, recovery);
     const trailing = queued.get("refresh");
-    recovery.attempt = Math.max(
-      denialAttempt,
-      !isContinuation(recovery.intent) ? recovery.attempt : 0,
-      trailing?.attempt ?? 0,
-    );
+    recovery.attempt = Math.max(denialAttempt, recovery.attempt, trailing?.attempt ?? 0);
     recovery.intent = { kind: "refresh" };
     recovery.manual = false;
     if (trailing) trailing.manual = false;
@@ -278,7 +261,8 @@ export function linkedTableReads<T>(options: {
     if (active !== owner || stopped) return;
     active = undefined;
     const scopeRetired = scope !== options.scope?.();
-    if (scopeRetired && outcome.state === "success") outcome = { state: "superseded" };
+    if (scopeRetired && (outcome.state === "success" || outcome.state === "suspended"))
+      outcome = { state: "superseded" };
     const coverage = outcome.state === "success" ? readTableCoverage(options.coverage?.(outcome.value)) : undefined;
     if (outcome.state === "success" && outcome.verification === "network") {
       batch.failures = 0;
@@ -343,6 +327,8 @@ export function linkedTableReads<T>(options: {
       }
     } else if (outcome.state === "suspended") {
       options.unavailable("suspended");
+      if (isContinuation(batch.intent)) batch.networkRequired = true;
+      requireVerification();
       enqueueRetry(batch);
     } else if (outcome.state === "superseded") {
       if (
@@ -440,13 +426,20 @@ export function linkedTableReads<T>(options: {
     const result = await receipt;
     return result.state === "complete" ? result.value : null;
   };
+  const requestVerification = () => {
+    // A heartbeat cannot downgrade full-query debt or a queued deliberate refresh.
+    if (verification?.fullQuery || freshnessPending() || queued.has("refresh"))
+      return requestIntent({ kind: "refresh" }, false, true);
+    requireVerification();
+    return requestIntent({ kind: "verify" }, false, true);
+  };
   const wake = () => {
     if (!available()) {
       clear();
       options.unavailable("suspended");
       return;
     }
-    void requestIntent({ kind: "refresh" }, false, true);
+    void requestVerification();
   };
   const poll =
     options.poll === false
@@ -454,7 +447,7 @@ export function linkedTableReads<T>(options: {
       : setInterval(() => {
           if (!available() || active) return;
           if (queued.size) next();
-          else void requestIntent({ kind: "refresh" }, false);
+          else void requestVerification();
         }, 15000);
   const reset = (preserveActive = false) => {
     clear();
@@ -483,10 +476,10 @@ export function linkedTableReads<T>(options: {
   return {
     request: (continuation?: LinkedTableContinuation) =>
       valueOf(requestIntent(continuation ? { kind: "append", ...continuation } : { kind: "refresh" })),
-    page: (continuation: CanonicalTableContinuation) => valueOf(requestIntent({ kind: "page", ...continuation })),
+    page: (continuation: CanonicalTableContinuation) => valueOf(requestIntent(continuation)),
     retirePages: (keep?: (intent: CanonicalTableContinuation) => boolean) =>
       retireQueued((intent) => intent.kind === "page" && !keep?.(intent)),
-    verifyReceipt: () => requestIntent({ kind: "refresh" }, false, true),
+    verifyReceipt: requestVerification,
     subscribe: (observer: (receipt: TableReadReceipt<T>) => void) => {
       observers.add(observer);
       if (

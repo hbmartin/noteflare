@@ -13,11 +13,35 @@ export type TableReadWindow = {
   continuation: LinkedTableContinuation | null;
 };
 export type LinkedTableReadResult = { window: TableReadWindow; verification: "network" | "buffer" };
-export class CursorChanged extends Error {
+class CursorChanged extends Error {
   constructor() {
     super("The table changed during pagination.");
   }
 }
+export const isTableReadConflict = (error: unknown) =>
+  error instanceof CursorChanged ||
+  (error instanceof ApiClientError && ["table_cursor_stale", "table_revision_conflict"].includes(error.code));
+// Record requires every coverage key, including optional metadata, when the protocol grows.
+const coverageFields: Record<keyof TableQueryCoverage, true> = {
+  protocolVersion: true,
+  taskList: true,
+  canEdit: true,
+  pageId: true,
+  generation: true,
+  revision: true,
+  projectedRevision: true,
+  columns: true,
+  views: true,
+  view: true,
+  invalidView: true,
+  people: true,
+};
+const coverageMetadata = (probe: TableQueryCoverage) =>
+  Object.fromEntries(
+    (Object.keys(coverageFields) as Array<keyof TableQueryCoverage>)
+      .filter((key) => key in probe)
+      .map((key) => [key, probe[key]]),
+  );
 const mergeRows = (left: TableQueryResult["rows"], right: TableQueryResult["rows"]) => [
   ...new Map([...left, ...right].map((row) => [row.id, row])).values(),
 ];
@@ -74,24 +98,7 @@ export async function readLinkedTable(
             ...reusable,
             data: {
               ...reusable.data,
-              ...Object.fromEntries(
-                [
-                  "protocolVersion",
-                  "taskList",
-                  "canEdit",
-                  "pageId",
-                  "generation",
-                  "revision",
-                  "projectedRevision",
-                  "columns",
-                  "views",
-                  "view",
-                  "invalidView",
-                  "people",
-                ]
-                  .filter((key) => key in probe)
-                  .map((key) => [key, probe[key as keyof TableQueryCoverage]]),
-              ),
+              ...coverageMetadata(probe),
             },
             verified: true,
           };
@@ -142,15 +149,7 @@ export async function readLinkedTable(
         verification: network ? "network" : "buffer",
       };
     } catch (error) {
-      if (
-        signal?.aborted ||
-        attempt ||
-        !(
-          error instanceof CursorChanged ||
-          (error instanceof ApiClientError && ["table_cursor_stale", "table_revision_conflict"].includes(error.code))
-        )
-      )
-        throw error;
+      if (signal?.aborted || attempt || !isTableReadConflict(error)) throw error;
     }
   }
 }

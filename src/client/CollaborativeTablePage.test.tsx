@@ -1494,11 +1494,11 @@ it("does not let superseded socket verification authorize a still-pending view q
   let releaseOld!: (value: TableQueryResult) => void, releaseNew!: (value: TableQueryResult) => void;
   let count = 0;
   vi.mocked(api).mockImplementation((path, init) => {
-    if (path.startsWith("/api/tables/table/query") && ++count === 1)
+    if (path.startsWith("/api/tables/table/coverage") && ++count === 1)
       return new Promise((resolve) => {
         releaseOld = resolve;
       });
-    if (count === 2)
+    if (path.startsWith("/api/tables/table/query") && ++count === 2)
       return new Promise((resolve) => {
         releaseNew = resolve;
       });

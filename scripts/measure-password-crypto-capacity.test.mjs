@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { once } from "node:events";
+import { once, EventEmitter } from "node:events";
 import { afterEach, expect, it, vi } from "vitest";
 import { cloudflare } from "./deploy.mjs";
 import {
@@ -14,8 +14,15 @@ import {
 import { capacityHarness } from "./__fixtures__/password-capacity-driver.mjs";
 const directories = [];
 afterEach(async () => {
-  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+  try {
+    await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  }
 });
+const signalStatus = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129, SIGQUIT: 131 };
 async function fixture(options) {
   const directory = await mkdtemp(resolve(tmpdir(), "capacity-test-"));
   directories.push(directory);
@@ -53,7 +60,14 @@ it("accepts matching explicit accounts, records safe resources, and cleans a smo
   expect(journal).not.toContain("signed-synthetic-url");
   expect(journal).not.toContain(f.token);
   expect(JSON.stringify(result)).not.toContain(f.token);
-  expect(JSON.parse(journal)).toMatchObject({ helperState: "removed", tails: [{ removed: true }, { removed: true }] });
+  expect(JSON.parse(journal)).toMatchObject({
+    version: 2,
+    resources: [
+      { kind: "helper", removal: "removed" },
+      { kind: "tail", removal: "removed" },
+      { kind: "tail", removal: "removed" },
+    ],
+  });
   expect((await stat(`${result.directory}/resource.json`)).mode & 0o777).toBe(0o600);
   expect(f.signals.listenerCount("SIGTERM")).toBe(0);
 });
@@ -129,7 +143,10 @@ it("continues all cleanup attempts after a deletion fails and records the residu
   expect(result.helperRemoved).toBe(true);
   expect(result.cleanupCompleted).toBe(false);
   expect(f.calls.filter((call) => call.method === "DELETE")).toHaveLength(3);
-  expect(journal.tails.map((tail) => tail.removed)).toEqual([false, true]);
+  expect(journal.resources.filter((r) => r.kind === "tail").map((tail) => tail.removal === "removed")).toEqual([
+    false,
+    true,
+  ]);
   expect(JSON.stringify(journal)).not.toContain("private-api-details");
 });
 it("bounds a cleanup request that never settles", async () => {
@@ -142,21 +159,24 @@ it("bounds a cleanup request that never settles", async () => {
     "cleanup_deadline",
   );
 });
-it.each(["SIGINT", "SIGTERM"])("waits for in-progress deployment on %s before reconciling deletion", async (signal) => {
-  let f;
-  f = await fixture({
-    onDeploy: async () => {
-      f.signals.emit(signal);
-      f.signals.emit(signal);
-      await Promise.resolve();
-    },
-  });
-  const result = await execute(f);
-  expect(result.exitStatus).toBe(signal === "SIGINT" ? 130 : 143);
-  expect(result.cleanupCompleted).toBe(true);
-  expect(f.operations).toEqual([]);
-  expect(f.calls.filter((call) => call.method === "DELETE")).toHaveLength(1);
-});
+it.each(Object.keys(signalStatus))(
+  "waits for in-progress deployment on %s before reconciling deletion",
+  async (signal) => {
+    let f;
+    f = await fixture({
+      onDeploy: async () => {
+        f.signals.emit(signal);
+        f.signals.emit(signal);
+        await Promise.resolve();
+      },
+    });
+    const result = await execute(f);
+    expect(result.exitStatus).toBe(signalStatus[signal]);
+    expect(result.cleanupCompleted).toBe(true);
+    expect(f.operations).toEqual([]);
+    expect(f.calls.filter((call) => call.method === "DELETE")).toHaveLength(1);
+  },
+);
 it.each(["helper", "tail", "proxy"])("stops before launching a planned %s after a signal", async (resource) => {
   const f = await fixture();
   let proxies = 0;
@@ -184,7 +204,7 @@ it("isolates generated files across concurrent runs", async () => {
 });
 it
   .runIf(["darwin", "linux"].includes(process.platform))
-  .each(["SIGINT", "SIGTERM"].flatMap((signal) => ["deploy", "load"].map((phase) => ({ signal, phase }))))(
+  .each(Object.keys(signalStatus).flatMap((signal) => ["deploy", "load"].map((phase) => ({ signal, phase }))))(
   "cleans up after OS $signal during $phase",
   async ({ signal, phase }) => {
     const f = await fixture();
@@ -214,7 +234,7 @@ it
         done(status);
       });
     });
-    expect(code).toBe(signal === "SIGINT" ? 130 : 143);
+    expect(code).toBe(signalStatus[signal]);
     const output = JSON.parse(stdout.trim().split("\n").at(-1));
     const result = JSON.parse(await readFile(`${output.directory}/results.json`, "utf8"));
     expect(result.cleanupCompleted).toBe(true);
@@ -397,6 +417,7 @@ it("uses one abortable tail budget across OAuth renewal and fresh cleanup creden
     renewalSignal,
     postSignal;
   const deleted = [];
+  vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", CAPACITY_TARGET.account);
   f.deps.connect = cloudflare;
   f.deps.readCredentials = async ({ signal }) => {
     reads++;
@@ -465,7 +486,7 @@ it.runIf(["darwin", "linux"].includes(process.platform)).each(Array.from({ lengt
       runDirectory = "";
     const deadline = setTimeout(() => {
       try {
-        process.kill(-driverPid, "SIGKILL");
+        if (child.exitCode === null && !child.signalCode) child.kill("SIGKILL");
       } catch {}
     }, 5000);
     try {
@@ -486,31 +507,25 @@ it.runIf(["darwin", "linux"].includes(process.platform)).each(Array.from({ lengt
       expect(signaled).toBe(true);
       expect(code).toBe(130);
       const journal = JSON.parse(await readFile(`${runDirectory}/resource.json`, "utf8"));
-      expect(journal).toMatchObject({ deploymentSettled: true, helperState: "removed", cleanupCompleted: true });
+      expect(journal).toMatchObject({
+        resources: [{ kind: "helper", creation: "created", removal: "removed" }],
+        cleanupCompleted: true,
+      });
       expect(journal.localProcesses).toMatchObject([
         { role: "deployment", exitObserved: true, groupStopped: true, state: "stopped" },
       ]);
       expect(journal.localProcesses[0].pgid).not.toBe(child.pid);
     } finally {
       clearTimeout(deadline);
-      try {
-        process.kill(-driverPid, "SIGKILL");
-      } catch {}
-      if (runDirectory) {
-        const journal = JSON.parse(await readFile(`${runDirectory}/resource.json`, "utf8"));
-        for (const record of journal.localProcesses)
-          if (record.role === "deployment") {
-            try {
-              process.kill(-record.pgid, "SIGKILL");
-            } catch {}
-          }
-      }
+      // Never target IDs recovered from a journal, or an already-exited child.
+      if (child.exitCode === null && !child.signalCode) child.kill("SIGKILL");
     }
   },
   7000,
 );
 it("cancels read-only credential preflight on SIGINT without remote provisioning", async () => {
   const f = await fixture();
+  vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", CAPACITY_TARGET.account);
   f.deps.connect = cloudflare;
   f.deps.readCredentials = async () => {
     f.signals.emit("SIGINT");
@@ -537,8 +552,8 @@ it("bounds cleanup credential renewal with its own fresh budget", async () => {
   };
   const result = await execute(f);
   const journal = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
-  expect(result).toMatchObject({ exitStatus: 1, cleanupCompleted: false, helperRemoved: false });
-  expect(journal.cleanupErrors).toContain("cleanup_deadline");
+  expect(result).toMatchObject({ exitStatus: 0, cleanupCompleted: true, helperRemoved: true });
+  expect(journal.cleanupWarnings).toContain("fresh_credentials_unavailable");
   expect(connects).toBe(2);
 });
 it("starts cleanup exactly at the tail operation deadline, without resetting its budget", async () => {
@@ -567,16 +582,206 @@ it("starts cleanup exactly at the tail operation deadline, without resetting its
       cleanupCompleted: false,
     });
   } finally {
-    await vi.runAllTimersAsync();
-    await pending;
-    vi.useRealTimers();
+    try {
+      await vi.runAllTimersAsync();
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
   }
 });
-it("stops owned local processes before remote deletion and verifies cleanup children afterward", async () => {
+it("stops provisioning before deletion and verifies a cleanup-created credential child afterward", async () => {
   let f;
-  const signals = [];
-  f = await fixture({ cleanup: () => signals.push(f.proxy.signalCode) });
+  const stoppedBeforeDeletion = [];
+  f = await fixture({ cleanup: () => stoppedBeforeDeletion.push(f.proxy.signalCode) });
+  const credential = new EventEmitter();
+  Object.assign(credential, { pid: 421338, exitCode: null, signalCode: null });
+  const connect = f.deps.connect;
+  let connects = 0;
+  f.deps.processes.spawn = (executable) => (executable === "cleanup-credentials" ? credential : f.proxy);
+  f.deps.processes.groupStopped = async (id) => Boolean((id === credential.pid ? credential : f.proxy).signalCode);
+  f.deps.processes.signalGroup = (id, signal) => {
+    const child = id === credential.pid ? credential : f.proxy;
+    child.signalCode = signal;
+    queueMicrotask(() => child.emit("exit", null, signal));
+  };
+  f.deps.readCredentials = async ({ processes }) => {
+    await processes.start("credentials", "cleanup-credentials", []);
+    return { type: "oauth", token: "synthetic-unused-token" };
+  };
+  f.deps.connect = async (...args) => {
+    if (++connects === 2) await args[1].readCredentials();
+    return connect(...args);
+  };
   const result = await execute(f);
   expect(result).toMatchObject({ exitStatus: 0, cleanupCompleted: true, helperRemoved: true });
-  expect(signals).toEqual(["SIGTERM", "SIGTERM", "SIGTERM"]);
+  expect(stoppedBeforeDeletion).toEqual(["SIGTERM", "SIGTERM", "SIGTERM"]);
+  const journal = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(journal.localProcesses).toMatchObject([
+    { role: "proxy", state: "stopped" },
+    { role: "credentials", exitObserved: true, groupStopped: true, state: "stopped" },
+  ]);
+});
+
+it("persists creation uncertainty before starting each remote mutation", async () => {
+  let directory;
+  const snapshots = [];
+  const capture = async () => {
+    snapshots.push(JSON.parse(await readFile(`${directory}/resource.json`, "utf8")));
+  };
+  const f = await fixture({ onDeploy: capture, onTail: capture });
+  f.deps.notify = (event) => {
+    if (event.event === "capacity.started") directory = event.directory;
+  };
+  const result = await execute(f);
+  expect(result.cleanupCompleted).toBe(true);
+  expect(snapshots).toHaveLength(3);
+  expect(snapshots[0].resources[0].creation).toBe("creating");
+  expect(snapshots[1].resources[1].creation).toBe("creating");
+  expect(snapshots[2].resources[2].creation).toBe("creating");
+});
+it("checks the proxy port when startup throws after registering the child", async () => {
+  const f = await fixture();
+  f.deps.startProxy = async ({ processes }) => {
+    await processes.start("proxy", "test", []);
+    throw Error("synthetic journal failure");
+  };
+  f.deps.portReleased = vi.fn(async () => false);
+  const result = await execute(f);
+  expect(f.deps.portReleased).toHaveBeenCalledOnce();
+  expect(result).toMatchObject({ cleanupCompleted: false, exitStatus: 1 });
+});
+it.each(["reject", "timeout"])("falls back to existing credentials after fresh lookup %s", async (mode) => {
+  const f = await fixture();
+  const connect = f.deps.connect;
+  let calls = 0;
+  f.deps.connect = async (...args) => {
+    if (++calls === 2) {
+      if (mode === "reject") throw Error("synthetic-private-error");
+      return new Promise(() => {});
+    }
+    return connect(...args);
+  };
+  const result = await execute(f);
+  expect(result).toMatchObject({ cleanupCompleted: true, helperRemoved: true, exitStatus: 0 });
+  expect(f.calls.filter((call) => call.method === "DELETE")).toHaveLength(3);
+  expect(JSON.stringify(result)).not.toContain("synthetic-private-error");
+});
+it("fences cleanup responses arriving after finalization", async () => {
+  let release;
+  const held = new Promise((done) => {
+    release = done;
+  });
+  const f = await fixture({ cleanup: () => held });
+  f.deps.limits.cleanup = 10;
+  const result = await execute(f);
+  const saved = await readFile(`${result.directory}/resource.json`, "utf8");
+  const snapshot = structuredClone(result);
+  release();
+  for (let i = 0; i < 40; i++) await Promise.resolve();
+  expect(result).toEqual(snapshot);
+  expect(await readFile(`${result.directory}/resource.json`, "utf8")).toBe(saved);
+  expect(JSON.parse(saved).resources.every((r) => r.removal === "unknown")).toBe(true);
+  expect(JSON.parse(saved).cleanupErrors).toEqual(["cleanup_deadline"]);
+});
+it.each([
+  { response: new Response("not JSON", { status: 503 }), code: "proxy_http_error" },
+  { response: new Response("not JSON"), code: "invalid_proxy_json" },
+])("classifies an HTTP/JSON failure as $code", async ({ response, code }) => {
+  const f = await fixture();
+  const request = f.deps.request;
+  f.deps.request = (url, options) => (new URL(url).pathname === "/health" ? request(url, options) : response.clone());
+  const result = await execute(f);
+  expect(result.outcome).toBe(code);
+  expect(result.exitStatus).toBe(1);
+});
+it("accepts a pre-RPC service failure without success-only shard metadata", async () => {
+  const f = await fixture({
+    response: {
+      runToken: "synthetic-local-proof-never-persist",
+      result: { ok: false, attempts: 0, code: "unavailable" },
+    },
+  });
+  const result = await execute(f);
+  expect(result.outcome).toBe("operation_failed");
+  expect(result.warmups[0]).toMatchObject({ ok: false, code: "unavailable", attempts: 0 });
+});
+it("retains late telemetry after a failed sample", async () => {
+  const f = await fixture({
+    response: { runToken: "synthetic-local-proof-never-persist", result: { ok: false, attempts: 1, shard: 0 } },
+  });
+  f.deps.limits.drain = 10;
+  f.deps.delay = vi.fn(async () => {
+    f.sockets[1].emit("message", JSON.stringify({ entrypoint: "default", cpuTime: 5, logs: [] }));
+  });
+  const result = await execute(f);
+  expect(f.deps.delay).toHaveBeenCalledOnce();
+  expect(result.invocations).toHaveLength(1);
+  expect(result.exitStatus).toBe(1);
+});
+it("cancels the native telemetry wait on a signal and leaves no timer behind", async () => {
+  const { setTimeout: delay } = await import("node:timers/promises");
+  const f = await fixture();
+  let entered;
+  const waiting = new Promise((done) => {
+    entered = done;
+  });
+  let signal;
+  f.deps.limits.drain = 10000;
+  f.deps.delay = (...args) => {
+    signal = args[2].signal;
+    entered();
+    return delay(...args);
+  };
+  const pending = execute(f);
+  await waiting;
+  f.signals.emit("SIGHUP");
+  const result = await pending;
+  expect(result.exitStatus).toBe(129);
+  expect(signal.aborted).toBe(true);
+});
+it("records safe bundle/filesystem diagnostics without exception text", async () => {
+  const f = await fixture();
+  f.deps.bundle = () => {
+    throw Object.assign(Error("private-credential-value"), { code: "EACCES" });
+  };
+  const result = await execute(f);
+  expect(result.failure).toEqual({ stage: "bundle", category: "driver_failed", code: "EACCES" });
+  expect(JSON.stringify(result)).not.toContain("private-credential-value");
+});
+
+it("keeps timed-out deletion state unknown while final port verification is held", async () => {
+  let releaseDeletes, enteredPort, releasePort;
+  const deletes = new Promise((done) => {
+    releaseDeletes = done;
+  });
+  const entered = new Promise((done) => {
+    enteredPort = done;
+  });
+  const port = new Promise((done) => {
+    releasePort = done;
+  });
+  const f = await fixture({ cleanup: () => deletes });
+  f.deps.limits.cleanup = 10;
+  f.deps.portReleased = async () => {
+    enteredPort();
+    await port;
+    return true;
+  };
+  const pending = execute(f);
+  try {
+    await entered;
+    releaseDeletes();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    releasePort();
+    const result = await pending;
+    expect(result.helperRemoved).toBe(false);
+    const journal = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+    expect(journal.resources.map((r) => r.removal)).toEqual(["unknown", "unknown", "unknown"]);
+    expect(journal.cleanupErrors).toEqual(["cleanup_deadline"]);
+  } finally {
+    releaseDeletes();
+    releasePort();
+    await pending;
+  }
 });

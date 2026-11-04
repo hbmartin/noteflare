@@ -320,7 +320,7 @@ it("verifies on foreground independently of an append deadline without replaying
   hidden = false;
   document.dispatchEvent(new Event("visibilitychange"));
   await vi.advanceTimersByTimeAsync(0);
-  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["append", "refresh"]);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["append", "verify"]);
   await vi.advanceTimersByTimeAsync(899);
   expect(read).toHaveBeenCalledTimes(2);
   await vi.advanceTimersByTimeAsync(1);
@@ -608,7 +608,7 @@ it.each(["buffer", "network"] as const)(
       generation: 1,
       revision: 1,
       prefix: 1,
-      cursor: "next",
+      kind: "page",
       target: 300,
     });
     void controller.refresh({ generation: 1, revision: 2 });
@@ -640,7 +640,7 @@ it("keeps append failures out of the first denial recovery deadline", async () =
   });
   const controller = linkedTableReads({ read, poll: false, coverage: (value) => value!, unavailable: vi.fn() });
   controllers.push(controller);
-  void controller.page({ queryIdentity: "query", generation: 1, revision: 1, prefix: 1, cursor: "next", target: 300 });
+  void controller.page({ queryIdentity: "query", generation: 1, revision: 1, prefix: 1, kind: "page", target: 300 });
   await flushReads();
   for (const delay of [1000, 2000, 4000, 8000, 15000]) await vi.advanceTimersByTimeAsync(delay);
   void controller.refresh({ generation: 1, revision: 2 });
@@ -690,7 +690,7 @@ it("runs prerequisite verification before a dependent continuation at the recove
     generation: 1,
     revision: 1,
     prefix: 1,
-    cursor: "next",
+    kind: "page",
     target: 300,
   });
   void controller.refresh({ generation: 1, revision: 2 });
@@ -719,7 +719,7 @@ it("reports exhausted cursor churn as pending and resumes its extent after netwo
       generation: 1,
       revision: 1,
       prefix: 1,
-      cursor: "next",
+      kind: "page",
       target: 300,
     }),
   ).toBeNull();
@@ -1291,8 +1291,8 @@ it("preserves 600 visible rows when stale verification joins an automatic refres
   let scope = 0,
     release!: (outcome: { state: "stale" }) => void;
   let window: TableReadWindow | null = null;
-  const rows = Array.from({ length: 1000 }, (_, i) => ({ id: String(i) }));
-  const readPage = async (cursor?: string, limit = 100) => {
+  let rows = Array.from({ length: 1000 }, (_, i) => ({ id: String(i) }));
+  const readPage = vi.fn(async (cursor?: string, limit = 100) => {
     const start = Number(cursor ?? 0),
       end = start + limit;
     return {
@@ -1300,7 +1300,7 @@ it("preserves 600 visible rows when stale verification joins an automatic refres
       rows: rows.slice(start, end),
       nextCursor: end < rows.length ? String(end) : null,
     } as TableQueryResult;
-  };
+  });
   const c = linkedTableReads({
     poll: false,
     scope: () => scope,
@@ -1333,9 +1333,18 @@ it("preserves 600 visible rows when stale verification joins an automatic refres
   scope++;
   void c.refresh(value);
   const recovery = c.refresh(undefined, { fresh: true });
+  const before = readPage.mock.calls.length;
+  value.revision = 2;
+  rows = rows.map((_, i) => ({ id: `updated-${i}` }));
   release({ state: "stale" });
-  await recovery;
-  expect(visible()).toEqual(Array.from({ length: 600 }, (_, i) => String(i)));
+  expect(await recovery).toMatchObject({ state: "complete", value: { revision: 2 } });
+  expect(readPage.mock.calls.slice(before)).toEqual([
+    [undefined, 500],
+    ["500", 500],
+  ]);
+  expect(visible()).toEqual(Array.from({ length: 600 }, (_, i) => `updated-${i}`));
+  expect(window!.data.revision).toBe(2);
+  expect(window!.verified).toBe(true);
 });
 
 it("settles queued verification before notifying continuation success", async () => {
@@ -1411,4 +1420,145 @@ it("retains an idle independent verification deadline when denial recovery takes
   expect(read).toHaveBeenCalledTimes(3);
   await vi.advanceTimersByTimeAsync(1);
   expect(read.mock.calls.at(-1)![0]).toEqual({ kind: "refresh" });
+});
+
+function windowFixture(size = 2000) {
+  const rows = Array.from({ length: 3000 }, (_, i) => ({
+    id: String(i),
+    position: i,
+    cells: {},
+    cellRevisions: {},
+    detailPageId: null,
+    createdAt: 1,
+    createdBy: "user",
+    editedAt: 1,
+    editedBy: "user",
+  }));
+  let window: TableReadWindow = {
+    data: { generation: 1, revision: 1, rows: rows.slice(0, size), people: [] } as unknown as TableQueryResult,
+    buffered: [],
+    serverCursor: String(size),
+    pageSize: 500,
+    queryIdentity: "query",
+    verified: true,
+    hasMore: true,
+    continuation: continuation(size + 100),
+  };
+  const page = vi.fn(async (cursor?: string, limit = 100) => ({
+    ...window.data,
+    rows: rows.slice(Number(cursor ?? 0), Number(cursor ?? 0) + limit),
+    nextCursor: Number(cursor ?? 0) + limit < rows.length ? String(Number(cursor ?? 0) + limit) : null,
+  }));
+  const proof = vi.fn(async () => ({
+    ...window.data,
+    rows: undefined,
+    people: [{ id: "updated", name: "Current", active: true }],
+  }));
+  const read = async (intent: TableReadIntent, signal: AbortSignal, context: TableReadContext) => {
+    const result = await readLinkedTable(
+      intent.kind === "append" || intent.kind === "refresh" ? intent : { kind: "refresh" },
+      window,
+      page,
+      signal,
+      "query",
+      {
+        verify: intent.kind === "verify",
+        networkRequired: context.networkRequired,
+        refresh: context.preserveExtent ? "visible" : "first-page",
+        verifyCoverage: proof,
+      },
+    );
+    window = result.window;
+    return { state: "success" as const, value: window.data, verification: result.verification };
+  };
+  return { page, proof, read, get: () => window };
+}
+it("uses one metadata proof for unchanged 2000-row heartbeats, polling and foreground checks", async () => {
+  vi.useFakeTimers();
+  const f = windowFixture();
+  const c = linkedTableReads({ read: f.read, unavailable: vi.fn(), coverage: (v) => v });
+  controllers.push(c);
+  await c.verifyReceipt();
+  expect(f.proof).toHaveBeenCalledOnce();
+  expect(f.page).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(f.proof).toHaveBeenCalledTimes(2);
+  document.dispatchEvent(new Event("visibilitychange"));
+  await flushReads();
+  expect(f.proof).toHaveBeenCalledTimes(3);
+  expect(f.page).not.toHaveBeenCalled();
+  expect(f.get().data.rows.map((r) => r.id)).toEqual(Array.from({ length: 2000 }, (_, i) => String(i)));
+  expect(f.get().data.people?.[0]?.id).toBe("updated");
+  expect(f.get().verified).toBe(true);
+  await c.refresh(undefined, { fresh: true });
+  expect(f.page).toHaveBeenCalledTimes(4);
+  expect(f.proof).toHaveBeenCalledTimes(3);
+});
+it.each(["hidden", "offline"].flatMap((mode) => [1, 2, 3, 4, 5].map((repetition) => ({ mode, repetition }))))(
+  "retries a suspended continuation target after $mode completion: repetition $repetition",
+  async ({ mode }) => {
+    let hidden = false,
+      online = true,
+      release!: () => void;
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    vi.spyOn(navigator, "onLine", "get").mockImplementation(() => online);
+    const gate = new Promise<void>((done) => {
+      release = done;
+    });
+    const f = windowFixture(600);
+    const intents: string[] = [];
+    let held = false;
+    const c = linkedTableReads({
+      poll: false,
+      coverage: (v: TableQueryResult) => v,
+      unavailable: vi.fn(),
+      read: async (intent, signal, context) => {
+        intents.push(intent.kind);
+        if (intent.kind === "append" && !held) {
+          held = true;
+          await gate;
+          if (hidden || !online) return { state: "suspended" };
+        }
+        return f.read(intent, signal, context);
+      },
+    });
+    controllers.push(c);
+    const pending = c.request(continuation(700));
+    if (mode === "hidden") hidden = true;
+    else online = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+    release();
+    expect(await pending).toBeNull();
+    expect(f.get().data.rows).toHaveLength(600);
+    hidden = false;
+    online = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await flushReads();
+    expect(intents).toEqual(["append", "verify", "append"]);
+    expect(f.get().data.rows.map((r) => r.id)).toEqual(Array.from({ length: 700 }, (_, i) => String(i)));
+    expect(f.get().verified).toBe(true);
+  },
+  3000,
+);
+it("retains the prior extent when a started canonical manual refresh needs stale recovery", async () => {
+  const f = windowFixture(600);
+  const contexts: Array<boolean | undefined> = [];
+  let reads = 0;
+  const c = linkedTableReads({
+    poll: false,
+    coverage: (v: TableQueryResult) => v,
+    unavailable: vi.fn(),
+    read: async (intent, signal, context) => {
+      contexts.push(context.preserveExtent);
+      if (++reads === 1) return { state: "stale" };
+      return f.read(intent, signal, context);
+    },
+  });
+  controllers.push(c);
+  await c.request();
+  await flushReads();
+  expect(contexts).toEqual([false, true]);
+  expect(f.get().data.rows).toHaveLength(600);
+  await c.request();
+  expect(f.get().data.rows).toHaveLength(100);
 });

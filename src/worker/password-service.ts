@@ -6,13 +6,13 @@ import {
   cryptoTelemetry,
   PASSWORD_CRYPTO_PREFIX,
   PASSWORD_CRYPTO_SHARDS,
-  PASSWORD_MAX_LENGTH,
+  validPasswordInput,
   validPasswordHash,
 } from "./password-format";
 export { PASSWORD_CRYPTO_PREFIX, PASSWORD_CRYPTO_SHARDS } from "./password-format";
 
 function validatePassword(password: unknown): asserts password is string {
-  if (typeof password !== "string" || password.length > PASSWORD_MAX_LENGTH)
+  if (!validPasswordInput(password))
     throw new APIError("BAD_REQUEST", { code: "INVALID_PASSWORD_INPUT", message: "Invalid password input." });
 }
 

@@ -1009,3 +1009,102 @@ test("canonical verification probes coverage and keeps rebuilt surplus for buffe
   expect(reads).toHaveLength(before);
   await page.unrouteAll({ behavior: "wait" });
 });
+
+for (const mode of ["hidden", "offline"] as const) {
+  test(`a ${mode} continuation finishes its requested extent after authorized resumption`, async ({ page }) => {
+    const f = await linkedFixture(page);
+    let path = f.path,
+      linked = f.linked,
+      cells = f.cells;
+    let coveragePath = `${path}/coverage`;
+    if (mode === "offline") {
+      // Document editors retire their embedded views on offline transitions;
+      // use the persistent canonical renderer for the offline completion race.
+      await page.goto(`/?page=${f.source.id}`);
+      linked = page
+        .locator(".table-live")
+        .filter({ has: page.getByRole("heading", { name: f.source.title, exact: true }) });
+      cells = linked.getByLabel("Linked title", { exact: true });
+      await expect(cells).toHaveCount(100);
+      await expect(cells.first()).toBeEnabled();
+      for (const count of [200, 300, 400, 500]) {
+        await linked.getByRole("button", { name: "Load more rows", exact: true }).click();
+        await expect(cells).toHaveCount(count);
+      }
+      path = `/api/tables/${f.source.id}/query`;
+      coveragePath = `/api/tables/${f.source.id}/coverage`;
+    }
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", {
+        configurable: true,
+        get: () => Boolean((window as unknown as { testHidden?: boolean }).testHidden),
+      });
+      Object.defineProperty(navigator, "onLine", {
+        configurable: true,
+        get: () => !(window as unknown as { testOffline?: boolean }).testOffline,
+      });
+    });
+    const expectedResponse = await page.request.get(`${path}?limit=500`);
+    expect(expectedResponse.ok()).toBeTruthy();
+    // The endpoint caps pages at500. Read the next page for exact expected ordering.
+    const first = await expectedResponse.json();
+    const nextResponse = await page.request.get(
+      `${path}?${new URLSearchParams({ limit: "500", cursor: first.nextCursor })}`,
+    );
+    expect(nextResponse.ok()).toBeTruthy();
+    const all = [...first.rows, ...(await nextResponse.json()).rows];
+    const expected = all
+      .slice(0, 600)
+      .map((row: { cells: Record<string, unknown> }) => String(Object.values(row.cells)[0]));
+    let release!: () => void;
+    const gate = new Promise<void>((done) => {
+      release = done;
+    });
+    let started = 0,
+      proofs = 0;
+    await page.route(`**${coveragePath}?**`, async (route) => {
+      proofs++;
+      await route.continue();
+    });
+    await page.route(`**${path}?**`, async (route) => {
+      const response = await route.fetch();
+      if (++started === 1) await gate;
+      await route.fulfill({ response });
+    });
+    try {
+      await linked.getByRole("button", { name: "Load more rows", exact: true }).click();
+      await expect.poll(() => started).toBe(1);
+      await page.evaluate((state) => {
+        const windowState = window as unknown as { testHidden?: boolean; testOffline?: boolean };
+        if (state === "hidden") windowState.testHidden = true;
+        else windowState.testOffline = true;
+        document.dispatchEvent(new Event("visibilitychange"));
+        window.dispatchEvent(new Event("offline"));
+      }, mode);
+      const completed = page.waitForResponse((response) => new URL(response.url()).pathname === path, {
+        timeout: 5000,
+      });
+      release();
+      expect((await completed).ok()).toBeTruthy();
+      await expect(cells).toHaveCount(500);
+      await expect(cells.first()).toBeDisabled();
+      await page.evaluate(() => {
+        const state = window as unknown as { testHidden?: boolean; testOffline?: boolean };
+        state.testHidden = false;
+        state.testOffline = false;
+        document.dispatchEvent(new Event("visibilitychange"));
+        window.dispatchEvent(new Event("online"));
+      });
+      await expect(cells).toHaveCount(600);
+      await expect(cells.first()).toBeEnabled();
+      expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
+        expected,
+      );
+      expect(proofs).toBeGreaterThanOrEqual(1);
+      expect(started).toBe(2);
+    } finally {
+      release();
+      if (!page.isClosed()) await page.unrouteAll({ behavior: "ignoreErrors" });
+    }
+  });
+}

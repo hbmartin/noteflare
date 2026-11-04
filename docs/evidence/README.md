@@ -14,6 +14,8 @@ Dated test and review records preserve the revision, environment, and limits of 
 - [Table recovery and password authentication review fixes](REVIEW_RECOVERY_AUTH_FIXES.md)
 - [PR #283 follow-up races and private-driver cleanup](PR283_FOLLOW_UP.md)
 - [Private capacity-driver lifecycle verification](CAPACITY_DRIVER_LIFECYCLE.md)
+- [PR #285 follow-up lifecycle and table recovery](PR285_FOLLOW_UP.md)
+- [PR #285 follow-up local CPU output](PR285_LOCAL_CPU_BENCHMARK.md)
 - [Documentation and release audit: 12 October 2026](documentation-audit-2026-10-12.md)
 
 - [One-click deployment verification](ONE_CLICK_DEPLOYMENT_VERIFICATION.md): prepared flow, disposable installation and redeployment, and the unresolved native-form release gate.

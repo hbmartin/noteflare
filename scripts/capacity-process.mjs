@@ -56,6 +56,7 @@ export async function groupStopped(
     },
   } = {},
 ) {
+  if (!Number.isInteger(pgid) || pgid <= 0) throw new CapacityError("process_identity_invalid");
   try {
     exists(pgid);
   } catch (error) {
@@ -67,6 +68,7 @@ export async function groupStopped(
   return !stdout
     .trim()
     .split("\n")
+    .filter(Boolean)
     .some((line) => {
       const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
       if (!match) throw new CapacityError("process_probe_invalid");
@@ -91,7 +93,10 @@ export async function portReleased(port, { signal } = {}) {
   }
 }
 
-/** Only processes started here supply signal targets. Never discover targets by name. */
+const positive = (id) => Number.isInteger(id) && id > 0;
+const retired = (record) => ["stopped", "spawn_failed"].includes(record.state);
+
+/** Retired IDs are never reused as signal targets. A departed leader loses ownership. */
 export function createProcessManager(records, dependencies = {}) {
   const spawnChild = dependencies.spawn ?? spawn;
   const signalGroup = dependencies.signalGroup ?? ((pgid, signal) => process.kill(-pgid, signal));
@@ -101,6 +106,7 @@ export function createProcessManager(records, dependencies = {}) {
   const handles = [];
   const grace = dependencies.grace ?? 2000;
   const force = dependencies.force ?? 2000;
+  const initialProbe = dependencies.initialProbe ?? 2000;
 
   async function start(role, executable, args, options = {}) {
     const child = spawnChild(executable, args, { ...options, detached: true });
@@ -113,79 +119,94 @@ export function createProcessManager(records, dependencies = {}) {
       escalated: false,
       state: "running",
     };
+    let complete;
     const exited = new Promise((resolve) => {
-      const complete = (code, signal) => {
+      complete = (code, signal) => {
         record.exitObserved = true;
         resolve({ code, signal });
       };
-      child.once("exit", complete);
-      child.on("error", () => {
-        if (!child.pid) {
-          record.groupStopped = true;
-          record.state = "spawn_failed";
-          complete(null, null);
-        }
-      });
-      if (child.exitCode !== null || child.signalCode) complete(child.exitCode, child.signalCode);
     });
     const handle = { child, record, exited };
     handles.push(handle);
     records.push(record);
-    await dependencies.persist?.();
-    return handle;
+    // Observe exit independently of stdout: a descendant may retain the pipe.
+    handle.finalized = exited.then(() => stop(handle));
+    handle.finalized.catch(() => {});
+    child.once("exit", complete);
+    child.on("error", () => {
+      if (!positive(child.pid)) {
+        record.groupStopped = true;
+        record.state = "spawn_failed";
+        complete(null, null);
+      }
+    });
+    if (child.exitCode !== null || child.signalCode) complete(child.exitCode, child.signalCode);
+    try {
+      await dependencies.persist?.();
+      return handle;
+    } catch (error) {
+      await stop(handle);
+      throw error;
+    }
   }
 
   async function stop(handle) {
+    if (retired(handle.record)) return true;
     return (handle.stopping ??= (async () => {
-      const { record } = handle;
-      if (!record.pgid && record.state !== "spawn_failed") {
+      const { record, child } = handle;
+      const unknown = () => {
         record.state = "unknown";
+        child.unref?.();
         return false;
-      }
-      const verified = async (remaining) => {
-        if (record.state === "spawn_failed") return true;
+      };
+      if (!positive(record.pid) || !positive(record.pgid)) return unknown();
+      let certain = false;
+      const inspect = async (budget) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), Math.max(1, budget));
         try {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), Math.max(1, remaining));
-          try {
-            record.groupStopped = await abortable(probe(record.pgid, { signal: controller.signal }), controller.signal);
-          } finally {
-            clearTimeout(timer);
-          }
-          return record.exitObserved && record.groupStopped;
+          record.groupStopped = await abortable(probe(record.pgid, { signal: controller.signal }), controller.signal);
+          certain = true;
+          return true;
         } catch {
           record.groupStopped = false;
+          certain = false;
           return false;
+        } finally {
+          clearTimeout(timer);
         }
       };
+      const verified = () => record.exitObserved && record.groupStopped;
       const wait = async (deadline) => {
         for (;;) {
-          if (await verified(deadline - now())) return true;
+          await inspect(deadline - now());
+          if (verified()) return true;
           if (now() >= deadline) return false;
-          await pause(Math.min(25, Math.max(0, deadline - now())));
+          await pause(Math.min(50, Math.max(0, deadline - now())));
         }
       };
       const send = (signal) => {
-        if (!record.pgid) return;
+        // No signalling after leader exit, even if a later probe finds this PGID alive.
+        if (!certain || record.exitObserved || child.exitCode !== null || child.signalCode || record.groupStopped)
+          return false;
         try {
           signalGroup(record.pgid, signal);
+          return true;
         } catch {
-          /* Exit/probe verification decides certainty. */
+          return false;
         }
       };
-      const gracefulDeadline = now() + grace;
-      if (await verified(grace)) {
+      if (!(await inspect(initialProbe))) return unknown();
+      if (verified()) {
         record.state = "stopped";
         return true;
       }
       send("SIGTERM");
-      if (!(await wait(gracefulDeadline))) {
+      // The probe above does not consume the process's graceful shutdown allowance.
+      if (!(await wait(now() + grace))) {
+        if (!send("SIGKILL")) return unknown();
         record.escalated = true;
-        send("SIGKILL");
-        if (!(await wait(now() + force))) {
-          record.state = "unknown";
-          return false;
-        }
+        if (!(await wait(now() + force))) return unknown();
       }
       record.state = "stopped";
       return true;
@@ -198,34 +219,41 @@ export function createProcessManager(records, dependencies = {}) {
       ...options,
       ...(capture ? { stdio: ["ignore", "pipe", "ignore"] } : {}),
     });
-    let output = "";
+    const chunks = [];
+    let bytes = 0;
     const captured = capture
       ? (async () => {
           for await (const chunk of handle.child.stdout) {
-            output += chunk.toString();
-            if (Buffer.byteLength(output) > 65536) throw new CapacityError("credential_output_limit");
+            const buffer = Buffer.from(chunk);
+            bytes += buffer.length;
+            if (bytes > 65536) throw new CapacityError("credential_output_limit");
+            chunks.push(buffer);
           }
         })()
       : Promise.resolve();
-    // Capture may reject before an abort or exit is observed.
     captured.catch(() => {});
     try {
-      const [{ code }] = await abortable(Promise.all([handle.exited, captured]), signal);
-      if (code !== 0) throw new CapacityError(`${role}_failed`);
-      return output;
+      const command = handle.exited.then(async ({ code }) => {
+        const stopped = await handle.finalized;
+        if (code !== 0) throw new CapacityError(`${role}_failed`);
+        if (!stopped) throw new CapacityError("process_stop_unverified");
+      });
+      await abortable(Promise.all([command, captured]), signal);
+      return Buffer.concat(chunks, bytes).toString("utf8");
     } catch (error) {
+      if (capture) handle.child.stdout.destroy();
       await stop(handle);
       throw error;
     }
   }
-
   return {
     start,
     run,
     async stopAll() {
-      await Promise.allSettled(handles.map(stop));
-      return records.every(
-        (record) => record.exitObserved && record.groupStopped && ["stopped", "spawn_failed"].includes(record.state),
+      const results = await Promise.allSettled(handles.map(stop));
+      return (
+        results.every((result) => result.status === "fulfilled" && result.value) &&
+        records.every((record) => record.exitObserved && record.groupStopped && retired(record))
       );
     },
   };
