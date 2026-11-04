@@ -1,7 +1,7 @@
 import { build } from "esbuild";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
-import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { createServer } from "node:net";
 import { openSync, closeSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
@@ -83,6 +83,9 @@ export function parseCapacityArguments(args) {
 
 class PreviewTargetError extends CapacityError {}
 
+const signalExitStatus = Object.freeze({ SIGINT: 130, SIGTERM: 143, SIGHUP: 129, SIGQUIT: 131 });
+const validHttpStatus = (value) => Number.isInteger(value) && value >= 100 && value <= 599;
+
 const shardValid = (shard) => Number.isInteger(shard) && shard >= 0 && shard < PASSWORD_CRYPTO_SHARDS;
 
 const safeCode = (error) =>
@@ -155,6 +158,9 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     invocations: [],
     telemetryErrors: { malformed: 0, socket: 0 },
     persistenceErrors: [],
+    cleanupErrors: [],
+    resourceCleanupCompleted: false,
+    persistenceCompleted: false,
     helperRemoved: false,
     exitStatus: 0,
   };
@@ -169,7 +175,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     database: CAPACITY_TARGET.database,
     phase: "planned",
     resources: [helperResource],
-    cleanupErrors: [],
+    cleanupErrors: result.cleanupErrors,
     cleanupWarnings: [],
     persistenceErrors: result.persistenceErrors,
     localProcesses: [],
@@ -195,6 +201,11 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
       await rename(`${target}.tmp`, target);
     } catch (error) {
       recordPersistence(name, phase, error);
+      try {
+        await unlink(`${target}.tmp`);
+      } catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") warn("temporary_file_cleanup_failed");
+      }
       throw error;
     }
   };
@@ -206,7 +217,8 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
   };
   let reason,
     proxy,
-    cleaning = false;
+    cleaning = false,
+    operationalFinalized = false;
   const sockets = [];
   const cancellable = new Set();
   let api,
@@ -224,6 +236,14 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     stopped = resolve;
   });
   const stop = (code, status = 1) => {
+    if (operationalFinalized) {
+      if (Object.hasOwn(signalExitStatus, code) && !result.lateSignal) {
+        result.lateSignal = code;
+        journal.lateSignal = code;
+        if (result.exitStatus === 0) result.exitStatus = status;
+      }
+      return;
+    }
     if (["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "tail_error", "tail_closed", "tail_open_deadline"].includes(code)) {
       skipDrain = true;
       cancelDrain();
@@ -235,21 +255,21 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     for (const controller of cancellable) controller.abort(new CapacityError(code));
   };
   const recordFailure = (error, category) => {
+    if (operationalFinalized || (reason && reason !== category)) return;
     result.failure ??= {
       stage: journal.phase,
       category,
       ...(safeCode(error) ? { code: safeCode(error) } : {}),
-      ...(Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599
-        ? { status: error.status }
-        : {}),
+      ...(validHttpStatus(error?.status) ? { status: error.status } : {}),
     };
   };
   const check = () => {
     if (reason) throw new CapacityError(reason);
   };
-  const signalHandlers = Object.entries({ SIGINT: 130, SIGTERM: 143, SIGHUP: 129, SIGQUIT: 131 }).map(
-    ([signal, status]) => [signal, () => stop(signal, status)],
-  );
+  const signalHandlers = Object.entries(signalExitStatus).map(([signal, status]) => [
+    signal,
+    () => stop(signal, status),
+  ]);
   for (const [signal, handler] of signalHandlers) signals.on(signal, handler);
   const processes = createProcessManager(journal.localProcesses, {
     ...dependencies.processes,
@@ -580,7 +600,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
         return {
           ok: false,
           code,
-          ...(Number.isInteger(error?.status) ? { status: error?.status } : {}),
+          ...(validHttpStatus(error?.status) ? { status: error.status } : {}),
           wallMs: clock() - started,
         };
       }
@@ -720,36 +740,44 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     if (helperResource.creation === "unknown") addError("deployment_outcome_unknown");
     if (journal.resources.some((resource) => resource.kind === "tail" && resource.creation === "unknown"))
       addError("tail_outcome_unknown");
+    const terminalCause = reason;
+    operationalFinalized = true;
     journal.phase = "finished";
     result.finishedAt = Date.now();
     const finalize = () => {
-      journal.cleanupCompleted =
+      result.resourceCleanupCompleted =
         journal.resources.every(
           (resource) =>
             resource.creation === "planned" || (resource.creation === "created" && resource.removal === "removed"),
-        ) && journal.cleanupErrors.length === 0;
+        ) && !journal.cleanupErrors.some((code) => code !== "persistence_failed");
+      result.persistenceCompleted = result.persistenceErrors.length === 0;
+      result.cleanupCompleted = result.resourceCleanupCompleted && result.persistenceCompleted;
+      journal.resourceCleanupCompleted = result.resourceCleanupCompleted;
+      journal.persistenceCompleted = result.persistenceCompleted;
+      journal.cleanupCompleted = result.cleanupCompleted;
       result.helperRemoved = helperResource.removal === "removed";
-      if (!journal.cleanupCompleted && result.exitStatus === 0) result.exitStatus = 1;
+      if (!result.cleanupCompleted && result.exitStatus === 0) result.exitStatus = 1;
       result.outcome =
-        reason ??
-        (result.persistenceErrors.length
-          ? "persistence_failed"
-          : journal.cleanupCompleted
-            ? "success"
-            : "cleanup_failed");
-      result.cleanupCompleted = journal.cleanupCompleted;
+        terminalCause ??
+        (!result.resourceCleanupCompleted
+          ? "cleanup_failed"
+          : !result.persistenceCompleted
+            ? "persistence_failed"
+            : "success");
     };
+    const summaryVersion = () =>
+      JSON.stringify([result.persistenceErrors, journal.cleanupWarnings, result.lateSignal, result.exitStatus]);
     try {
-      // Independent writes, followed by at most one reconciliation pass. In-memory
-      // diagnostics remain authoritative if the filesystem cannot accept either file.
+      // Final writes cannot replace the operational cause. Reconcile newly collected
+      // diagnostics once; the CLI remains authoritative if the last snapshot is stale.
+      finalize();
       for (let pass = 0; pass < 2; pass++) {
-        const before = result.persistenceErrors.length;
-        finalize();
+        const before = summaryVersion();
         await persist().catch(() => {});
         finalize();
         await save("results", structuredClone(result)).catch(() => {});
         finalize();
-        if (before === result.persistenceErrors.length) break;
+        if (before === summaryVersion()) break;
       }
     } finally {
       for (const [signal, handler] of signalHandlers) signals.off(signal, handler);
@@ -770,6 +798,10 @@ if (import.meta.main) {
         outcome: result.outcome,
         helperRemoved: result.helperRemoved,
         cleanupCompleted: result.cleanupCompleted,
+        resourceCleanupCompleted: result.resourceCleanupCompleted,
+        persistenceCompleted: result.persistenceCompleted,
+        cleanupErrors: result.cleanupErrors,
+        lateSignal: result.lateSignal,
         exitStatus: result.exitStatus,
         failure: result.failure,
         persistenceErrors: result.persistenceErrors,

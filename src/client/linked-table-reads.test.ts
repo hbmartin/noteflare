@@ -1669,3 +1669,124 @@ it("transfers active callers and queued targets through current-scope authorized
   await flushReads();
   expect(read).toHaveBeenCalledTimes(count);
 });
+
+it("retires active and queued old-query callers without blocking the replacement query", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((done) => {
+    release = done;
+  });
+  const signals: AbortSignal[] = [];
+  const read = vi.fn(async (intent: TableReadIntent, signal: AbortSignal) => {
+    signals.push(signal);
+    if (intent.kind === "page") await gate;
+    return {
+      state: "success" as const,
+      value: intent.kind === "page" ? "old" : "new",
+      verification: "network" as const,
+    };
+  });
+  const c = linkedTableReads({ read, poll: false, unavailable: vi.fn() });
+  controllers.push(c);
+  const active = c.page({ kind: "page", ...continuation(200) }),
+    queued = c.page({ kind: "page", ...continuation(300) });
+  c.reset();
+  expect(signals[0]?.aborted).toBe(true);
+  expect(await active).toBeNull();
+  expect(await queued).toBeNull();
+  expect(await c.request()).toBe("new");
+  release();
+  await flushReads();
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["page", "refresh"]);
+});
+it("starts recovery immediately after merging capped verification debt and settles its callers", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(1);
+  let refreshes = 0,
+    release!: () => void;
+  const gate = new Promise<void>((done) => {
+    release = done;
+  });
+  const read = vi.fn(async (intent: TableReadIntent) => {
+    if (intent.kind === "verify") return { state: "failure" as const };
+    if (++refreshes > 1) await gate;
+    return { state: "success" as const, value: refreshes, verification: "network" as const };
+  });
+  const c = linkedTableReads({ read, poll: false, unavailable: vi.fn() });
+  controllers.push(c);
+  try {
+    await c.request();
+    await c.verifyReceipt();
+    for (const ms of [2000, 4000, 8000, 16000, 30000]) await vi.advanceTimersByTimeAsync(ms);
+    expect(read.mock.calls.filter(([intent]) => intent.kind === "verify")).toHaveLength(6);
+    const before = Date.now();
+    const recovery = c.recover(),
+      verification = c.verifyReceipt();
+    expect(refreshes).toBe(2);
+    expect(Date.now()).toBe(before);
+    release();
+    expect(await recovery).toBe(2);
+    expect(await verification).toEqual({ state: "complete", value: 2 });
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(read).toHaveBeenCalledTimes(8);
+  } finally {
+    release();
+  }
+});
+it("preserves cumulative failures when immediate recovery fails again", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  let initial = true,
+    restored = false;
+  const read = vi.fn(async () => {
+    if (initial || restored) {
+      initial = false;
+      return { state: "success" as const, value: 1, verification: "network" as const };
+    }
+    return { state: "failure" as const };
+  });
+  const c = linkedTableReads({ read, poll: false, unavailable: vi.fn() });
+  controllers.push(c);
+  await c.request();
+  await c.verifyReceipt();
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(read).toHaveBeenCalledTimes(3);
+  expect(await c.recover()).toBeNull();
+  expect(read).toHaveBeenCalledTimes(4);
+  restored = true;
+  await vi.advanceTimersByTimeAsync(3999);
+  expect(read).toHaveBeenCalledTimes(4);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(read).toHaveBeenCalledTimes(5);
+});
+it("keeps queued explicit Refresh first-page policy when immediate recovery joins", async () => {
+  let release!: () => void,
+    held = false;
+  const gate = new Promise<void>((done) => {
+    release = done;
+  });
+  const contexts: Array<boolean | undefined> = [];
+  const c = linkedTableReads({
+    poll: false,
+    unavailable: vi.fn(),
+    read: async (_intent, _signal, context) => {
+      contexts.push(context.preserveExtent);
+      if (!held) {
+        held = true;
+        await gate;
+      }
+      return { state: "success", value: context.preserveExtent ? 300 : 100, verification: "network" };
+    },
+  });
+  controllers.push(c);
+  try {
+    const active = c.request(),
+      queued = c.request(),
+      recovery = c.recover();
+    expect(await recovery).toBe(100);
+    expect(await active).toBe(100);
+    expect(await queued).toBe(100);
+    expect(contexts).toEqual([false, false]);
+  } finally {
+    release();
+  }
+});
