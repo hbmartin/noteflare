@@ -10,6 +10,8 @@ OS user+system CPU consumed by the entire local workerd process (macOS proc_pid_
 
 CPU: Apple M2 Pro; Node: v26.11.1; samples: 20; warmups: 3.
 
+The measurement revision's `pnpm-lock.yaml` pins workerd and its Darwin ARM64 package to `1.20261006.1`. The executed binary version was not recorded separately. The original artifacts identify Darwin ARM64 but did not capture the macOS product/build version; that historical value is unrecorded. No measurement was rerun to add this environment note.
+
 | Operation                                                    |   n | Median process CPU upper bound ms | P95 process CPU upper bound ms | Upper bound >10ms | Median compute elapsed ms | P95 compute elapsed ms |
 | ------------------------------------------------------------ | --: | --------------------------------: | -----------------------------: | ----------------: | ------------------------: | ---------------------: |
 | calibration / no-op                                          |  20 |                              0.31 |                           0.71 |              0/20 |                         — |                      — |
