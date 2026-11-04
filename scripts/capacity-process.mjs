@@ -178,12 +178,12 @@ export function createProcessManager(records, dependencies = {}) {
       };
       const verified = () => record.exitObserved && record.groupStopped;
       const wait = async (deadline) => {
-        for (;;) {
+        while (now() < deadline) {
           await inspect(deadline - now());
           if (verified()) return true;
-          if (now() >= deadline) return false;
           await pause(Math.min(50, Math.max(0, deadline - now())));
         }
+        return false;
       };
       const send = (signal) => {
         // No signalling after leader exit, even if a later probe finds this PGID alive.
@@ -204,9 +204,16 @@ export function createProcessManager(records, dependencies = {}) {
       send("SIGTERM");
       // The probe above does not consume the process's graceful shutdown allowance.
       if (!(await wait(now() + grace))) {
-        if (!send("SIGKILL")) return unknown();
-        record.escalated = true;
-        if (!(await wait(now() + force))) return unknown();
+        // A phase deadline is not an ownership observation. Get fresh evidence with
+        // its own full budget before escalating, or certifying a late exit.
+        if (!(await inspect(initialProbe))) return unknown();
+        if (!verified()) {
+          if (!send("SIGKILL")) return unknown();
+          record.escalated = true;
+          if (!(await wait(now() + force))) {
+            if (!(await inspect(initialProbe)) || !verified()) return unknown();
+          }
+        }
       }
       record.state = "stopped";
       return true;

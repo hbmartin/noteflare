@@ -12,8 +12,20 @@ import {
   CAPACITY_TARGET,
 } from "./measure-password-crypto-capacity.mjs";
 import { capacityHarness } from "./__fixtures__/password-capacity-driver.mjs";
+const journalGate = vi.hoisted(() => ({ afterRename: undefined }));
+vi.mock("node:fs/promises", async (original) => {
+  const filesystem = await original();
+  return {
+    ...filesystem,
+    rename: async (...args) => {
+      await filesystem.rename(...args);
+      await journalGate.afterRename?.(...args);
+    },
+  };
+});
 const directories = [];
 afterEach(async () => {
+  journalGate.afterRename = undefined;
   try {
     await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
   } finally {
@@ -195,6 +207,53 @@ it.each(["helper", "tail", "proxy"])("stops before launching a planned %s after 
   expect(proxies).toBe(0);
   expect(f.calls.filter((call) => call.method === "deploy")).toHaveLength(resource === "helper" ? 0 : 1);
   expect(f.calls.filter((call) => call.method === "POST")).toHaveLength(resource === "proxy" ? 2 : 0);
+});
+it.each(["helper", "tail"])("restores a known-unsent %s after a signal during durable intent", async (kind) => {
+  const f = await fixture();
+  let signalled = false;
+  journalGate.afterRename = async (_from, to) => {
+    if (signalled || !to.endsWith("/resource.json")) return;
+    const snapshot = JSON.parse(await readFile(to, "utf8"));
+    if (!snapshot.resources.some((resource) => resource.kind === kind && resource.creation === "creating")) return;
+    signalled = true;
+    f.signals.emit("SIGTERM");
+  };
+  const result = await execute(f);
+  expect(signalled).toBe(true);
+  const journal = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(result).toMatchObject({ exitStatus: 143, cleanupCompleted: true });
+  expect(f.calls.filter((call) => call.method === "deploy")).toHaveLength(kind === "helper" ? 0 : 1);
+  expect(f.calls.filter((call) => call.method === "POST")).toHaveLength(0);
+  expect(journal.resources.find((resource) => resource.kind === kind).creation).toBe("planned");
+  expect(journal.cleanupErrors).toEqual([]);
+});
+it("skips telemetry drain when a tail never opened and cancels the open timer", async () => {
+  const f = await fixture();
+  let created;
+  const socketCreated = new Promise((done) => {
+    created = done;
+  });
+  f.deps.limits.open = 10;
+  f.deps.limits.drain = 10000;
+  f.deps.delay = vi.fn(async () => {});
+  f.deps.createSocket = () => {
+    const socket = new EventEmitter();
+    socket.terminate = vi.fn(() => socket.emit("close"));
+    f.sockets.push(socket);
+    created();
+    return socket;
+  };
+  vi.useFakeTimers();
+  const pending = execute(f);
+  await socketCreated;
+  await vi.advanceTimersByTimeAsync(10);
+  const result = await pending;
+  expect(result).toMatchObject({ outcome: "tail_open_deadline", exitStatus: 1, cleanupCompleted: true });
+  expect(f.operations).toEqual([]);
+  expect(f.deps.delay).not.toHaveBeenCalled();
+  expect(f.sockets[0].terminate).toHaveBeenCalledOnce();
+  expect(f.signals.listenerCount("SIGTERM")).toBe(0);
+  expect(vi.getTimerCount()).toBe(0);
 });
 it("isolates generated files across concurrent runs", async () => {
   const f = await fixture();

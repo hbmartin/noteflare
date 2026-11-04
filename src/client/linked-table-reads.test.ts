@@ -1562,3 +1562,45 @@ it("retains the prior extent when a started canonical manual refresh needs stale
   await c.request();
   expect(f.get().data.rows).toHaveLength(100);
 });
+
+it("retires active and queued canonical pages without retiring later page work or verification debt", async () => {
+  const value = { generation: 1, revision: 1 };
+  let release!: () => void;
+  const gate = new Promise<void>((done) => {
+    release = done;
+  });
+  let heldSignal: AbortSignal | undefined;
+  const read = vi.fn(async (intent: TableReadIntent, signal: AbortSignal) => {
+    if (intent.kind === "page" && intent.target === 200) {
+      heldSignal = signal;
+      await gate;
+    }
+    return { state: "success" as const, value, verification: "network" as const };
+  });
+  const c = linkedTableReads({ read, poll: false, coverage: (v: typeof value) => v, unavailable: vi.fn() });
+  controllers.push(c);
+  await c.request();
+  const page = (target: number) => ({ kind: "page" as const, ...continuation(target), revision: 1, prefix: 1 });
+  const active = c.page(page(200));
+  const queued = c.page(page(300));
+  const verification = c.verifyReceipt();
+  c.retirePages(undefined, { active: true });
+  expect(heldSignal?.aborted).toBe(true);
+  expect(await active).toBeNull();
+  expect(await queued).toBeNull();
+  const refreshed = c.request();
+  const later = c.page(page(400));
+  expect(await verification).toMatchObject({ state: "complete", value });
+  expect(await refreshed).toEqual(value);
+  expect(await later).toEqual(value);
+  const before = read.mock.calls.length;
+  release();
+  await flushReads();
+  expect(read).toHaveBeenCalledTimes(before);
+  expect(read.mock.calls.map(([intent]) => (intent.kind === "page" ? intent.target : intent.kind))).toEqual([
+    "refresh",
+    200,
+    "refresh",
+    400,
+  ]);
+});

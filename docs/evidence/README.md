@@ -16,6 +16,7 @@ Dated test and review records preserve the revision, environment, and limits of 
 - [Private capacity-driver lifecycle verification](CAPACITY_DRIVER_LIFECYCLE.md)
 - [PR #285 follow-up lifecycle and table recovery](PR285_FOLLOW_UP.md)
 - [PR #285 follow-up local CPU output](PR285_LOCAL_CPU_BENCHMARK.md)
+- [PR #286 follow-up escalation and explicit Refresh](PR286_FOLLOW_UP.md)
 - [Documentation and release audit: 12 October 2026](documentation-audit-2026-10-12.md)
 
 - [One-click deployment verification](ONE_CLICK_DEPLOYMENT_VERIFICATION.md): prepared flow, disposable installation and redeployment, and the unresolved native-form release gate.

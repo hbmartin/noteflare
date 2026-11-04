@@ -631,11 +631,15 @@ export function CollaborativeTablePage({
     recordAuthorization,
     advanceGeneration,
   ]);
-  const load = useCallback((continuation?: CanonicalTableContinuation | LinkedTableContinuation) => {
-    const reads = linkedReads.current;
-    if (!reads) return Promise.resolve(null);
-    return continuation && "kind" in continuation ? reads.page(continuation) : reads.request(continuation);
-  }, []);
+  const load = useCallback(
+    (continuation?: CanonicalTableContinuation | LinkedTableContinuation) => {
+      const reads = linkedReads.current;
+      if (!reads) return Promise.resolve(null);
+      if (!continuation && !queryBase) reads.retirePages(undefined, { active: true });
+      return continuation && "kind" in continuation ? reads.page(continuation) : reads.request(continuation);
+    },
+    [queryBase],
+  );
   useEffect(() => {
     if (!retry?.submission) return undefined;
     const { map, key, version, operationId } = retry.submission;

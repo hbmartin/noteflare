@@ -546,7 +546,7 @@ test("canonical invalidation during an older read performs a trailing fresh read
   expect(reads).toBeGreaterThanOrEqual(2);
 });
 
-test("canonical refresh rebinds the requested continuation extent without leaving a row gap", async ({ page }) => {
+test("explicit canonical Refresh retires an older failed continuation and permits new Load more", async ({ page }) => {
   const { source } = await linkedFixture(page);
   await page.goto(`/?page=${source.id}`);
   const table = page
@@ -582,13 +582,15 @@ test("canonical refresh rebinds the requested continuation extent without leavin
   await expect(cells).toHaveCount(100);
   await expect(cells.first()).toBeEnabled();
   await page.clock.runFor(3000);
-  await expect(cells).toHaveCount(300);
-  expect(attempts).toBe(2);
+  await expect(cells).toHaveCount(100);
+  expect(attempts).toBe(1);
   expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
-    expected.slice(0, 300),
+    expected.slice(0, 100),
   );
-  await table.getByRole("button", { name: "Load more rows", exact: true }).click();
-  await expect(cells).toHaveCount(400);
+  for (const count of [200, 300, 400]) {
+    await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+    await expect(cells).toHaveCount(count);
+  }
   expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
     expected,
   );

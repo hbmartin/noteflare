@@ -1354,7 +1354,7 @@ it("retains task conflict feedback across later successful background verificati
   await waitFor(() => expect(screen.queryByText(message)).not.toBeInTheDocument());
 });
 
-it("rebinds a failed canonical extent to the refreshed prefix without a row gap", async () => {
+it("retires a failed canonical extent on explicit Refresh without leaving gaps in new requests", async () => {
   const rows = Array.from({ length: 350 }, (_, index) => ({
     ...data.rows[0]!,
     id: `row-${index}`,
@@ -1390,14 +1390,16 @@ it("rebinds a failed canonical extent to the refreshed prefix without a row gap"
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
   });
   expect(screen.getAllByLabelText("Title")).toHaveLength(100);
+  const afterRefresh = offsets.length;
   await act(async () => {
     await vi.advanceTimersByTimeAsync(2000);
   });
-  expect(screen.getAllByLabelText("Title")).toHaveLength(300);
-  expect(offsets.slice(-2)).toEqual([100, 200]);
-  await act(async () => {
-    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-  });
+  expect(screen.getAllByLabelText("Title")).toHaveLength(100);
+  expect(offsets).toHaveLength(afterRefresh);
+  for (const count of [200, 300, 350]) {
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
+    expect(screen.getAllByLabelText("Title")).toHaveLength(count);
+  }
   expect(screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value)).toEqual(
     rows.slice(0, 350).map((row) => row.cells.Title),
   );
@@ -2844,4 +2846,78 @@ it.each(["hidden", "offline", "verification"] as const)(
     });
     await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
   },
+);
+
+it.each(["failed", "suspended", "held"] as const)(
+  "explicit canonical Refresh retires an older %s continuation and keeps later requests",
+  async (mode) => {
+    const rows = Array.from({ length: 400 }, (_, i) => ({
+      ...data.rows[0]!,
+      id: `refresh-${i}`,
+      cells: { Title: `Refresh ${i}` },
+      detailPageId: `detail-${i}`,
+    }));
+    data = { ...data, columns: [column("Title", "text")], rows, rowCount: 400 };
+    let hidden = false,
+      old = true,
+      release!: () => void;
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    const gate = new Promise<void>((done) => {
+      release = done;
+    });
+    const calls: string[] = [];
+    let heldSignal: AbortSignal | undefined;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.includes("/coverage?")) return { ...data };
+      const params = new URL(path, "https://test").searchParams;
+      const offset = Number(params.get("cursor") ?? 0),
+        limit = Number(params.get("limit") ?? 100);
+      calls.push(`${offset}:${limit}`);
+      if (offset === 100 && old) {
+        old = false;
+        if (mode === "failed") throw new ApiClientError(503, "unavailable", "Synthetic continuation failure");
+        heldSignal = init?.signal as AbortSignal;
+        await gate;
+      }
+      return {
+        ...data,
+        rows: rows.slice(offset, offset + limit),
+        nextCursor: offset + limit < 400 ? String(offset + limit) : null,
+      };
+    });
+    render(
+      <CollaborativeTablePage
+        page={{ id: "table", title: "Explicit Refresh" }}
+        member={member}
+        onSelectPage={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+    calls.length = 0;
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const visible = () => screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value);
+    const expected = (count: number) => Array.from({ length: count }, (_, i) => `Refresh ${i}`);
+    await act(async () => fireEvent.click(screen.getByText("Load more rows", { selector: "button" })));
+    if (mode === "suspended") {
+      hidden = true;
+      await act(async () => release());
+      hidden = false;
+    }
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh" })));
+    expect(visible()).toEqual(expected(100));
+    expect(heldSignal?.aborted).toBe(mode === "held" ? true : mode === "suspended" ? false : undefined);
+    if (mode === "held") {
+      await act(async () => release());
+    }
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(visible()).toEqual(expected(100));
+    expect(calls).toEqual(["100:100", "0:100"]);
+    await act(async () => fireEvent.click(screen.getByText("Load more rows", { selector: "button" })));
+    expect(visible()).toEqual(expected(200));
+    expect(calls).toEqual(["100:100", "0:100", "100:100"]);
+  },
+  5000,
 );
