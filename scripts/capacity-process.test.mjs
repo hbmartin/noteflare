@@ -420,3 +420,141 @@ it("rejects uncertain command completion without waiting for a descendant-held s
   expect(f.child.unref).toHaveBeenCalledOnce();
   expect(f.signals).toEqual([]);
 }, 3000);
+
+it.each(
+  ["SIGTERM", "SIGKILL"].flatMap((signal) =>
+    ["clean", "missing-exit", "reused", "probe-fails"].map((mode) => ({ signal, mode })),
+  ),
+)("verifies $signal ESRCH termination without re-signalling: $mode", async ({ signal, mode }) => {
+  const f = fake("force");
+  let gone = false,
+    time = 0;
+  const probe = vi.fn(async () => {
+    if (gone && mode === "probe-fails") throw Error("synthetic probe failure");
+    return gone && mode !== "reused";
+  });
+  const manager = createProcessManager(f.records, {
+    ...f.dependencies,
+    now: () => time,
+    groupStopped: probe,
+    delay: async (ms) => {
+      time += ms;
+      if (gone && mode !== "missing-exit" && !f.child.exitCode) {
+        f.child.exitCode = 0;
+        f.child.emit("exit", 0, null);
+      }
+    },
+    signalGroup: (pgid, value) => {
+      f.signals.push({ pgid, signal: value });
+      if (value !== signal) return;
+      gone = true;
+      throw Object.assign(Error("synthetic"), { code: "ESRCH" });
+    },
+  });
+  await manager.start("proxy", "synthetic", []);
+  expect(await manager.stopAll()).toBe(mode === "clean");
+  expect(f.signals.map((entry) => entry.signal)).toEqual(signal === "SIGTERM" ? [signal] : ["SIGTERM", signal]);
+  expect(f.records[0]).toMatchObject({ state: mode === "clean" ? "stopped" : "unknown", escalated: false });
+  const count = probe.mock.calls.length;
+  await manager.stopAll();
+  expect(probe).toHaveBeenCalledTimes(count);
+});
+it("does not convert a signal permission failure into escalation", async () => {
+  const f = fake();
+  const signalGroup = vi.fn(() => {
+    throw Object.assign(Error("synthetic"), { code: "EPERM" });
+  });
+  const manager = createProcessManager(f.records, { ...f.dependencies, signalGroup });
+  await manager.start("proxy", "synthetic", []);
+  expect(await manager.stopAll()).toBe(false);
+  expect(signalGroup).toHaveBeenCalledExactlyOnceWith(f.child.pid, "SIGTERM");
+});
+it("verifies leader exit between final proof and escalation without sending SIGKILL", async () => {
+  const f = fake("force");
+  let probes = 0;
+  const manager = createProcessManager(f.records, {
+    ...f.dependencies,
+    groupStopped: async () => {
+      if (++probes === 3) {
+        f.child.exitCode = 0;
+        f.child.emit("exit", 0, null);
+        return false;
+      }
+      return probes > 3;
+    },
+  });
+  await manager.start("proxy", "synthetic", []);
+  expect(await manager.stopAll()).toBe(true);
+  expect(f.signals.map((entry) => entry.signal)).toEqual(["SIGTERM"]);
+});
+const signalAwarePause = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    const done = () => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+it.each([1, 2, 3, 4, 5])("uses independent final proof budgets with a virtual clock: repetition %s", async () => {
+  vi.useFakeTimers();
+  const f = fake("force");
+  try {
+    const manager = createProcessManager(f.records, {
+      ...f.dependencies,
+      initialProbe: 200,
+      grace: 30,
+      force: 30,
+      now: () => Date.now(),
+      delay: (ms) => signalAwarePause(ms),
+      groupStopped: async (_id, { signal }) => {
+        await signalAwarePause(20, signal);
+        return Boolean(f.child.signalCode);
+      },
+    });
+    await manager.start("proxy", "synthetic", []);
+    const pending = manager.stopAll();
+    await vi.runAllTimersAsync();
+    expect(await pending).toBe(true);
+    expect(f.signals.map((entry) => entry.signal)).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+it.runIf(supported)(
+  "lets the synthetic deployment child exit when its IPC owner disconnects",
+  async () => {
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, ["-e", 'process.on("message",()=>process.exit(0));console.log("ready");'], {
+      detached: true,
+      stdio: ["ignore", "pipe", "ignore", "ipc"],
+    });
+    let failure;
+    try {
+      await bounded(once(child.stdout, "data"), 2000, "ready_deadline");
+      const exited = once(child, "exit");
+      child.disconnect();
+      expect(await bounded(exited, 2000, "exit_deadline")).toEqual([0, null]);
+    } catch (error) {
+      failure = error;
+    } finally {
+      try {
+        if (child.exitCode === null && !child.signalCode) {
+          const exited = once(child, "exit");
+          child.kill("SIGKILL");
+          await bounded(exited, 2000, "exit_deadline");
+        }
+      } catch (error) {
+        failure ??= error;
+      }
+      child.stdout.destroy();
+    }
+    if (failure) throw failure;
+  },
+  6000,
+);

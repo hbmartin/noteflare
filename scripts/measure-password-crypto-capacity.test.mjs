@@ -12,12 +12,13 @@ import {
   CAPACITY_TARGET,
 } from "./measure-password-crypto-capacity.mjs";
 import { capacityHarness } from "./__fixtures__/password-capacity-driver.mjs";
-const journalGate = vi.hoisted(() => ({ afterRename: undefined }));
+const journalGate = vi.hoisted(() => ({ afterRename: undefined, beforeRename: undefined }));
 vi.mock("node:fs/promises", async (original) => {
   const filesystem = await original();
   return {
     ...filesystem,
     rename: async (...args) => {
+      await journalGate.beforeRename?.(...args);
       await filesystem.rename(...args);
       await journalGate.afterRename?.(...args);
     },
@@ -26,6 +27,7 @@ vi.mock("node:fs/promises", async (original) => {
 const directories = [];
 afterEach(async () => {
   journalGate.afterRename = undefined;
+  journalGate.beforeRename = undefined;
   try {
     await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
   } finally {
@@ -753,6 +755,11 @@ it.each([
   const result = await execute(f);
   expect(result.outcome).toBe(code);
   expect(result.exitStatus).toBe(1);
+  expect(result.failure).toEqual({
+    stage: "sampling",
+    category: code,
+    ...(code === "proxy_http_error" ? { status: 503 } : {}),
+  });
 });
 it("accepts a pre-RPC service failure without success-only shard metadata", async () => {
   const f = await fixture({
@@ -843,4 +850,196 @@ it("keeps timed-out deletion state unknown while final port verification is held
     releasePort();
     await pending;
   }
+});
+
+it.each(["invalid-second-tail", "proxy-readiness", "proxy-exit"])(
+  "skips telemetry draining before sampling: %s",
+  async (mode) => {
+    let tails = 0;
+    const f = await fixture({
+      ...(mode === "invalid-second-tail"
+        ? { onTail: () => (++tails === 1 ? { id: "one", url: "ws://synthetic" } : { id: "two", url: null }) }
+        : {}),
+      ...(mode === "proxy-readiness" ? { foreign: true } : {}),
+      ...(mode === "proxy-exit"
+        ? {
+            onProxy: (proxy) => {
+              proxy.exitCode = 1;
+            },
+          }
+        : {}),
+    });
+    f.deps.limits.drain = 10000;
+    f.deps.delay = vi.fn(async () => {});
+    const result = await execute(f);
+    expect(result.exitStatus).toBe(1);
+    expect(f.operations).toEqual([]);
+    expect(f.deps.delay.mock.calls.some(([ms]) => ms === 10000)).toBe(false);
+  },
+);
+it("retains partial cleanup outcomes and closes the collector before late deletion results", async () => {
+  let release;
+  const gate = new Promise((done) => {
+    release = done;
+  });
+  const f = await fixture({
+    cleanup: (path) => {
+      if (path.endsWith("/tails/1")) throw Error("synthetic-private-detail");
+      if (path.endsWith("/tails/2")) return gate;
+      return undefined;
+    },
+  });
+  f.deps.limits.cleanup = 10;
+  try {
+    const result = await execute(f);
+    const saved = await readFile(`${result.directory}/resource.json`, "utf8");
+    expect(JSON.parse(saved).resources.map((r) => r.removal)).toEqual(["removed", "failed", "unknown"]);
+    expect(JSON.parse(saved).cleanupErrors).toEqual(["remote_cleanup_failed", "cleanup_deadline"]);
+    expect(result).toMatchObject({ cleanupCompleted: false, helperRemoved: true, exitStatus: 1 });
+    expect(f.calls.filter((c) => c.method === "DELETE")).toHaveLength(3);
+    release();
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    expect(await readFile(`${result.directory}/resource.json`, "utf8")).toBe(saved);
+    expect(JSON.stringify(result)).not.toContain("synthetic-private-detail");
+  } finally {
+    release();
+  }
+});
+it("does not launch deletions after the credential owner exceeds the overall cleanup deadline", async () => {
+  const f = await fixture();
+  const connect = f.deps.connect;
+  let release,
+    calls = 0;
+  const late = new Promise((done) => {
+    release = done;
+  });
+  f.deps.connect = (...args) => (++calls === 2 ? late : connect(...args));
+  f.deps.limits.cleanup = 10;
+  f.deps.limits.credentials = 100;
+  const lateApi = vi.fn();
+  try {
+    const result = await execute(f);
+    const saved = await readFile(`${result.directory}/resource.json`, "utf8");
+    expect(f.calls.filter((c) => c.method === "DELETE")).toHaveLength(0);
+    expect(JSON.parse(saved).resources.every((r) => r.removal === "unknown")).toBe(true);
+    release({ account: CAPACITY_TARGET.account, api: lateApi });
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    expect(lateApi).not.toHaveBeenCalled();
+    expect(await readFile(`${result.directory}/resource.json`, "utf8")).toBe(saved);
+    expect(result.cleanupCompleted).toBe(false);
+  } finally {
+    release({ account: CAPACITY_TARGET.account, api: lateApi });
+  }
+});
+it("rejects failed durable intent before deployment and returns safe persistence evidence", async () => {
+  const f = await fixture();
+  let failed = false;
+  journalGate.beforeRename = async (from, to) => {
+    if (!to.endsWith("/resource.json") || failed) return;
+    const snapshot = JSON.parse(await readFile(from, "utf8"));
+    if (snapshot.resources[0].creation === "creating") {
+      failed = true;
+      throw Object.assign(Error("private-disk-detail"), { code: "ENOSPC" });
+    }
+  };
+  const result = await execute(f);
+  expect(f.calls.filter((c) => c.method === "deploy")).toEqual([]);
+  expect(result).toMatchObject({
+    exitStatus: 1,
+    cleanupCompleted: false,
+    failure: { stage: "deploying", category: "driver_failed", code: "ENOSPC" },
+  });
+  expect(result.persistenceErrors).toEqual([{ artifact: "resource", phase: "deploying", code: "ENOSPC" }]);
+  expect(JSON.stringify(result)).not.toContain("private-disk-detail");
+  const journal = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(journal.resources[0].creation).toBe("planned");
+  expect(journal.cleanupErrors).toEqual(["persistence_failed"]);
+});
+it.each(Object.entries(signalStatus))(
+  "preserves %s outcome when known-unsent restoration cannot be persisted",
+  async (signal, status) => {
+    const f = await fixture();
+    let signalled = false,
+      failed = false;
+    journalGate.afterRename = async (_from, to) => {
+      if (signalled || !to.endsWith("/resource.json")) return;
+      const snapshot = JSON.parse(await readFile(to, "utf8"));
+      if (snapshot.resources[0].creation === "creating") {
+        signalled = true;
+        f.signals.emit(signal);
+      }
+    };
+    journalGate.beforeRename = async (from, to) => {
+      if (!signalled || failed || !to.endsWith("/resource.json")) return;
+      const snapshot = JSON.parse(await readFile(from, "utf8"));
+      if (snapshot.phase === "deploying" && snapshot.resources[0].creation === "planned") {
+        failed = true;
+        throw Object.assign(Error("private-detail"), { code: "EIO" });
+      }
+    };
+    const pending = execute(f);
+    await expect(pending).resolves.toMatchObject({ exitStatus: status, outcome: signal });
+    const result = await pending;
+    expect(result).toMatchObject({ exitStatus: status, outcome: signal, cleanupCompleted: false });
+    expect(result.persistenceErrors).toEqual([{ artifact: "resource", phase: "deploying", code: "EIO" }]);
+    expect(f.calls.filter((c) => c.method === "deploy")).toHaveLength(0);
+    expect(f.signals.listenerCount(signal)).toBe(0);
+  },
+);
+it.each(["resource", "results"].flatMap((artifact) => ["once", "always"].map((mode) => ({ artifact, mode }))))(
+  "returns a structured result after $mode final $artifact write failure with bounded reconciliation",
+  async ({ artifact, mode }) => {
+    const f = await fixture();
+    let failures = 0,
+      attempts = 0;
+    journalGate.beforeRename = async (from, to) => {
+      const value = JSON.parse(await readFile(from, "utf8"));
+      const finished = to.endsWith("/resource.json") ? value.phase === "finished" : Boolean(value.finishedAt);
+      if (!finished || !to.endsWith(`/${artifact}.json`)) return;
+      attempts++;
+      if (mode === "always" || !failures) {
+        failures++;
+        throw Object.assign(Error("private-final-detail"), { code: "EROFS" });
+      }
+    };
+    const result = await execute(f);
+    expect(result).toMatchObject({
+      exitStatus: 1,
+      outcome: "persistence_failed",
+      cleanupCompleted: false,
+      helperRemoved: true,
+    });
+    expect(result.persistenceErrors).toEqual([{ artifact, phase: "finished", code: "EROFS" }]);
+    expect(attempts).toBe(2);
+    const surviving = artifact === "resource" ? "results" : "resource";
+    const saved = JSON.parse(await readFile(`${result.directory}/${surviving}.json`, "utf8"));
+    expect(saved.cleanupCompleted).toBe(false);
+    expect(saved.persistenceErrors).toEqual(result.persistenceErrors);
+    expect(JSON.stringify(result)).not.toContain("private-final-detail");
+  },
+);
+it("attempts both final artifacts even when neither can be saved", async () => {
+  const f = await fixture();
+  const attempts = [];
+  journalGate.beforeRename = async (from, to) => {
+    const value = JSON.parse(await readFile(from, "utf8"));
+    if (!(value.phase === "finished" || value.finishedAt)) return;
+    attempts.push(to.endsWith("/resource.json") ? "resource" : "results");
+    throw Object.assign(Error("synthetic"), { code: "EIO" });
+  };
+  const result = await execute(f);
+  expect(result.exitStatus).toBe(1);
+  expect(result.persistenceErrors).toHaveLength(2);
+  expect(attempts).toEqual(["resource", "results", "resource", "results"]);
+  expect(f.signals.listenerCount("SIGINT")).toBe(0);
+});
+it("preserves target-validation rejection when final persistence also fails", async () => {
+  const f = await fixture({ settings: { bindings: [] } });
+  journalGate.beforeRename = async (from) => {
+    const value = JSON.parse(await readFile(from, "utf8"));
+    if (value.phase === "finished" || value.finishedAt) throw Object.assign(Error("synthetic"), { code: "EIO" });
+  };
+  await expect(execute(f)).rejects.toThrow("preview_binding_mismatch");
+  expect(f.calls.filter((c) => c.method !== "GET")).toEqual([]);
+  expect(f.signals.listenerCount("SIGTERM")).toBe(0);
 });
