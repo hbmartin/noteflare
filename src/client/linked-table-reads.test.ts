@@ -606,8 +606,6 @@ it.each(["buffer", "network"] as const)(
     void controller.page({
       queryIdentity: "query",
       generation: 1,
-      revision: 1,
-      prefix: 1,
       kind: "page",
       target: 300,
     });
@@ -640,7 +638,7 @@ it("keeps append failures out of the first denial recovery deadline", async () =
   });
   const controller = linkedTableReads({ read, poll: false, coverage: (value) => value!, unavailable: vi.fn() });
   controllers.push(controller);
-  void controller.page({ queryIdentity: "query", generation: 1, revision: 1, prefix: 1, kind: "page", target: 300 });
+  void controller.page({ queryIdentity: "query", generation: 1, kind: "page", target: 300 });
   await flushReads();
   for (const delay of [1000, 2000, 4000, 8000, 15000]) await vi.advanceTimersByTimeAsync(delay);
   void controller.refresh({ generation: 1, revision: 2 });
@@ -688,8 +686,6 @@ it("runs prerequisite verification before a dependent continuation at the recove
   const pending = controller.page({
     queryIdentity: "query",
     generation: 1,
-    revision: 1,
-    prefix: 1,
     kind: "page",
     target: 300,
   });
@@ -717,8 +713,6 @@ it("reports exhausted cursor churn as pending and resumes its extent after netwo
     await controller.page({
       queryIdentity: "query",
       generation: 1,
-      revision: 1,
-      prefix: 1,
       kind: "page",
       target: 300,
     }),
@@ -1580,7 +1574,7 @@ it("retires active and queued canonical pages without retiring later page work o
   const c = linkedTableReads({ read, poll: false, coverage: (v: typeof value) => v, unavailable: vi.fn() });
   controllers.push(c);
   await c.request();
-  const page = (target: number) => ({ kind: "page" as const, ...continuation(target), revision: 1, prefix: 1 });
+  const page = (target: number) => ({ kind: "page" as const, ...continuation(target) });
   const active = c.page(page(200));
   const queued = c.page(page(300));
   const verification = c.verifyReceipt();
@@ -1603,4 +1597,75 @@ it("retires active and queued canonical pages without retiring later page work o
     "refresh",
     400,
   ]);
+});
+
+it("schedules queued verification after standalone active retirement", async () => {
+  vi.useFakeTimers();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const read = vi.fn(async (intent: TableReadIntent) => {
+    if (intent.kind === "page") await gate;
+    return { state: "success" as const, value: 1, verification: "network" as const };
+  });
+  const c = linkedTableReads({ read, poll: false, unavailable: vi.fn() });
+  controllers.push(c);
+  const page = c.page({ kind: "page", ...continuation(200) });
+  const verify = c.verifyReceipt();
+  c.retirePages(undefined, { active: true });
+  expect(await page).toBeNull();
+  expect(read).toHaveBeenCalledOnce();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["page", "verify"]);
+  expect(await verify).toEqual({ state: "complete", value: 1 });
+  release();
+  await flushReads();
+  expect(read).toHaveBeenCalledTimes(2);
+});
+it("transfers active callers and queued targets through current-scope authorized recovery", async () => {
+  let scope = 1,
+    release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let oldSignal: AbortSignal | undefined;
+  const read = vi.fn(async (intent: TableReadIntent, signal: AbortSignal, context: TableReadContext) => {
+    if (intent.kind === "page" && scope === 1) {
+      oldSignal = signal;
+      await gate;
+    }
+    return {
+      state: "success" as const,
+      value: {
+        generation: 1,
+        revision: scope,
+        target: "target" in intent ? intent.target : 100,
+        preserved: context.preserveExtent,
+      },
+      verification: "network" as const,
+    };
+  });
+  const c = linkedTableReads({ read, poll: false, scope: () => scope, coverage: (v) => v, unavailable: vi.fn() });
+  controllers.push(c);
+  const active = c.page({ kind: "page", ...continuation(700) });
+  const queued = c.page({ kind: "page", ...continuation(800) });
+  let settled = false;
+  void active.then(() => {
+    settled = true;
+  });
+  scope++;
+  const recovery = c.recover();
+  expect(oldSignal?.aborted).toBe(true);
+  expect(settled).toBe(false);
+  expect(await recovery).toMatchObject({ revision: 2, preserved: true });
+  await flushReads();
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["page", "refresh", "page", "page"]);
+  expect(await active).toMatchObject({ revision: 2, target: 700 });
+  expect(await queued).toMatchObject({ revision: 2, target: 800 });
+  expect(read.mock.calls.map(([intent]) => intent.kind)).toEqual(["page", "refresh", "page", "page"]);
+  const count = read.mock.calls.length;
+  release();
+  await flushReads();
+  expect(read).toHaveBeenCalledTimes(count);
 });

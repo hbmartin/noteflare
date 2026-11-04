@@ -394,19 +394,13 @@ export function CollaborativeTablePage({
     async function fetchTable({ signal, intent, context }: TableFetchOptions = {}): Promise<
       LinkedTableReadOutcome<TableQueryResult>
     > {
-      if (intent?.kind === "page") {
-        const prefix = canonicalPrefix.current,
-          current = prefix.window;
-        if (intent.queryIdentity !== queryIdentity || current?.data.generation !== intent.generation)
-          return { state: "superseded" };
-        intent = { ...intent, prefix: prefix.id, revision: current.data.revision };
-      }
+      const prefixProof = canonicalPrefix.current;
       const ownsPrefix = () =>
         intent?.kind !== "page" ||
         (intent.queryIdentity === queryIdentity &&
-          intent.prefix === canonicalPrefix.current.id &&
+          prefixProof.id === canonicalPrefix.current.id &&
           intent.generation === canonicalPrefix.current.window?.data.generation &&
-          intent.revision === canonicalPrefix.current.window?.data.revision);
+          prefixProof.window?.data.revision === canonicalPrefix.current.window?.data.revision);
       if (!ownsPrefix()) return { state: "superseded" };
       const owner = ++ownership.current.request;
       const verification = ownership.current.verification;
@@ -434,7 +428,7 @@ export function CollaborativeTablePage({
                 kind: "append",
                 queryIdentity: intent.queryIdentity,
                 generation: intent.generation,
-                target: intent.target ?? (previous?.data.rows.length ?? 0) + 100,
+                target: intent.target,
               }
             : intent?.kind === "verify"
               ? { kind: "refresh" }
@@ -468,16 +462,15 @@ export function CollaborativeTablePage({
           return { state: "stale" };
         // Query/access evidence belongs to this verification lifetime. Later content watermarks
         // remain the coordinator's background freshness obligation, not an authorization latch.
-        const verified = network;
         if (linked) {
-          const available = verified || linkedWindow.current?.verified === true;
+          const available = network || linkedWindow.current?.verified === true;
           publishLinkedWindow(
             linked.window.verified === available ? linked.window : { ...linked.window, verified: available },
           );
         }
         ownership.current.generation = result.generation;
         ownership.current.canEdit = result.canEdit !== false;
-        if (verified) {
+        if (network) {
           ownership.current.verifiedQuery = true;
         }
         if (!queryBase) {
@@ -504,13 +497,13 @@ export function CollaborativeTablePage({
             request: owner,
           };
           ownership.current.applied = applied;
-          settleVerification(applied, verified);
+          settleVerification(applied, network);
         }
-        if (verified) {
+        if (network) {
           setError("");
           setBlocked("");
         }
-        if (verified)
+        if (network)
           publishReadiness(
             Boolean(
               queryBase || (connectionPermit.current() && ownership.current.authorizedGeneration === result.generation),
@@ -631,15 +624,15 @@ export function CollaborativeTablePage({
     recordAuthorization,
     advanceGeneration,
   ]);
-  const load = useCallback(
-    (continuation?: CanonicalTableContinuation | LinkedTableContinuation) => {
-      const reads = linkedReads.current;
-      if (!reads) return Promise.resolve(null);
-      if (!continuation && !queryBase) reads.retirePages(undefined, { active: true });
-      return continuation && "kind" in continuation ? reads.page(continuation) : reads.request(continuation);
-    },
-    [queryBase],
-  );
+  const load = useCallback((continuation?: CanonicalTableContinuation | LinkedTableContinuation) => {
+    const reads = linkedReads.current;
+    if (!reads) return Promise.resolve(null);
+    return continuation && "kind" in continuation ? reads.page(continuation) : reads.request(continuation);
+  }, []);
+  const refresh = () => {
+    if (!queryBase) linkedReads.current?.retirePages(undefined, { active: true });
+    return load();
+  };
   useEffect(() => {
     if (!retry?.submission) return undefined;
     const { map, key, version, operationId } = retry.submission;
@@ -798,7 +791,7 @@ export function CollaborativeTablePage({
           apiErrorMessage(cause, "The table update was rejected. Refresh before saving again."),
         );
         retireVerification("invalidate");
-        const refreshed = await load();
+        const refreshed = await linkedReads.current?.recover();
         if (refreshed)
           reportMutation(
             operation,
@@ -902,7 +895,7 @@ export function CollaborativeTablePage({
             submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
           retireVerification("invalidate");
         }
-        const refreshed = await load();
+        const refreshed = await linkedReads.current?.recover();
         if (refreshed && ownership.current.verifiedQuery)
           reportMutation(
             operation,
@@ -1197,7 +1190,7 @@ export function CollaborativeTablePage({
               </button>
             </>
           )}
-          <button disabled={busy} onClick={() => void load()}>
+          <button disabled={busy} onClick={() => void refresh()}>
             Refresh
           </button>
         </div>
@@ -1443,8 +1436,6 @@ export function CollaborativeTablePage({
                   kind: "page",
                   queryIdentity,
                   generation: data.generation,
-                  revision: data.revision,
-                  prefix: canonicalPrefix.current.id,
                   target: data.rows.length + 100,
                 });
               else if (linkedWindow.current?.queryIdentity === queryIdentity && linkedWindow.current.continuation)

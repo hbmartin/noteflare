@@ -8,8 +8,6 @@ export type CanonicalTableContinuation = {
   kind: "page";
   queryIdentity: string;
   generation: number;
-  revision: number;
-  prefix: number;
   target: number;
 };
 export type TableReadIntent = LinkedTableReadIntent | { kind: "verify" } | CanonicalTableContinuation;
@@ -470,6 +468,26 @@ export function linkedTableReads<T>(options: {
     scheduleDenied(refresh);
     schedule();
   };
+  const recover = () => {
+    if (stopped) return Promise.resolve(null);
+    // Retire the execution, not its logical target or callers. Its replacement
+    // must pass a current full-query authorization before continuing.
+    if (active) {
+      const batch = active.batch;
+      const replacement = { ...batch, waiters: batch.waiters.splice(0), networkRequired: true };
+      abortActive();
+      enqueueRetry(replacement);
+    }
+    for (const batch of queued.values()) {
+      batch.networkRequired = true;
+      if (batch.intent.kind === "refresh") {
+        batch.manual = false;
+        batch.preserveExtent = true;
+      }
+    }
+    requireVerification(true);
+    return valueOf(requireFreshness(undefined, { fresh: true }));
+  };
   window.addEventListener("online", wake);
   window.addEventListener("offline", wake);
   document.addEventListener("visibilitychange", wake);
@@ -481,6 +499,7 @@ export function linkedTableReads<T>(options: {
       const retire = (intent: TableReadIntent) => intent.kind === "page" && !keep?.(intent);
       retireQueued(retire);
       if (includeActive && active && retire(active.batch.intent)) abortActive();
+      schedule();
     },
     verifyReceipt: requestVerification,
     subscribe: (observer: (receipt: TableReadReceipt<T>) => void) => {
@@ -501,6 +520,7 @@ export function linkedTableReads<T>(options: {
     invalidate: (coverage?: TableCoverage) => valueOf(requireFreshness(coverage)),
     reset,
     recoverDenied,
+    recover,
     dispose: () => {
       stopped = true;
       reset();

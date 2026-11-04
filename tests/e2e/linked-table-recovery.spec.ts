@@ -1110,3 +1110,66 @@ for (const mode of ["hidden", "offline"] as const) {
     }
   });
 }
+
+test("canonical edit conflict preserves the held Load more target through authorized recovery", async ({ page }) => {
+  const { source, columnId } = await linkedFixture(page);
+  await page.goto(`/?page=${source.id}`);
+  const table = page
+    .locator(".table-live")
+    .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
+  const cells = table.getByLabel("Linked title", { exact: true });
+  await expect(cells.first()).toBeEnabled();
+  await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+  await expect(cells).toHaveCount(200);
+  const expectedResponse = await page.request.get(`/api/tables/${source.id}/query?limit=400`);
+  expect(expectedResponse.ok()).toBeTruthy();
+  const expected = (await expectedResponse.json()).rows.map((row: { cells: Record<string, unknown> }) =>
+    String(row.cells[columnId]),
+  );
+  await page.clock.install();
+  let release!: () => void,
+    held = false;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queries: Array<{ cursor: boolean; limit: string | null }> = [];
+  await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    queries.push({ cursor: params.has("cursor"), limit: params.get("limit") });
+    if (params.has("cursor") && !held) {
+      held = true;
+      const response = await route.fetch();
+      await gate;
+      await route.fulfill({ response }).catch(() => {});
+    } else await route.continue();
+  });
+  await page.route(`**/api/tables/${source.id}/commands`, (route) =>
+    route.fulfill({
+      status: 409,
+      json: { error: { code: "table_revision_conflict", message: "Synthetic edit conflict" } },
+    }),
+  );
+  try {
+    await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+    await expect.poll(() => held).toBe(true);
+    await cells.first().fill("Draft survives conflict");
+    await cells.first().press("Enter");
+    await expect(cells).toHaveCount(300);
+    await expect(cells.first()).toBeEnabled();
+    expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual([
+      "Draft survives conflict",
+      ...expected.slice(1, 300),
+    ]);
+    expect(queries).toEqual([
+      { cursor: true, limit: "100" },
+      { cursor: false, limit: "200" },
+      { cursor: true, limit: "200" },
+    ]);
+    release();
+    await page.clock.fastForward(3000);
+    await expect(cells).toHaveCount(300);
+    expect(queries).toHaveLength(3);
+  } finally {
+    release();
+  }
+});
