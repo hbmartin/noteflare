@@ -70,7 +70,10 @@ an explicit linked Refresh preserves the visible extent. Explicit canonical Refr
 retires older queued or active page requests; later Load more requests remain valid.
 If a started manual Refresh becomes stale, its automatic recovery preserves the
 previous visible extent; another explicit canonical Refresh still starts at page
-one. Heartbeats and foreground/online resumption use metadata-only verification
+one. Internal mutation-conflict recovery preserves pending continuation targets
+and their callers, transferring them to a fresh authorized read before retrying.
+Mount loads and internal recovery do not perform explicit Refresh retirement.
+Heartbeats and foreground/online resumption use metadata-only verification
 unless full-query recovery is required. Suspended continuations retain their
 requested target and resume only after verification. Retired, hidden or offline
 completions cannot restore verification. The shared reader owns one cursor restart;

@@ -3,6 +3,8 @@ import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { createServer } from "node:net";
 
+const positive = (id) => Number.isInteger(id) && id > 0;
+
 export class CapacityError extends Error {
   constructor(code) {
     super(code);
@@ -56,7 +58,7 @@ export async function groupStopped(
     },
   } = {},
 ) {
-  if (!Number.isInteger(pgid) || pgid <= 0) throw new CapacityError("process_identity_invalid");
+  if (!positive(pgid)) throw new CapacityError("process_identity_invalid");
   try {
     exists(pgid);
   } catch (error) {
@@ -93,7 +95,6 @@ export async function portReleased(port, { signal } = {}) {
   }
 }
 
-const positive = (id) => Number.isInteger(id) && id > 0;
 const retired = (record) => ["stopped", "spawn_failed"].includes(record.state);
 
 /** Retired IDs are never reused as signal targets. A departed leader loses ownership. */
@@ -185,15 +186,17 @@ export function createProcessManager(records, dependencies = {}) {
         }
         return false;
       };
+      const waitPhase = async (duration) =>
+        (await wait(now() + duration)) || ((await inspect(initialProbe)) && verified());
       const send = (signal) => {
         // No signalling after leader exit, even if a later probe finds this PGID alive.
         if (!certain || record.exitObserved || child.exitCode !== null || child.signalCode || record.groupStopped)
-          return false;
+          return "refused";
         try {
           signalGroup(record.pgid, signal);
-          return true;
-        } catch {
-          return false;
+          return "sent";
+        } catch (error) {
+          return error.code === "ESRCH" ? "gone" : "failed";
         }
       };
       if (!(await inspect(initialProbe))) return unknown();
@@ -201,19 +204,18 @@ export function createProcessManager(records, dependencies = {}) {
         record.state = "stopped";
         return true;
       }
-      send("SIGTERM");
+      const term = send("SIGTERM");
+      if (term === "failed") return unknown();
       // The probe above does not consume the process's graceful shutdown allowance.
-      if (!(await wait(now() + grace))) {
+      if (!(await waitPhase(grace))) {
         // A phase deadline is not an ownership observation. Get fresh evidence with
         // its own full budget before escalating, or certifying a late exit.
-        if (!(await inspect(initialProbe))) return unknown();
-        if (!verified()) {
-          if (!send("SIGKILL")) return unknown();
-          record.escalated = true;
-          if (!(await wait(now() + force))) {
-            if (!(await inspect(initialProbe)) || !verified()) return unknown();
-          }
-        }
+        if (!certain || term !== "sent") return unknown();
+        const forceResult = send("SIGKILL");
+        if (forceResult === "failed") return unknown();
+        record.escalated = forceResult === "sent";
+        // ESRCH and observed leader exit are reasons to verify, never to signal again.
+        if (!(await waitPhase(force))) return unknown();
       }
       record.state = "stopped";
       return true;

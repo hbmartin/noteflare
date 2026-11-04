@@ -2921,3 +2921,128 @@ it.each(["failed", "suspended", "held"] as const)(
   },
   5000,
 );
+
+it.each(
+  [false, true].flatMap((taskList) =>
+    [409, 404, 403].flatMap((status) => ["held", "failed", "suspended"].map((mode) => ({ taskList, status, mode }))),
+  ),
+)(
+  "retains the pending canonical target through internal $status recovery after $mode; task $taskList",
+  async ({ taskList, status, mode }) => {
+    const title = taskList ? taskColumns("table").title : "Title";
+    let rows = Array.from({ length: 400 }, (_, i) => ({
+      ...data.rows[0]!,
+      id: i === 0 ? "row" : `internal-${i}`,
+      cells: { [title]: `Row ${i}` },
+      cellRevisions: { [title]: 1 },
+    }));
+    data = { ...data, columns: [{ ...column(title, "text"), name: "Title" }], rows, rowCount: 400 };
+    let releasePage!: () => void,
+      releaseCommand!: () => void,
+      hidden = false,
+      started = false;
+    const pageGate = new Promise<void>((resolve) => {
+      releasePage = resolve;
+    });
+    const commandGate = new Promise<void>((resolve) => {
+      releaseCommand = resolve;
+    });
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    let hold = false,
+      oldSignal: AbortSignal | undefined;
+    const reads: Array<[number, number]> = [];
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if ((init?.method === "POST" && path.endsWith("/commands")) || init?.method === "PATCH") {
+        started = true;
+        await commandGate;
+        throw new ApiClientError(
+          status,
+          status === 409 ? "table_revision_conflict" : status === 404 ? "row_not_found" : "feature_disabled",
+          "Synthetic edit conflict",
+        );
+      }
+      if (path.endsWith("/draft-rows"))
+        return {
+          pageId: "table",
+          generation: 1,
+          revision: data.revision,
+          columns: data.columns,
+          rows,
+          missingRowIds: [],
+        };
+      if (path.includes("/coverage?")) return { ...data };
+      const params = new URL(path, "https://test").searchParams,
+        offset = Number(params.get("cursor") ?? 0),
+        limit = Number(params.get("limit") ?? 100);
+      reads.push([offset, limit]);
+      if (hold && offset === 200) {
+        hold = false;
+        oldSignal = init?.signal as AbortSignal;
+        await pageGate;
+        if (mode === "failed") throw new ApiClientError(503, "unavailable", "Synthetic page failure");
+      }
+      return {
+        ...data,
+        rows: rows.slice(offset, offset + limit),
+        nextCursor: offset + limit < 400 ? String(offset + limit) : null,
+      };
+    });
+    render(
+      <CollaborativeTablePage
+        page={{ id: "table", title: "Internal recovery", taskList }}
+        member={member}
+        onSelectPage={vi.fn()}
+      />,
+    );
+    const visible = () => screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value);
+    try {
+      await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+      fireEvent.click(screen.getByText("Load more rows", { selector: "button" }));
+      await waitFor(() => expect(visible()).toHaveLength(200));
+      vi.useFakeTimers();
+      vi.spyOn(Math, "random").mockReturnValue(0);
+      reads.length = 0;
+      hold = true;
+      await act(async () => fireEvent.click(screen.getByText("Load more rows", { selector: "button" })));
+      expect(oldSignal).toBeDefined();
+      const input = screen.getAllByLabelText("Title")[0]!;
+      await act(async () => {
+        fireEvent.focus(input);
+        fireEvent.change(input, { target: { value: "Local edit" } });
+        fireEvent.blur(input);
+      });
+      expect(started).toBe(true);
+      if (mode !== "held") {
+        hidden = mode === "suspended";
+        await act(async () => releasePage());
+        hidden = false;
+      }
+      rows = rows.map((row, i) => ({ ...row, cells: { [title]: `Current ${i}` } }));
+      data = { ...data, revision: 2, rows };
+      await act(async () => releaseCommand());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(visible()).toEqual(["Local edit", ...Array.from({ length: 299 }, (_, i) => `Current ${i + 1}`)]);
+      expect(reads).toEqual([
+        [200, 100],
+        [0, 200],
+        [200, 200],
+      ]);
+      expect(screen.getByText("Views", { selector: "button" })).toBeEnabled();
+      await act(async () => releasePage());
+      expect(visible()).toHaveLength(300);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(reads).toHaveLength(3);
+    } finally {
+      hidden = false;
+      await act(async () => {
+        releasePage();
+        releaseCommand();
+      });
+    }
+  },
+  5000,
+);
