@@ -72,6 +72,13 @@ If a started manual Refresh becomes stale, its automatic recovery preserves the
 previous visible extent; another explicit canonical Refresh still starts at page
 one. Internal mutation-conflict recovery preserves pending continuation targets
 and their callers, transferring them to a fresh authorized read before retrying.
+Its prerequisite becomes immediately eligible after verification debt is merged,
+while retaining failure history for the next genuine failure. This urgency does
+not change a queued explicit canonical Refresh's first-page policy. Ordinary
+heartbeat and retry deadlines remain unchanged. Query or owner retirement aborts
+obsolete executions and settles their callers immediately, so a replacement
+query can start without waiting for the old response. Late responses cannot
+publish or requeue retired work.
 Mount loads and internal recovery do not perform explicit Refresh retirement.
 Heartbeats and foreground/online resumption use metadata-only verification
 unless full-query recovery is required. Suspended continuations retain their

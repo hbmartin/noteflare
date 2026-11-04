@@ -18,6 +18,7 @@ Dated test and review records preserve the revision, environment, and limits of 
 - [PR #285 follow-up local CPU output](PR285_LOCAL_CPU_BENCHMARK.md)
 - [PR #286 follow-up escalation and explicit Refresh](PR286_FOLLOW_UP.md)
 - [PR #287 follow-up internal recovery and bounded cleanup](PR287_FOLLOW_UP.md)
+- [PR #288 follow-up query retirement and driver reporting](PR288_FOLLOW_UP.md)
 - [Documentation and release audit: 12 October 2026](documentation-audit-2026-10-12.md)
 
 - [One-click deployment verification](ONE_CLICK_DEPLOYMENT_VERIFICATION.md): prepared flow, disposable installation and redeployment, and the unresolved native-form release gate.
