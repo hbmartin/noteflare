@@ -347,7 +347,12 @@ export function linkedTableReads<T>(options: {
     }
     next();
   }
-  function requestIntent(intent: TableReadIntent, manual = true, joinActive = false): Promise<TableReadReceipt<T>> {
+  function requestIntent(
+    intent: TableReadIntent,
+    manual = true,
+    joinActive = false,
+    immediate = false,
+  ): Promise<TableReadReceipt<T>> {
     if (stopped) return Promise.resolve({ state: "retired" });
     const name = intentKey(intent);
     const scope = options.scope?.();
@@ -382,6 +387,9 @@ export function linkedTableReads<T>(options: {
         refresh.manual = true;
       }
     }
+    // Recovery urgency is independent of extent policy and failure history. Apply
+    // it after merging verification waiters/deadlines, before scheduling the read.
+    if (immediate) batch.retryAt = 0;
     if (!available()) return Promise.resolve({ state: "suspended" });
     return new Promise((resolve) => {
       const waiter: Waiter<T> = {
@@ -394,7 +402,7 @@ export function linkedTableReads<T>(options: {
       next();
     });
   }
-  const requireFreshness = (coverage?: TableCoverage, { fresh = false } = {}) => {
+  const requireFreshness = (coverage?: TableCoverage, { fresh = false, immediate = false } = {}) => {
     coverage = readTableCoverage(coverage);
     if (
       !fresh &&
@@ -418,7 +426,7 @@ export function linkedTableReads<T>(options: {
       });
     }
     if (!coverage || fresh) unscoped = invalidation;
-    return requestIntent({ kind: "refresh" }, false, Boolean(coverage) && !fresh);
+    return requestIntent({ kind: "refresh" }, false, Boolean(coverage) && !fresh, immediate);
   };
   const valueOf = async (receipt: Promise<TableReadReceipt<T>>) => {
     const result = await receipt;
@@ -447,7 +455,7 @@ export function linkedTableReads<T>(options: {
           if (queued.size) next();
           else void requestVerification();
         }, 15000);
-  const reset = (preserveActive = false) => {
+  const reset = () => {
     clear();
     refreshAhead = false;
     denialAttempt = 0;
@@ -456,7 +464,7 @@ export function linkedTableReads<T>(options: {
     verification = undefined;
     watermarks.clear();
     unscoped = ++invalidation;
-    if (!preserveActive) abortActive();
+    abortActive();
     retireQueued(() => true);
   };
   const recoverDenied = () => {
@@ -480,13 +488,12 @@ export function linkedTableReads<T>(options: {
     }
     for (const batch of queued.values()) {
       batch.networkRequired = true;
-      if (batch.intent.kind === "refresh") {
-        batch.manual = false;
+      if (batch.intent.kind === "refresh" && !batch.manual) {
         batch.preserveExtent = true;
       }
     }
     requireVerification(true);
-    return valueOf(requireFreshness(undefined, { fresh: true }));
+    return valueOf(requireFreshness(undefined, { fresh: true, immediate: true }));
   };
   window.addEventListener("online", wake);
   window.addEventListener("offline", wake);

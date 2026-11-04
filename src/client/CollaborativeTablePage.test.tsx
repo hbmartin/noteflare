@@ -3046,3 +3046,75 @@ it.each(
   },
   5000,
 );
+
+it.each(["search", "view"].flatMap((change) => [1, 2, 3, 4, 5].map((repetition) => ({ change, repetition }))))(
+  "aborts obsolete canonical pagination before $change query dispatch: repetition $repetition",
+  async ({ change }) => {
+    const rows = Array.from({ length: 400 }, (_, i) => ({
+      ...data.rows[0]!,
+      id: `old-query-${i}`,
+      cells: { Title: `Old ${i}` },
+    }));
+    const current = rows.map((row, i) => ({ ...row, id: `new-query-${i}`, cells: { Title: `New ${i}` } }));
+    data = { ...data, columns: [column("Title", "text")], rows, rowCount: 400 };
+    let release!: () => void,
+      oldSignal: AbortSignal | undefined,
+      newQueries = 0;
+    const gate = new Promise<void>((done) => {
+      release = done;
+    });
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      const params = new URL(path, "https://test").searchParams;
+      const fresh = params.get("q") === "needle" || params.get("viewId") === "grid";
+      const selectedRows = fresh ? current : rows;
+      const offset = Number(params.get("cursor") ?? 0),
+        limit = Number(params.get("limit") ?? 100);
+      if (path.includes("/coverage?"))
+        return { ...data, view: fresh && change === "view" ? { ...grid, visibleColumnIds: ["Title"] } : null };
+      if (fresh) newQueries++;
+      if (!fresh && offset === 100) {
+        oldSignal = init?.signal as AbortSignal;
+        await gate;
+      }
+      return {
+        ...data,
+        view: fresh && change === "view" ? { ...grid, visibleColumnIds: ["Title"] } : null,
+        rows: selectedRows.slice(offset, offset + limit),
+        nextCursor: offset + limit < 400 ? String(offset + limit) : null,
+      };
+    });
+    render(
+      <CollaborativeTablePage
+        page={{ id: "table", title: "Query retirement" }}
+        member={member}
+        onSelectPage={vi.fn()}
+      />,
+    );
+    try {
+      await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(screen.getByText("Load more rows", { selector: "button" })));
+      expect(oldSignal).toBeDefined();
+      await act(async () => {
+        if (change === "search")
+          fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "needle" } });
+        else fireEvent.change(screen.getByLabelText("Saved table view"), { target: { value: "grid" } });
+      });
+      expect(oldSignal?.aborted).toBe(true);
+      expect(newQueries).toBeGreaterThan(0);
+      const visible = () => screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value);
+      const expected = Array.from({ length: 100 }, (_, i) => `New ${i}`);
+      expect(visible()).toEqual(expected);
+      const before = vi.mocked(api).mock.calls.length;
+      await act(async () => release());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(visible()).toEqual(expected);
+      expect(vi.mocked(api)).toHaveBeenCalledTimes(before);
+    } finally {
+      await act(async () => release());
+    }
+  },
+  5000,
+);

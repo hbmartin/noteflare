@@ -560,8 +560,8 @@ export function CollaborativeTablePage({
     if (previous.queryIdentity === queryIdentity && sameOwner) return;
     queryOwner.current = next;
     retireVerification(sameOwner ? "retire" : "denied");
-    linkedReads.current?.reset(!queryBase && sameOwner);
-  }, [queryIdentity, queryBase, currentOwner, retireVerification]);
+    linkedReads.current?.reset();
+  }, [queryIdentity, currentOwner, retireVerification]);
   useEffect(() => {
     if (!page.id || (incarnation && incarnation.key !== account)) return undefined;
     const owns = () => active.current && sameTableOwner(currentOwner, retryLifetime.current);

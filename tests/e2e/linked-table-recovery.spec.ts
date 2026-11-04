@@ -1,8 +1,45 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page, type Request, type Route } from "@playwright/test";
 import { signInOwner, editableDocument } from "./security-helpers";
 
 test.setTimeout(60_000);
 test.use({ serviceWorkers: "block" });
+
+function heldBrowserRead(page: Page) {
+  let release!: () => void, handled!: () => void, terminal!: () => void, request: Request | undefined;
+  const gate = new Promise<void>((done) => {
+    release = done;
+  });
+  const routeHandled = new Promise<void>((done) => {
+    handled = done;
+  });
+  const requestTerminated = new Promise<void>((done) => {
+    terminal = done;
+  });
+  const finish = (candidate: Request) => {
+    if (candidate === request) terminal();
+  };
+  page.on("requestfinished", finish);
+  page.on("requestfailed", finish);
+  return {
+    async hold(route: Route) {
+      request = route.request();
+      try {
+        const response = await route.fetch();
+        await gate;
+        await route.fulfill({ response }).catch(() => {});
+      } finally {
+        handled();
+      }
+    },
+    release,
+    completed: () => Promise.all([routeHandled, requestTerminated]),
+    dispose: () => {
+      release();
+      page.off("requestfinished", finish);
+      page.off("requestfailed", finish);
+    },
+  };
+}
 
 async function linkedFixture(page: Page) {
   // Creation controls are enabled only in this client fixture; deployment flags stay unchanged.
@@ -1127,20 +1164,15 @@ test("canonical edit conflict preserves the held Load more target through author
     String(row.cells[columnId]),
   );
   await page.clock.install();
-  let release!: () => void,
-    held = false;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  let held = false;
+  const heldRead = heldBrowserRead(page);
   const queries: Array<{ cursor: boolean; limit: string | null }> = [];
   await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
     const params = new URL(route.request().url()).searchParams;
     queries.push({ cursor: params.has("cursor"), limit: params.get("limit") });
     if (params.has("cursor") && !held) {
       held = true;
-      const response = await route.fetch();
-      await gate;
-      await route.fulfill({ response }).catch(() => {});
+      await heldRead.hold(route);
     } else await route.continue();
   });
   await page.route(`**/api/tables/${source.id}/commands`, (route) =>
@@ -1165,11 +1197,63 @@ test("canonical edit conflict preserves the held Load more target through author
       { cursor: false, limit: "200" },
       { cursor: true, limit: "200" },
     ]);
-    release();
+    heldRead.release();
+    await heldRead.completed();
     await page.clock.fastForward(3000);
     await expect(cells).toHaveCount(300);
     expect(queries).toHaveLength(3);
   } finally {
-    release();
+    heldRead.dispose();
+  }
+});
+
+test("a canonical search starts before its obsolete held continuation completes", async ({ page }) => {
+  const { source, columnId } = await linkedFixture(page);
+  await page.goto(`/?page=${source.id}`);
+  const table = page
+    .locator(".table-live")
+    .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
+  const cells = table.getByLabel("Linked title", { exact: true });
+  await expect(cells.first()).toBeEnabled();
+  const expectedResponse = await page.request.get(`/api/tables/${source.id}/query?limit=100&q=Row%201`);
+  expect(expectedResponse.ok()).toBeTruthy();
+  const expected = (await expectedResponse.json()).rows.map((row: { cells: Record<string, unknown> }) =>
+    String(row.cells[columnId]),
+  );
+  expect(expected).toHaveLength(100);
+  await page.clock.install();
+  const heldRead = heldBrowserRead(page);
+  let held = false,
+    newQueries = 0;
+  await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    if (params.get("q") === "Row 1") {
+      newQueries++;
+      await route.continue();
+    } else if (params.has("cursor") && !held) {
+      held = true;
+      await heldRead.hold(route);
+    } else await route.continue();
+  });
+  try {
+    await table.getByRole("button", { name: "Load more rows", exact: true }).click();
+    await expect.poll(() => held).toBe(true);
+    await table.getByLabel("Search table").fill("Row 1");
+    await expect.poll(() => newQueries).toBeGreaterThan(0);
+    await expect(cells).toHaveCount(100);
+    await expect(cells.first()).toBeEnabled();
+    expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
+      expected,
+    );
+    const count = newQueries;
+    heldRead.release();
+    await heldRead.completed();
+    await page.clock.fastForward(3000);
+    expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
+      expected,
+    );
+    expect(newQueries).toBe(count);
+  } finally {
+    heldRead.dispose();
   }
 });
