@@ -154,6 +154,8 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     exitStatus: 0,
   };
   const helperResource = { kind: "helper", scriptName: helper, creation: "planned", removal: "pending" };
+  // Durable intent precedes the mutation; only this live run can prove it was never invoked.
+  const invokedCreations = new Set();
   const journal = {
     version: 2,
     helper,
@@ -203,7 +205,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     stopped = resolve;
   });
   const stop = (code, status = 1) => {
-    if (["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "tail_error", "tail_closed"].includes(code)) {
+    if (["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "tail_error", "tail_closed", "tail_open_deadline"].includes(code)) {
       skipDrain = true;
       cancelDrain();
     }
@@ -361,12 +363,14 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     helperResource.creation = "creating";
     await persist();
     check();
-    await scoped("deployment_deadline", timing.deploy, (signal) =>
-      (dependencies.runCommand ?? ((args, options) => wranglerCommand(processes, "deployment", args, options)))(
+    await scoped("deployment_deadline", timing.deploy, (signal) => {
+      check();
+      invokedCreations.add(helperResource);
+      return (dependencies.runCommand ?? ((args, options) => wranglerCommand(processes, "deployment", args, options)))(
         ["deploy", "--config", `${directory}/helper.json`, "--env", ""],
         { directory, signal, processes },
-      ),
-    );
+      );
+    });
     helperResource.creation = "created";
     await persist();
     check();
@@ -379,9 +383,11 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
       creation.creation = "creating";
       await persist();
       check();
-      const tail = await scoped("tail_provision_deadline", timing.deploy, () =>
-        api(`/workers/scripts/${scriptName}/tails`, { method: "POST", body: { filters: [] } }),
-      );
+      const tail = await scoped("tail_provision_deadline", timing.deploy, () => {
+        check();
+        invokedCreations.add(creation);
+        return api(`/workers/scripts/${scriptName}/tails`, { method: "POST", body: { filters: [] } });
+      });
       if (typeof tail?.id !== "string") throw new CapacityError("invalid_tail_response");
       creation.id = tail.id;
       creation.creation = "created";
@@ -577,7 +583,12 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     check();
   } catch (error) {
     if (error instanceof PreviewTargetError) preflightError = error;
-    for (const resource of journal.resources) if (resource.creation === "creating") resource.creation = "unknown";
+    let restoredUnsent = false;
+    for (const resource of journal.resources) {
+      if (resource.creation !== "creating") continue;
+      resource.creation = invokedCreations.has(resource) ? "unknown" : "planned";
+      restoredUnsent ||= resource.creation === "planned";
+    }
     const category = error instanceof CapacityError ? error.code : "driver_failed";
     if (!reason || reason === category) {
       result.failure = { stage: journal.phase, category };
@@ -586,6 +597,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
       if (Number.isInteger(error?.status)) result.failure.status = error?.status;
     }
     stop(category);
+    if (restoredUnsent) await persist();
   } finally {
     // Sample failures still need delayed invocation frames. Signals and broken streams skip this wait.
     if (sockets.length && !skipDrain) {

@@ -1,5 +1,6 @@
 import { EventEmitter, once } from "node:events";
 import { createServer } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, expect, it, vi } from "vitest";
 import { createProcessManager, groupStopped, portReleased, bounded } from "./capacity-process.mjs";
 const disposals = [];
@@ -51,6 +52,74 @@ it("records verified escalation without declaring residual processes", async () 
   expect(f.signals.map((entry) => entry.signal)).toEqual(["SIGTERM", "SIGKILL"]);
   expect(f.records[0]).toMatchObject({ escalated: true, exitObserved: true, groupStopped: true, state: "stopped" });
 });
+it.each([1, 2, 3, 4, 5])(
+  "escalates after a signal-aware delayed probe: repetition %s",
+  async () => {
+    const f = fake("force");
+    const manager = createProcessManager(f.records, {
+      ...f.dependencies,
+      initialProbe: 200,
+      grace: 30,
+      force: 30,
+      now: () => performance.now(),
+      delay,
+      groupStopped: async (_pgid, { signal }) => {
+        await delay(20, undefined, { signal });
+        return Boolean(f.child.signalCode);
+      },
+    });
+    await manager.start("proxy", "test", []);
+    expect(await manager.stopAll()).toBe(true);
+    expect(f.signals.map((entry) => entry.signal)).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(f.records[0]).toMatchObject({ state: "stopped", escalated: true, exitObserved: true, groupStopped: true });
+  },
+  3000,
+);
+it.each(["failure", "timeout", "leader-exit"])(
+  "does not escalate after %s in the independent final probe",
+  async (mode) => {
+    const f = fake("force");
+    let probes = 0;
+    const manager = createProcessManager(f.records, {
+      ...f.dependencies,
+      groupStopped: async (_pgid, { signal }) => {
+        if (++probes < 3) return false;
+        if (mode === "failure") throw Error("probe failed");
+        if (mode === "timeout") await delay(1000, undefined, { signal });
+        f.child.exitCode = 0;
+        f.child.emit("exit", 0, null);
+        return false; // Remaining members are uncertain once their leader exits.
+      },
+    });
+    await manager.start("proxy", "test", []);
+    expect(await manager.stopAll()).toBe(false);
+    expect(f.signals.map((entry) => entry.signal)).toEqual(["SIGTERM"]);
+    expect(f.records[0].state).toBe("unknown");
+  },
+  2000,
+);
+it("certifies a post-SIGKILL exit using a fresh probe after the force window expires", async () => {
+  const f = fake("force");
+  let forcedProbes = 0;
+  const manager = createProcessManager(f.records, {
+    ...f.dependencies,
+    initialProbe: 200,
+    grace: 10,
+    force: 10,
+    now: () => performance.now(),
+    delay,
+    groupStopped: async (_pgid, { signal }) => {
+      if (!f.child.signalCode) return false;
+      forcedProbes++;
+      await delay(20, undefined, { signal });
+      return true;
+    },
+  });
+  await manager.start("proxy", "test", []);
+  expect(await manager.stopAll()).toBe(true);
+  expect(forcedProbes).toBeGreaterThanOrEqual(2);
+  expect(f.records[0]).toMatchObject({ state: "stopped", escalated: true, exitObserved: true, groupStopped: true });
+}, 3000);
 it("cannot certify a proxy that refuses both stop signals", async () => {
   const f = fake("refuse");
   await f.manager.start("proxy", "test", []);
@@ -129,6 +198,40 @@ it("does not accept a listener owned by another process as released", async () =
   expect(await portReleased(port)).toBe(true);
 });
 const supported = ["darwin", "linux"].includes(process.platform);
+it.runIf(supported)(
+  "force-stops a live child that ignores SIGTERM and verifies its exit",
+  async () => {
+    const records = [];
+    const manager = createProcessManager(records, { initialProbe: 1000, grace: 40, force: 500 });
+    const handle = await manager.start(
+      "proxy",
+      process.execPath,
+      ["-e", 'process.on("SIGTERM",()=>{});console.log("ready");setInterval(()=>{},1000);'],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
+    let failure;
+    try {
+      await bounded(once(handle.child.stdout, "data"), 2000, "child_ready_deadline");
+      expect(await manager.stopAll()).toBe(true);
+      expect(records[0]).toMatchObject({ state: "stopped", escalated: true, exitObserved: true, groupStopped: true });
+    } catch (error) {
+      failure = error;
+    } finally {
+      // Signal only this still-live direct child, never a historical journal/group ID.
+      try {
+        if (handle.child.exitCode === null && !handle.child.signalCode) {
+          handle.child.kill("SIGKILL");
+          await bounded(handle.exited, 2000, "child_exit_deadline");
+        }
+      } catch (error) {
+        failure ??= error;
+      }
+      handle.child.stdout.destroy();
+    }
+    if (failure) throw failure;
+  },
+  6000,
+);
 it.runIf(supported)("captures credential output in memory while journaling identities only", async () => {
   const records = [];
   const manager = createProcessManager(records, { grace: 500, force: 500 });
@@ -282,7 +385,7 @@ it.each([0, -1, null, 1.5])("never signals invalid identity %s", async (pid) => 
   expect(await f.manager.stopAll()).toBe(false);
   expect(f.signals).toEqual([]);
 });
-it("preserves spawn failure diagnostics", async () => {
+it("preserves spawn_failed classification", async () => {
   const f = fake();
   delete f.child.pid;
   const started = f.manager.start("proxy", "missing", []);
