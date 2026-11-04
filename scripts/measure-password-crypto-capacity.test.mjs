@@ -12,11 +12,15 @@ import {
   CAPACITY_TARGET,
 } from "./measure-password-crypto-capacity.mjs";
 import { capacityHarness } from "./__fixtures__/password-capacity-driver.mjs";
-const journalGate = vi.hoisted(() => ({ afterRename: undefined, beforeRename: undefined }));
+const journalGate = vi.hoisted(() => ({ afterRename: undefined, beforeRename: undefined, beforeUnlink: undefined }));
 vi.mock("node:fs/promises", async (original) => {
   const filesystem = await original();
   return {
     ...filesystem,
+    unlink: async (...args) => {
+      await journalGate.beforeUnlink?.(...args);
+      return filesystem.unlink(...args);
+    },
     rename: async (...args) => {
       await journalGate.beforeRename?.(...args);
       await filesystem.rename(...args);
@@ -28,6 +32,7 @@ const directories = [];
 afterEach(async () => {
   journalGate.afterRename = undefined;
   journalGate.beforeRename = undefined;
+  journalGate.beforeUnlink = undefined;
   try {
     await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
   } finally {
@@ -1043,3 +1048,179 @@ it("preserves target-validation rejection when final persistence also fails", as
   expect(f.calls.filter((c) => c.method !== "GET")).toEqual([]);
   expect(f.signals.listenerCount("SIGTERM")).toBe(0);
 });
+
+it("does not label a later deployment failure as the earlier signal's primary cause", async () => {
+  const f = await fixture();
+  f.deps.runCommand = () => {
+    f.signals.emit("SIGINT");
+    throw Object.assign(Error("private-subsequent-detail"), { code: "EIO" });
+  };
+  const result = await execute(f);
+  expect(result).toMatchObject({ outcome: "SIGINT", exitStatus: 130 });
+  expect(result.failure).toBeUndefined();
+  expect(JSON.stringify(result)).not.toContain("private-subsequent-detail");
+});
+it("reports failed resource cleanup ahead of a final persistence failure", async () => {
+  const f = await fixture({
+    cleanup: (path) => {
+      if (path.endsWith("/tails/1")) throw Error("private-cleanup-detail");
+    },
+  });
+  journalGate.beforeRename = async (from, to) => {
+    if (to.endsWith("/results.json") && JSON.parse(await readFile(from, "utf8")).finishedAt)
+      throw Object.assign(Error("private-save-detail"), { code: "EIO" });
+  };
+  const result = await execute(f);
+  expect(result).toMatchObject({
+    outcome: "cleanup_failed",
+    exitStatus: 1,
+    helperRemoved: true,
+    resourceCleanupCompleted: false,
+    persistenceCompleted: false,
+    cleanupCompleted: false,
+  });
+  expect(result.cleanupErrors).toEqual(["remote_cleanup_failed", "persistence_failed"]);
+  const saved = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(saved.resources[1].removal).toBe("failed");
+  expect(saved.resourceCleanupCompleted).toBe(false);
+  expect(saved.persistenceCompleted).toBe(false);
+});
+it("reports complete resource removal separately from failed persistence and removes its owned temporary file", async () => {
+  const f = await fixture();
+  journalGate.beforeRename = async (from, to) => {
+    if (to.endsWith("/results.json") && JSON.parse(await readFile(from, "utf8")).finishedAt)
+      throw Object.assign(Error("synthetic"), { code: "EIO" });
+  };
+  const result = await execute(f);
+  expect(result).toMatchObject({
+    outcome: "persistence_failed",
+    exitStatus: 1,
+    resourceCleanupCompleted: true,
+    persistenceCompleted: false,
+    cleanupCompleted: false,
+  });
+  expect(result.cleanupErrors).toEqual(["persistence_failed"]);
+  const saved = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(saved.resources.every((resource) => resource.removal === "removed")).toBe(true);
+  const { readdir } = await import("node:fs/promises");
+  expect(await readdir(result.directory)).not.toContain("results.json.tmp");
+});
+it("keeps the original persistence failure when temporary-file removal also fails", async () => {
+  const f = await fixture();
+  journalGate.beforeRename = async (from, to) => {
+    if (to.endsWith("/results.json") && JSON.parse(await readFile(from, "utf8")).finishedAt)
+      throw Object.assign(Error("private-rename-detail"), { code: "EIO" });
+  };
+  journalGate.beforeUnlink = () => {
+    throw Object.assign(Error("private-unlink-detail"), { code: "EPERM" });
+  };
+  const result = await execute(f);
+  expect(result.persistenceErrors).toEqual([{ artifact: "results", phase: "finished", code: "EIO" }]);
+  expect(result.resourceCleanupCompleted).toBe(true);
+  const saved = JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8"));
+  expect(saved.cleanupWarnings).toContain("temporary_file_cleanup_failed");
+  expect(JSON.stringify(result)).not.toMatch(/private-(rename|unlink)-detail/);
+});
+it.each(
+  ["resource-before", "resource-after", "results-before", "results-after"].flatMap((boundary) =>
+    ["success", "failure", "signal"].map((earlier) => ({ boundary, earlier })),
+  ),
+)("records a late signal at $boundary without replacing $earlier", async ({ boundary, earlier }) => {
+  const f = await fixture(
+    earlier === "failure"
+      ? {
+          response: {
+            runToken: "synthetic-local-proof-never-persist",
+            result: { ok: false, code: "unavailable", attempts: 0 },
+          },
+        }
+      : {},
+  );
+  if (earlier === "signal")
+    f.deps.runCommand = () => {
+      f.signals.emit("SIGTERM");
+    };
+  let signalled = false;
+  const artifact = boundary.startsWith("resource") ? "resource" : "results";
+  const hook = async (from, to) => {
+    if (signalled || !to.endsWith(`/${artifact}.json`)) return;
+    const value = JSON.parse(await readFile(boundary.endsWith("before") ? from : to, "utf8"));
+    if (value.phase !== "finished" && !value.finishedAt) return;
+    signalled = true;
+    f.signals.emit("SIGINT");
+    f.signals.emit("SIGHUP");
+  };
+  if (boundary.endsWith("before")) journalGate.beforeRename = hook;
+  else journalGate.afterRename = hook;
+  const result = await execute(f);
+  expect(signalled).toBe(true);
+  expect(result).toMatchObject({
+    outcome: earlier === "success" ? "success" : earlier === "failure" ? "operation_failed" : "SIGTERM",
+    lateSignal: "SIGINT",
+    exitStatus: earlier === "success" ? 130 : earlier === "failure" ? 1 : 143,
+    resourceCleanupCompleted: true,
+    persistenceCompleted: true,
+    cleanupCompleted: true,
+  });
+  expect(result.failure?.category).not.toBe("SIGINT");
+  const saved = JSON.parse(await readFile(`${result.directory}/results.json`, "utf8"));
+  expect(saved.lateSignal).toBe("SIGINT");
+  expect(saved.outcome).toBe(result.outcome);
+  expect(saved.exitStatus).toBe(result.exitStatus);
+  expect(f.signals.listenerCount("SIGINT")).toBe(0);
+});
+it.each(Object.entries(signalStatus))(
+  "uses %s exit status for a late signal after successful cleanup",
+  async (signal, status) => {
+    const f = await fixture();
+    let sent = false;
+    journalGate.afterRename = async (_from, to) => {
+      if (sent || !to.endsWith("/resource.json")) return;
+      if (JSON.parse(await readFile(to, "utf8")).phase !== "finished") return;
+      sent = true;
+      f.signals.emit(signal);
+    };
+    expect(await execute(f)).toMatchObject({ outcome: "success", lateSignal: signal, exitStatus: status });
+  },
+);
+it("bounds reconciliation when a first late signal arrives after the last result snapshot", async () => {
+  const f = await fixture();
+  let resourceWrites = 0,
+    resultWrites = 0;
+  journalGate.beforeRename = async (from, to) => {
+    const value = JSON.parse(await readFile(from, "utf8"));
+    if (to.endsWith("/resource.json") && value.phase === "finished" && ++resourceWrites === 1)
+      throw Object.assign(Error("synthetic"), { code: "EIO" });
+  };
+  journalGate.afterRename = async (_from, to) => {
+    if (!to.endsWith("/results.json")) return;
+    const value = JSON.parse(await readFile(to, "utf8"));
+    if (value.finishedAt && ++resultWrites === 2) f.signals.emit("SIGINT");
+  };
+  const result = await execute(f);
+  expect(result).toMatchObject({
+    outcome: "persistence_failed",
+    lateSignal: "SIGINT",
+    exitStatus: 1,
+    resourceCleanupCompleted: true,
+    persistenceCompleted: false,
+  });
+  expect(resourceWrites).toBe(2);
+  expect(resultWrites).toBe(2);
+  const saved = JSON.parse(await readFile(`${result.directory}/results.json`, "utf8"));
+  expect(saved.lateSignal).toBeUndefined();
+  expect(saved.outcome).toBe(result.outcome);
+});
+it.each([0, 99, 100, 503, 599, 600, 999, 1.5, "503", undefined])(
+  "uses the same status predicate for sample and summary: %s",
+  async (status) => {
+    const f = await fixture(),
+      request = f.deps.request;
+    f.deps.request = (url, input) =>
+      new URL(url).pathname === "/health" ? request(url, input) : { ok: false, status };
+    const result = await execute(f);
+    const expected = Number.isInteger(status) && Number(status) >= 100 && Number(status) <= 599 ? status : undefined;
+    expect(result.warmups[0].status).toBe(expected);
+    expect(result.failure.status).toBe(expected);
+  },
+);
