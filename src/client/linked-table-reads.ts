@@ -477,8 +477,11 @@ export function linkedTableReads<T>(options: {
     request: (continuation?: LinkedTableContinuation) =>
       valueOf(requestIntent(continuation ? { kind: "append", ...continuation } : { kind: "refresh" })),
     page: (continuation: CanonicalTableContinuation) => valueOf(requestIntent(continuation)),
-    retirePages: (keep?: (intent: CanonicalTableContinuation) => boolean) =>
-      retireQueued((intent) => intent.kind === "page" && !keep?.(intent)),
+    retirePages: (keep?: (intent: CanonicalTableContinuation) => boolean, { active: includeActive = false } = {}) => {
+      const retire = (intent: TableReadIntent) => intent.kind === "page" && !keep?.(intent);
+      retireQueued(retire);
+      if (includeActive && active && retire(active.batch.intent)) abortActive();
+    },
     verifyReceipt: requestVerification,
     subscribe: (observer: (receipt: TableReadReceipt<T>) => void) => {
       observers.add(observer);
