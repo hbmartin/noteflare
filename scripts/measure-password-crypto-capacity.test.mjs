@@ -10,13 +10,28 @@ import {
   measurePasswordCryptoCapacity as run,
   parseCapacityArguments,
   CAPACITY_TARGET,
+  capacitySummary,
 } from "./measure-password-crypto-capacity.mjs";
 import { capacityHarness } from "./__fixtures__/password-capacity-driver.mjs";
-const journalGate = vi.hoisted(() => ({ afterRename: undefined, beforeRename: undefined, beforeUnlink: undefined }));
+const journalGate = vi.hoisted(() => ({
+  afterRename: undefined,
+  beforeRename: undefined,
+  beforeUnlink: undefined,
+  beforeWrite: undefined,
+  beforeLstat: undefined,
+}));
 vi.mock("node:fs/promises", async (original) => {
   const filesystem = await original();
   return {
     ...filesystem,
+    writeFile: async (...args) => {
+      await journalGate.beforeWrite?.(...args);
+      return filesystem.writeFile(...args);
+    },
+    lstat: async (...args) => {
+      await journalGate.beforeLstat?.(...args);
+      return filesystem.lstat(...args);
+    },
     unlink: async (...args) => {
       await journalGate.beforeUnlink?.(...args);
       return filesystem.unlink(...args);
@@ -33,6 +48,8 @@ afterEach(async () => {
   journalGate.afterRename = undefined;
   journalGate.beforeRename = undefined;
   journalGate.beforeUnlink = undefined;
+  journalGate.beforeWrite = undefined;
+  journalGate.beforeLstat = undefined;
   try {
     await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
   } finally {
@@ -1224,3 +1241,134 @@ it.each([0, 99, 100, 503, 599, 600, 999, 1.5, "503", undefined])(
     expect(result.failure.status).toBe(expected);
   },
 );
+
+it("captures a pre-open stream failure at its first source", async () => {
+  const f = await fixture();
+  f.deps.createSocket = () => {
+    const socket = new EventEmitter();
+    socket.terminate = () => {};
+    queueMicrotask(() => socket.emit("error", Error("private socket text")));
+    return socket;
+  };
+  const result = await execute(f);
+  expect(result.stopCause).toEqual({ stage: "deploying", category: "tail_error" });
+  expect(result.failure).toEqual(result.stopCause);
+  expect(result.outcome).toBe("tail_error");
+  expect(JSON.stringify(result)).not.toContain("private socket text");
+});
+it("keeps a tail failure's stage when a different API error follows", async () => {
+  let f,
+    tails = 0;
+  f = await fixture({
+    onTail: () => {
+      if (++tails === 2) {
+        f.sockets[0].emit("error", Error("private socket text"));
+        throw Object.assign(Error("private API text"), { code: "EIO" });
+      }
+    },
+  });
+  const result = await execute(f);
+  expect(result.stopCause).toEqual({ stage: "deploying", category: "tail_error" });
+  expect(result.failure).toEqual(result.stopCause);
+  expect(result.outcome).toBe("tail_error");
+  expect(JSON.stringify(result)).not.toMatch(/private (socket|API) text/);
+});
+it.each(
+  ["deploying", "sampling", "cleanup"].flatMap((stage) =>
+    Object.entries(signalStatus).map(([signal]) => ({ stage, signal })),
+  ),
+)("records secondary $signal during $stage without changing its primary cause", async ({ stage, signal }) => {
+  let f,
+    tails = 0;
+  const stop = () => {
+    f.sockets[0].emit("error", Error("private first cause"));
+    f.signals.emit(signal);
+    f.signals.emit("SIGQUIT");
+  };
+  f = await fixture({
+    ...(stage === "deploying"
+      ? {
+          onTail: () => {
+            if (++tails === 2) stop();
+          },
+        }
+      : {}),
+    ...(stage === "sampling" ? { onSample: stop } : {}),
+    ...(stage === "cleanup"
+      ? {
+          response: { runToken: "synthetic-local-proof-never-persist", result: { ok: false, attempts: 0 } },
+          cleanup: () => {
+            f.signals.emit(signal);
+            f.signals.emit("SIGQUIT");
+          },
+        }
+      : {}),
+  });
+  const result = await execute(f);
+  const category = stage === "cleanup" ? "operation_failed" : "tail_error";
+  expect(result).toMatchObject({ outcome: category, exitStatus: 1, secondarySignal: { signal, stage } });
+  expect(result.stopCause).toEqual({ stage: stage === "cleanup" ? "sampling" : stage, category });
+  expect(result.failure).toEqual(result.stopCause);
+  expect(result.lateSignal).toBeUndefined();
+  expect(capacitySummary(result).secondarySignal).toEqual({ signal, stage });
+  expect(JSON.parse(await readFile(`${result.directory}/resource.json`, "utf8")).secondarySignal).toEqual({
+    signal,
+    stage,
+  });
+});
+it("retains a primary signal's safe stage and status through a second cleanup signal", async () => {
+  let f;
+  f = await fixture({ onDeploy: () => f.signals.emit("SIGTERM"), cleanup: () => f.signals.emit("SIGINT") });
+  const result = await execute(f);
+  expect(result).toMatchObject({
+    outcome: "SIGTERM",
+    exitStatus: 143,
+    stopCause: { stage: "deploying", category: "SIGTERM" },
+    secondarySignal: { signal: "SIGINT", stage: "cleanup" },
+  });
+  expect(result.failure).toBeUndefined();
+});
+it.each(["absent", "present", "unverifiable"])(
+  "reports failed temporary removal only when not proven absent: %s",
+  async (state) => {
+    const f = await fixture();
+    journalGate.beforeWrite = (path) => {
+      if (state !== "present" && path.endsWith(".json.tmp"))
+        throw Object.assign(Error("private write text"), { code: "EROFS" });
+    };
+    journalGate.beforeRename = async (from, to) => {
+      if (state === "present" && to.endsWith("/results.json") && JSON.parse(await readFile(from, "utf8")).finishedAt)
+        throw Object.assign(Error("private rename text"), { code: "EIO" });
+    };
+    journalGate.beforeUnlink = () => {
+      throw Object.assign(Error("private unlink text"), { code: "EROFS" });
+    };
+    journalGate.beforeLstat = () => {
+      if (state === "unverifiable") throw Object.assign(Error("private inspection text"), { code: "EACCES" });
+    };
+    const result = await execute(f);
+    expect(result.cleanupWarnings).toEqual(state === "absent" ? [] : ["temporary_file_cleanup_failed"]);
+    expect(capacitySummary(result).cleanupWarnings).toEqual(result.cleanupWarnings);
+    expect(result.persistenceCompleted).toBe(false);
+    expect(result.persistenceErrors[0].code).toBe(state === "present" ? "EIO" : "EROFS");
+    expect(JSON.stringify(capacitySummary(result))).not.toContain("private");
+  },
+);
+it("reports a partial-write cleanup warning even when neither final artifact can be saved", async () => {
+  const f = await fixture();
+  journalGate.beforeRename = () => {
+    throw Object.assign(Error("private rename"), { code: "EIO" });
+  };
+  journalGate.beforeUnlink = () => {
+    throw Object.assign(Error("private unlink"), { code: "EPERM" });
+  };
+  const result = await execute(f);
+  expect(capacitySummary(result)).toMatchObject({
+    cleanupWarnings: ["temporary_file_cleanup_failed"],
+    persistenceCompleted: false,
+    exitStatus: 1,
+  });
+  const { readdir } = await import("node:fs/promises");
+  expect(await readdir(result.directory)).not.toContain("resource.json");
+  expect(await readdir(result.directory)).not.toContain("results.json");
+});
