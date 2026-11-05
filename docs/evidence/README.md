@@ -21,6 +21,7 @@ Dated test and review records preserve the revision, environment, and limits of 
 - [PR #288 follow-up query retirement and driver reporting](PR288_FOLLOW_UP.md)
 - [PR #289 follow-up search dispatch and driver diagnostics](PR289_FOLLOW_UP.md)
 - [PR #290 follow-up applied search and IME recovery](PR290_FOLLOW_UP.md)
+- [PR #291 follow-up search reconnection and saved-refresh feedback](PR291_FOLLOW_UP.md)
 - [Documentation and release audit: 12 October 2026](documentation-audit-2026-10-12.md)
 
 - [One-click deployment verification](ONE_CLICK_DEPLOYMENT_VERIFICATION.md): prepared flow, disposable installation and redeployment, and the unresolved native-form release gate.
