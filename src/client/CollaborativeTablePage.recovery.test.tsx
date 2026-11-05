@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, expect, it, vi } from "vitest";
 import { CollaborativeTablePage, type CollaborativeTableProps } from "./CollaborativeTablePage";
 import { api, ApiClientError } from "./api";
+import * as tableReadCoordinator from "./linked-table-reads";
 import { accountCellDrafts, purgeCellDrafts, CellDraftMap } from "./cell-drafts";
 import { taskColumns } from "../shared/tasks";
 import type { CollaborativeColumn, TableQueryResult } from "../shared/table-protocol";
@@ -421,7 +422,9 @@ it.each(["row_not_found", "column_not_found", "task_not_found", "view_not_found"
     fireEvent.focus(input);
     fireEvent.change(input, { target: { value: "Local draft" } });
     fireEvent.blur(input);
-    await screen.findByText("Item disappeared");
+    await screen.findByText(
+      `The ${code === "task_not_found" ? "task" : "table item"} is unavailable. Your edit was not saved. Review the table before trying again.`,
+    );
     await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
     expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
     expect(screen.getByRole("button", { name: "Views" })).toBeEnabled();
@@ -645,43 +648,50 @@ it.each([false, true])("retries the captured %s task operation through a current
   expect(accountCellDrafts(account).some((draft) => draft.columnId === ids.title)).toBe(false);
 });
 
-it.each(["relation_target_unavailable", "feature_disabled", "read_only", "owner_required", "unknown_operation_denial"])(
-  "preserves authorized rows after operation 403 %s",
-  async (code) => {
-    fixture();
-    const input = await screen.findByLabelText("Title");
-    await waitFor(() => expect(input).toBeEnabled());
-    const read = vi.mocked(api).getMockImplementation()!;
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let verify = false;
-    const writes: string[] = [];
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (init?.method === "POST" && path.endsWith("/commands")) {
-        writes.push(String(init.body));
-        verify = true;
-        throw new ApiClientError(403, code, "Operation rejected");
-      }
-      if (verify && !init?.method) await held;
-      return read(path, init);
-    });
-    fireEvent.focus(input);
-    fireEvent.change(input, { target: { value: "Preserved draft" } });
-    fireEvent.blur(input);
-    await screen.findByText("Operation rejected");
-    expect(screen.getByLabelText("Search table")).toBeInTheDocument();
-    expect(input).toBeDisabled();
-    await act(async () => {
-      release();
-    });
-    await waitFor(() => expect(input).toBeEnabled());
-    expect(writes).toHaveLength(1);
-    expect(screen.getByText("Operation rejected")).toBeInTheDocument();
-    expect(accountCellDrafts(account).some((draft) => draft.text === "Preserved draft")).toBe(true);
-  },
-);
+it.each([
+  ["relation_target_unavailable", "The related table is unavailable."],
+  ["feature_disabled", "This feature is unavailable."],
+  ["read_only", "This table is read-only."],
+  ["owner_required", "This action requires an owner."],
+  ["unknown_operation_denial", "Operation rejected"],
+])("preserves authorized rows after operation 403 %s", async (code, reason) => {
+  fixture();
+  const input = await screen.findByLabelText("Title");
+  await waitFor(() => expect(input).toBeEnabled());
+  const read = vi.mocked(api).getMockImplementation()!;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let verify = false;
+  const writes: string[] = [];
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method === "POST" && path.endsWith("/commands")) {
+      writes.push(String(init.body));
+      verify = true;
+      throw new ApiClientError(403, code, "Operation rejected");
+    }
+    if (verify && !init?.method) await held;
+    return read(path, init);
+  });
+  fireEvent.focus(input);
+  fireEvent.change(input, { target: { value: "Preserved draft" } });
+  fireEvent.blur(input);
+  const message =
+    code === "unknown_operation_denial"
+      ? `${reason} Your edit was not saved. Review the table before trying again.`
+      : `${reason} Your edit was not saved. Review the current permissions and available actions before trying again.`;
+  await screen.findByText(message);
+  expect(screen.getByLabelText("Search table")).toBeInTheDocument();
+  expect(input).toBeDisabled();
+  await act(async () => {
+    release();
+  });
+  await waitFor(() => expect(input).toBeEnabled());
+  expect(writes).toHaveLength(1);
+  expect(screen.getByText(message)).toBeInTheDocument();
+  expect(accountCellDrafts(account).some((draft) => draft.text === "Preserved draft")).toBe(true);
+});
 
 it.each(["Views", "Properties"])("retains the open %s form while verification blocks mutations", async (panel) => {
   fixture();
@@ -746,7 +756,11 @@ it.each([false, true])(
       await waitFor(() => expect(refreshStarted).toBe(true));
       fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Other query" } });
       await waitFor(() => expect(input).toBeEnabled());
-      expect(screen.getByText("Conflict before refresh")).toBeVisible();
+      expect(
+        screen.getByText(
+          `The ${taskList ? "task list" : "table"} changed. Your edit was not saved. Review the latest values before saving again.`,
+        ),
+      ).toBeVisible();
       expect(input).toHaveValue("Preserved during view change");
       expect(writes).toBe(1);
     } finally {
@@ -815,13 +829,19 @@ it.each(
     await act(async () => command.release());
     expect(heldReads).toBeGreaterThan(0);
     const initialMessage =
-      typeof outcome === "number" ? `Rejected ${outcome}` : "Saved. Refreshing the latest table data…";
+      outcome === 409
+        ? `The ${task ? "task list" : "table"} changed. Your edit was not saved. Review the latest values before saving again.`
+        : outcome === 404
+          ? `The ${task ? "task" : "table item"} is unavailable. Your edit was not saved. Review the table before trying again.`
+          : outcome === 403
+            ? "This table is read-only. Your edit was not saved. Review the current permissions and available actions before trying again."
+            : "Saved. Refreshing the latest table data…";
     expect(screen.queryByText(initialMessage)).not.toBeNull();
     expect(screen.getByText(initialMessage)).toBeVisible();
     await act(async () => postRead.release());
     const failureMessage =
       typeof outcome === "number"
-        ? `Rejected ${outcome}`
+        ? initialMessage
         : outcome === "saved-denied"
           ? "Saved. Access to the table could not be confirmed."
           : "Saved. The latest table data could not be refreshed. Retrying…";
@@ -847,57 +867,237 @@ it.each(
   5000,
 );
 
-it.each([false, true])("ignores a pre-save read failure and retired-owner results; task %s", async (task) => {
-  const { data, rerender } = fixture(task, 2);
+it.each([false, true])(
+  "reports an adopted pre-save read failure and ignores retired-owner results; task %s",
+  async (task) => {
+    const { data, rerender } = fixture(task, 2);
+    await act(async () => {
+      await firstFixtureRead;
+    });
+    const title = titleInputs()[0]!;
+    await waitFor(() => expect(title).toBeEnabled());
+    const read = vi.mocked(api).getMockImplementation()!;
+    const command = heldFixtureRead(),
+      previous = heldFixtureRead(),
+      verification = heldFixtureRead();
+    let started = 0;
+    vi.mocked(api).mockImplementation(async (_path, init) => {
+      if ((init?.method === "POST" && !init.readOnly) || init?.method === "PATCH") {
+        await command.promise;
+        data.revision++;
+        return { generation: 1, revision: data.revision, result: {} };
+      }
+      if (++started === 1) {
+        await previous.promise;
+        throw new ApiClientError(503, "temporary", "Previous read failed");
+      }
+      await verification.promise;
+      throw new ApiClientError(503, "temporary", "Retired read failed");
+    });
+    await act(async () => {
+      fireEvent.focus(title);
+      fireEvent.change(title, { target: { value: "Local" } });
+      fireEvent.blur(title);
+      window.dispatchEvent(
+        new CustomEvent("notes:workspace-event", {
+          detail: { type: "task-list-invalidated", pageId: "table", forceRefresh: true },
+        }),
+      );
+    });
+    await act(async () => command.release());
+    await act(async () => previous.release());
+    expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+    expect(screen.getByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeVisible();
+    vi.mocked(api).mockImplementation(read);
+    rerender(
+      <CollaborativeTablePage
+        page={{ id: "replacement", title: "Other owner" }}
+        member={{ role: "editor", user: { id: "other" }, features: {} } as CollaborativeTableProps["member"]}
+        queryBase="/other"
+        onSelectPage={() => {}}
+      />,
+    );
+    await act(async () => verification.release());
+    expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+    expect(screen.queryByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeNull();
+  },
+);
+
+it.each([false, true].flatMap((task) => ["failure", "denied"].map((outcome) => ({ task, outcome }))))(
+  "reports an adopted read's $outcome immediately and clears it only after covering verification; task $task",
+  async ({ task, outcome }) => {
+    const { data } = fixture(task, 2);
+    await act(async () => {
+      await firstFixtureRead;
+    });
+    const input = titleInputs()[0]!;
+    await waitFor(() => expect(input).toBeEnabled());
+    const original = vi.mocked(api).getMockImplementation()!;
+    const held = heldFixtureRead();
+    let reads = 0,
+      mutations = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if ((init?.method === "POST" && !init.readOnly) || init?.method === "PATCH") {
+        mutations++;
+        data.revision++;
+        return { generation: 1, revision: data.revision, result: {} };
+      }
+      if (++reads === 1) {
+        await held.promise;
+        throw new ApiClientError(
+          outcome === "denied" ? 403 : 503,
+          outcome === "denied" ? "forbidden" : "temporary",
+          "Adopted read unavailable",
+        );
+      }
+      return original(path, init);
+    });
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    await act(async () =>
+      window.dispatchEvent(
+        new CustomEvent("notes:workspace-event", {
+          detail: { type: "task-list-invalidated", pageId: "table", forceRefresh: true },
+        }),
+      ),
+    );
+    expect(reads).toBe(1);
+    await act(async () => {
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "Saved draft" } });
+      fireEvent.blur(input);
+    });
+    expect(mutations).toBe(1);
+    expect(reads).toBe(1); // the save adopted the pre-existing execution
+    await act(async () => held.release());
+    const message =
+      outcome === "denied"
+        ? "Saved. Access to the table could not be confirmed."
+        : "Saved. The latest table data could not be refreshed. Retrying…";
+    expect(screen.getByText(message)).toBeVisible();
+    expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+    expect(reads).toBe(1); // feedback precedes the backed-off retry
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(reads).toBe(2);
+    expect(screen.queryByText(message)).toBeNull();
+    expect(titleInputs()[0]).toBeEnabled();
+    expect(mutations).toBe(1);
+  },
+);
+
+it("does not attribute an unrelated pre-save continuation failure to the save's queued refresh", async () => {
+  const { data } = fixture(false, 201);
   await act(async () => {
     await firstFixtureRead;
   });
-  const title = titleInputs()[0]!;
-  await waitFor(() => expect(title).toBeEnabled());
-  const read = vi.mocked(api).getMockImplementation()!;
-  const command = heldFixtureRead(),
-    previous = heldFixtureRead(),
-    verification = heldFixtureRead();
-  let started = 0;
-  vi.mocked(api).mockImplementation(async (_path, init) => {
+  const input = titleInputs()[0]!;
+  await waitFor(() => expect(input).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  const page = heldFixtureRead(),
+    refresh = heldFixtureRead();
+  let queries = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
     if ((init?.method === "POST" && !init.readOnly) || init?.method === "PATCH") {
-      await command.promise;
       data.revision++;
       return { generation: 1, revision: data.revision, result: {} };
     }
-    if (++started === 1) {
-      await previous.promise;
-      throw new ApiClientError(503, "temporary", "Previous read failed");
+    queries++;
+    if (new URL(path, "http://test").searchParams.has("cursor")) {
+      await page.promise;
+      throw new ApiClientError(503, "temporary", "Earlier continuation failed");
     }
-    await verification.promise;
-    throw new ApiClientError(503, "temporary", "Retired read failed");
+    await refresh.promise;
+    return original(path, init);
   });
+  vi.useFakeTimers();
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
   await act(async () => {
-    fireEvent.focus(title);
-    fireEvent.change(title, { target: { value: "Local" } });
-    fireEvent.blur(title);
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "Saved draft" } });
+    fireEvent.blur(input);
+  });
+  expect(queries).toBe(1);
+  await act(async () => page.release());
+  expect(queries).toBe(2);
+  expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
+  expect(screen.queryByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeNull();
+  await act(async () => refresh.release());
+  expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+  expect(titleInputs()[0]).toBeEnabled();
+});
+
+it("ignores a delayed adopted-failure receipt after a newer commit owns refresh feedback", async () => {
+  const receipt = heldFixtureRead();
+  const createReads = tableReadCoordinator.linkedTableReads;
+  let delayed = false;
+  vi.spyOn(tableReadCoordinator, "linkedTableReads").mockImplementation(function <T>(
+    options: Parameters<typeof createReads<T>>[0],
+  ) {
+    const reads = createReads(options);
+    return {
+      ...reads,
+      refresh: async (...args: Parameters<typeof reads.refresh>) => {
+        const hold = !delayed;
+        delayed = true;
+        const outcome = await reads.refresh(...args);
+        if (hold) await receipt.promise;
+        return outcome;
+      },
+    };
+  });
+  const { data } = fixture(false, 2);
+  await act(async () => {
+    await firstFixtureRead;
+  });
+  const input = titleInputs()[0]!;
+  await waitFor(() => expect(input).toBeEnabled());
+  const original = vi.mocked(api).getMockImplementation()!;
+  const oldRead = heldFixtureRead(),
+    newRead = heldFixtureRead();
+  let reads = 0,
+    mutations = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method === "POST" && !init.readOnly) {
+      mutations++;
+      data.revision++;
+      return { generation: 1, revision: data.revision, result: {} };
+    }
+    if (++reads === 1) {
+      await oldRead.promise;
+      throw new ApiClientError(503, "temporary", "Old adopted read failed");
+    }
+    if (mutations === 2) await newRead.promise;
+    return original(path, init);
+  });
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  await act(async () =>
     window.dispatchEvent(
       new CustomEvent("notes:workspace-event", {
         detail: { type: "task-list-invalidated", pageId: "table", forceRefresh: true },
       }),
-    );
-  });
-  await act(async () => command.release());
-  await act(async () => previous.release());
+    ),
+  );
+  const save = async (value: string) =>
+    act(async () => {
+      fireEvent.focus(titleInputs()[0]!);
+      fireEvent.change(titleInputs()[0]!, { target: { value } });
+      fireEvent.blur(titleInputs()[0]!);
+    });
+  await save("First commit");
+  await act(async () => oldRead.release());
+  await act(async () => vi.advanceTimersByTimeAsync(1000));
+  expect(titleInputs()[0]).toBeEnabled();
+  expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+  await save("Second commit");
+  expect(mutations).toBe(2);
+  expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
+  await act(async () => receipt.release());
   expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
   expect(screen.queryByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeNull();
-  vi.mocked(api).mockImplementation(read);
-  rerender(
-    <CollaborativeTablePage
-      page={{ id: "replacement", title: "Other owner" }}
-      member={{ role: "editor", user: { id: "other" }, features: {} } as CollaborativeTableProps["member"]}
-      queryBase="/other"
-      onSelectPage={() => {}}
-    />,
-  );
-  await act(async () => verification.release());
+  await act(async () => newRead.release());
+  expect(titleInputs()[0]).toBeEnabled();
   expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
-  expect(screen.queryByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeNull();
 });
 
 it.each(

@@ -1342,7 +1342,7 @@ it("retains task conflict feedback across later successful background verificati
   fireEvent.focus(input);
   fireEvent.change(input, { target: { value: "Preserved conflict text" } });
   fireEvent.blur(input);
-  const message = "Conflict";
+  const message = "The task list changed. Your edit was not saved. Review the latest values before saving again.";
   await screen.findByText(message);
   await act(async () => {
     window.dispatchEvent(new CustomEvent("notes:workspace-event"));
@@ -1451,7 +1451,7 @@ it("keeps a busy-only rejection separate from an existing conflict notice", asyn
   failure = new ApiClientError(409, "table_revision_conflict", "Conflict");
   fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Retain title" } });
   fireEvent.click(screen.getByRole("button", { name: "Add row" }));
-  const message = "Conflict";
+  const message = "The table changed. Your edit was not saved. Review the latest values before saving again.";
   await screen.findByText(message);
   expect(screen.getByLabelText("New row title")).toHaveValue("Retain title");
   const release = delayNextCommand();
@@ -1584,7 +1584,9 @@ it.each(["view", "property"] as const)(
     else fireEvent.blur(input);
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]!.payload).toMatchObject({ revision: 1, name: "Unsubmitted settings" });
-    await screen.findByText(kind === "view" ? "View changed." : "Property changed.");
+    await screen.findByText(
+      "The table changed. Your edit was not saved. Review the latest values before saving again.",
+    );
     expect(input).toHaveValue("Unsubmitted settings");
     expect(
       kind === "view"
@@ -1832,7 +1834,11 @@ it.each(["saved", "conflict"] as const)("releases busy during continuous refresh
   // Committed and rejected saves both require current data; neither keeps the mutation busy.
   expect(screen.getByLabelText("Check")).toBeDisabled();
   expect(
-    screen.getByText(mode === "saved" ? "Saved. Refreshing the latest table data…" : "Rejected edit"),
+    screen.getByText(
+      mode === "saved"
+        ? "Saved. Refreshing the latest table data…"
+        : "The table changed. Your edit was not saved. Review the latest values before saving again.",
+    ),
   ).toBeVisible();
   await act(async () => {
     await vi.advanceTimersByTimeAsync(1000);
@@ -2646,7 +2652,7 @@ it("requires new network application after one failed continuation retires cache
   expect(commands).toBe(1);
 });
 
-it("retains the specific task rejection when verification fails", async () => {
+it("retains task rejection guidance when verification fails", async () => {
   taskColumnFixture();
   show("", member, vi.fn(), true);
   const input = await screen.findByLabelText("Task");
@@ -2660,7 +2666,10 @@ it("retains the specific task rejection when verification fails", async () => {
   fireEvent.change(input, { target: { value: "Preserved text" } });
   fireEvent.blur(input);
   await screen.findByText("The table could not be loaded.");
-  expect(screen.getByText("Specific task rejection")).toBeVisible();
+  expect(
+    screen.getByText("The task list changed. Your edit was not saved. Review the latest values before saving again."),
+  ).toBeVisible();
+  expect(screen.queryByText("Specific task rejection")).toBeNull();
   expect(screen.queryByText("The task list changed. Review the latest value before saving again.")).toBeNull();
   expect(input).toBeDisabled();
 });
