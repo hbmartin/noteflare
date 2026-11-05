@@ -226,7 +226,7 @@ it.each(["read", "mutation"] as const)("retires buffered and late rows after con
   expect(titleInputs()[0]).toBeEnabled();
 });
 
-it("retires continuation controls synchronously when the query changes", async () => {
+it("disables continuation controls while draft text waits to become the applied query", async () => {
   vi.useFakeTimers();
   fixture(false, 800);
   await bufferedRows();
@@ -240,7 +240,7 @@ it("retires continuation controls synchronously when the query changes", async (
     return read(path, init);
   });
   fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "different" } });
-  expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Load more rows" })).toBeDisabled();
   expect(titleInputs()[0]).toBeDisabled();
   await act(async () => {
     release();
@@ -753,4 +753,199 @@ it.each([false, true])(
       await act(async () => release());
     }
   },
+);
+
+it.each(
+  [false, true].flatMap((task) =>
+    ["pending", "applied"].flatMap((search) =>
+      [409, 404, 403, "saved-failure", "saved-denied"].map((outcome) => ({ task, search, outcome })),
+    ),
+  ),
+)(
+  "retains mutation feedback across $search search: task $task / $outcome",
+  async ({ task, search, outcome }) => {
+    const { data } = fixture(task, 2);
+    await act(async () => {
+      await firstFixtureRead;
+    });
+    const title = (await screen.findAllByLabelText("Title"))[0]!;
+    await waitFor(() => expect(title).toBeEnabled());
+    const read = vi.mocked(api).getMockImplementation()!;
+    const command = heldFixtureRead(),
+      postRead = heldFixtureRead();
+    let replied = false,
+      failRead = true,
+      heldReads = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if ((init?.method === "POST" && !init.readOnly) || init?.method === "PATCH") {
+        await command.promise;
+        replied = true;
+        data.revision++;
+        if (typeof outcome === "number")
+          throw new ApiClientError(
+            outcome,
+            outcome === 403 ? "read_only" : outcome === 404 ? "row_not_found" : "table_revision_conflict",
+            `Rejected ${outcome}`,
+          );
+        return { generation: data.generation, revision: data.revision, result: {} };
+      }
+      if (replied) {
+        heldReads++;
+        await postRead.promise;
+        if (failRead)
+          throw new ApiClientError(
+            outcome === "saved-denied" ? 403 : 503,
+            outcome === "saved-denied" ? "forbidden" : "temporary",
+            "Read unavailable",
+          );
+      }
+      return read(path, init);
+    });
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.focus(title);
+      fireEvent.change(title, { target: { value: "Local edit" } });
+      fireEvent.blur(title);
+    });
+    await act(async () => fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Original" } }));
+    if (search === "applied")
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+      });
+    await act(async () => command.release());
+    expect(heldReads).toBeGreaterThan(0);
+    const initialMessage =
+      typeof outcome === "number" ? `Rejected ${outcome}` : "Saved. Refreshing the latest table data…";
+    expect(screen.queryByText(initialMessage)).not.toBeNull();
+    expect(screen.getByText(initialMessage)).toBeVisible();
+    await act(async () => postRead.release());
+    const failureMessage =
+      typeof outcome === "number"
+        ? `Rejected ${outcome}`
+        : outcome === "saved-denied"
+          ? "Saved. Access to the table could not be confirmed."
+          : "Saved. The latest table data could not be refreshed. Retrying…";
+    expect(screen.queryByText(failureMessage)).not.toBeNull();
+    expect(screen.getByText(failureMessage)).toBeVisible();
+    failRead = false;
+    await act(async () => {
+      if (search === "pending") await vi.advanceTimersByTimeAsync(250);
+      if (screen.queryByRole("button", { name: "Reload" }))
+        fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+      else fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    });
+    expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+    expect(screen.queryByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeNull();
+    expect(screen.queryByText("Saved. Access to the table could not be confirmed.")).toBeNull();
+    expect(titleInputs()[0]).toBeEnabled();
+    expect(
+      vi
+        .mocked(api)
+        .mock.calls.filter(([, init]) => (init?.method === "POST" && !init.readOnly) || init?.method === "PATCH"),
+    ).toHaveLength(1);
+  },
+  5000,
+);
+
+it.each([false, true])("ignores a pre-save read failure and retired-owner results; task %s", async (task) => {
+  const { data, rerender } = fixture(task, 2);
+  await act(async () => {
+    await firstFixtureRead;
+  });
+  const title = titleInputs()[0]!;
+  await waitFor(() => expect(title).toBeEnabled());
+  const read = vi.mocked(api).getMockImplementation()!;
+  const command = heldFixtureRead(),
+    previous = heldFixtureRead(),
+    verification = heldFixtureRead();
+  let started = 0;
+  vi.mocked(api).mockImplementation(async (_path, init) => {
+    if ((init?.method === "POST" && !init.readOnly) || init?.method === "PATCH") {
+      await command.promise;
+      data.revision++;
+      return { generation: 1, revision: data.revision, result: {} };
+    }
+    if (++started === 1) {
+      await previous.promise;
+      throw new ApiClientError(503, "temporary", "Previous read failed");
+    }
+    await verification.promise;
+    throw new ApiClientError(503, "temporary", "Retired read failed");
+  });
+  await act(async () => {
+    fireEvent.focus(title);
+    fireEvent.change(title, { target: { value: "Local" } });
+    fireEvent.blur(title);
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "task-list-invalidated", pageId: "table", forceRefresh: true },
+      }),
+    );
+  });
+  await act(async () => command.release());
+  await act(async () => previous.release());
+  expect(screen.getByText("Saved. Refreshing the latest table data…")).toBeVisible();
+  expect(screen.queryByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeNull();
+  vi.mocked(api).mockImplementation(read);
+  rerender(
+    <CollaborativeTablePage
+      page={{ id: "replacement", title: "Other owner" }}
+      member={{ role: "editor", user: { id: "other" }, features: {} } as CollaborativeTableProps["member"]}
+      queryBase="/other"
+      onSelectPage={() => {}}
+    />,
+  );
+  await act(async () => verification.release());
+  expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+  expect(screen.queryByText("Saved. The latest table data could not be refreshed. Retrying…")).toBeNull();
+});
+
+it.each(
+  ["hidden", "offline"].flatMap((environment) => ["denied", "transport"].map((outcome) => ({ environment, outcome }))),
+)(
+  "reports the actual post-save $outcome outcome while $environment",
+  async ({ environment, outcome }) => {
+    const { data } = fixture(false, 2);
+    await act(async () => {
+      await firstFixtureRead;
+    });
+    const input = titleInputs()[0]!;
+    await waitFor(() => expect(input).toBeEnabled());
+    let reject!: (error: Error) => void;
+    vi.mocked(api).mockImplementation(async (_path, init) => {
+      if ((init?.method === "POST" && !init.readOnly) || init?.method === "PATCH") {
+        data.revision++;
+        return { generation: 1, revision: data.revision, result: {} };
+      }
+      return new Promise((_resolve, fail) => {
+        reject = fail;
+      });
+    });
+    await act(async () => {
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "Saved edit" } });
+      fireEvent.blur(input);
+    });
+    expect(reject).toBeTypeOf("function");
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(environment !== "offline");
+    vi.spyOn(document, "hidden", "get").mockReturnValue(environment === "hidden");
+    await act(async () => {
+      window.dispatchEvent(new Event("offline"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      reject(
+        outcome === "denied"
+          ? new ApiClientError(403, "forbidden", "Access removed")
+          : new TypeError("Transport unavailable"),
+      );
+    });
+    const message =
+      outcome === "denied"
+        ? "Saved. Access to the table could not be confirmed."
+        : environment === "offline"
+          ? "Saved. Refreshing the latest table data…"
+          : "Saved. The latest table data could not be refreshed. Retrying…";
+    expect(screen.queryByText(message)).not.toBeNull();
+    expect(screen.getByText(message)).toBeVisible();
+  },
+  5000,
 );

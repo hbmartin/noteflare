@@ -1090,7 +1090,10 @@ for (const mode of ["hidden", "offline"] as const) {
         window.dispatchEvent(new Event("offline"));
       }, mode);
       heldRead.release();
-      await heldRead.completed();
+      const completion = await heldRead.completed();
+      expect(completion.terminal).toBe("finished");
+      expect(completion.request.failure()).toBeNull();
+      expect((await completion.request.response())?.ok()).toBe(true);
       await expect(cells).toHaveCount(500);
       await expect(cells.first()).toBeDisabled();
       await page.evaluate(() => {
@@ -1188,6 +1191,7 @@ test("a canonical search starts before its obsolete held continuation completes"
   );
   expect(expected).toHaveLength(100);
   await page.clock.install();
+  await page.clock.pauseAt(new Date(Date.now() + 1000));
   const heldRead = heldBrowserRead(page);
   let held = false,
     newQueries = 0;
@@ -1232,3 +1236,84 @@ test("a canonical search starts before its obsolete held continuation completes"
     heldRead.dispose();
   }
 });
+
+for (const canonical of [false, true]) {
+  test(`@table-search-ime visible composition and no-op completion; canonical ${canonical}`, async ({ page }) => {
+    const f = await linkedFixture(page);
+    let table = f.linked,
+      cells = f.cells,
+      path = f.path;
+    if (canonical) {
+      await page.goto(`/?page=${f.source.id}`);
+      table = page
+        .locator(".table-live")
+        .filter({ has: page.getByRole("heading", { name: f.source.title, exact: true }) });
+      cells = table.getByLabel("Linked title", { exact: true });
+      path = `/api/tables/${f.source.id}/query`;
+    }
+    await expect(cells.first()).toBeEnabled();
+    const original = await cells.evaluateAll((inputs) => inputs.map((field) => (field as HTMLInputElement).value));
+    const rowReads: Array<string | null> = [];
+    await page.route(
+      (url) => url.pathname === path,
+      async (route) => {
+        rowReads.push(new URL(route.request().url()).searchParams.get("q"));
+        await route.continue();
+      },
+    );
+    await page.clock.install();
+    await page.clock.pauseAt(new Date(Date.now() + 1000));
+    const input = table.getByLabel("Search table");
+    await input.dispatchEvent("compositionstart");
+    await input.dispatchEvent("compositionend");
+    await page.clock.runFor(300);
+    expect(rowReads).toEqual([]);
+    expect(await cells.evaluateAll((inputs) => inputs.map((field) => (field as HTMLInputElement).value))).toEqual(
+      original,
+    );
+    await expect(cells.first()).toBeEnabled();
+    await input.dispatchEvent("compositionstart");
+    await input.fill("Row 1");
+    await page.clock.runFor(249);
+    expect(rowReads).toEqual([]);
+    await expect(cells.first()).toBeDisabled();
+    await expect(table.getByRole("button", { name: "Load more rows", exact: true })).toBeDisabled();
+    await page.clock.runFor(1);
+    await expect.poll(() => rowReads).toEqual(["Row 1"]);
+    await expect(cells).toHaveCount(100);
+    await expect(cells.first()).toBeEnabled();
+    // A confirming Enter after compositionend must not flush an outstanding timer.
+    await input.fill("Row 2");
+    await page.clock.runFor(200);
+    await input.dispatchEvent("compositionend");
+    const prevented = await input.evaluate((element) => {
+      const event = new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        key: "Enter",
+        keyCode: 229,
+        isComposing: false,
+      });
+      element.dispatchEvent(event);
+      return event.defaultPrevented;
+    });
+    expect(prevented).toBe(false);
+    await page.clock.runFor(49);
+    expect(rowReads).toEqual(["Row 1"]);
+    await page.clock.runFor(1);
+    await expect.poll(() => rowReads).toEqual(["Row 1", "Row 2"]);
+    await expect(cells.first()).toBeEnabled();
+    expect(
+      await cells.evaluateAll((inputs) =>
+        inputs.map((field) => (field as HTMLInputElement).value).every((value) => value.includes("Row 2")),
+      ),
+    ).toBe(true);
+    await input.dispatchEvent("compositionstart");
+    await input.fill("");
+    await expect.poll(() => rowReads).toEqual(["Row 1", "Row 2", null]);
+    await expect(cells.first()).toBeEnabled();
+    await input.dispatchEvent("compositionend");
+    await page.clock.runFor(1000);
+    expect(rowReads).toEqual(["Row 1", "Row 2", null]);
+  });
+}

@@ -86,12 +86,18 @@ requested target and resume only after verification. Retired, hidden or offline
 completions cannot restore verification. The shared reader owns one cursor restart;
 further churn returns to bounded coordinator recovery.
 
-Canonical and linked table search share a 250 ms trailing debounce. Text changes
-immediately retire obsolete reads and disable editing while preserving visible
-rows. The coordinator gates all dispatch paths during the delay, including
-heartbeats, invalidations, retries and online/visibility resumption. Once the
-delay expires, the current query receives fresh authorization before editing
-resumes. Enter, clearing to an empty string, and explicit Refresh flush pending
-search without a duplicate timer request. IME composition defers dispatch until
-composition ends. Initial loads and view, month or owner changes are immediate;
-context changes and unmount cancel timers belonging to the previous context.
+Canonical and linked table search cache the input draft separately from the
+applied query. Visible text, including IME updates, applies after a 250 ms quiet
+period. Pending text disables editing and new continuation actions while keeping
+rows visible. Background reads continue against the applied query. Applying a
+replacement query aborts obsolete executions and requires fresh authorization;
+an earlier query's successful read cannot enable editing for pending text.
+Enter, clearing and explicit Refresh flush once; view/month changes immediately
+apply the destination context's visible text. Owner changes use their own cache.
+Unchanged text creates no read or verification work, including composition end.
+Composition tracks confirmation keys only and ends on blur or input detachment.
+Native composition and legacy key code 229 cannot submit a search. Context
+changes do not falsely end composition, and query timers cannot escape their
+context/version. Mutation rejection notices are immediate; saved-refresh failures
+follow current reads and the existing commit watermark rather than one request
+promise. A covering verified read clears the saved-refresh status.

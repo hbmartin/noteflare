@@ -2,6 +2,7 @@ import type { Page, Request, Route } from "@playwright/test";
 
 export function heldBrowserRead(page: Page) {
   let release!: () => void, handled!: () => void, terminal!: () => void, request: Request | undefined;
+  let outcome: { request: Request; terminal: "finished" | "failed" };
   const gate = new Promise<void>((done) => {
     release = done;
   });
@@ -11,14 +12,19 @@ export function heldBrowserRead(page: Page) {
   const requestTerminated = new Promise<void>((done) => {
     terminal = done;
   });
-  const finish = (candidate: Request) => {
-    if (candidate === request) terminal();
+  const finish = (candidate: Request, state: "finished" | "failed") => {
+    if (candidate === request) {
+      outcome ??= { request, terminal: state };
+      terminal();
+    }
   };
-  page.on("requestfinished", finish);
-  page.on("requestfailed", finish);
+  const finished = (candidate: Request) => finish(candidate, "finished");
+  const failed = (candidate: Request) => finish(candidate, "failed");
+  page.on("requestfinished", finished);
+  page.on("requestfailed", failed);
   const track = async (route: Route, operation: (gate: Promise<void>) => Promise<void>) => {
     request = route.request();
-    if (request.failure()) terminal();
+    if (request.failure()) failed(request);
     try {
       await operation(gate);
     } catch (error) {
@@ -36,11 +42,14 @@ export function heldBrowserRead(page: Page) {
         await route.fulfill({ response });
       }),
     release,
-    completed: () => Promise.all([routeHandled, requestTerminated]),
+    completed: async () => {
+      await Promise.all([routeHandled, requestTerminated]);
+      return outcome;
+    },
     dispose: () => {
       release();
-      page.off("requestfinished", finish);
-      page.off("requestfailed", finish);
+      page.off("requestfinished", finished);
+      page.off("requestfailed", failed);
     },
   };
 }

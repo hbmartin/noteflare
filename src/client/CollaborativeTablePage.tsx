@@ -8,6 +8,7 @@ import {
 } from "./table-view-state";
 import { CellDraftPersistenceRetry } from "./CellDraftPersistenceRetry";
 import { useOnlineStatus } from "./online-status";
+import { useTableSearch } from "./use-table-search";
 import { RelationPanel } from "./RelationPanel";
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { ClientMemberContext, Page } from "../shared/types";
@@ -314,61 +315,19 @@ export function CollaborativeTablePage({
     return () => controller.abort();
   }, [draftGeneration, draftRevision, missingDraftIds, online, page.id, queryBase]);
 
-  const [query, setQuery] = useTableViewState("query", "", viewState);
+  const [searchDraft, setSearchDraft] = useTableViewState("query", "", viewState);
   const [month, setMonth] = useTableViewState("month", () => new Date().toISOString().slice(0, 7), viewState);
-  const queryIdentity = JSON.stringify([base, viewId, query, month]);
-  const [searchEpoch, setSearchEpoch] = useState(0);
   const searchContext = useMemo(
     () => ({ base, viewId, month, owner: currentOwner }),
     [base, viewId, month, currentOwner],
   );
-  const searchDispatch = useRef({
-    pending: false,
-    composing: false,
-    version: 0,
-    epoch: searchEpoch,
-    context: searchContext,
-    timer: undefined as ReturnType<typeof setTimeout> | undefined,
-  });
-  const cancelSearchDispatch = useCallback((pending = false) => {
-    const state = searchDispatch.current;
-    clearTimeout(state.timer);
-    state.timer = undefined;
-    state.version++;
-    state.pending = pending;
-  }, []);
-  useLayoutEffect(() => {
-    searchDispatch.current.context = searchContext;
-    cancelSearchDispatch();
-    searchDispatch.current.composing = false;
-    return () => cancelSearchDispatch(true);
-  }, [searchContext, cancelSearchDispatch]);
-  const changeSearch = (value: string) => {
-    const state = searchDispatch.current;
-    cancelSearchDispatch(value !== "" || state.composing);
-    setQuery(value);
-    if (!state.pending || state.composing) return;
-    const version = state.version;
-    const context = state.context;
-    state.timer = setTimeout(() => {
-      if (state.version !== version || state.context !== context) return;
-      state.timer = undefined;
-      setSearchEpoch((epoch) => epoch + 1);
-    }, 250);
-  };
-  const releaseSearch = () => {
-    const state = searchDispatch.current;
-    if (state.composing || !state.pending) return false;
-    clearTimeout(state.timer);
-    state.timer = undefined;
-    state.version++;
-    setSearchEpoch((epoch) => epoch + 1);
-    return true;
-  };
-  useLayoutEffect(() => {
-    searchDispatch.current.epoch = searchEpoch;
-    if (!searchDispatch.current.composing) searchDispatch.current.pending = false;
-  }, [searchEpoch]);
+  const search = useTableSearch(searchDraft, setSearchDraft, searchContext);
+  const query = search.query;
+  const pendingSearch = search.pendingNow;
+  const detachSearch = search.detach;
+  // React runs this cleanup when the actual input is detached.
+  const searchInput = useCallback(() => detachSearch, [detachSearch]);
+  const queryIdentity = JSON.stringify([base, viewId, query, month]);
   const queryOwner = useRef({ queryIdentity, account, incarnation, host, tableId: page.id });
   const [error, setError] = useState("");
   const reportMutation = (notice: MutationNotice, message: string) => {
@@ -385,6 +344,7 @@ export function CollaborativeTablePage({
   const active = useRef(true);
   const editable = Boolean(
     online &&
+    !search.pending &&
     !commitNeedsCoverage &&
     connectionReady &&
     (queryBase || authorizedGeneration === data?.generation) &&
@@ -396,6 +356,7 @@ export function CollaborativeTablePage({
       active.current &&
       navigator.onLine &&
       !document.hidden &&
+      !pendingSearch() &&
       ownership.current.ready &&
       ownership.current.canEdit &&
       ownership.current.role !== "viewer" &&
@@ -403,10 +364,9 @@ export function CollaborativeTablePage({
       !commitRequirement.current &&
       connectionPermit.current() &&
       sameTableOwner(queryOwner.current, currentOwner) &&
-      (queryBase
-        ? queryOwner.current.queryIdentity === queryIdentity
-        : ownership.current.authorizedGeneration === ownership.current.generation),
-    [currentOwner, queryBase, queryIdentity],
+      queryOwner.current.queryIdentity === queryIdentity &&
+      (Boolean(queryBase) || ownership.current.authorizedGeneration === ownership.current.generation),
+    [currentOwner, queryBase, queryIdentity, pendingSearch],
   );
   const taskList = Boolean(page.taskList || data?.taskList);
   const tasksPath = queryBase ? `${queryBase}/tasks` : `/api/task-lists/${page.id}/tasks`;
@@ -509,8 +469,7 @@ export function CollaborativeTablePage({
           queryOwner.current.queryIdentity !== queryIdentity
         )
           return { state: "superseded" };
-        if (!navigator.onLine || document.hidden || searchDispatch.current.pending || searchDispatch.current.composing)
-          return { state: "suspended" };
+        if (!navigator.onLine || document.hidden) return { state: "suspended" };
         if ((context && !context.acceptsGeneration(result)) || result.generation < ownership.current.minimumGeneration)
           return { state: "stale" };
         // Query/access evidence belongs to this verification lifetime. Later content watermarks
@@ -575,7 +534,22 @@ export function CollaborativeTablePage({
           verification !== ownership.current.verification
         )
           return { state: "superseded" };
+        const reportRefreshFailure = (denied: boolean) => {
+          const commit = commitRequirement.current;
+          if (
+            commit &&
+            owner > commit.afterRequest &&
+            sameTableOwner(commit.operation.owner, retryLifetime.current) &&
+            noticeSequence.current === commit.operation.sequence
+          )
+            setSaveRefreshStatus(
+              denied
+                ? "Saved. Access to the table could not be confirmed."
+                : "Saved. The latest table data could not be refreshed. Retrying…",
+            );
+        };
         if (discardDenied(cause, true)) {
+          reportRefreshFailure(true);
           setError(apiErrorMessage(cause, "The table is unavailable."));
           return { state: "denied" };
         }
@@ -583,6 +557,7 @@ export function CollaborativeTablePage({
           return { state: "suspended" };
         }
         if (isTableReadConflict(cause)) return { state: "stale" };
+        reportRefreshFailure(false);
         setError(apiErrorMessage(cause, "The table could not be loaded."));
         return { state: "failure" };
       }
@@ -623,7 +598,6 @@ export function CollaborativeTablePage({
       poll: Boolean(queryBase),
       coverage: (value: TableQueryResult) => ({ generation: value.generation, revision: value.revision }),
       scope: () => ownership.current.verification,
-      canDispatch: () => !searchDispatch.current.pending && !searchDispatch.current.composing,
       read: (intent, signal, context) =>
         owns() ? fetchRef.current({ signal, intent, context }) : Promise.resolve({ state: "superseded" }),
       unavailable: (reason) => {
@@ -678,14 +652,17 @@ export function CollaborativeTablePage({
     recordAuthorization,
     advanceGeneration,
   ]);
-  const load = useCallback((continuation?: CanonicalTableContinuation | LinkedTableContinuation) => {
-    const reads = linkedReads.current;
-    if (!reads) return Promise.resolve(null);
-    return continuation && "kind" in continuation ? reads.page(continuation) : reads.request(continuation);
-  }, []);
+  const load = useCallback(
+    (continuation?: CanonicalTableContinuation | LinkedTableContinuation) => {
+      const reads = linkedReads.current;
+      if (!reads || (continuation && pendingSearch())) return Promise.resolve(null);
+      return continuation && "kind" in continuation ? reads.page(continuation) : reads.request(continuation);
+    },
+    [pendingSearch],
+  );
   const refresh = () => {
     if (!queryBase) linkedReads.current?.retirePages(undefined, { active: true });
-    if (releaseSearch()) return Promise.resolve(null);
+    if (search.flush()) return Promise.resolve(null);
     return load();
   };
   useEffect(() => {
@@ -704,21 +681,16 @@ export function CollaborativeTablePage({
     if ((incarnation && incarnation.key !== account) || queryOwner.current.queryIdentity !== queryIdentity)
       return undefined;
     active.current = true;
-    if (!searchDispatch.current.pending && !searchDispatch.current.composing)
-      void Promise.resolve().then(() => {
-        if (
-          searchDispatch.current.epoch === searchEpoch &&
-          !searchDispatch.current.pending &&
-          !searchDispatch.current.composing
-        )
-          void load();
-      });
+    const expected = queryOwner.current;
+    void Promise.resolve().then(() => {
+      if (active.current && queryOwner.current === expected) void load();
+    });
     const requestOwnership = ownership;
     return () => {
       active.current = false;
       requestOwnership.current.request++;
     };
-  }, [load, queryIdentity, searchEpoch, account, incarnation]);
+  }, [load, queryIdentity, account, incarnation]);
   useEffect(() => {
     const invalidate = (event: Event) => {
       const hostId = queryBase?.match(/^\/api\/pages\/([^/]+)\/linked-tables\//)?.[1];
@@ -776,18 +748,7 @@ export function CollaborativeTablePage({
     const changedGeneration = Boolean(coverage && coverage.generation !== ownership.current.generation);
     advanceGeneration(coverage);
     if (changedGeneration) retireVerification("invalidate");
-    void reads.refresh(coverage, { fresh: changedGeneration }).then((receipt) => {
-      if (
-        !active.current ||
-        !sameTableOwner(operation.owner, retryLifetime.current) ||
-        noticeSequence.current !== operation.sequence
-      )
-        return;
-      if (!commitRequirement.current) return;
-      if (receipt.state === "failure")
-        setSaveRefreshStatus("Saved. The latest table data could not be refreshed. Retrying…");
-      else if (receipt.state === "denied") setSaveRefreshStatus("Saved. Access to the table could not be confirmed.");
-    });
+    void reads.refresh(coverage, { fresh: changedGeneration });
     return "committed-current";
   };
   const send = async (command: TableCommand, submission?: CellDraftSubmission, form?: TableViewSubmission) => {
@@ -849,19 +810,17 @@ export function CollaborativeTablePage({
         });
       else if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
         setError("");
+        retireVerification("invalidate");
         reportMutation(
           operation,
-          apiErrorMessage(cause, "The table update was rejected. Refresh before saving again."),
-        );
-        retireVerification("invalidate");
-        const refreshed = await linkedReads.current?.recover();
-        if (refreshed)
-          reportMutation(
-            operation,
+          apiErrorMessage(
+            cause,
             cause.status === 404 || cause.status === 403
-              ? apiErrorMessage(cause, "The table item is unavailable.")
+              ? "The table item is unavailable."
               : "The table changed. Review the latest value before saving again.",
-          );
+          ),
+        );
+        await linkedReads.current?.recover();
       }
       return false;
     } finally {
@@ -952,20 +911,21 @@ export function CollaborativeTablePage({
       }
       if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
         setError("");
-        reportMutation(operation, apiErrorMessage(cause, "The task update was rejected. Refresh before saving again."));
         if (cause.code === "table_revision_conflict" || cause.status === 404 || cause.status === 403) {
           if (submission)
             submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
           retireVerification("invalidate");
         }
-        const refreshed = await linkedReads.current?.recover();
-        if (refreshed && ownership.current.verifiedQuery)
-          reportMutation(
-            operation,
+        reportMutation(
+          operation,
+          apiErrorMessage(
+            cause,
             cause.status === 404 || cause.status === 403
-              ? apiErrorMessage(cause, "The task is unavailable.")
+              ? "The task is unavailable."
               : "The task list changed. Review the latest value before saving again.",
-          );
+          ),
+        );
+        await linkedReads.current?.recover();
       }
       return { state: "rejected", code: cause.code };
     } finally {
@@ -1112,6 +1072,7 @@ export function CollaborativeTablePage({
   if (!data)
     return (
       <output className="table-live">
+        {saveRefreshStatus && <p>{saveRefreshStatus}</p>}
         {error || "Loading table…"}
         {blocked && <p>{blocked}</p>}
         {recovery}
@@ -1228,23 +1189,14 @@ export function CollaborativeTablePage({
           <input
             aria-label="Search table"
             placeholder="Search rows"
-            value={query}
-            onChange={(event) => changeSearch(event.target.value)}
-            onCompositionStart={() => {
-              searchDispatch.current.composing = true;
-              cancelSearchDispatch(searchDispatch.current.pending);
-            }}
-            onCompositionEnd={(event) => {
-              searchDispatch.current.composing = false;
-              if (event.currentTarget.value === "" && query === "") {
-                cancelSearchDispatch();
-                void linkedReads.current?.verifyReceipt();
-                return;
-              }
-              changeSearch(event.currentTarget.value);
-            }}
+            ref={searchInput}
+            value={searchDraft}
+            onChange={(event) => search.change(event.target.value)}
+            onBlur={search.detach}
+            onCompositionStart={search.compositionStart}
+            onCompositionEnd={(event) => search.compositionEnd(event.currentTarget.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.nativeEvent.isComposing && releaseSearch()) {
+              if (event.key === "Enter" && !search.isConfirmation(event.nativeEvent) && search.flush()) {
                 event.preventDefault();
               }
             }}
@@ -1510,8 +1462,9 @@ export function CollaborativeTablePage({
         )}
         {readSnapshot?.queryIdentity === queryIdentity && readSnapshot.continuation && (
           <button
-            disabled={busy}
+            disabled={busy || search.pending}
             onClick={() => {
+              if (pendingSearch()) return;
               if (!queryBase)
                 void load({
                   kind: "page",
