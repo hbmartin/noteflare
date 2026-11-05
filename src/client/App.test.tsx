@@ -285,6 +285,22 @@ describe("App error handling", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each([
+    { key: "k", keyCode: 75, isComposing: true },
+    { key: "k", keyCode: 229, isComposing: false },
+    { key: "Process", keyCode: 0, isComposing: false },
+  ])("ignores composing global shortcuts: %j", async (event) => {
+    mockDialogMethods();
+    mockShellApi();
+    render(<App />);
+    await screen.findByRole("button", { name: "Actions for Roadmap" });
+    const modifier = /Mac|iPhone|iPad/.test(navigator.platform) ? { metaKey: true } : { ctrlKey: true };
+    fireEvent.keyDown(window, { ...event, ...modifier });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.keyDown(window, { key: "k", keyCode: 75, ...modifier });
+    expect(await screen.findByRole("dialog")).toBeVisible();
+  });
+
   it.each(["preserve", "cancel", "page", "utility"])(
     "handles an unconsumed writing launch while its page is pending: %s",
     async (action) => {

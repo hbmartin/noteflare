@@ -1,9 +1,17 @@
 import { useCallback, useLayoutEffect, useState, useSyncExternalStore } from "react";
+import { isComposingKey } from "./keyboard";
+
+type SearchSnapshot = { context: object; version: number; draft: string; query: string };
+const pendingSearch = (snapshot: SearchSnapshot, owner: object, rendered: string) =>
+  snapshot.context !== owner || snapshot.draft !== rendered || snapshot.query !== rendered;
 
 function createSearch(context: object, value: string) {
   let snapshot = { context, version: 0, draft: value, query: value };
   let committed = value;
   let composing = false;
+  let connected = false;
+  let lifetime = 0;
+  let deadline: number | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const listeners = new Set<() => void>();
   const cancel = () => {
@@ -14,10 +22,24 @@ function createSearch(context: object, value: string) {
     snapshot = next;
     for (const listener of listeners) listener();
   };
-  const apply = (expected: typeof snapshot) => {
-    if (snapshot.context !== expected.context || snapshot.version !== expected.version) return;
+  const apply = (expected: typeof snapshot, connection = lifetime) => {
+    if (
+      !connected ||
+      connection !== lifetime ||
+      snapshot.context !== expected.context ||
+      snapshot.version !== expected.version
+    )
+      return;
     cancel();
+    deadline = undefined;
     if (snapshot.query !== expected.draft) publish({ ...snapshot, query: expected.draft });
+  };
+  const schedule = () => {
+    if (!connected || deadline === undefined || snapshot.query === snapshot.draft) return;
+    const expected = snapshot;
+    const connection = lifetime;
+    if (deadline <= Date.now()) apply(expected, connection);
+    else timer = setTimeout(() => apply(expected, connection), deadline - Date.now());
   };
   return {
     snapshot: () => snapshot,
@@ -30,6 +52,7 @@ function createSearch(context: object, value: string) {
     context: (next: object, draft: string) => {
       if (snapshot.context === next) return;
       cancel();
+      deadline = undefined;
       committed = draft;
       publish({ context: next, version: snapshot.version + 1, draft, query: draft });
     },
@@ -42,34 +65,38 @@ function createSearch(context: object, value: string) {
         committed = snapshot.query;
     },
     change: (owner: object, draft: string) => {
-      if (snapshot.context !== owner || snapshot.draft === draft) return false;
+      if (!connected || snapshot.context !== owner || snapshot.draft === draft) return false;
       cancel();
       // A newer input supersedes an application that React has not committed yet.
       const expected = { ...snapshot, version: snapshot.version + 1, draft, query: committed };
+      deadline = draft === expected.query ? undefined : Date.now() + 250;
       publish(expected);
       if (draft === snapshot.query) return true;
       if (draft === "") apply(expected);
-      else timer = setTimeout(() => apply(expected), 250);
+      else schedule();
       return true;
     },
     flush: (owner: object) => {
-      if (snapshot.context !== owner || snapshot.draft === snapshot.query) return false;
+      if (!connected || snapshot.context !== owner || snapshot.draft === snapshot.query) return false;
       apply(snapshot);
       return true;
     },
-    pending: (owner: object, rendered: string) =>
-      snapshot.context === owner && (snapshot.draft !== rendered || snapshot.query !== rendered),
+    pending: (owner: object, rendered: string) => !connected || pendingSearch(snapshot, owner, rendered),
     compositionStart: () => {
       composing = true;
     },
     detach: () => {
       composing = false;
     },
-    isConfirmation: (event: { isComposing: boolean; keyCode: number }) =>
-      composing || event.isComposing || event.keyCode === 229,
-    cancel: () => {
-      cancel();
-      snapshot = { ...snapshot, version: snapshot.version + 1 };
+    isConfirmation: (event: Parameters<typeof isComposingKey>[0]) => composing || isComposingKey(event),
+    connect: () => {
+      connected = true;
+      schedule();
+      return () => {
+        connected = false;
+        lifetime++;
+        cancel();
+      };
     },
   };
 }
@@ -83,14 +110,14 @@ export function useTableSearch(draft: string, writeDraft: (value: string) => voi
     search.context(context, draft);
     search.commit(snapshot);
   }, [search, context, draft, snapshot]);
-  useLayoutEffect(() => () => search.cancel(), [search]);
+  useLayoutEffect(() => search.connect(), [search]);
   const pendingNow = useCallback(() => search.pending(context, query), [search, context, query]);
   const change = (value: string) => {
     if (search.change(context, value)) writeDraft(value);
   };
   return {
     query,
-    pending: draft !== query,
+    pending: pendingSearch(snapshot, context, query),
     pendingNow,
     change,
     flush: () => search.flush(context),
