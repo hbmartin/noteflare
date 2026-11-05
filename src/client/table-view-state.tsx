@@ -8,6 +8,9 @@ export function createTableViewCache() {
     activate: () => {
       lifetime.active = true;
     },
+    suspend: () => {
+      lifetime.active = false;
+    },
     retire: () => {
       lifetime.active = false;
       for (const view of views.values()) view.values.clear();

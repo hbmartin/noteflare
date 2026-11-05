@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { Activity } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { CollaborativeColumn, TableCommand, TableQueryResult, TableView } from "../shared/table-protocol";
@@ -3593,3 +3594,45 @@ it("flushes month changes while retaining the input's active composition", async
   });
   expect(vi.mocked(api)).toHaveBeenCalledTimes(3);
 });
+
+it.each([false, true])(
+  "preserves the visible search draft through table effect reconnection; linked %s",
+  async (linked) => {
+    const tree = (mode: "visible" | "hidden", owner = member) => (
+      <Activity mode={mode}>
+        <CollaborativeTablePage
+          page={{ id: "table", title: "Activity table" }}
+          member={owner}
+          queryBase={linked ? "/linked" : undefined}
+          initialViewId="calendar"
+          onSelectPage={vi.fn()}
+        />
+      </Activity>
+    );
+    const view = render(tree("visible"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    vi.useFakeTimers();
+    await act(async () => fireEvent.change(screen.getByLabelText("Calendar month"), { target: { value: "2027-03" } }));
+    await act(async () => fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "needle" } }));
+    await act(async () => vi.advanceTimersByTime(100));
+    view.rerender(tree("hidden"));
+    await act(async () => vi.advanceTimersByTime(500));
+    vi.mocked(api).mockClear();
+    view.rerender(tree("visible"));
+    await act(async () => {});
+    expect(screen.getByLabelText("Search table")).toHaveValue("needle");
+    expect(screen.getByLabelText("Calendar month")).toHaveValue("2027-03");
+    expect(screen.getByRole("button", { name: "Views" })).toBeEnabled();
+    expect(
+      vi.mocked(api).mock.calls.every(([path]) => new URL(path, "http://test").searchParams.get("q") === "needle"),
+    ).toBe(true);
+    // Canonical reconnection retains the existing mount + socket authorization reads.
+    expect(vi.mocked(api).mock.calls.filter(([path]) => !path.includes("/coverage?"))).toHaveLength(linked ? 1 : 2);
+    const afterResume = vi.mocked(api).mock.calls.length;
+    await act(async () => vi.advanceTimersByTime(1000));
+    expect(vi.mocked(api).mock.calls).toHaveLength(afterResume);
+    view.rerender(tree("visible", { ...member, user: { id: "replacement" } } as ClientMemberContext));
+    await act(async () => {});
+    expect(screen.getByLabelText("Search table")).toHaveValue("");
+  },
+);

@@ -173,9 +173,14 @@ export function CollaborativeTablePage({
     viewCache = createTableViewCache();
     setCacheLifetime({ owner: currentOwner, cache: viewCache });
   }
+  const previousViewCache = useRef(viewCache);
   useLayoutEffect(() => {
+    if (previousViewCache.current !== viewCache) previousViewCache.current.retire();
+    previousViewCache.current = viewCache;
     viewCache.activate();
-    return () => viewCache.retire();
+    // A disconnected effect can reconnect with the same owner. Its cache stays
+    // private and inactive until then; owner replacement clears the old values.
+    return () => viewCache.suspend();
   }, [viewCache]);
   const viewState = viewCache.view(viewId);
 
