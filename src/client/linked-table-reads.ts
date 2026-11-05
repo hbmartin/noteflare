@@ -61,7 +61,6 @@ export function linkedTableReads<T>(options: {
   unavailable: (reason: "failure" | "suspended" | "stale") => void;
   coverage?: (value: T) => TableCoverage;
   scope?: () => unknown;
-  canDispatch?: () => boolean;
   poll?: boolean;
 }) {
   options.unavailable("failure");
@@ -78,7 +77,7 @@ export function linkedTableReads<T>(options: {
   const observers = new Set<(receipt: TableReadReceipt<T>) => void>();
   const queued = new Map<string, Batch<T>>();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const available = () => !stopped && navigator.onLine && !document.hidden && options.canDispatch?.() !== false;
+  const available = () => !stopped && navigator.onLine && !document.hidden;
   const covered = (sequence: number, coverage?: TableCoverage) => {
     if (sequence < unscoped) return false;
     for (const [generation, required] of watermarks)

@@ -226,7 +226,7 @@ it.each(["read", "mutation"] as const)("retires buffered and late rows after con
   expect(titleInputs()[0]).toBeEnabled();
 });
 
-it("retires continuation controls synchronously when the query changes", async () => {
+it("disables continuation controls while draft text waits to become the applied query", async () => {
   vi.useFakeTimers();
   fixture(false, 800);
   await bufferedRows();
@@ -240,7 +240,7 @@ it("retires continuation controls synchronously when the query changes", async (
     return read(path, init);
   });
   fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "different" } });
-  expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Load more rows" })).toBeDisabled();
   expect(titleInputs()[0]).toBeDisabled();
   await act(async () => {
     release();

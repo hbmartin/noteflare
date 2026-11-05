@@ -1790,26 +1790,3 @@ it("keeps queued explicit Refresh first-page policy when immediate recovery join
     release();
   }
 });
-
-it("gates all dispatch paths while retaining current verification obligations", async () => {
-  vi.useFakeTimers();
-  let allowed = false;
-  const read = vi.fn(async (_intent: TableReadIntent) => ({
-    state: "success" as const,
-    value: 1,
-    verification: "network" as const,
-  }));
-  const c = linkedTableReads({ read, canDispatch: () => allowed, unavailable: vi.fn() });
-  controllers.push(c);
-  await c.request();
-  await c.verifyReceipt();
-  await c.refresh();
-  window.dispatchEvent(new Event("online"));
-  document.dispatchEvent(new Event("visibilitychange"));
-  await vi.advanceTimersByTimeAsync(15000);
-  expect(read).not.toHaveBeenCalled();
-  allowed = true;
-  expect(await c.request()).toBe(1);
-  expect(read).toHaveBeenCalledTimes(1);
-  expect(read.mock.calls[0]?.[0]).toEqual({ kind: "refresh" });
-});

@@ -212,8 +212,8 @@ beforeEach(() => {
     });
 });
 afterEach(() => {
-  vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 function delayNextCommand() {
@@ -3052,7 +3052,7 @@ it.each(
     ["held", "before-dispatch", "after-dispatch", "rejected", "round-trip"].map((schedule) => ({ change, schedule })),
   ),
 )(
-  "aborts obsolete canonical pagination before $change query dispatch: $schedule",
+  "retires canonical pagination when $change becomes the applied query: $schedule",
   async ({ change, schedule }) => {
     const rows = Array.from({ length: 400 }, (_, i) => ({
       ...data.rows[0]!,
@@ -3112,7 +3112,8 @@ it.each(
           fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "needle" } });
         else fireEvent.change(screen.getByLabelText("Saved table view"), { target: { value: "grid" } });
       });
-      expect(oldSignal?.aborted).toBe(true);
+      expect(oldSignal?.aborted).toBe(change === "view");
+      expect(screen.getAllByLabelText("Title")[0]).toBeDisabled();
       if (schedule === "round-trip") {
         await act(async () =>
           fireEvent.change(screen.getByLabelText(change === "search" ? "Search table" : "Saved table view"), {
@@ -3131,6 +3132,7 @@ it.each(
           await vi.advanceTimersByTimeAsync(250);
         });
       }
+      expect(Boolean(oldSignal?.aborted) || ["before-dispatch", "rejected"].includes(schedule)).toBe(true);
       expect(newQueries).toBeGreaterThan(0);
       if (schedule === "after-dispatch") await act(async () => release());
       await act(async () => releaseNew());
@@ -3216,33 +3218,51 @@ it.each([false, true])("debounces search and flushes Enter, clearing and Refresh
   expect(queries).toHaveLength(4);
 });
 
-it("holds composition without queries and releases only its completed text", async () => {
-  render(<CollaborativeTablePage page={{ id: "table", title: "IME search" }} member={member} onSelectPage={vi.fn()} />);
-  await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
-  vi.useFakeTimers();
-  const read = vi.mocked(api).getMockImplementation()!,
-    queries: string[] = [];
-  vi.mocked(api).mockImplementation((path, init) => {
-    if (!path.includes("/coverage?")) queries.push(path);
-    return read(path, init);
-  });
-  const input = screen.getByLabelText("Search table");
-  await act(async () => {
-    fireEvent.compositionStart(input);
-    fireEvent.change(input, { target: { value: "入" } });
-    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
-    await vi.advanceTimersByTimeAsync(16000);
-    fireEvent.change(input, { target: { value: "入力" } });
-    fireEvent.compositionEnd(input);
-    await vi.advanceTimersByTimeAsync(249);
-  });
-  expect(queries).toEqual([]);
-  await act(async () => {
-    await vi.advanceTimersByTimeAsync(1);
-  });
-  expect(queries).toHaveLength(1);
-  expect(new URL(queries[0]!, "https://test").searchParams.get("q")).toBe("入力");
-});
+it.each([false, true])(
+  "debounces visible composition text and clearing without waiting for commit; linked %s",
+  async (linked) => {
+    render(
+      <CollaborativeTablePage
+        page={{ id: "table", title: "IME search" }}
+        member={member}
+        onSelectPage={vi.fn()}
+        queryBase={linked ? "/linked" : undefined}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+    vi.useFakeTimers();
+    const read = vi.mocked(api).getMockImplementation()!,
+      queries: Array<string | null> = [];
+    vi.mocked(api).mockImplementation((path, init) => {
+      if (!path.includes("/coverage?")) queries.push(new URL(path, "https://test").searchParams.get("q"));
+      return read(path, init);
+    });
+    const input = screen.getByLabelText("Search table");
+    await act(async () => {
+      fireEvent.compositionStart(input);
+      fireEvent.change(input, { target: { value: "入" } });
+      fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+      await vi.advanceTimersByTimeAsync(249);
+    });
+    expect(queries).toEqual([]);
+    expect(screen.getByLabelText("Title")).toBeDisabled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(queries).toEqual(["入"]);
+    expect(screen.getByLabelText("Title")).toBeEnabled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(16000);
+    });
+    expect(queries).toEqual(["入"]);
+    await act(async () => fireEvent.change(input, { target: { value: "" } }));
+    expect(queries).toEqual(["入", null]);
+    expect(screen.getByLabelText("Title")).toBeEnabled();
+    const before = vi.mocked(api).mock.calls.length;
+    await act(async () => fireEvent.compositionEnd(input));
+    expect(vi.mocked(api)).toHaveBeenCalledTimes(before);
+  },
+);
 
 it.each(["view", "owner", "unmount"])("retires pending search timers on %s changes", async (change) => {
   const view = render(
@@ -3338,13 +3358,229 @@ it.each(["hidden", "offline"])("resumes expired search with one current authoriz
   expect(screen.getByLabelText("Title")).toBeEnabled();
 });
 
-it("restores verification after an empty composition finishes", async () => {
+it("does not verify an unchanged empty composition", async () => {
   render(<CollaborativeTablePage page={{ id: "table", title: "Empty IME" }} member={member} onSelectPage={vi.fn()} />);
   await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
   const input = screen.getByLabelText("Search table");
+  const before = vi.mocked(api).mock.calls.length;
   await act(async () => {
     fireEvent.compositionStart(input);
     fireEvent.compositionEnd(input);
   });
   expect(screen.getByLabelText("Title")).toBeEnabled();
+  expect(vi.mocked(api)).toHaveBeenCalledTimes(before);
+});
+
+it.each(["Reload", "retry"])("recovers a denied read during composition through %s", async (mode) => {
+  show();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  let reject!: (error: Error) => void;
+  const held = new Promise<never>((_resolve, fail) => {
+    reject = fail;
+  });
+  vi.mocked(api).mockImplementationOnce(() => held);
+  vi.useFakeTimers();
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh" })));
+  fireEvent.compositionStart(screen.getByLabelText("Search table"));
+  await act(async () => reject(new ApiClientError(403, "forbidden", "Table access was removed.")));
+  expect(screen.queryByLabelText("Search table")).toBeNull();
+  const before = vi.mocked(api).mock.calls.length;
+  await act(async () => {
+    if (mode === "Reload") fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+    else await vi.advanceTimersByTimeAsync(2000);
+  });
+  expect(vi.mocked(api).mock.calls.length).toBeGreaterThan(before);
+  expect(screen.getByLabelText("Title")).toBeEnabled();
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "new" } });
+    fireEvent.keyDown(screen.getByLabelText("Search table"), { key: "Enter" });
+  });
+  expect(new URL(vi.mocked(api).mock.calls.at(-1)![0], "https://test").searchParams.get("q")).toBe("new");
+});
+
+it("publishes a current held response during unchanged composition", async () => {
+  show();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  let release!: (value: unknown) => void;
+  vi.mocked(api).mockImplementationOnce(
+    () =>
+      new Promise((done) => {
+        release = done;
+      }),
+  );
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh" })));
+  fireEvent.compositionStart(screen.getByLabelText("Search table"));
+  expect(screen.getByLabelText("Title")).toBeEnabled();
+  await act(async () => release({ ...data, revision: 2, rows: [{ ...data.rows[0]!, cells: { Title: "Fresh" } }] }));
+  expect(screen.getByLabelText("Title")).toHaveValue("Fresh");
+  expect(screen.getByLabelText("Title")).toBeEnabled();
+});
+
+it("preserves 300 exact canonical rows through an unchanged nonempty composition", async () => {
+  const rows = Array.from({ length: 350 }, (_, i) => ({
+    ...data.rows[0]!,
+    id: `row-${i}`,
+    cells: { Title: `Row ${i}` },
+  }));
+  data = { ...data, columns: [column("Title", "text")], rows, rowCount: 350 };
+  vi.mocked(api).mockImplementation(async (path) => {
+    const params = new URL(path, "https://test").searchParams;
+    const offset = Number(params.get("cursor") ?? 0);
+    return {
+      ...data,
+      rows: rows.slice(offset, offset + 100),
+      nextCursor: offset + 100 < 350 ? String(offset + 100) : null,
+    };
+  });
+  render(<CollaborativeTablePage page={{ id: "table", title: "No-op IME" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  vi.useFakeTimers();
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Row" } });
+    await vi.advanceTimersByTimeAsync(250);
+  });
+  for (let i = 0; i < 2; i++)
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more rows" })));
+  const before = vi.mocked(api).mock.calls.length;
+  await act(async () => {
+    fireEvent.compositionStart(screen.getByLabelText("Search table"));
+    fireEvent.compositionEnd(screen.getByLabelText("Search table"));
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value)).toEqual(
+    rows.slice(0, 300).map((row) => row.cells.Title),
+  );
+  expect(vi.mocked(api)).toHaveBeenCalledTimes(before);
+  expect(screen.getAllByLabelText("Title")[0]).toBeEnabled();
+});
+
+it.each(["verify", "invalidation", "Refresh"])(
+  "continues %s against the applied query during pending text",
+  async (work) => {
+    show();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    vi.useFakeTimers();
+    const before = vi.mocked(api).mock.calls.length;
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Latest" } });
+      if (work === "verify") window.dispatchEvent(new Event("online"));
+      else if (work === "invalidation")
+        window.dispatchEvent(
+          new CustomEvent("notes:workspace-event", {
+            detail: { type: "task-list-invalidated", pageId: "table", forceRefresh: true },
+          }),
+        );
+      else fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    });
+    const reads = vi
+      .mocked(api)
+      .mock.calls.slice(before)
+      .map(([path]) => path);
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.every((path) => !new URL(path, "https://test").searchParams.has("q"))).toBe(work !== "Refresh");
+    expect(screen.getByLabelText("Title")).toHaveProperty("disabled", work !== "Refresh");
+    if (work !== "Refresh")
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+      });
+    expect(screen.getByLabelText("Title")).toBeEnabled();
+    expect(
+      vi
+        .mocked(api)
+        .mock.calls.slice(before)
+        .filter(
+          ([path]) => !path.includes("/coverage?") && new URL(path, "https://test").searchParams.get("q") === "Latest",
+        ),
+    ).toHaveLength(1);
+  },
+);
+
+it.each(["before-deadline", "callback-before-commit", "canceled-callback", "flush-before-input", "return-to-applied"])(
+  "owns search application across %s",
+  async (schedule) => {
+    show();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    vi.useFakeTimers();
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const input = screen.getByLabelText("Search table");
+    await act(async () => fireEvent.change(input, { target: { value: "old" } }));
+    const stale = timers.mock.calls.findLast(([, delay]) => delay === 250)![0] as () => void;
+    vi.mocked(api).mockClear();
+    await act(async () => {
+      if (schedule === "before-deadline") vi.advanceTimersByTime(249);
+      if (schedule === "callback-before-commit" || schedule === "return-to-applied") vi.advanceTimersByTime(250);
+      if (schedule === "flush-before-input") fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.change(input, { target: { value: schedule === "return-to-applied" ? "" : "new" } });
+      if (schedule === "canceled-callback") stale();
+    });
+    expect(vi.mocked(api)).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Title")).toHaveProperty("disabled", schedule !== "return-to-applied");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(249);
+    });
+    expect(vi.mocked(api)).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(vi.mocked(api).mock.calls.map(([path]) => new URL(path, "https://test").searchParams.get("q"))).toEqual(
+      schedule === "return-to-applied" ? [] : ["new"],
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(vi.mocked(api).mock.calls).toHaveLength(schedule === "return-to-applied" ? 0 : 1);
+  },
+);
+
+it("ignores IME-confirming Enter after composition end and keeps the existing deadline", async () => {
+  show();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  vi.useFakeTimers();
+  const input = screen.getByLabelText("Search table");
+  vi.mocked(api).mockClear();
+  await act(async () => {
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "入力" } });
+    await vi.advanceTimersByTimeAsync(200);
+    fireEvent.compositionEnd(input);
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229, isComposing: false });
+    fireEvent.keyDown(input, { key: "Process" });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    await vi.advanceTimersByTimeAsync(49);
+  });
+  expect(vi.mocked(api)).not.toHaveBeenCalled();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+  });
+  expect(vi.mocked(api)).toHaveBeenCalledTimes(1);
+  expect(new URL(vi.mocked(api).mock.calls[0]![0], "https://test").searchParams.get("q")).toBe("入力");
+});
+
+it("flushes month changes while retaining the input's active composition", async () => {
+  show("calendar");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  vi.useFakeTimers();
+  vi.mocked(api).mockClear();
+  await act(async () => {
+    fireEvent.compositionStart(screen.getByLabelText("Search table"));
+    fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "partial" } });
+    fireEvent.change(screen.getByLabelText("Calendar month"), { target: { value: "2030-02" } });
+  });
+  expect(vi.mocked(api)).toHaveBeenCalledTimes(1);
+  expect(new URL(vi.mocked(api).mock.calls[0]![0], "https://test").searchParams.get("q")).toBe("partial");
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "next" } });
+    fireEvent.keyDown(screen.getByLabelText("Search table"), { key: "Enter", isComposing: false });
+  });
+  expect(vi.mocked(api)).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(250);
+  });
+  expect(vi.mocked(api)).toHaveBeenCalledTimes(2);
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "blurred" } });
+    fireEvent.blur(screen.getByLabelText("Search table"));
+    fireEvent.keyDown(screen.getByLabelText("Search table"), { key: "Enter" });
+  });
+  expect(vi.mocked(api)).toHaveBeenCalledTimes(3);
 });
