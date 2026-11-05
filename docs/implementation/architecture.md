@@ -96,8 +96,25 @@ Enter, clearing and explicit Refresh flush once; view/month changes immediately
 apply the destination context's visible text. Owner changes use their own cache.
 Unchanged text creates no read or verification work, including composition end.
 Composition tracks confirmation keys only and ends on blur or input detachment.
-Native composition and legacy key code 229 cannot submit a search. Context
-changes do not falsely end composition, and query timers cannot escape their
-context/version. Mutation rejection notices are immediate; saved-refresh failures
-follow current reads and the existing commit watermark rather than one request
-promise. A covering verified read clears the saved-refresh status.
+Native composition, Process keys and legacy key code 229 cannot submit a search;
+global shortcuts share the native-key classifier. Context changes do not falsely
+end composition, and query timers cannot escape their context/version or effect
+lifetime. Effect disconnection cancels the timer while preserving its original
+deadline. Reconnection waits only the remaining quiet period, or applies the
+current draft once if that deadline elapsed. This effect lifecycle is distinct
+from ordinary browser-tab visibility and online verification. Rendered and
+imperative pending checks share an ownership predicate; retired contexts fail
+closed. Temporary effect disconnection suspends the owned presentation cache
+without clearing its drafts. Suspended caches reject writes and acknowledgements;
+owner replacement retires and clears the old cache. An unmounted cache remains
+inactive and can be garbage collected with its component.
+
+Mutation rejection notices are immediate and retain review guidance without
+promising an automatic mutation retry or completed recovery. Known conflict,
+missing-item and permission errors use client-owned copy; other recoverable errors
+keep their specific explanation alongside neutral guidance. Saved-refresh failures
+follow current reads and the existing commit watermark. The save-requested
+refresh receipt also associates an adopted earlier execution with that exact
+pending commit. Unrelated earlier reads, retired receipts, replaced commits and
+retired owners cannot replace its status. A covering verified read clears the
+saved-refresh status; a successful receipt alone cannot establish coverage.

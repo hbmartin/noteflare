@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { Activity } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { CollaborativeColumn, TableCommand, TableQueryResult, TableView } from "../shared/table-protocol";
@@ -1342,7 +1343,7 @@ it("retains task conflict feedback across later successful background verificati
   fireEvent.focus(input);
   fireEvent.change(input, { target: { value: "Preserved conflict text" } });
   fireEvent.blur(input);
-  const message = "Conflict";
+  const message = "The task list changed. Your edit was not saved. Review the latest values before saving again.";
   await screen.findByText(message);
   await act(async () => {
     window.dispatchEvent(new CustomEvent("notes:workspace-event"));
@@ -1451,7 +1452,7 @@ it("keeps a busy-only rejection separate from an existing conflict notice", asyn
   failure = new ApiClientError(409, "table_revision_conflict", "Conflict");
   fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Retain title" } });
   fireEvent.click(screen.getByRole("button", { name: "Add row" }));
-  const message = "Conflict";
+  const message = "The table changed. Your edit was not saved. Review the latest values before saving again.";
   await screen.findByText(message);
   expect(screen.getByLabelText("New row title")).toHaveValue("Retain title");
   const release = delayNextCommand();
@@ -1584,7 +1585,9 @@ it.each(["view", "property"] as const)(
     else fireEvent.blur(input);
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]!.payload).toMatchObject({ revision: 1, name: "Unsubmitted settings" });
-    await screen.findByText(kind === "view" ? "View changed." : "Property changed.");
+    await screen.findByText(
+      "The table changed. Your edit was not saved. Review the latest values before saving again.",
+    );
     expect(input).toHaveValue("Unsubmitted settings");
     expect(
       kind === "view"
@@ -1832,7 +1835,11 @@ it.each(["saved", "conflict"] as const)("releases busy during continuous refresh
   // Committed and rejected saves both require current data; neither keeps the mutation busy.
   expect(screen.getByLabelText("Check")).toBeDisabled();
   expect(
-    screen.getByText(mode === "saved" ? "Saved. Refreshing the latest table data…" : "Rejected edit"),
+    screen.getByText(
+      mode === "saved"
+        ? "Saved. Refreshing the latest table data…"
+        : "The table changed. Your edit was not saved. Review the latest values before saving again.",
+    ),
   ).toBeVisible();
   await act(async () => {
     await vi.advanceTimersByTimeAsync(1000);
@@ -2646,7 +2653,7 @@ it("requires new network application after one failed continuation retires cache
   expect(commands).toBe(1);
 });
 
-it("retains the specific task rejection when verification fails", async () => {
+it("retains task rejection guidance when verification fails", async () => {
   taskColumnFixture();
   show("", member, vi.fn(), true);
   const input = await screen.findByLabelText("Task");
@@ -2660,7 +2667,10 @@ it("retains the specific task rejection when verification fails", async () => {
   fireEvent.change(input, { target: { value: "Preserved text" } });
   fireEvent.blur(input);
   await screen.findByText("The table could not be loaded.");
-  expect(screen.getByText("Specific task rejection")).toBeVisible();
+  expect(
+    screen.getByText("The task list changed. Your edit was not saved. Review the latest values before saving again."),
+  ).toBeVisible();
+  expect(screen.queryByText("Specific task rejection")).toBeNull();
   expect(screen.queryByText("The task list changed. Review the latest value before saving again.")).toBeNull();
   expect(input).toBeDisabled();
 });
@@ -3584,3 +3594,45 @@ it("flushes month changes while retaining the input's active composition", async
   });
   expect(vi.mocked(api)).toHaveBeenCalledTimes(3);
 });
+
+it.each([false, true])(
+  "preserves the visible search draft through table effect reconnection; linked %s",
+  async (linked) => {
+    const tree = (mode: "visible" | "hidden", owner = member) => (
+      <Activity mode={mode}>
+        <CollaborativeTablePage
+          page={{ id: "table", title: "Activity table" }}
+          member={owner}
+          queryBase={linked ? "/linked" : undefined}
+          initialViewId="calendar"
+          onSelectPage={vi.fn()}
+        />
+      </Activity>
+    );
+    const view = render(tree("visible"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    vi.useFakeTimers();
+    await act(async () => fireEvent.change(screen.getByLabelText("Calendar month"), { target: { value: "2027-03" } }));
+    await act(async () => fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "needle" } }));
+    await act(async () => vi.advanceTimersByTime(100));
+    view.rerender(tree("hidden"));
+    await act(async () => vi.advanceTimersByTime(500));
+    vi.mocked(api).mockClear();
+    view.rerender(tree("visible"));
+    await act(async () => {});
+    expect(screen.getByLabelText("Search table")).toHaveValue("needle");
+    expect(screen.getByLabelText("Calendar month")).toHaveValue("2027-03");
+    expect(screen.getByRole("button", { name: "Views" })).toBeEnabled();
+    expect(
+      vi.mocked(api).mock.calls.every(([path]) => new URL(path, "http://test").searchParams.get("q") === "needle"),
+    ).toBe(true);
+    // Canonical reconnection retains the existing mount + socket authorization reads.
+    expect(vi.mocked(api).mock.calls.filter(([path]) => !path.includes("/coverage?"))).toHaveLength(linked ? 1 : 2);
+    const afterResume = vi.mocked(api).mock.calls.length;
+    await act(async () => vi.advanceTimersByTime(1000));
+    expect(vi.mocked(api).mock.calls).toHaveLength(afterResume);
+    view.rerender(tree("visible", { ...member, user: { id: "replacement" } } as ClientMemberContext));
+    await act(async () => {});
+    expect(screen.getByLabelText("Search table")).toHaveValue("");
+  },
+);

@@ -377,7 +377,9 @@ test("operation restrictions retain linked rows and open settings retain unsaved
   });
   await cells.first().fill("Restricted edit remains local");
   await cells.first().press("Enter");
-  await expect(linked.getByText("This operation is read-only", { exact: true })).toBeVisible();
+  const rejection =
+    "This table is read-only. Your edit was not saved. Review the current permissions and available actions before trying again.";
+  await expect(linked.getByText(rejection, { exact: true })).toBeVisible();
   await expect(cells).toHaveCount(500);
   await expect(cells.first()).toBeEnabled();
   await linked.getByRole("button", { name: "Properties", exact: true }).click();
@@ -398,7 +400,7 @@ test("operation restrictions retain linked rows and open settings retain unsaved
   await expect(property).toBeEnabled();
   await expect(property).toHaveValue("Settings text survives");
   await linked.getByRole("button", { name: "Dismiss notice", exact: true }).click();
-  await expect(linked.getByText("This operation is read-only", { exact: true })).toHaveCount(0);
+  await expect(linked.getByText(rejection, { exact: true })).toHaveCount(0);
   await expect(cells.first()).toHaveValue("Restricted edit remains local");
   await expect(linked.getByRole("region", { name: "Pending cell edits" })).toBeVisible();
 });
@@ -639,13 +641,21 @@ test("conflict notice survives a query change before its refresh completes", asy
     await linked.getByLabel("Search table").fill("Row");
     await aborted;
     await expect(cells.first()).toBeEnabled();
-    await expect(linked.getByText("Conflict before refresh", { exact: true })).toBeVisible();
+    await expect(
+      linked.getByText("The table changed. Your edit was not saved. Review the latest values before saving again.", {
+        exact: true,
+      }),
+    ).toBeVisible();
     await expect(cells.first()).toHaveValue("Preserved after superseded refresh");
     expect(writes).toBe(1);
     heldRead.release();
     await heldRead.completed();
     await linked.getByRole("button", { name: "Dismiss notice", exact: true }).click();
-    await expect(linked.getByText("Conflict before refresh", { exact: true })).toHaveCount(0);
+    await expect(
+      linked.getByText("The table changed. Your edit was not saved. Review the latest values before saving again.", {
+        exact: true,
+      }),
+    ).toHaveCount(0);
     await expect(cells.first()).toHaveValue("Preserved after superseded refresh");
   } finally {
     heldRead.dispose();

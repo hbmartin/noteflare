@@ -1,4 +1,5 @@
 import { CommentPublicationNotice } from "./CommentPublicationNotice";
+import { isComposingKey } from "./keyboard";
 import { purgeCommentDrafts } from "./comment-drafts";
 import { DiagramRestoreOwner } from "./diagram-restore-owner";
 import { useRealtimeAccessCoordinator } from "./RealtimeAccessCoordinator";
@@ -1622,7 +1623,7 @@ function Workspace({
       const target = event.target instanceof Element ? event.target : null;
       const editableTarget = target?.closest("input, textarea, select, [contenteditable='true']");
       const shortcutModifier = /Mac|iPhone|iPad/.test(navigator.platform) ? event.metaKey : event.ctrlKey;
-      if (event.defaultPrevented || event.isComposing || event.key === "Process") return;
+      if (event.defaultPrevented || isComposingKey(event)) return;
       if (document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) return;
       let mode: PaletteMode | null = null;
       if (shortcutModifier && !event.altKey) {

@@ -257,7 +257,9 @@ test("task draft retries an unrelated revision conflict without retyping", async
   await expect(input).toHaveValue("Original target");
   await input.fill("Saved without retyping");
   await input.press("Enter");
-  await expect(page.getByText("The task list changed. Review the latest value before saving again.")).toBeVisible();
+  await expect(
+    page.getByText("The task list changed. Your edit was not saved. Review the latest values before saving again."),
+  ).toBeVisible();
   await expect(input).toHaveValue("Saved without retyping");
   expect(attempts).toHaveLength(1);
   await page.getByRole("button", { name: "Save draft", exact: true }).click();
@@ -1137,7 +1139,9 @@ test("rapid task saves wait for committed data without keeping mutation busy", a
         async () => (await query()).rows.find((row: { id: string }) => row.id === rows[0]).cells[`${table.id}-title`],
       )
       .toBe("Second commit");
-    await expect(page.getByText("The task list changed. Review the latest value before saving again.")).toHaveCount(0);
+    await expect(
+      page.getByText("The task list changed. Your edit was not saved. Review the latest values before saving again."),
+    ).toHaveCount(0);
   } finally {
     draining = true;
     for (const release of releases) release();

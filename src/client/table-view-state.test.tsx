@@ -43,3 +43,24 @@ it("does not notify for no-op writes and ignores retired-cache completions", () 
   expect(cache.view("a").values.size).toBe(0);
   expect(renders).toBe(before);
 });
+
+it("preserves suspended values without accepting writes or acknowledgements", () => {
+  const cache = createTableViewCache();
+  const { result } = renderHook(() => useTableViewState("query", "", cache.view("a")));
+  act(() => result.current[1]("Pending search"));
+  const write = result.current[1],
+    acknowledge = result.current[2];
+  cache.suspend();
+  act(() => {
+    write("Late write");
+    acknowledge("");
+  });
+  expect(result.current[0]).toBe("Pending search");
+  expect(cache.view("a").snapshot("query", "").value).toBe("Pending search");
+  cache.activate();
+  act(() => result.current[1]("Resumed"));
+  expect(result.current[0]).toBe("Resumed");
+  cache.retire();
+  cache.activate();
+  expect(cache.view("a").snapshot("query", "").value).toBe("");
+});
