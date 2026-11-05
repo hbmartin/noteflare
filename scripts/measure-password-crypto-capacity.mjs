@@ -1,7 +1,7 @@
 import { build } from "esbuild";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
-import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, unlink, lstat } from "node:fs/promises";
 import { createServer } from "node:net";
 import { openSync, closeSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
@@ -159,6 +159,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     telemetryErrors: { malformed: 0, socket: 0 },
     persistenceErrors: [],
     cleanupErrors: [],
+    cleanupWarnings: [],
     resourceCleanupCompleted: false,
     persistenceCompleted: false,
     helperRemoved: false,
@@ -176,7 +177,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     phase: "planned",
     resources: [helperResource],
     cleanupErrors: result.cleanupErrors,
-    cleanupWarnings: [],
+    cleanupWarnings: result.cleanupWarnings,
     persistenceErrors: result.persistenceErrors,
     localProcesses: [],
     proxyPortReleased: null,
@@ -204,7 +205,14 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
       try {
         await unlink(`${target}.tmp`);
       } catch (cleanupError) {
-        if (cleanupError?.code !== "ENOENT") warn("temporary_file_cleanup_failed");
+        if (cleanupError?.code !== "ENOENT") {
+          try {
+            await lstat(`${target}.tmp`);
+            warn("temporary_file_cleanup_failed");
+          } catch (inspectionError) {
+            if (inspectionError?.code !== "ENOENT") warn("temporary_file_cleanup_failed");
+          }
+        }
       }
       throw error;
     }
@@ -235,40 +243,46 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
   const stopEvent = new Promise((resolve) => {
     stopped = resolve;
   });
-  const stop = (code, status = 1) => {
+  const stop = (code, { status = 1, error, receivedSignal = false } = {}) => {
+    const isSignal = Object.hasOwn(signalExitStatus, code);
     if (operationalFinalized) {
-      if (Object.hasOwn(signalExitStatus, code) && !result.lateSignal) {
+      if (receivedSignal && !result.lateSignal) {
         result.lateSignal = code;
         journal.lateSignal = code;
         if (result.exitStatus === 0) result.exitStatus = status;
       }
       return;
     }
-    if (["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "tail_error", "tail_closed", "tail_open_deadline"].includes(code)) {
+    if (isSignal || ["tail_error", "tail_closed", "tail_open_deadline"].includes(code)) {
       skipDrain = true;
       cancelDrain();
     }
-    if (reason) return;
+    if (reason) {
+      if (receivedSignal && !result.secondarySignal) {
+        result.secondarySignal = { signal: code, stage: journal.phase };
+        journal.secondarySignal = result.secondarySignal;
+      }
+      return;
+    }
     reason = code;
-    result.exitStatus = status;
-    stopped();
-    for (const controller of cancellable) controller.abort(new CapacityError(code));
-  };
-  const recordFailure = (error, category) => {
-    if (operationalFinalized || (reason && reason !== category)) return;
-    result.failure ??= {
+    result.stopCause = {
       stage: journal.phase,
-      category,
+      category: code,
       ...(safeCode(error) ? { code: safeCode(error) } : {}),
       ...(validHttpStatus(error?.status) ? { status: error.status } : {}),
     };
+    journal.stopCause = result.stopCause;
+    if (!isSignal) result.failure = result.stopCause;
+    result.exitStatus = status;
+    stopped();
+    for (const controller of cancellable) controller.abort(new CapacityError(code));
   };
   const check = () => {
     if (reason) throw new CapacityError(reason);
   };
   const signalHandlers = Object.entries(signalExitStatus).map(([signal, status]) => [
     signal,
-    () => stop(signal, status),
+    () => stop(signal, { status, receivedSignal: true }),
   ]);
   for (const [signal, handler] of signalHandlers) signals.on(signal, handler);
   const processes = createProcessManager(journal.localProcesses, {
@@ -588,15 +602,13 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
           if (/^[a-f0-9]{16}$/.test(value.spanId)) safe.spanId = value.spanId;
           if (!value.ok) {
             safe.code = value.code === "unavailable" ? "unavailable" : "operation_failed";
-            recordFailure(undefined, "operation_failed");
             stop("operation_failed");
           }
           return { ...safe, wallMs: clock() - started };
         });
       } catch (error) {
         const code = error instanceof CapacityError ? error.code : "transport_failed";
-        recordFailure(error, code);
-        stop(code);
+        stop(code, { error });
         return {
           ok: false,
           code,
@@ -645,8 +657,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
       restoredUnsent ||= resource.creation === "planned";
     }
     const category = error instanceof CapacityError ? error.code : "driver_failed";
-    recordFailure(error, category);
-    stop(category);
+    stop(category, { error });
     if (restoredUnsent) await persist().catch(() => {}); // save records the persistence failure.
   } finally {
     // Sample failures still need delayed invocation frames. Signals and broken streams skip this wait.
@@ -745,16 +756,19 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
     journal.phase = "finished";
     result.finishedAt = Date.now();
     const finalize = () => {
-      result.resourceCleanupCompleted =
+      const resourceCleanupCompleted =
         journal.resources.every(
           (resource) =>
             resource.creation === "planned" || (resource.creation === "created" && resource.removal === "removed"),
         ) && !journal.cleanupErrors.some((code) => code !== "persistence_failed");
-      result.persistenceCompleted = result.persistenceErrors.length === 0;
-      result.cleanupCompleted = result.resourceCleanupCompleted && result.persistenceCompleted;
-      journal.resourceCleanupCompleted = result.resourceCleanupCompleted;
-      journal.persistenceCompleted = result.persistenceCompleted;
-      journal.cleanupCompleted = result.cleanupCompleted;
+      const persistenceCompleted = result.persistenceErrors.length === 0;
+      const completion = {
+        resourceCleanupCompleted,
+        persistenceCompleted,
+        cleanupCompleted: resourceCleanupCompleted && persistenceCompleted,
+      };
+      Object.assign(result, completion);
+      Object.assign(journal, completion);
       result.helperRemoved = helperResource.removal === "removed";
       if (!result.cleanupCompleted && result.exitStatus === 0) result.exitStatus = 1;
       result.outcome =
@@ -766,7 +780,7 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
             : "success");
     };
     const summaryVersion = () =>
-      JSON.stringify([result.persistenceErrors, journal.cleanupWarnings, result.lateSignal, result.exitStatus]);
+      JSON.stringify([result.persistenceErrors, result.cleanupWarnings, result.lateSignal, result.exitStatus]);
     try {
       // Final writes cannot replace the operational cause. Reconcile newly collected
       // diagnostics once; the CLI remains authoritative if the last snapshot is stale.
@@ -788,25 +802,30 @@ export async function measurePasswordCryptoCapacity({ configPath, smoke = false 
   return structuredClone(result);
 }
 
+export function capacitySummary(result) {
+  return {
+    event: "capacity.finished",
+    directory: result.directory,
+    outcome: result.outcome,
+    helperRemoved: result.helperRemoved,
+    cleanupCompleted: result.cleanupCompleted,
+    resourceCleanupCompleted: result.resourceCleanupCompleted,
+    persistenceCompleted: result.persistenceCompleted,
+    cleanupErrors: result.cleanupErrors,
+    cleanupWarnings: result.cleanupWarnings,
+    stopCause: result.stopCause,
+    secondarySignal: result.secondarySignal,
+    lateSignal: result.lateSignal,
+    exitStatus: result.exitStatus,
+    failure: result.failure,
+    persistenceErrors: result.persistenceErrors,
+  };
+}
+
 if (import.meta.main) {
   try {
     const result = await measurePasswordCryptoCapacity(parseCapacityArguments(process.argv.slice(2)));
-    console.log(
-      JSON.stringify({
-        event: "capacity.finished",
-        directory: result.directory,
-        outcome: result.outcome,
-        helperRemoved: result.helperRemoved,
-        cleanupCompleted: result.cleanupCompleted,
-        resourceCleanupCompleted: result.resourceCleanupCompleted,
-        persistenceCompleted: result.persistenceCompleted,
-        cleanupErrors: result.cleanupErrors,
-        lateSignal: result.lateSignal,
-        exitStatus: result.exitStatus,
-        failure: result.failure,
-        persistenceErrors: result.persistenceErrors,
-      }),
-    );
+    console.log(JSON.stringify(capacitySummary(result)));
     process.exitCode = result.exitStatus;
   } catch (error) {
     console.error(

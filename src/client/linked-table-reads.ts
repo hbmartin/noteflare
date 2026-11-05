@@ -61,6 +61,7 @@ export function linkedTableReads<T>(options: {
   unavailable: (reason: "failure" | "suspended" | "stale") => void;
   coverage?: (value: T) => TableCoverage;
   scope?: () => unknown;
+  canDispatch?: () => boolean;
   poll?: boolean;
 }) {
   options.unavailable("failure");
@@ -77,7 +78,7 @@ export function linkedTableReads<T>(options: {
   const observers = new Set<(receipt: TableReadReceipt<T>) => void>();
   const queued = new Map<string, Batch<T>>();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const available = () => !stopped && navigator.onLine && !document.hidden;
+  const available = () => !stopped && navigator.onLine && !document.hidden && options.canDispatch?.() !== false;
   const covered = (sequence: number, coverage?: TableCoverage) => {
     if (sequence < unscoped) return false;
     for (const [generation, required] of watermarks)
@@ -349,9 +350,7 @@ export function linkedTableReads<T>(options: {
   }
   function requestIntent(
     intent: TableReadIntent,
-    manual = true,
-    joinActive = false,
-    immediate = false,
+    { manual = true, joinActive = false, immediate = false } = {},
   ): Promise<TableReadReceipt<T>> {
     if (stopped) return Promise.resolve({ state: "retired" });
     const name = intentKey(intent);
@@ -415,7 +414,7 @@ export function linkedTableReads<T>(options: {
       if (!verification && completed.scope === options.scope?.())
         return Promise.resolve<TableReadReceipt<T>>({ state: "complete", value: completed.value });
       requireVerification();
-      return requestIntent({ kind: "verify" }, false, true);
+      return requestIntent({ kind: "verify" }, { manual: false, joinActive: true });
     }
     invalidation++;
     if (coverage) {
@@ -426,7 +425,7 @@ export function linkedTableReads<T>(options: {
       });
     }
     if (!coverage || fresh) unscoped = invalidation;
-    return requestIntent({ kind: "refresh" }, false, Boolean(coverage) && !fresh, immediate);
+    return requestIntent({ kind: "refresh" }, { manual: false, joinActive: Boolean(coverage) && !fresh, immediate });
   };
   const valueOf = async (receipt: Promise<TableReadReceipt<T>>) => {
     const result = await receipt;
@@ -435,9 +434,9 @@ export function linkedTableReads<T>(options: {
   const requestVerification = () => {
     // A heartbeat cannot downgrade full-query debt or a queued deliberate refresh.
     if (verification?.fullQuery || freshnessPending() || queued.has("refresh"))
-      return requestIntent({ kind: "refresh" }, false, true);
+      return requestIntent({ kind: "refresh" }, { manual: false, joinActive: true });
     requireVerification();
-    return requestIntent({ kind: "verify" }, false, true);
+    return requestIntent({ kind: "verify" }, { manual: false, joinActive: true });
   };
   const wake = () => {
     if (!available()) {
@@ -523,7 +522,7 @@ export function linkedTableReads<T>(options: {
         observers.delete(observer);
       };
     },
-    refresh: requireFreshness,
+    refresh: (coverage?: TableCoverage, { fresh = false } = {}) => requireFreshness(coverage, { fresh }),
     invalidate: (coverage?: TableCoverage) => valueOf(requireFreshness(coverage)),
     reset,
     recoverDenied,

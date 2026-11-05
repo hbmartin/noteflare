@@ -360,7 +360,7 @@ describe("collaborative table UI", () => {
     await act(async () => {
       release(data);
     });
-    expect(title).not.toBeDisabled();
+    await waitFor(() => expect(title).not.toBeDisabled());
     expect(socket.readyState).toBe(WebSocket.OPEN);
     expect(AuthorizedTableSocket.instances).toHaveLength(1);
     expect(writes).toHaveLength(0);
@@ -1513,7 +1513,7 @@ it("does not let superseded socket verification authorize a still-pending view q
   await act(async () => {
     releaseOld(data);
   });
-  expect(count).toBe(2);
+  await waitFor(() => expect(count).toBe(2));
   expect(input).toBeDisabled();
   await act(async () => {
     releaseNew(data);
@@ -3047,9 +3047,13 @@ it.each(
   5000,
 );
 
-it.each(["search", "view"].flatMap((change) => [1, 2, 3, 4, 5].map((repetition) => ({ change, repetition }))))(
-  "aborts obsolete canonical pagination before $change query dispatch: repetition $repetition",
-  async ({ change }) => {
+it.each(
+  ["search", "view"].flatMap((change) =>
+    ["held", "before-dispatch", "after-dispatch", "rejected", "round-trip"].map((schedule) => ({ change, schedule })),
+  ),
+)(
+  "aborts obsolete canonical pagination before $change query dispatch: $schedule",
+  async ({ change, schedule }) => {
     const rows = Array.from({ length: 400 }, (_, i) => ({
       ...data.rows[0]!,
       id: `old-query-${i}`,
@@ -3058,10 +3062,14 @@ it.each(["search", "view"].flatMap((change) => [1, 2, 3, 4, 5].map((repetition) 
     const current = rows.map((row, i) => ({ ...row, id: `new-query-${i}`, cells: { Title: `New ${i}` } }));
     data = { ...data, columns: [column("Title", "text")], rows, rowCount: 400 };
     let release!: () => void,
+      releaseNew!: () => void,
       oldSignal: AbortSignal | undefined,
       newQueries = 0;
     const gate = new Promise<void>((done) => {
       release = done;
+    });
+    const newGate = new Promise<void>((done) => {
+      releaseNew = done;
     });
     vi.mocked(api).mockImplementation(async (path, init) => {
       const params = new URL(path, "https://test").searchParams;
@@ -3071,10 +3079,14 @@ it.each(["search", "view"].flatMap((change) => [1, 2, 3, 4, 5].map((repetition) 
         limit = Number(params.get("limit") ?? 100);
       if (path.includes("/coverage?"))
         return { ...data, view: fresh && change === "view" ? { ...grid, visibleColumnIds: ["Title"] } : null };
-      if (fresh) newQueries++;
+      if (fresh) {
+        newQueries++;
+        await newGate;
+      }
       if (!fresh && offset === 100) {
         oldSignal = init?.signal as AbortSignal;
         await gate;
+        if (schedule === "rejected") throw new ApiClientError(503, "synthetic", "Old query failed");
       }
       return {
         ...data,
@@ -3101,7 +3113,27 @@ it.each(["search", "view"].flatMap((change) => [1, 2, 3, 4, 5].map((repetition) 
         else fireEvent.change(screen.getByLabelText("Saved table view"), { target: { value: "grid" } });
       });
       expect(oldSignal?.aborted).toBe(true);
+      if (schedule === "round-trip") {
+        await act(async () =>
+          fireEvent.change(screen.getByLabelText(change === "search" ? "Search table" : "Saved table view"), {
+            target: { value: "" },
+          }),
+        );
+        await act(async () =>
+          fireEvent.change(screen.getByLabelText(change === "search" ? "Search table" : "Saved table view"), {
+            target: { value: change === "search" ? "needle" : "grid" },
+          }),
+        );
+      }
+      if (schedule === "before-dispatch" || schedule === "rejected") await act(async () => release());
+      if (change === "search") {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(250);
+        });
+      }
       expect(newQueries).toBeGreaterThan(0);
+      if (schedule === "after-dispatch") await act(async () => release());
+      await act(async () => releaseNew());
       const visible = () => screen.getAllByLabelText("Title").map((input) => (input as HTMLInputElement).value);
       const expected = Array.from({ length: 100 }, (_, i) => `New ${i}`);
       expect(visible()).toEqual(expected);
@@ -3113,8 +3145,206 @@ it.each(["search", "view"].flatMap((change) => [1, 2, 3, 4, 5].map((repetition) 
       expect(visible()).toEqual(expected);
       expect(vi.mocked(api)).toHaveBeenCalledTimes(before);
     } finally {
-      await act(async () => release());
+      await act(async () => {
+        release();
+        releaseNew();
+      });
     }
   },
   5000,
 );
+
+it.each([false, true])("debounces search and flushes Enter, clearing and Refresh once; linked %s", async (linked) => {
+  const queries: Array<string | null> = [];
+  vi.mocked(api).mockImplementation(async (path) => {
+    const params = new URL(path, "https://test").searchParams;
+    if (!path.includes("/coverage?")) queries.push(params.get("q"));
+    return { ...data, nextCursor: null };
+  });
+  render(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "Search dispatch" }}
+      member={member}
+      onSelectPage={vi.fn()}
+      queryBase={linked ? "/api/pages/host/linked-tables/table" : undefined}
+    />,
+  );
+  await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+  queries.length = 0;
+  vi.useFakeTimers();
+  const input = screen.getByLabelText("Search table");
+  for (const [index, query] of ["n", "ne", "nee", "need", "needl", "needle"].entries()) {
+    await act(async () => {
+      fireEvent.change(input, { target: { value: query } });
+      if (index < 5) await vi.advanceTimersByTimeAsync(40);
+    });
+  }
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    AuthorizedTableSocket.instances
+      .at(-1)
+      ?.dispatchEvent(new MessageEvent("message", { data: '{"type":"table-ready"}' }));
+    await vi.advanceTimersByTimeAsync(249);
+  });
+  expect(queries).toEqual([]);
+  expect(screen.getByLabelText("Title")).toBeDisabled();
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+  });
+  expect(queries).toEqual(["needle"]);
+  expect(screen.getByLabelText("Title")).toBeEnabled();
+  await act(async () => {
+    fireEvent.change(input, { target: { value: "Enter now" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+  });
+  expect(queries).toEqual(["needle", "Enter now"]);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(queries).toHaveLength(2);
+  await act(async () => fireEvent.change(input, { target: { value: "" } }));
+  expect(queries).toEqual(["needle", "Enter now", null]);
+  await act(async () => {
+    fireEvent.change(input, { target: { value: "Refresh now" } });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  });
+  expect(queries).toEqual(["needle", "Enter now", null, "Refresh now"]);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(queries).toHaveLength(4);
+});
+
+it("holds composition without queries and releases only its completed text", async () => {
+  render(<CollaborativeTablePage page={{ id: "table", title: "IME search" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+  vi.useFakeTimers();
+  const read = vi.mocked(api).getMockImplementation()!,
+    queries: string[] = [];
+  vi.mocked(api).mockImplementation((path, init) => {
+    if (!path.includes("/coverage?")) queries.push(path);
+    return read(path, init);
+  });
+  const input = screen.getByLabelText("Search table");
+  await act(async () => {
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "入" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    await vi.advanceTimersByTimeAsync(16000);
+    fireEvent.change(input, { target: { value: "入力" } });
+    fireEvent.compositionEnd(input);
+    await vi.advanceTimersByTimeAsync(249);
+  });
+  expect(queries).toEqual([]);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1);
+  });
+  expect(queries).toHaveLength(1);
+  expect(new URL(queries[0]!, "https://test").searchParams.get("q")).toBe("入力");
+});
+
+it.each(["view", "owner", "unmount"])("retires pending search timers on %s changes", async (change) => {
+  const view = render(
+    <CollaborativeTablePage page={{ id: "table", title: "Timer ownership" }} member={member} onSelectPage={vi.fn()} />,
+  );
+  await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+  vi.useFakeTimers();
+  await act(async () => fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Old timer" } }));
+  await act(async () => {
+    if (change === "view") fireEvent.change(screen.getByLabelText("Saved table view"), { target: { value: "grid" } });
+    else if (change === "owner")
+      view.rerender(
+        <CollaborativeTablePage
+          page={{ id: "new-owner", title: "New owner" }}
+          member={member}
+          onSelectPage={vi.fn()}
+        />,
+      );
+    else view.unmount();
+  });
+  const before = vi.mocked(api).mock.calls.length;
+  expect(before).toBeGreaterThan(change === "unmount" ? 0 : 1);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(vi.mocked(api)).toHaveBeenCalledTimes(before);
+});
+
+it("dispatches a calendar month change immediately using the latest pending text", async () => {
+  const queries: URLSearchParams[] = [];
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (!path.includes("/coverage?")) queries.push(new URL(path, "https://test").searchParams);
+    return { ...data, view: { ...calendar, visibleColumnIds: ["Title", "Due"] }, nextCursor: null };
+  });
+  render(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "Month search" }}
+      initialViewId="calendar"
+      member={member}
+      onSelectPage={vi.fn()}
+    />,
+  );
+  await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+  queries.length = 0;
+  vi.useFakeTimers();
+  await act(async () => fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Latest" } }));
+  expect(queries).toEqual([]);
+  await act(async () => fireEvent.change(screen.getByLabelText("Calendar month"), { target: { value: "2030-02" } }));
+  expect(queries).toHaveLength(1);
+  expect(queries[0]!.get("q")).toBe("Latest");
+  expect(queries[0]!.get("month")).toBe("2030-02");
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(1000);
+  });
+  expect(queries).toHaveLength(1);
+});
+
+it.each(["hidden", "offline"])("resumes expired search with one current authorized read after %s", async (mode) => {
+  let hidden = false,
+    online = true;
+  vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+  vi.spyOn(navigator, "onLine", "get").mockImplementation(() => online);
+  render(
+    <CollaborativeTablePage page={{ id: "table", title: "Suspended search" }} member={member} onSelectPage={vi.fn()} />,
+  );
+  await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+  vi.useFakeTimers();
+  const before = vi.mocked(api).mock.calls.length;
+  await act(async () => {
+    fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "Latest" } });
+    hidden = mode === "hidden";
+    online = mode !== "offline";
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("offline"));
+    await vi.advanceTimersByTimeAsync(250);
+  });
+  expect(vi.mocked(api)).toHaveBeenCalledTimes(before);
+  await act(async () => {
+    hidden = false;
+    online = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("online"));
+  });
+  const reads = vi
+    .mocked(api)
+    .mock.calls.slice(before)
+    .map(([path]) => path);
+  expect(reads.map((path) => new URL(path, "https://test").pathname)).toEqual([
+    "/api/tables/table/query",
+    "/api/tables/table/coverage",
+  ]);
+  expect(reads.every((path) => new URL(path, "https://test").searchParams.get("q") === "Latest")).toBe(true);
+  expect(screen.getByLabelText("Title")).toBeEnabled();
+});
+
+it("restores verification after an empty composition finishes", async () => {
+  render(<CollaborativeTablePage page={{ id: "table", title: "Empty IME" }} member={member} onSelectPage={vi.fn()} />);
+  await waitFor(() => expect(screen.getByText("Views", { selector: "button" })).toBeEnabled());
+  const input = screen.getByLabelText("Search table");
+  await act(async () => {
+    fireEvent.compositionStart(input);
+    fireEvent.compositionEnd(input);
+  });
+  expect(screen.getByLabelText("Title")).toBeEnabled();
+});

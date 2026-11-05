@@ -244,6 +244,7 @@ it("retires continuation controls synchronously when the query changes", async (
   expect(titleInputs()[0]).toBeDisabled();
   await act(async () => {
     release();
+    await vi.advanceTimersByTimeAsync(250);
   });
   expect(titleInputs()).toHaveLength(100);
 });
@@ -570,7 +571,7 @@ it("retains toolbar identity while a changed query requires verification", async
   await act(async () => {
     release();
   });
-  expect(input).toBeEnabled();
+  await waitFor(() => expect(input).toBeEnabled());
   expect(views).toBeEnabled();
   expect(properties).toBeEnabled();
 });

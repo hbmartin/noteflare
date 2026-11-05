@@ -1,45 +1,9 @@
-import { test, expect, type Page, type Request, type Route } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { signInOwner, editableDocument } from "./security-helpers";
+import { heldBrowserRead } from "./held-browser-read";
 
 test.setTimeout(60_000);
 test.use({ serviceWorkers: "block" });
-
-function heldBrowserRead(page: Page) {
-  let release!: () => void, handled!: () => void, terminal!: () => void, request: Request | undefined;
-  const gate = new Promise<void>((done) => {
-    release = done;
-  });
-  const routeHandled = new Promise<void>((done) => {
-    handled = done;
-  });
-  const requestTerminated = new Promise<void>((done) => {
-    terminal = done;
-  });
-  const finish = (candidate: Request) => {
-    if (candidate === request) terminal();
-  };
-  page.on("requestfinished", finish);
-  page.on("requestfailed", finish);
-  return {
-    async hold(route: Route) {
-      request = route.request();
-      try {
-        const response = await route.fetch();
-        await gate;
-        await route.fulfill({ response }).catch(() => {});
-      } finally {
-        handled();
-      }
-    },
-    release,
-    completed: () => Promise.all([routeHandled, requestTerminated]),
-    dispose: () => {
-      release();
-      page.off("requestfinished", finish);
-      page.off("requestfailed", finish);
-    },
-  };
-}
 
 async function linkedFixture(page: Page) {
   // Creation controls are enabled only in this client fixture; deployment flags stay unchanged.
@@ -176,12 +140,8 @@ async function bufferedFixture(page: Page) {
 
 test("save denial retires queued buffers and automatically verifies restored access", async ({ page }) => {
   const { path, linked, cells } = await bufferedFixture(page);
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  const heldRead = heldBrowserRead(page);
   let held = false,
-    settled = false,
     mutations = 0,
     denied = false;
   await page.route(`**${path}/commands`, async (route) => {
@@ -192,9 +152,10 @@ test("save denial retires queued buffers and automatically verifies restored acc
   await page.route(`**${path}?**`, async (route) => {
     if (!held) {
       held = true;
-      await gate;
-      await route.continue();
-      settled = true;
+      await heldRead.track(route, async (gate) => {
+        await gate;
+        await route.continue();
+      });
     } else if (denied) {
       await route.fulfill({ status: 403, json: { error: { code: "forbidden", message: "Linked access removed" } } });
     } else await route.continue();
@@ -206,8 +167,8 @@ test("save denial retires queued buffers and automatically verifies restored acc
     await cells.first().fill("Local text survives access loss");
     await cells.first().press("Tab");
     await expect(linked).toContainText("Linked access removed");
-    release();
-    await expect.poll(() => settled).toBe(true);
+    heldRead.release();
+    await heldRead.completed();
     await expect(cells).toHaveCount(0);
     await expect(linked.getByRole("button", { name: "Load more rows" })).toHaveCount(0);
     await expect(linked.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue(
@@ -223,16 +184,13 @@ test("save denial retires queued buffers and automatically verifies restored acc
     await expect(cells.first()).toBeEnabled();
     expect(mutations).toBe(1);
   } finally {
-    release();
+    heldRead.dispose();
   }
 });
 
 test("failed conflict verification retains cached drafts and requires network recovery", async ({ page }) => {
   const { path, linked, cells } = await bufferedFixture(page);
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  const heldRead = heldBrowserRead(page);
   let held = false,
     failReads = true,
     mutations = 0;
@@ -244,16 +202,21 @@ test("failed conflict verification retains cached drafts and requires network re
     });
   });
   await page.route(`**${path}?**`, async (route) => {
+    const respond = async () => {
+      if (failReads)
+        await route.fulfill({
+          status: 503,
+          json: { error: { code: "unavailable", message: "Fresh verification failed" } },
+        });
+      else await route.continue();
+    };
     if (!held) {
       held = true;
-      await gate;
-    }
-    if (failReads)
-      await route.fulfill({
-        status: 503,
-        json: { error: { code: "unavailable", message: "Fresh verification failed" } },
+      await heldRead.track(route, async (gate) => {
+        await gate;
+        await respond();
       });
-    else await route.continue();
+    } else await respond();
   });
   try {
     await cells.first().fill("Deliberate draft remains unsaved");
@@ -261,7 +224,8 @@ test("failed conflict verification retains cached drafts and requires network re
     await expect.poll(() => held).toBe(true);
     await expect(cells.first()).toBeDisabled();
     await expect(linked.getByRole("button", { name: "Refresh", exact: true })).toBeDisabled();
-    release();
+    heldRead.release();
+    await heldRead.completed();
     await expect(linked.getByText("Fresh verification failed", { exact: true })).toBeVisible();
     await expect(linked.getByRole("button", { name: "Refresh", exact: true })).toBeEnabled();
     await expect(cells.first()).toBeDisabled();
@@ -278,7 +242,7 @@ test("failed conflict verification retains cached drafts and requires network re
     await expect(cells.first()).toHaveValue("Deliberate draft remains unsaved");
     expect(mutations).toBe(1);
   } finally {
-    release();
+    heldRead.dispose();
   }
 });
 
@@ -545,42 +509,47 @@ test("canonical invalidation during an older read performs a trailing fresh read
     .filter({ has: page.getByRole("heading", { name: source.title, exact: true }) });
   const cell = table.getByLabel("Linked title", { exact: true }).first();
   await expect(cell).toBeEnabled();
-  let release!: () => void, captured!: (value: { id: string; cellRevisions: Record<string, number> }) => void;
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  let captured!: (value: { id: string; cellRevisions: Record<string, number> }) => void;
+  const heldRead = heldBrowserRead(page);
   const snapshot = new Promise<{ id: string; cellRevisions: Record<string, number> }>((resolve) => {
     captured = resolve;
   });
   let reads = 0;
   await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
     if (++reads === 1) {
-      const response = await route.fetch();
-      const data = await response.json();
-      captured(data.rows[0]);
-      await held;
-      await route.fulfill({ response });
+      await heldRead.track(route, async (gate) => {
+        const response = await route.fetch();
+        const data = await response.json();
+        captured(data.rows[0]);
+        await gate;
+        await route.fulfill({ response });
+      });
     } else await route.continue();
   });
-  await table.getByRole("button", { name: "Refresh", exact: true }).click();
-  const row = await snapshot;
-  const response = await page.request.post(`/api/tables/${source.id}/commands`, {
-    data: {
-      operationId: crypto.randomUUID(),
-      kind: "update_cells",
-      payload: {
-        rowId: row.id,
-        values: { [columnId]: "Fresh after notification" },
-        expectedCellRevisions: { [columnId]: row.cellRevisions[columnId] ?? 0 },
+  try {
+    await table.getByRole("button", { name: "Refresh", exact: true }).click();
+    const row = await snapshot;
+    const response = await page.request.post(`/api/tables/${source.id}/commands`, {
+      data: {
+        operationId: crypto.randomUUID(),
+        kind: "update_cells",
+        payload: {
+          rowId: row.id,
+          values: { [columnId]: "Fresh after notification" },
+          expectedCellRevisions: { [columnId]: row.cellRevisions[columnId] ?? 0 },
+        },
       },
-    },
-  });
-  expect(response.ok()).toBeTruthy();
-  await page.evaluate(() => window.dispatchEvent(new CustomEvent("notes:workspace-event")));
-  release();
-  await expect(cell).toHaveValue("Fresh after notification");
-  await expect(cell).toBeEnabled();
-  expect(reads).toBeGreaterThanOrEqual(2);
+    });
+    expect(response.ok()).toBeTruthy();
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent("notes:workspace-event")));
+    heldRead.release();
+    await heldRead.completed();
+    await expect(cell).toHaveValue("Fresh after notification");
+    await expect(cell).toBeEnabled();
+    expect(reads).toBeGreaterThanOrEqual(2);
+  } finally {
+    heldRead.dispose();
+  }
 });
 
 test("explicit canonical Refresh retires an older failed continuation and permits new Load more", async ({ page }) => {
@@ -635,10 +604,8 @@ test("explicit canonical Refresh retires an older failed continuation and permit
 
 test("conflict notice survives a query change before its refresh completes", async ({ page }) => {
   const { path, linked, cells } = await linkedFixture(page);
-  let release!: () => void, started!: () => void;
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  let started!: () => void;
+  const heldRead = heldBrowserRead(page);
   const loading = new Promise<void>((resolve) => {
     started = resolve;
   });
@@ -656,10 +623,12 @@ test("conflict notice survives a query change before its refresh completes", asy
   await page.route(`**${path}?**`, async (route) => {
     if (rejected && !new URL(route.request().url()).searchParams.has("q") && !heldUrl) {
       heldUrl = route.request().url();
-      const response = await route.fetch();
-      started();
-      await held;
-      if (!route.request().failure()) await route.fulfill({ response });
+      await heldRead.track(route, async (gate) => {
+        const response = await route.fetch();
+        started();
+        await gate;
+        if (!route.request().failure()) await route.fulfill({ response });
+      });
     } else await route.continue();
   });
   try {
@@ -673,12 +642,13 @@ test("conflict notice survives a query change before its refresh completes", asy
     await expect(linked.getByText("Conflict before refresh", { exact: true })).toBeVisible();
     await expect(cells.first()).toHaveValue("Preserved after superseded refresh");
     expect(writes).toBe(1);
-    release();
+    heldRead.release();
+    await heldRead.completed();
     await linked.getByRole("button", { name: "Dismiss notice", exact: true }).click();
     await expect(linked.getByText("Conflict before refresh", { exact: true })).toHaveCount(0);
     await expect(cells.first()).toHaveValue("Preserved after superseded refresh");
   } finally {
-    release();
+    heldRead.dispose();
   }
 });
 
@@ -1095,10 +1065,7 @@ for (const mode of ["hidden", "offline"] as const) {
     const expected = all
       .slice(0, 600)
       .map((row: { cells: Record<string, unknown> }) => String(Object.values(row.cells)[0]));
-    let release!: () => void;
-    const gate = new Promise<void>((done) => {
-      release = done;
-    });
+    const heldRead = heldBrowserRead(page);
     let started = 0,
       proofs = 0;
     await page.route(`**${coveragePath}?**`, async (route) => {
@@ -1106,9 +1073,11 @@ for (const mode of ["hidden", "offline"] as const) {
       await route.continue();
     });
     await page.route(`**${path}?**`, async (route) => {
-      const response = await route.fetch();
-      if (++started === 1) await gate;
-      await route.fulfill({ response });
+      if (++started === 1) await heldRead.hold(route);
+      else {
+        const response = await route.fetch();
+        await route.fulfill({ response });
+      }
     });
     try {
       await linked.getByRole("button", { name: "Load more rows", exact: true }).click();
@@ -1120,11 +1089,8 @@ for (const mode of ["hidden", "offline"] as const) {
         document.dispatchEvent(new Event("visibilitychange"));
         window.dispatchEvent(new Event("offline"));
       }, mode);
-      const completed = page.waitForResponse((response) => new URL(response.url()).pathname === path, {
-        timeout: 5000,
-      });
-      release();
-      expect((await completed).ok()).toBeTruthy();
+      heldRead.release();
+      await heldRead.completed();
       await expect(cells).toHaveCount(500);
       await expect(cells.first()).toBeDisabled();
       await page.evaluate(() => {
@@ -1142,7 +1108,7 @@ for (const mode of ["hidden", "offline"] as const) {
       expect(proofs).toBeGreaterThanOrEqual(1);
       expect(started).toBe(2);
     } finally {
-      release();
+      heldRead.dispose();
       if (!page.isClosed()) await page.unrouteAll({ behavior: "ignoreErrors" });
     }
   });
@@ -1225,10 +1191,12 @@ test("a canonical search starts before its obsolete held continuation completes"
   const heldRead = heldBrowserRead(page);
   let held = false,
     newQueries = 0;
+  const searchQueries: string[] = [];
   await page.route(`**/api/tables/${source.id}/query?**`, async (route) => {
     const params = new URL(route.request().url()).searchParams;
-    if (params.get("q") === "Row 1") {
+    if (params.has("q")) {
       newQueries++;
+      searchQueries.push(params.get("q")!);
       await route.continue();
     } else if (params.has("cursor") && !held) {
       held = true;
@@ -1238,13 +1206,20 @@ test("a canonical search starts before its obsolete held continuation completes"
   try {
     await table.getByRole("button", { name: "Load more rows", exact: true }).click();
     await expect.poll(() => held).toBe(true);
-    await table.getByLabel("Search table").fill("Row 1");
+    for (const [index, value] of ["R", "Ro", "Row", "Row ", "Row 1"].entries()) {
+      await table.getByLabel("Search table").fill(value);
+      if (index < 4) await page.clock.runFor(40);
+    }
+    await page.clock.runFor(249);
+    expect(searchQueries).toEqual([]);
+    await page.clock.runFor(1);
     await expect.poll(() => newQueries).toBeGreaterThan(0);
     await expect(cells).toHaveCount(100);
     await expect(cells.first()).toBeEnabled();
     expect(await cells.evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(
       expected,
     );
+    expect(searchQueries).toEqual(["Row 1"]);
     const count = newQueries;
     heldRead.release();
     await heldRead.completed();

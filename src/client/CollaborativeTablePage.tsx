@@ -317,6 +317,58 @@ export function CollaborativeTablePage({
   const [query, setQuery] = useTableViewState("query", "", viewState);
   const [month, setMonth] = useTableViewState("month", () => new Date().toISOString().slice(0, 7), viewState);
   const queryIdentity = JSON.stringify([base, viewId, query, month]);
+  const [searchEpoch, setSearchEpoch] = useState(0);
+  const searchContext = useMemo(
+    () => ({ base, viewId, month, owner: currentOwner }),
+    [base, viewId, month, currentOwner],
+  );
+  const searchDispatch = useRef({
+    pending: false,
+    composing: false,
+    version: 0,
+    epoch: searchEpoch,
+    context: searchContext,
+    timer: undefined as ReturnType<typeof setTimeout> | undefined,
+  });
+  const cancelSearchDispatch = useCallback((pending = false) => {
+    const state = searchDispatch.current;
+    clearTimeout(state.timer);
+    state.timer = undefined;
+    state.version++;
+    state.pending = pending;
+  }, []);
+  useLayoutEffect(() => {
+    searchDispatch.current.context = searchContext;
+    cancelSearchDispatch();
+    searchDispatch.current.composing = false;
+    return () => cancelSearchDispatch(true);
+  }, [searchContext, cancelSearchDispatch]);
+  const changeSearch = (value: string) => {
+    const state = searchDispatch.current;
+    cancelSearchDispatch(value !== "" || state.composing);
+    setQuery(value);
+    if (!state.pending || state.composing) return;
+    const version = state.version;
+    const context = state.context;
+    state.timer = setTimeout(() => {
+      if (state.version !== version || state.context !== context) return;
+      state.timer = undefined;
+      setSearchEpoch((epoch) => epoch + 1);
+    }, 250);
+  };
+  const releaseSearch = () => {
+    const state = searchDispatch.current;
+    if (state.composing || !state.pending) return false;
+    clearTimeout(state.timer);
+    state.timer = undefined;
+    state.version++;
+    setSearchEpoch((epoch) => epoch + 1);
+    return true;
+  };
+  useLayoutEffect(() => {
+    searchDispatch.current.epoch = searchEpoch;
+    if (!searchDispatch.current.composing) searchDispatch.current.pending = false;
+  }, [searchEpoch]);
   const queryOwner = useRef({ queryIdentity, account, incarnation, host, tableId: page.id });
   const [error, setError] = useState("");
   const reportMutation = (notice: MutationNotice, message: string) => {
@@ -457,7 +509,8 @@ export function CollaborativeTablePage({
           queryOwner.current.queryIdentity !== queryIdentity
         )
           return { state: "superseded" };
-        if (!navigator.onLine || document.hidden) return { state: "suspended" };
+        if (!navigator.onLine || document.hidden || searchDispatch.current.pending || searchDispatch.current.composing)
+          return { state: "suspended" };
         if ((context && !context.acceptsGeneration(result)) || result.generation < ownership.current.minimumGeneration)
           return { state: "stale" };
         // Query/access evidence belongs to this verification lifetime. Later content watermarks
@@ -570,6 +623,7 @@ export function CollaborativeTablePage({
       poll: Boolean(queryBase),
       coverage: (value: TableQueryResult) => ({ generation: value.generation, revision: value.revision }),
       scope: () => ownership.current.verification,
+      canDispatch: () => !searchDispatch.current.pending && !searchDispatch.current.composing,
       read: (intent, signal, context) =>
         owns() ? fetchRef.current({ signal, intent, context }) : Promise.resolve({ state: "superseded" }),
       unavailable: (reason) => {
@@ -631,6 +685,7 @@ export function CollaborativeTablePage({
   }, []);
   const refresh = () => {
     if (!queryBase) linkedReads.current?.retirePages(undefined, { active: true });
+    if (releaseSearch()) return Promise.resolve(null);
     return load();
   };
   useEffect(() => {
@@ -649,13 +704,21 @@ export function CollaborativeTablePage({
     if ((incarnation && incarnation.key !== account) || queryOwner.current.queryIdentity !== queryIdentity)
       return undefined;
     active.current = true;
-    void Promise.resolve().then(() => load());
+    if (!searchDispatch.current.pending && !searchDispatch.current.composing)
+      void Promise.resolve().then(() => {
+        if (
+          searchDispatch.current.epoch === searchEpoch &&
+          !searchDispatch.current.pending &&
+          !searchDispatch.current.composing
+        )
+          void load();
+      });
     const requestOwnership = ownership;
     return () => {
       active.current = false;
       requestOwnership.current.request++;
     };
-  }, [load, queryIdentity, account, incarnation]);
+  }, [load, queryIdentity, searchEpoch, account, incarnation]);
   useEffect(() => {
     const invalidate = (event: Event) => {
       const hostId = queryBase?.match(/^\/api\/pages\/([^/]+)\/linked-tables\//)?.[1];
@@ -1166,7 +1229,25 @@ export function CollaborativeTablePage({
             aria-label="Search table"
             placeholder="Search rows"
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => changeSearch(event.target.value)}
+            onCompositionStart={() => {
+              searchDispatch.current.composing = true;
+              cancelSearchDispatch(searchDispatch.current.pending);
+            }}
+            onCompositionEnd={(event) => {
+              searchDispatch.current.composing = false;
+              if (event.currentTarget.value === "" && query === "") {
+                cancelSearchDispatch();
+                void linkedReads.current?.verifyReceipt();
+                return;
+              }
+              changeSearch(event.currentTarget.value);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.nativeEvent.isComposing && releaseSearch()) {
+                event.preventDefault();
+              }
+            }}
           />
           {view?.kind === "calendar" && (
             <input
