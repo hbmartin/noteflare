@@ -534,7 +534,22 @@ export function CollaborativeTablePage({
           verification !== ownership.current.verification
         )
           return { state: "superseded" };
+        const reportRefreshFailure = (denied: boolean) => {
+          const commit = commitRequirement.current;
+          if (
+            commit &&
+            owner > commit.afterRequest &&
+            sameTableOwner(commit.operation.owner, retryLifetime.current) &&
+            noticeSequence.current === commit.operation.sequence
+          )
+            setSaveRefreshStatus(
+              denied
+                ? "Saved. Access to the table could not be confirmed."
+                : "Saved. The latest table data could not be refreshed. Retrying…",
+            );
+        };
         if (discardDenied(cause, true)) {
+          reportRefreshFailure(true);
           setError(apiErrorMessage(cause, "The table is unavailable."));
           return { state: "denied" };
         }
@@ -542,6 +557,7 @@ export function CollaborativeTablePage({
           return { state: "suspended" };
         }
         if (isTableReadConflict(cause)) return { state: "stale" };
+        reportRefreshFailure(false);
         setError(apiErrorMessage(cause, "The table could not be loaded."));
         return { state: "failure" };
       }
@@ -732,18 +748,7 @@ export function CollaborativeTablePage({
     const changedGeneration = Boolean(coverage && coverage.generation !== ownership.current.generation);
     advanceGeneration(coverage);
     if (changedGeneration) retireVerification("invalidate");
-    void reads.refresh(coverage, { fresh: changedGeneration }).then((receipt) => {
-      if (
-        !active.current ||
-        !sameTableOwner(operation.owner, retryLifetime.current) ||
-        noticeSequence.current !== operation.sequence
-      )
-        return;
-      if (!commitRequirement.current) return;
-      if (receipt.state === "failure")
-        setSaveRefreshStatus("Saved. The latest table data could not be refreshed. Retrying…");
-      else if (receipt.state === "denied") setSaveRefreshStatus("Saved. Access to the table could not be confirmed.");
-    });
+    void reads.refresh(coverage, { fresh: changedGeneration });
     return "committed-current";
   };
   const send = async (command: TableCommand, submission?: CellDraftSubmission, form?: TableViewSubmission) => {
@@ -805,19 +810,17 @@ export function CollaborativeTablePage({
         });
       else if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
         setError("");
+        retireVerification("invalidate");
         reportMutation(
           operation,
-          apiErrorMessage(cause, "The table update was rejected. Refresh before saving again."),
-        );
-        retireVerification("invalidate");
-        const refreshed = await linkedReads.current?.recover();
-        if (refreshed)
-          reportMutation(
-            operation,
+          apiErrorMessage(
+            cause,
             cause.status === 404 || cause.status === 403
-              ? apiErrorMessage(cause, "The table item is unavailable.")
+              ? "The table item is unavailable."
               : "The table changed. Review the latest value before saving again.",
-          );
+          ),
+        );
+        await linkedReads.current?.recover();
       }
       return false;
     } finally {
@@ -908,20 +911,21 @@ export function CollaborativeTablePage({
       }
       if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
         setError("");
-        reportMutation(operation, apiErrorMessage(cause, "The task update was rejected. Refresh before saving again."));
         if (cause.code === "table_revision_conflict" || cause.status === 404 || cause.status === 403) {
           if (submission)
             submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
           retireVerification("invalidate");
         }
-        const refreshed = await linkedReads.current?.recover();
-        if (refreshed && ownership.current.verifiedQuery)
-          reportMutation(
-            operation,
+        reportMutation(
+          operation,
+          apiErrorMessage(
+            cause,
             cause.status === 404 || cause.status === 403
-              ? apiErrorMessage(cause, "The task is unavailable.")
+              ? "The task is unavailable."
               : "The task list changed. Review the latest value before saving again.",
-          );
+          ),
+        );
+        await linkedReads.current?.recover();
       }
       return { state: "rejected", code: cause.code };
     } finally {
@@ -1068,6 +1072,7 @@ export function CollaborativeTablePage({
   if (!data)
     return (
       <output className="table-live">
+        {saveRefreshStatus && <p>{saveRefreshStatus}</p>}
         {error || "Loading table…"}
         {blocked && <p>{blocked}</p>}
         {recovery}

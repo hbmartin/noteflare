@@ -1342,7 +1342,7 @@ it("retains task conflict feedback across later successful background verificati
   fireEvent.focus(input);
   fireEvent.change(input, { target: { value: "Preserved conflict text" } });
   fireEvent.blur(input);
-  const message = "The task list changed. Review the latest value before saving again.";
+  const message = "Conflict";
   await screen.findByText(message);
   await act(async () => {
     window.dispatchEvent(new CustomEvent("notes:workspace-event"));
@@ -1451,7 +1451,7 @@ it("keeps a busy-only rejection separate from an existing conflict notice", asyn
   failure = new ApiClientError(409, "table_revision_conflict", "Conflict");
   fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Retain title" } });
   fireEvent.click(screen.getByRole("button", { name: "Add row" }));
-  const message = "The table changed. Review the latest value before saving again.";
+  const message = "Conflict";
   await screen.findByText(message);
   expect(screen.getByLabelText("New row title")).toHaveValue("Retain title");
   const release = delayNextCommand();
@@ -1584,7 +1584,7 @@ it.each(["view", "property"] as const)(
     else fireEvent.blur(input);
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]!.payload).toMatchObject({ revision: 1, name: "Unsubmitted settings" });
-    await screen.findByText("The table changed. Review the latest value before saving again.");
+    await screen.findByText(kind === "view" ? "View changed." : "Property changed.");
     expect(input).toHaveValue("Unsubmitted settings");
     expect(
       kind === "view"
