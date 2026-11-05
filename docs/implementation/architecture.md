@@ -85,3 +85,13 @@ unless full-query recovery is required. Suspended continuations retain their
 requested target and resume only after verification. Retired, hidden or offline
 completions cannot restore verification. The shared reader owns one cursor restart;
 further churn returns to bounded coordinator recovery.
+
+Canonical and linked table search share a 250 ms trailing debounce. Text changes
+immediately retire obsolete reads and disable editing while preserving visible
+rows. The coordinator gates all dispatch paths during the delay, including
+heartbeats, invalidations, retries and online/visibility resumption. Once the
+delay expires, the current query receives fresh authorization before editing
+resumes. Enter, clearing to an empty string, and explicit Refresh flush pending
+search without a duplicate timer request. IME composition defers dispatch until
+composition ends. Initial loads and view, month or owner changes are immediate;
+context changes and unmount cancel timers belonging to the previous context.
