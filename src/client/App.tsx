@@ -1,4 +1,5 @@
 import { noticeSentence } from "./notice-text";
+import { PageCover } from "./PageCover";
 import { CommentPublicationNotice } from "./CommentPublicationNotice";
 import { isComposingKey } from "./keyboard";
 import { purgeCommentDrafts } from "./comment-drafts";
@@ -105,6 +106,8 @@ const DiagramPage = lazy(() =>
 );
 
 import type { SecurityStatus } from "../shared/security";
+import { usePublicChallenge } from "./PublicChallenge";
+import { withAuthChallenge } from "./public-challenge-token";
 import { SecurityScreen, finishPasswordSignIn } from "./SecurityScreen";
 
 type AppState =
@@ -788,7 +791,8 @@ async function stateAfterUnauthorized(failure: ApiClientError): Promise<AppState
   }
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state === "signed_out") return { screen: "signin" };
-  if (status.state !== "ready") return { screen: "security", status };
+  if (status.state !== "ready" || (status.accessIdentity?.required && !status.accessIdentity.linked))
+    return { screen: "security", status };
   return null;
 }
 
@@ -868,7 +872,8 @@ async function resolveAppState(alreadyPurgedAccount?: string): Promise<AppState>
     localStorage.removeItem(LOCAL_SIGNOUT_KEY);
     return invite ? { screen: "invite", token: invite } : { screen: "signin" };
   }
-  if (status.state !== "ready") return { screen: "security", status };
+  if (status.state !== "ready" || (status.accessIdentity?.required && !status.accessIdentity.linked))
+    return { screen: "security", status };
   if (locallySignedOut) {
     const signedOutUserId = locallySignedOut.split("\u0000")[0];
     if (!status.userId || status.userId === signedOutUserId) return { screen: "signin" };
@@ -1295,6 +1300,7 @@ function AuthLayout({
 }
 
 function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
+  const challenge = usePublicChallenge("bootstrap");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -1303,12 +1309,16 @@ function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
     setError("");
     const values = new FormData(event.currentTarget);
     try {
-      await api("/api/install/bootstrap", { method: "POST", body: json(Object.fromEntries(values)) });
+      await api("/api/install/bootstrap", {
+        method: "POST",
+        body: json({ ...Object.fromEntries(values), ...(challenge.token ? { turnstileToken: challenge.token } : {}) }),
+      });
       await onComplete();
     } catch (cause) {
       setError(apiErrorMessage(cause, "Setup failed."));
     } finally {
       setBusy(false);
+      challenge.reset();
     }
   }
   return (
@@ -1339,8 +1349,9 @@ function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
           Setup key
           <input name="bootstrapToken" type="password" required />
         </label>
+        {challenge.element}
         {error && <p className="form-error">{error}</p>}
-        <button className="primary-button" disabled={busy}>
+        <button className="primary-button" disabled={busy || !challenge.ready}>
           {busy ? "Creating workspace…" : "Create workspace"}
         </button>
       </form>
@@ -1349,6 +1360,7 @@ function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
 }
 
 function InviteScreen({ token, onComplete }: { token: string; onComplete: () => Promise<void> }) {
+  const challenge = usePublicChallenge("invite");
   const [error, setError] = useState(() => consumeSlackAuthError());
   const [busy, setBusy] = useState(false);
   const slackAvailable = useSlackIdentityAvailable();
@@ -1359,13 +1371,18 @@ function InviteScreen({ token, onComplete }: { token: string; onComplete: () => 
     try {
       await api("/api/invites/accept", {
         method: "POST",
-        body: json({ ...Object.fromEntries(new FormData(event.currentTarget)), token }),
+        body: json({
+          ...Object.fromEntries(new FormData(event.currentTarget)),
+          token,
+          ...(challenge.token ? { turnstileToken: challenge.token } : {}),
+        }),
       });
       await onComplete();
     } catch (cause) {
       setError(apiErrorMessage(cause, "Invite could not be accepted."));
     } finally {
       setBusy(false);
+      challenge.reset();
     }
   }
   return (
@@ -1376,23 +1393,49 @@ function InviteScreen({ token, onComplete }: { token: string; onComplete: () => 
     >
       <form className="auth-form" onSubmit={submit}>
         <h2>Join workspace</h2>
+        {challenge.access.available && (
+          <button
+            type="button"
+            disabled={busy || !challenge.ready}
+            onClick={() => {
+              setBusy(true);
+              setError("");
+              sessionStorage.setItem("pending-invite", token);
+              void api("/api/auth/access/sign-in", {
+                method: "POST",
+                headers: { "x-turnstile-token": challenge.token },
+                body: json({ inviteToken: token }),
+              })
+                .then(onComplete)
+                .catch((cause) => setError(apiErrorMessage(cause, "Access sign-up failed.")))
+                .finally(() => {
+                  setBusy(false);
+                  challenge.reset();
+                });
+            }}
+          >
+            Continue with Cloudflare Access
+          </button>
+        )}
+
         {slackAvailable && (
           <button
             type="button"
-            disabled={busy}
+            disabled={busy || !challenge.ready}
             onClick={() => {
               setBusy(true);
               setError("");
               sessionStorage.setItem("pending-invite", token);
               void api<{ url: string }>("/api/slack/identity/invite/start", {
                 method: "POST",
-                body: json({ token }),
+                body: json({ token, ...(challenge.token ? { turnstileToken: challenge.token } : {}) }),
               })
                 .then((result) => window.location.assign(result.url))
                 .catch((cause) => {
                   sessionStorage.removeItem("pending-invite");
                   setError(apiErrorMessage(cause, "Slack sign-up could not be started."));
                   setBusy(false);
+                  challenge.reset();
                 });
             }}
           >
@@ -1411,8 +1454,9 @@ function InviteScreen({ token, onComplete }: { token: string; onComplete: () => 
           Password
           <input name="password" type="password" minLength={8} required />
         </label>
+        {challenge.element}
         {error && <p className="form-error">{error}</p>}
-        <button className="primary-button" disabled={busy}>
+        <button className="primary-button" disabled={busy || !challenge.ready}>
           {busy ? "Joining…" : "Accept invite"}
         </button>
       </form>
@@ -1443,6 +1487,7 @@ function signInFailure(cause: unknown, fallback: string) {
 }
 
 function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Promise<void>; initialError?: string }) {
+  const challenge = usePublicChallenge("sign_in");
   const [error, setError] = useState(() => consumeSlackAuthError() || initialError);
   const [busy, setBusy] = useState(false);
   const [purgeNotice, setPurgeNotice] = useState(offlinePurgeNotice);
@@ -1463,7 +1508,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
     const values = Object.fromEntries(new FormData(event.currentTarget)) as { email: string; password: string };
     try {
       await finishPendingServerSignOut();
-      const result = await authClient.signIn.email(values);
+      const result = await withAuthChallenge(challenge.token, () => authClient.signIn.email(values));
       if (result.error) {
         setError(result.error.message?.trim() || "Sign in failed.");
         return;
@@ -1475,6 +1520,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
       setError(signInFailure(cause, "Sign in failed."));
     } finally {
       setBusy(false);
+      challenge.reset();
     }
   }
   return (
@@ -1485,21 +1531,50 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
     >
       <form className="auth-form" onSubmit={submit}>
         <h2>Sign in</h2>
-        {purgeNotice && <output>{purgeNotice}</output>}
-        {slackAvailable && (
+        {challenge.access.available && (
           <button
             type="button"
-            disabled={busy}
+            disabled={busy || !challenge.ready}
             onClick={() => {
               setBusy(true);
               setError("");
               void finishPendingServerSignOut()
                 .then(() =>
-                  authClient.signIn.social({
-                    provider: "slack",
-                    callbackURL: "/",
-                    errorCallbackURL: "/?slackAuth=callback",
+                  api("/api/auth/access/sign-in", {
+                    method: "POST",
+                    headers: { "x-turnstile-token": challenge.token },
+                    body: json({}),
                   }),
+                )
+                .then(onComplete)
+                .catch((cause) => setError(signInFailure(cause, "Access sign-in failed.")))
+                .finally(() => {
+                  setBusy(false);
+                  challenge.reset();
+                });
+            }}
+          >
+            Sign in with Cloudflare Access
+          </button>
+        )}
+
+        {purgeNotice && <output>{purgeNotice}</output>}
+        {slackAvailable && (
+          <button
+            type="button"
+            disabled={busy || !challenge.ready}
+            onClick={() => {
+              setBusy(true);
+              setError("");
+              void finishPendingServerSignOut()
+                .then(() =>
+                  withAuthChallenge(challenge.token, () =>
+                    authClient.signIn.social({
+                      provider: "slack",
+                      callbackURL: "/",
+                      errorCallbackURL: "/?slackAuth=callback",
+                    }),
+                  ),
                 )
                 .then((result) => {
                   if (result.error) throw new Error(result.error.message || "Slack sign-in failed.");
@@ -1507,6 +1582,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
                 .catch((cause) => {
                   setError(signInFailure(cause, "Slack sign-in failed."));
                   setBusy(false);
+                  challenge.reset();
                 });
             }}
           >
@@ -1515,19 +1591,22 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
         )}
         <button
           type="button"
-          disabled={busy}
+          disabled={busy || !challenge.ready}
           onClick={() => {
             setBusy(true);
             setError("");
             void finishPendingServerSignOut()
-              .then(() => authClient.signIn.passkey())
+              .then(() => withAuthChallenge(challenge.token, () => authClient.signIn.passkey()))
               .then(async (result) => {
                 if (result.error) throw new Error(result.error.message || "Passkey sign-in failed.");
                 await onComplete();
                 setPurgeNotice(offlinePurgeNotice());
               })
               .catch((cause) => setError(signInFailure(cause, "Passkey sign-in failed.")))
-              .finally(() => setBusy(false));
+              .finally(() => {
+                setBusy(false);
+                challenge.reset();
+              });
           }}
         >
           Sign in with a passkey
@@ -1540,8 +1619,9 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
           Password
           <input name="password" type="password" required />
         </label>
+        {challenge.element}
         {error && <p className="form-error">{error}</p>}
-        <button className="primary-button" disabled={busy}>
+        <button className="primary-button" disabled={busy || !challenge.ready}>
           {busy ? "Signing in…" : "Continue"}
         </button>
       </form>
@@ -4648,68 +4728,78 @@ function Workspace({
             retryingLabel="Loading…"
           />
         ) : activeSelected ? (
-          activeSelected.taskList ? (
-            <TasksView
+          <>
+            <PageCover
               key={activeSelected.id}
               page={activeSelected}
-              member={activeMember}
-              metadata={metadata}
-              onSelectPage={navigateToPage}
-              onPageChanged={updatePage}
-              refreshVersion={taskRefresh.byPageId[activeSelected.id] ?? 0}
-              forceRefreshVersion={(taskRefresh.byPageForceId[activeSelected.id] ?? 0) + taskRefresh.globalForceVersion}
-              onTaskOperationStart={startTaskOperation}
-              onTaskOperationSettled={settleTaskOperation}
+              editable={activeMember.role !== "viewer"}
+              onChanged={updatePage}
             />
-          ) : activeSelected.kind === "document" ? (
-            <EditorPage
-              key={`${activeSelected.id}:${activeSelected.contentEpoch}`}
-              page={activeSelected}
-              taskList={
-                sidebarHiddenPageIds.has(activeSelected.id)
-                  ? pages.find((parent) => parent.id === activeSelected.parentId && parent.taskList)
-                  : undefined
-              }
-              metadata={metadata}
-              member={activeMember}
-              spaceName={activeSpace?.name ?? "Space"}
-              onPageChanged={updatePage}
-              onPageUnavailable={pageUnavailable}
-              onAccessDenied={documentAccessDenied}
-              onSelectPage={navigateToPage}
-              backlinksRevision={backlinksRevision}
-              commentsRevision={commentsRevision}
-              writingLaunchRequest={writingLaunch?.pageId === activeSelected.id ? writingLaunch : undefined}
-              onWritingLaunchConsumed={consumeWritingLaunch}
-            />
-          ) : activeSelected.kind === "table" ? (
-            <TablePage
-              key={activeSelected.id}
-              page={activeSelected}
-              metadata={metadata}
-              member={activeMember}
-              onPageChanged={updatePage}
-              onPageUnavailable={pageUnavailable}
-              onSelectPage={navigateToPage}
-              backlinksRevision={backlinksRevision}
-            />
-          ) : (
-            <Suspense fallback={<div className="editor-loading">Loading the diagram editor…</div>}>
-              <DiagramPage
-                restoreOwner={diagramRestores}
+            {activeSelected.taskList ? (
+              <TasksView
+                key={activeSelected.id}
+                page={activeSelected}
+                member={activeMember}
+                metadata={metadata}
+                onSelectPage={navigateToPage}
+                onPageChanged={updatePage}
+                refreshVersion={taskRefresh.byPageId[activeSelected.id] ?? 0}
+                forceRefreshVersion={
+                  (taskRefresh.byPageForceId[activeSelected.id] ?? 0) + taskRefresh.globalForceVersion
+                }
+                onTaskOperationStart={startTaskOperation}
+                onTaskOperationSettled={settleTaskOperation}
+              />
+            ) : activeSelected.kind === "document" ? (
+              <EditorPage
                 key={`${activeSelected.id}:${activeSelected.contentEpoch}`}
                 page={activeSelected}
+                taskList={
+                  sidebarHiddenPageIds.has(activeSelected.id)
+                    ? pages.find((parent) => parent.id === activeSelected.parentId && parent.taskList)
+                    : undefined
+                }
                 metadata={metadata}
                 member={activeMember}
+                spaceName={activeSpace?.name ?? "Space"}
                 onPageChanged={updatePage}
                 onPageUnavailable={pageUnavailable}
                 onAccessDenied={documentAccessDenied}
                 onSelectPage={navigateToPage}
                 backlinksRevision={backlinksRevision}
                 commentsRevision={commentsRevision}
+                writingLaunchRequest={writingLaunch?.pageId === activeSelected.id ? writingLaunch : undefined}
+                onWritingLaunchConsumed={consumeWritingLaunch}
               />
-            </Suspense>
-          )
+            ) : activeSelected.kind === "table" ? (
+              <TablePage
+                key={activeSelected.id}
+                page={activeSelected}
+                metadata={metadata}
+                member={activeMember}
+                onPageChanged={updatePage}
+                onPageUnavailable={pageUnavailable}
+                onSelectPage={navigateToPage}
+                backlinksRevision={backlinksRevision}
+              />
+            ) : (
+              <Suspense fallback={<div className="editor-loading">Loading the diagram editor…</div>}>
+                <DiagramPage
+                  restoreOwner={diagramRestores}
+                  key={`${activeSelected.id}:${activeSelected.contentEpoch}`}
+                  page={activeSelected}
+                  metadata={metadata}
+                  member={activeMember}
+                  onPageChanged={updatePage}
+                  onPageUnavailable={pageUnavailable}
+                  onAccessDenied={documentAccessDenied}
+                  onSelectPage={navigateToPage}
+                  backlinksRevision={backlinksRevision}
+                  commentsRevision={commentsRevision}
+                />
+              </Suspense>
+            )}
+          </>
         ) : (
           <EmptyWorkspace canEdit={canEditActiveSpace} onCreate={() => void createPage("document", null)} />
         )}

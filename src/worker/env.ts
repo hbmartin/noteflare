@@ -3,6 +3,7 @@ import type { TableAuthority } from "./table-authority";
 import type { WorkspaceEvents } from "./workspace-events";
 import type { JobWorkflowParams } from "./jobs";
 import type { PasswordCrypto } from "./password-crypto";
+import type { PlatformCoordinator } from "./platform-coordinator";
 
 export type { MemberContext } from "../shared/types";
 
@@ -61,6 +62,49 @@ export interface AppBindings {
   SLACK_RICH_DIGESTS_ENABLED?: "true" | "false";
   SLACK_DIGEST_DEFAULT_TIMEZONE?: string;
   OBSERVABILITY_PROBE_TOKEN?: string;
+  // Optional platform capabilities. Portable installations do not provision paid services.
+  PLATFORM_QUEUE?: Queue;
+  PLATFORM?: DurableObjectNamespace<PlatformCoordinator>;
+  AI?: Ai;
+  SEMANTIC_INDEX?: Vectorize;
+  SEMANTIC_SEARCH_ENABLED?: "true" | "false";
+  SEMANTIC_DAILY_TOKEN_LIMIT?: string;
+  SEMANTIC_DAILY_QUERY_LIMIT?: string;
+  SEMANTIC_MAX_STORED_CHUNKS?: string;
+  D1_READ_REPLICATION_ENABLED?: "true" | "false";
+  D1_READ_REPLICATION_ROUTES?: string;
+  TURNSTILE_SITE_KEY?: string;
+  TURNSTILE_SECRET_KEY?: string;
+  TURNSTILE_ENABLED?: "true" | "false";
+  AUTH_MODE?: "local" | "access_required";
+  ACCESS_TEAM_DOMAIN?: string;
+  ACCESS_AUD?: string;
+  PUBLIC_BASE_URL?: string;
+  PUBLICATIONS_BUCKET?: R2Bucket;
+  PUBLIC_PUBLISHING_ENABLED?: "true" | "false";
+  IMAGES?: ImagesBinding;
+  IMAGES_ENABLED?: "true" | "false";
+  FORMS_ENABLED?: "true" | "false";
+  FORMS_DAILY_LIMIT?: string;
+  TABLE_GALLERY_ENABLED?: "true" | "false";
+  CF_ZONE_ID?: string;
+  CF_ACCOUNT_ID?: string;
+  CF_SAAS_API_TOKEN?: string;
+  CF_CACHE_PURGE_API_TOKEN?: string;
+  CUSTOM_HOSTNAMES_ENABLED?: "true" | "false";
+  SAAS_CNAME_TARGET?: string;
+  SLACK_ENCRYPTION_KEYS?: { get(): Promise<string> };
+  WEBHOOK_ENCRYPTION_KEYS?: { get(): Promise<string> };
+  AI_ENCRYPTION_KEYS?: { get(): Promise<string> };
+  AUDIT_ENABLED?: "true" | "false";
+  AUDIT_BUCKET?: R2Bucket;
+  AUDIT_HOT_DAYS?: string;
+  AUDIT_ARCHIVE_DAYS?: string;
+  BASIN_ENABLED?: "true" | "false";
+  AUDIT_PIPELINE?: { send(records: Record<string, unknown>[]): Promise<void> };
+  HEATMAP_PIPELINE?: { send(records: Record<string, unknown>[]): Promise<void> };
+  HEATMAPS_ENABLED?: "true" | "false";
+  HEATMAP_HMAC_KEY?: string;
 }
 
 export interface Env extends AppBindings {}
@@ -87,6 +131,25 @@ declare global {
       | "SLACK_SHARE_REFRESH_ENABLED"
       | "SLACK_RICH_DIGESTS_ENABLED"
       | "SLACK_DIGEST_DEFAULT_TIMEZONE"
+      | "PLATFORM"
+      | "AUTH_MODE"
+      | "SEMANTIC_SEARCH_ENABLED"
+      | "SEMANTIC_MAX_STORED_CHUNKS"
+      | "SEMANTIC_DAILY_TOKEN_LIMIT"
+      | "D1_READ_REPLICATION_ENABLED"
+      | "D1_READ_REPLICATION_ROUTES"
+      | "PUBLIC_PUBLISHING_ENABLED"
+      | "IMAGES_ENABLED"
+      | "FORMS_ENABLED"
+      | "FORMS_DAILY_LIMIT"
+      | "TABLE_GALLERY_ENABLED"
+      | "TURNSTILE_ENABLED"
+      | "CUSTOM_HOSTNAMES_ENABLED"
+      | "AUDIT_ENABLED"
+      | "AUDIT_HOT_DAYS"
+      | "AUDIT_ARCHIVE_DAYS"
+      | "BASIN_ENABLED"
+      | "HEATMAPS_ENABLED"
     > {}
   }
 }

@@ -1,3 +1,4 @@
+import { publishedRows, publishedCell } from "../shared/published-table";
 import { escapeHtml } from "./html";
 import { documentBlocks } from "../shared/notion-blocks";
 import {
@@ -15,10 +16,27 @@ import type { Env, MemberContext } from "./env";
 import { attachmentDisposition, HttpError } from "./http";
 import { correlationHeaders } from "./observability";
 
+export type ShareOptions = Partial<{
+  includeSubpages: boolean;
+  allowIndexing: boolean;
+  showToc: boolean;
+  showLastUpdated: boolean;
+  password: string | null;
+  expiresAt: number | null;
+  revokeAccess: boolean;
+}>;
+function validateExpiry(value: number | null | undefined) {
+  if (value !== undefined && value !== null && (!Number.isSafeInteger(value) || value <= Date.now()))
+    throw new HttpError(422, "invalid_share_expiry", "Choose a future expiration time.");
+}
+
 const PUBLIC_DOCUMENT_FETCH_TIMEOUT_MS = 5_000;
 const PUBLIC_LINKED_DIAGRAM_LIMIT = 64;
 
 export type ShareRow = {
+  password_hash?: string | null;
+  expires_at?: number | null;
+  access_generation?: number;
   id: string;
   workspace_id: string;
   root_page_id: string;
@@ -58,6 +76,9 @@ function shareJson(row: ShareRow, origin: string) {
     allowIndexing: Boolean(row.allow_indexing),
     showToc: Boolean(row.show_toc),
     showLastUpdated: Boolean(row.show_last_updated),
+    hasPassword: !!row.password_hash,
+    expiresAt: row.expires_at ?? null,
+    accessGeneration: row.access_generation ?? 1,
     views: row.views,
     lastAccessedAt: row.last_accessed_at,
     revokedAt: row.revoked_at,
@@ -97,7 +118,7 @@ export async function createShare(
   member: MemberContext,
   pageId: string,
   origin: string,
-  options: Partial<{ includeSubpages: boolean; allowIndexing: boolean; showToc: boolean; showLastUpdated: boolean }>,
+  options: ShareOptions,
   mutation?: { guard: D1PreparedStatement; afterCreate: (shareId: string) => D1PreparedStatement[] },
 ) {
   const owner = await env.DB.prepare(
@@ -117,6 +138,11 @@ export async function createShare(
   }
   const existing = await activeShareForPage(env, member, pageId);
   if (existing) return shareJson(existing, origin);
+  validateExpiry(options.expiresAt);
+  const passwordHash =
+    options.password === undefined || options.password === null
+      ? null
+      : await (await import("./share-access")).hashSharePassword(env, options.password);
   const timestamp = Date.now();
   const id = crypto.randomUUID();
   const urlKey = randomUrlKey();
@@ -124,8 +150,8 @@ export async function createShare(
     const insert = env.DB.prepare(
       `INSERT INTO share_links
         (id, workspace_id, root_page_id, url_key, include_subpages, allow_indexing, show_toc,
-         show_last_updated, created_by, created_at, updated_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         show_last_updated, created_by, created_at, updated_at, password_hash, expires_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role = 'owner')
           AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND workspace_id = ? AND archived_at IS NULL
             AND import_job_id IS NULL AND kind <> 'diagram')`,
@@ -135,12 +161,14 @@ export async function createShare(
       pageId,
       urlKey,
       options.includeSubpages ? 1 : 0,
-      options.allowIndexing ? 1 : 0,
+      options.allowIndexing && !passwordHash ? 1 : 0,
       options.showToc === false ? 0 : 1,
       options.showLastUpdated === false ? 0 : 1,
       member.user.id,
       timestamp,
       timestamp,
+      passwordHash,
+      options.expiresAt ?? null,
       member.workspace.id,
       member.user.id,
       pageId,
@@ -167,8 +195,11 @@ export async function createShare(
       workspace_id: member.workspace.id,
       root_page_id: pageId,
       url_key: urlKey,
+      password_hash: passwordHash,
+      expires_at: options.expiresAt ?? null,
+      access_generation: 1,
       include_subpages: options.includeSubpages ? 1 : 0,
-      allow_indexing: options.allowIndexing ? 1 : 0,
+      allow_indexing: options.allowIndexing && !passwordHash ? 1 : 0,
       show_toc: options.showToc === false ? 0 : 1,
       show_last_updated: options.showLastUpdated === false ? 0 : 1,
       views: 0,
@@ -186,27 +217,46 @@ export async function updateShare(
   member: MemberContext,
   pageId: string,
   origin: string,
-  options: Partial<{ includeSubpages: boolean; allowIndexing: boolean; showToc: boolean; showLastUpdated: boolean }>,
+  options: ShareOptions,
 ) {
   const existing = await activeShareForPage(env, member, pageId);
   if (!existing) throw new HttpError(404, "share_not_found", "Public share not found.");
+  validateExpiry(options.expiresAt);
+  const passwordHash =
+    options.password === undefined
+      ? (existing.password_hash ?? null)
+      : options.password === null
+        ? null
+        : await (await import("./share-access")).hashSharePassword(env, options.password);
+  const invalidate =
+    options.password !== undefined ||
+    options.expiresAt !== undefined ||
+    options.includeSubpages !== undefined ||
+    options.revokeAccess === true;
   const updated = await env.DB.prepare(
     `UPDATE share_links SET
        include_subpages = COALESCE(?, include_subpages),
        allow_indexing = COALESCE(?, allow_indexing),
        show_toc = COALESCE(?, show_toc),
        show_last_updated = COALESCE(?, show_last_updated),
-       updated_at = ?
-     WHERE id = ? AND workspace_id = ? AND revoked_at IS NULL RETURNING *`,
+       password_hash = ?, expires_at = CASE WHEN ? THEN ? ELSE expires_at END,
+       access_generation = access_generation + ?, updated_at = ?
+     WHERE id = ? AND workspace_id = ? AND revoked_at IS NULL
+       AND EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=share_links.workspace_id AND user_id=? AND role='owner') RETURNING *`,
   )
     .bind(
       options.includeSubpages === undefined ? null : options.includeSubpages ? 1 : 0,
-      options.allowIndexing === undefined ? null : options.allowIndexing ? 1 : 0,
+      passwordHash ? 0 : options.allowIndexing === undefined ? null : options.allowIndexing ? 1 : 0,
       options.showToc === undefined ? null : options.showToc ? 1 : 0,
       options.showLastUpdated === undefined ? null : options.showLastUpdated ? 1 : 0,
+      passwordHash,
+      options.expiresAt === undefined ? 0 : 1,
+      options.expiresAt ?? null,
+      invalidate ? 1 : 0,
       Date.now(),
       existing.id,
       member.workspace.id,
+      member.user.id,
     )
     .first<ShareRow>();
   if (!updated) throw new HttpError(404, "share_not_found", "Public share not found.");
@@ -215,10 +265,11 @@ export async function updateShare(
 
 export async function revokeShare(env: Env, member: MemberContext, pageId: string) {
   const result = await env.DB.prepare(
-    `UPDATE share_links SET revoked_at = ?, revoked_by = ?, updated_at = ?
-      WHERE root_page_id = ? AND workspace_id = ? AND revoked_at IS NULL`,
+    `UPDATE share_links SET access_generation=access_generation+1, revoked_at = ?, revoked_by = ?, updated_at = ?
+      WHERE root_page_id = ? AND workspace_id = ? AND revoked_at IS NULL
+        AND EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=share_links.workspace_id AND user_id=? AND role='owner')`,
   )
-    .bind(Date.now(), member.user.id, Date.now(), pageId, member.workspace.id)
+    .bind(Date.now(), member.user.id, Date.now(), pageId, member.workspace.id, member.user.id)
     .run();
   if (!result.meta.changes) throw new HttpError(404, "share_not_found", "Public share not found.");
 }
@@ -229,8 +280,10 @@ async function resolveSharedTarget(
   requestedPageId: string | undefined,
   target: "page" | "diagram",
 ) {
-  const share = await env.DB.prepare(`SELECT * FROM share_links WHERE url_key = ? AND revoked_at IS NULL`)
-    .bind(key)
+  const share = await env.DB.prepare(
+    `SELECT * FROM share_links WHERE url_key = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`,
+  )
+    .bind(key, Date.now())
     .first<ShareRow>();
   if (!share) return null;
   const pageId = requestedPageId ?? share.root_page_id;
@@ -245,7 +298,7 @@ async function resolveSharedTarget(
      SELECT share.*, page.id page_id, page.parent_id, page.title page_title, page.icon page_icon,
             page.kind page_kind, page.full_width, page.content_epoch, page.updated_at page_updated_at
        FROM share_links share JOIN pages page ON page.id = ?
-      WHERE share.id = ? AND share.revoked_at IS NULL
+      WHERE share.id = ? AND share.revoked_at IS NULL AND (share.expires_at IS NULL OR share.expires_at > ?)
         AND page.workspace_id = share.workspace_id AND page.archived_at IS NULL AND page.import_job_id IS NULL
         AND page.kind ${target === "diagram" ? "=" : "<>"} 'diagram'
         AND EXISTS (
@@ -255,7 +308,7 @@ async function resolveSharedTarget(
         AND (page.id = share.root_page_id OR
              (share.include_subpages = 1 AND EXISTS (SELECT 1 FROM ancestors WHERE id = share.root_page_id)))`,
   )
-    .bind(pageId, pageId, share.id)
+    .bind(pageId, pageId, share.id, Date.now())
     .first<SharedPageRow>();
   return page;
 }
@@ -456,65 +509,67 @@ async function publicTransclusions(
   return { html: available, diagramIds: availableDiagramIds, diagramsOmitted };
 }
 
-async function publicTableHtml(env: Env, pageId: string) {
-  const [columns, cells] = await Promise.all([
-    env.DB.prepare(
-      `SELECT column.id, column.name,
-              CASE WHEN page.is_task_list=1 AND column.id=page.id||'-assignee' THEN 1 ELSE 0 END private_assignee
-         FROM table_columns column JOIN pages page ON page.id=column.page_id
-        WHERE column.page_id = ? ORDER BY column.position, column.id`,
-    )
-      .bind(pageId)
-      .all<{ id: string; name: string; private_assignee: number }>(),
-    env.DB.prepare(
-      `SELECT row.id row_id, cell.column_id, cell.text_value, cell.number_value, cell.boolean_value,
-              cell.date_value, option.label select_label
-         FROM (
-           SELECT id, position FROM table_rows WHERE page_id = ? AND NOT EXISTS (SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id JOIN pages list ON list.id=table_rows.page_id WHERE link.row_id=table_rows.id AND list.is_task_list=1 AND detail.archived_at IS NOT NULL) ORDER BY position, id LIMIT 501
-         ) row LEFT JOIN table_cells cell ON cell.row_id = row.id
-         LEFT JOIN table_select_options option ON option.id = cell.select_value
-        ORDER BY row.position, row.id, cell.column_id`,
-    )
-      .bind(pageId)
-      .all<Record<string, unknown>>(),
-  ]);
-  const rows = new Map<string, Map<string, string>>();
-  for (const raw of cells.results) {
-    const rowId = String(raw.row_id);
-    const values = rows.get(rowId) ?? new Map<string, string>();
-    const value =
-      raw.text_value ??
-      raw.number_value ??
-      raw.date_value ??
-      raw.select_label ??
-      (raw.boolean_value === 1 ? "✓" : raw.boolean_value === 0 ? "" : "");
-    if (raw.column_id) values.set(String(raw.column_id), String(value ?? ""));
-    rows.set(rowId, values);
-  }
-  const rowIds = [...rows.keys()];
-  const truncated = rowIds.length > 500;
-  const html = `<table><thead><tr>${columns.results.map((column) => `<th>${escapeHtml(column.name)}</th>`).join("")}</tr></thead><tbody>${rowIds
-    .slice(0, 500)
-    .map((rowId) => rows.get(rowId)!)
-    .map(
-      (row) =>
-        `<tr>${columns.results
-          .map((column) => {
-            const value = row.get(column.id) ?? "";
-            return `<td>${escapeHtml(column.private_assignee ? (value ? "Assigned" : "") : value)}</td>`;
-          })
-          .join("")}</tr>`,
-    )
-    .join("")}</tbody></table>`;
-  return { html, truncated };
+async function publicTableHtml(
+  env: Env,
+  share: SharedPageRow,
+  key: string,
+  options: { cursor?: string; viewId?: string },
+) {
+  const table = await (
+      await import("./public-table")
+    ).publicTablePage(env, share.page_id, options.viewId, options.cursor),
+    view = table.view;
+  const columns = view ? table.columns.filter((column) => view.visibleColumnIds.includes(column.id)) : table.columns;
+  const rows = publishedRows(table.columns, table.rows, null, true);
+  const task = Boolean(
+    (
+      await env.DB.prepare("SELECT is_task_list FROM pages WHERE id=?")
+        .bind(share.page_id)
+        .first<{ is_task_list: number }>()
+    )?.is_task_list,
+  );
+  const base =
+    share.page_id === share.root_page_id
+      ? `/share/${encodeURIComponent(key)}`
+      : `/share/${encodeURIComponent(key)}/pages/${encodeURIComponent(share.page_id)}`;
+  const params = new URLSearchParams();
+  if (options.viewId) params.set("view", options.viewId);
+  const next = new URLSearchParams(params);
+  if (table.nextCursor) next.set("cursor", table.nextCursor);
+  const nav = `<nav>${options.cursor ? `<a href="${base}?${escapeHtml(params.toString())}">First page</a>` : ""}${table.nextCursor ? `<a href="${base}?${escapeHtml(next.toString())}">Next 100 rows</a>` : ""}</nav>`;
+  let html: string;
+  if (view?.kind === "gallery") {
+    const children = share.include_subpages
+      ? (
+          await env.DB.prepare(
+            "SELECT id,cover_attachment_id FROM pages WHERE parent_id=? AND archived_at IS NULL AND import_job_id IS NULL AND id IN (SELECT value FROM json_each(?))",
+          )
+            .bind(share.page_id, JSON.stringify(rows.map((row) => row.detailPageId).filter(Boolean)))
+            .all<{ id: string; cover_attachment_id: string | null }>()
+        ).results
+      : [];
+    html = `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(${view.gallery?.cardSize === "small" ? 180 : view.gallery?.cardSize === "large" ? 360 : 260}px,1fr));gap:16px">${rows
+      .map((row) => {
+        const detail = children.find((page) => page.id === row.detailPageId);
+        return `<article>${detail?.cover_attachment_id && view.gallery?.preview !== "none" ? `<img alt="" loading="lazy" src="/share/${encodeURIComponent(key)}/assets/${encodeURIComponent(detail.cover_attachment_id)}?page=${encodeURIComponent(detail.id)}">` : ""}${columns.map((column, index) => `<${index ? "p" : "h2"}>${index ? escapeHtml(column.name) + ": " : ""}${escapeHtml(publishedCell(column, row, task))}</${index ? "p" : "h2"}>`).join("")}${detail ? `<a href="/share/${encodeURIComponent(key)}/pages/${encodeURIComponent(detail.id)}">Open page</a>` : ""}</article>`;
+      })
+      .join("")}</div>`;
+  } else
+    html = `<table><thead><tr>${columns.map((column) => `<th>${escapeHtml(column.name)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td>${escapeHtml(publishedCell(column, row, task))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  return html + nav;
 }
 
-export async function renderPublicShare(env: Env, share: SharedPageRow, key: string, origin: string) {
+export async function renderPublicShare(
+  env: Env,
+  share: SharedPageRow,
+  key: string,
+  origin: string,
+  options: { cursor?: string; viewId?: string } = {},
+) {
   if (share.page_kind === "diagram") return null;
   const [tree, trail] = await Promise.all([sharedTree(env, share), breadcrumbs(env, share)]);
   let content: string;
   let toc = "";
-  let tableTruncated = false;
   if (share.page_kind === "document") {
     const response = await env.DOCUMENT.getByName(`${share.page_id}~${share.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
@@ -538,9 +593,7 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
       content += "<p><small>Some linked whiteboard previews were omitted from this public view.</small></p>";
     }
   } else {
-    const table = await publicTableHtml(env, share.page_id);
-    content = table.html;
-    tableTruncated = table.truncated;
+    content = await publicTableHtml(env, share, key, options);
   }
   const nav =
     tree.length > 1
@@ -557,7 +610,6 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
     '<nav class="breadcrumb" data-derived-block="breadcrumb"></nav>',
     `<nav class="public-breadcrumb">${breadcrumbHtml}</nav>`,
   );
-  if (tableTruncated) content += "<p><small>This public view is limited to the first 500 rows.</small></p>";
   const updatedAt = new Date(share.page_updated_at).toISOString();
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="robots" content="${robots}"><link rel="canonical" href="${canonical}"><title>${escapeHtml(share.page_title)}</title><style>:root{color-scheme:light dark;--page:#fbfaf7;--ink:#25231f;--muted:#625f57;--line:#dfddd5;--card:#f7f5ef;--accent:#5b5bd6}html[data-theme=dark]{--page:#191a19;--ink:#f0f1ed;--muted:#a7aaa4;--line:#3a3c39;--card:#242624;--accent:#9a98ff}*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:16px/1.6 system-ui,sans-serif}.public-shell{display:grid;grid-template-columns:${nav ? "240px" : "0"} minmax(0,${share.full_width || share.page_kind === "table" ? "1200px" : "720px"}) ${share.show_toc && toc ? "210px" : "0"};justify-content:center;gap:30px;padding:32px 24px}.public-tree,.public-toc{position:sticky;top:24px;align-self:start;display:grid;gap:5px;max-height:calc(100vh - 48px);overflow:auto}.public-tree a,.public-toc a{padding:5px 8px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:13px}.public-tree a:hover,.public-tree a.active{background:var(--card);color:var(--ink)}main{min-width:0}header{margin-bottom:34px}.public-breadcrumb{color:var(--muted);font-size:12px}.public-breadcrumb span{padding:0 5px}h1{font:400 clamp(32px,5vw,40px)/1.15 Georgia,serif;margin:16px 0 8px}header small{color:var(--muted)}a{color:var(--accent)}img,video,iframe{max-width:100%}pre{white-space:pre-wrap;background:var(--card);padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-radius:5px;background:var(--card)}.columns{display:flex;gap:16px}.column{flex:1}table{width:100%;border-collapse:collapse}td,th{border:1px solid var(--line);padding:7px;text-align:left}.theme-switch{position:fixed;right:14px;top:14px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);padding:7px 10px;cursor:pointer}@media(max-width:900px){.public-shell{display:block}.public-tree,.public-toc{position:static;margin-bottom:24px}.columns{display:block}}</style><script>try{const media=matchMedia('(prefers-color-scheme:dark)');const values=['auto','light','dark'];const apply=()=>{const preference=localStorage.getItem('notes:public-theme')||'auto';document.documentElement.dataset.theme=preference==='dark'||(preference==='auto'&&media.matches)?'dark':'light';document.documentElement.dataset.themePreference=preference};apply();media.addEventListener('change',()=>{if((localStorage.getItem('notes:public-theme')||'auto')==='auto')apply()});window.cyclePublicTheme=()=>{const current=localStorage.getItem('notes:public-theme')||'auto';const next=values[(values.indexOf(current)+1)%values.length];localStorage.setItem('notes:public-theme',next);apply()}}catch{}</script></head><body><button class="theme-switch" aria-label="Change theme: system, light, or dark" title="Theme: system → light → dark" onclick="cyclePublicTheme()">◐</button><div class="public-shell">${nav}<main><header><nav class="public-breadcrumb">${breadcrumbHtml}</nav><h1>${escapeHtml(share.page_icon ? `${share.page_icon} ${share.page_title}` : share.page_title)}</h1>${share.show_last_updated ? `<small>Updated <time datetime="${updatedAt}">${updatedAt}</time></small>` : ""}</header>${content}</main>${share.show_toc ? toc : ""}</div></body></html>`;
 }
@@ -569,6 +621,8 @@ export async function publicAttachment(env: Env, share: SharedPageRow, attachmen
     .bind(attachmentId, share.page_id)
     .first<{ id: string; page_id: string; r2_key: string; name: string; mime: string }>();
   if (!attachment) return null;
+  if (attachment.mime.startsWith("image/"))
+    return (await import("./images")).imageDerivative(env, attachmentId, "preview-v1");
   const object = await env.BUCKET.get(attachment.r2_key);
   if (!object) return null;
   const inline = isInlineMime(attachment.mime);

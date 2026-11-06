@@ -13,6 +13,9 @@ import { SlackSettings } from "./SlackSettings";
 import { OAuthConnectionsSettings } from "./OAuthConnectionsSettings";
 import { WritingSettings } from "./WritingSettings";
 import { IntegrationsSettings } from "./IntegrationsSettings";
+import { PlatformSettings } from "./PlatformSettings";
+import { EncryptionKeysSettings } from "./EncryptionKeysSettings";
+import { PublicationSettings } from "./PublicationSettings";
 type MemberRow = { id: string; name: string; email: string; role: Role; createdAt: number };
 export function WorkspaceSettings({
   member,
@@ -191,6 +194,9 @@ export function WorkspaceSettings({
         <WritingSettings owner={member.role === "owner"} />
       </section>
       <IntegrationsSettings owner={member.role === "owner"} pages={pages} />
+      {member.role === "owner" && <PlatformSettings />}
+      {member.role === "owner" && <EncryptionKeysSettings />}
+      {member.role === "owner" && <PublicationSettings spaces={spaces} pages={pages} />}
     </main>
   );
 }

@@ -271,7 +271,7 @@ describe("public page shares", () => {
     expect((await SELF.fetch(`http://example.test${transcludedThumbnailUrl}`)).status).toBe(200);
   });
 
-  it("limits public tables to 500 rows and tells the reader when truncated", async () => {
+  it("paginates all public table rows beyond 500 without silent loss or duplicates", async () => {
     const installed = await bootstrap();
     const pageResponse = await authenticated(installed.cookie, "/api/pages", {
       method: "POST",
@@ -298,6 +298,10 @@ describe("public page shares", () => {
         }),
       );
     }
+    await env.DB.prepare(`INSERT INTO table_cells(row_id,column_id,text_value,updated_at)
+      SELECT id,?,'Row '||position,? FROM table_rows WHERE page_id=?`)
+      .bind(columnId, timestamp, page.id)
+      .run();
     const published = await authenticated(installed.cookie, `/api/pages/${page.id}/share`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -305,12 +309,23 @@ describe("public page shares", () => {
     });
     const key = new URL((await published.json<{ share: { url: string } }>()).share.url).pathname.split("/").at(-1)!;
 
-    const response = await SELF.fetch(`http://example.test/share/${key}`);
-    const html = await response.text();
-
-    expect(response.status).toBe(200);
-    expect(html.match(/<tr>/g) ?? []).toHaveLength(501);
-    expect(html).toContain("limited to the first 500 rows");
+    let nextUrl: string | null = `http://example.test/share/${key}`;
+    const rows: number[] = [];
+    let pages = 0;
+    while (nextUrl !== null) {
+      expect(++pages).toBeLessThanOrEqual(6);
+      const response = await SELF.fetch(nextUrl);
+      const html = await response.text();
+      expect(response.status).toBe(200);
+      const labels = [...html.matchAll(/<td>Row (\d+)<\/td>/g)].map((match) => Number(match[1]));
+      expect(labels).toHaveLength(pages === 6 ? 1 : 100);
+      rows.push(...labels);
+      expect(html).not.toContain("limited to the first 500 rows");
+      const next = html.match(/<a href="([^"]+)">Next 100 rows<\/a>/)?.[1];
+      nextUrl = next ? new URL(next.replaceAll("&amp;", "&"), nextUrl).href : null;
+    }
+    expect(pages).toBe(6);
+    expect(rows).toEqual(Array.from({ length: 501 }, (_, index) => index));
   });
 
   it("forces non-inline public attachments to download with a safe filename", async () => {

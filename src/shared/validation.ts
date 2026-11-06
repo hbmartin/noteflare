@@ -72,6 +72,17 @@ const PAGE_FIELD_VALIDATORS = {
   title: (value: unknown) => typeof value === "string",
   taskList: (value: unknown) => value === undefined || typeof value === "boolean",
   fullWidth: (value: unknown) => value === undefined || typeof value === "boolean",
+  cover: (value: unknown) =>
+    value === undefined ||
+    value === null ||
+    (typeof value === "object" &&
+      typeof (value as { attachmentId?: unknown }).attachmentId === "string" &&
+      ["x", "y"].every(
+        (key) =>
+          typeof (value as Record<string, unknown>)[key] === "number" &&
+          Number((value as Record<string, unknown>)[key]) >= 0 &&
+          Number((value as Record<string, unknown>)[key]) <= 1,
+      )),
   icon: (value: unknown) => value === null || typeof value === "string",
   revision: (value: unknown) => typeof value === "number",
   contentEpoch: (value: unknown) => typeof value === "number",

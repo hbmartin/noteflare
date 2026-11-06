@@ -36,6 +36,7 @@ import { normalizeYCodeBlocks } from "../shared/code-content";
 import { joinBytes, splitBytes } from "../shared/bytes";
 import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
+import { initializeLocalAudit, appendLocalAudit, flushLocalAudit } from "./audit";
 import { sweepOutbox } from "./jobs";
 import { notificationFanoutStatements } from "./notifications";
 import { reconcileDateRemindersForPage } from "./date-reminders";
@@ -704,6 +705,7 @@ export class Document extends YServer {
     this.observedMentionRoot = null;
     this.observedMentionDocument = null;
     const sql = this.state.storage.sql;
+    initializeLocalAudit(sql);
     sql.exec(
       "CREATE TABLE IF NOT EXISTS provisional_comment_anchors(user_id TEXT NOT NULL,operation_id TEXT NOT NULL,thread_id TEXT NOT NULL,token TEXT NOT NULL,PRIMARY KEY(user_id,operation_id))",
     );
@@ -795,9 +797,10 @@ export class Document extends YServer {
     // an authoritative check so a purged room cannot restart without its tombstone.
     if (!hadMetadata) {
       const { pageId, epoch } = this.ids;
-      const current = await this.bindings.DB.prepare(`SELECT content_epoch, kind FROM pages WHERE id = ?`)
+      const current = await this.bindings.DB.prepare(`SELECT content_epoch, kind, workspace_id FROM pages WHERE id = ?`)
         .bind(pageId)
-        .first<{ content_epoch: number; kind: string }>();
+        .first<{ content_epoch: number; kind: string; workspace_id: string }>();
+      if (current) sql.exec("INSERT OR REPLACE INTO audit_identity(id,workspace_id) VALUES(1,?)", current.workspace_id);
       this.metadata.retired = !current || current.content_epoch !== epoch ? 1 : 0;
       this.metadata.restore_pending = 0;
       this.metadata.content_kind = current?.kind === "diagram" ? "diagram" : "document";
@@ -908,6 +911,9 @@ export class Document extends YServer {
     }
 
     const userId = context.request.headers.get("x-notes-user-id");
+    const workspaceId = context.request.headers.get("x-notes-workspace-id");
+    if (workspaceId)
+      this.state.storage.sql.exec("INSERT OR REPLACE INTO audit_identity(id,workspace_id) VALUES(1,?)", workspaceId);
     const role = context.request.headers.get("x-notes-role") as ConnectionAuth["role"] | null;
     const expiresAt = Number(context.request.headers.get("x-notes-expires-at"));
     const authGeneration = Number(context.request.headers.get("x-notes-auth-generation") ?? 0);
@@ -1055,6 +1061,14 @@ export class Document extends YServer {
 
   async onAlarm() {
     if (this.purged) return;
+    // Audit forwarding is independent of compaction and retirement. A failed
+    // D1 delivery leaves the original local transaction evidence available.
+    try {
+      if (await flushLocalAudit(this.bindings, this.state.storage.sql))
+        await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
+    } catch {
+      await this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
+    }
     if (this.transition) {
       this.transitionAlarmDeferred = true;
       const rearm = this.scheduleAlarm(Date.now() + ALARM_RETRY_DELAY_MS);
@@ -1107,6 +1121,11 @@ export class Document extends YServer {
       await this.retryCommentAnchors(error);
     }
     if (this.metadata.dirty) await this.compact();
+    if (
+      this.bindings.PLATFORM &&
+      (this.bindings.SEMANTIC_SEARCH_ENABLED === "true" || this.bindings.PUBLIC_PUBLISHING_ENABLED === "true")
+    )
+      await this.bindings.PLATFORM.get(this.bindings.PLATFORM.idFromName("maintenance")).wake();
 
     const nextExpiry = Array.from(this.getConnections<ConnectionAuth>())
       .map((connection) => connection.state?.expiresAt ?? 0)
@@ -1123,6 +1142,16 @@ export class Document extends YServer {
     const url = new URL(request.url);
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
+    }
+    if (
+      this.bindings.AUDIT_ENABLED === "true" &&
+      !this.state.storage.sql.exec("SELECT 1 FROM audit_identity WHERE id=1").toArray().length
+    ) {
+      const workspaceId = await this.bindings.DB.prepare("SELECT workspace_id FROM pages WHERE id=?")
+        .bind(this.ids.pageId)
+        .first<string>("workspace_id");
+      if (workspaceId)
+        this.state.storage.sql.exec("INSERT INTO audit_identity(id,workspace_id) VALUES(1,?)", workspaceId);
     }
     if (request.method === "POST" && url.pathname === "/revoke-access") {
       const body = await request.json<{ generation?: unknown }>();
@@ -1766,6 +1795,9 @@ export class Document extends YServer {
       return this.restoreVersion(body.versionId, body.userId);
     }
     if (request.method === "POST" && url.pathname.endsWith("/purge")) {
+      this.flushPendingUpdates();
+      if (await flushLocalAudit(this.bindings, this.state.storage.sql))
+        return Response.json({ purged: false, auditPending: true }, { status: 503 });
       this.purged = true;
       this.metadata.retired = 1;
       this.pendingUpdates = [];
@@ -1917,6 +1949,22 @@ export class Document extends YServer {
           Date.now(),
         )
         .one();
+      if (this.bindings.AUDIT_ENABLED === "true")
+        appendLocalAudit(this.state.storage.sql, {
+          id: `document:${this.ids.pageId}:${this.ids.epoch}:${row.seq}`,
+          workspaceId:
+            this.state.storage.sql
+              .exec<{ workspace_id: string }>("SELECT workspace_id FROM audit_identity WHERE id=1")
+              .toArray()[0]?.workspace_id ?? "",
+          actorType: authorId ? "user" : "system",
+          actorId: authorId,
+          action: `${this.metadata.content_kind}.update`,
+          targetType: "page",
+          targetId: this.ids.pageId,
+          outcome: "success",
+          committedAt: Date.now(),
+          metadata: { epoch: this.ids.epoch, sequence: row.seq, contributors: authors },
+        });
       for (const id of authors)
         this.state.storage.sql.exec("INSERT INTO version_authors VALUES(?,?,?)", row.seq, id, Date.now());
       for (const [index, bytes] of splitBytes(merged).entries()) {

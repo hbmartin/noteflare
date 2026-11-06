@@ -47,6 +47,8 @@ export interface SecurityStatus {
   recoveryKeyPendingElsewhere?: boolean;
   recoveryEnrollmentAllowed?: boolean;
   pendingInvite?: boolean;
+  accessIdentity?: { available: boolean; required: boolean; linked: boolean };
+  accessPrimary?: { available: boolean; expiresAt: number };
   slackPrimary?: { available: boolean; expiresAt: number };
   serverNow?: number;
 }

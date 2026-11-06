@@ -70,14 +70,13 @@ describe("first login after mandatory protection rollout", () => {
     });
   });
 
-  it("demonstrates that missing 0029 breaks authenticated status while anonymous status still succeeds", async () => {
+  it("demonstrates that missing 0029 invite columns break authenticated status while anonymous status still succeeds", async () => {
     await legacyAccount();
-    await applyD1Migrations(
-      env.DB,
-      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0029"),
-    );
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    // Isolate the missing 0029 invite column from unrelated current auth/recovery tables.
+    // Renaming also preserves dependent triggers so restoring the column repairs this fixture.
+    await env.DB.prepare("ALTER TABLE invites RENAME COLUMN claimed_by TO diagnostic_missing_claimed_by").run();
     expect(await (await request("", "/api/security/status")).json()).toMatchObject({ state: "signed_out" });
-    // Isolate the historical security schema failure from later worker-level revocation migrations.
     const signedIn = await createAuth(env).api.signInEmail({
       body: { email: "legacy-diagnostic@example.test", password: "password123" },
       headers: new Headers({ origin: "http://example.test" }),
@@ -87,6 +86,10 @@ describe("first login after mandatory protection rollout", () => {
     const status = await request(responseCookies(signedIn), "/api/security/status");
     expect(status.status).toBe(500);
     expect(await status.text()).toBe("");
+    await env.DB.prepare("ALTER TABLE invites RENAME COLUMN diagnostic_missing_claimed_by TO claimed_by").run();
+    const repaired = await request(responseCookies(signedIn), "/api/security/status");
+    expect(repaired.status).toBe(200);
+    expect(await repaired.json()).toMatchObject({ state: "enrollment_required" });
   });
 
   it("detects an absent security row and rejects that account without granting workspace access", async () => {

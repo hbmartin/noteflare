@@ -1,3 +1,4 @@
+import { accessConfiguration, accessPrimaryProof, verifyAccessAssertion } from "./access-identity";
 import { validPasswordInput } from "./password-format";
 import { trackRealtimeUser } from "./realtime-access";
 import type { GenericEndpointContext } from "@better-auth/core";
@@ -146,6 +147,17 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
       ? { slackPrimary: { available: true, expiresAt: row.slack_primary_expires_at } }
       : {}),
   };
+  const config = accessConfiguration(env);
+  if (config.available || config.required) {
+    const linked = config.available
+      ? await env.DB.prepare("SELECT 1 FROM access_identities WHERE user_id=? AND issuer=?")
+          .bind(userId, new URL(env.ACCESS_TEAM_DOMAIN!).origin)
+          .first()
+      : null;
+    status.accessIdentity = { ...config, linked: !!linked };
+  }
+  const access = await accessPrimaryProof(env, userId, sessionId);
+  if (access) status.accessPrimary = { available: true, expiresAt: access.expires_at };
   return { account: row, proof, status };
 }
 
@@ -307,6 +319,14 @@ async function primaryFactor(ctx: GenericEndpointContext, env: Env, id: Identity
           .first()
       : null;
     if (slack) return;
+    const access = await accessPrimaryProof(env, id.userId, id.sessionId);
+    if (access) {
+      const assertion = await verifyAccessAssertion(env, ctx.headers ?? new Headers());
+      const linked = await env.DB.prepare("SELECT 1 FROM access_identities WHERE issuer=? AND subject=? AND user_id=?")
+        .bind(assertion.issuer, assertion.subject, id.userId)
+        .first();
+      if (linked) return;
+    }
     throw deny("Enter your password or sign in with Slack again.");
   }
   if (!validPasswordInput(value)) throw deny("The password or Slack sign-in is invalid.");
@@ -1300,6 +1320,8 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
               "/passkey/generate-authenticate-options",
               "/passkey/verify-authentication",
               "/sign-in/social",
+              "/access/sign-in",
+              "/access/status",
               "/callback/slack",
             ]);
             if (publicPaths.has(ctx.path) || (ctx.path === "/callback/:id" && ctx.params?.id === "slack")) return;

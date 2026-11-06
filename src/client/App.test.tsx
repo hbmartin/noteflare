@@ -708,6 +708,7 @@ describe("App error handling", () => {
     fireEvent.change(name, { target: { value: "Guest" } });
     fireEvent.change(email, { target: { value: "guest@example.test" } });
     fireEvent.change(password, { target: { value: "incorrect" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Accept invite" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Accept invite" }));
 
     expect(await screen.findByText("Invalid email or password.")).toBeInTheDocument();
@@ -1012,6 +1013,7 @@ describe("App error handling", () => {
     const email = await screen.findByLabelText("Email");
     fireEvent.change(email, { target: { value: "next@example.test" } });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(
       await screen.findByText("Server sign-out could not be confirmed. Connect and try again."),
@@ -1458,6 +1460,7 @@ describe("App error handling", () => {
 
     fireEvent.change(await screen.findByLabelText("Email"), { target: { value: "editor@example.test" } });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
 
     expect(await screen.findByText("Sign in failed.")).toBeInTheDocument();

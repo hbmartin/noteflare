@@ -68,6 +68,7 @@ export type MemberContext = {
 
 export type ClientMemberContext = Omit<MemberContext, "session"> & {
   features?: {
+    heatmaps?: boolean;
     expandedEmbeds: boolean;
     offlineEditing?: boolean;
     workspaceActivity?: boolean;
@@ -77,6 +78,7 @@ export type ClientMemberContext = Omit<MemberContext, "session"> & {
     tableAuthority?: boolean;
     tableBoard?: boolean;
     tableCalendar?: boolean;
+    tableGallery?: boolean;
     tableRelations?: boolean;
     diffDigests?: boolean;
   };
@@ -92,6 +94,7 @@ export type Page = {
   title: string;
   icon: string | null;
   fullWidth?: boolean;
+  cover?: { attachmentId: string; x: number; y: number } | null;
   taskList?: boolean;
   revision: number;
   contentEpoch: number;
@@ -421,6 +424,10 @@ export type SearchResult = {
 };
 
 export type SearchResponse = {
+  mode?: "keyword" | "hybrid";
+  nextCursor?: string | null;
+  retrievalStatus?: "available" | "disabled" | "unavailable" | "budget_exhausted";
+  windowLimited?: boolean;
   matchMode?: "primary" | "title-typo";
   results: SearchResult[];
   limit: number;

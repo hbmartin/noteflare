@@ -138,3 +138,21 @@ expires them after 30 days. Frozen delivery references remain frozen across retr
 
 Complete the deployed exit matrix in [Phase 11](roadmap/11-document-ideas.md) before marking any feature shipped.
 Email and Slack pilots need a user-approved real recipient and test destination; do not send unsolicited test messages.
+
+## Cloudflare platform release controls
+
+All new Boolean controls default to `false`. Preserve durable pending work and old keyrings when rolling back.
+
+| Flag                          | Behavior when enabled                                                                                         |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `SEMANTIC_SEARCH_ENABLED`     | Enable optional hybrid retrieval with AI and Vectorize; keyword remains available.                            |
+| `D1_READ_REPLICATION_ENABLED` | Enable primary-anchored read sessions for allowed routes; Cloudflare replica enablement is separate.          |
+| `PUBLIC_PUBLISHING_ENABLED`   | Enable publication configuration and asynchronous builds; requires separate private bucket and public origin. |
+| `IMAGES_ENABLED`              | Enable sanitized image processing; saved derivatives remain readable on rollback.                             |
+| `FORMS_ENABLED`               | Enable canonical public forms; requires TableAuthority and Turnstile.                                         |
+| `TABLE_GALLERY_ENABLED`       | Enable creation of gallery views on authoritative tables.                                                     |
+| `TURNSTILE_ENABLED`           | Require server-verified browser initiation/public input challenges.                                           |
+| `CUSTOM_HOSTNAMES_ENABLED`    | Enable explicit customer CNAME hostname provisioning; provider subscription is separate.                      |
+| `AUDIT_ENABLED`               | Enable mutation journals and verified archive maintenance; disabled by default in minimal portable installs.  |
+| `BASIN_ENABLED`               | Enable secondary exports to explicitly provisioned Basin streams; requires Workers Paid.                      |
+| `HEATMAPS_ENABLED`            | Enable heatmap availability; owner and reader opt-in are still required.                                      |

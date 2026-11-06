@@ -28,6 +28,7 @@ function initialSearchState() {
   const parameters = new URLSearchParams(window.location.search);
   return {
     query: parameters.get("q") ?? "",
+    mode: parameters.get("mode") === "keyword" ? ("keyword" as const) : ("hybrid" as const),
     filters: {
       spaceId: parameters.get("space") ?? "",
       tagIds: parameters.getAll("tag"),
@@ -59,11 +60,12 @@ function requestParameters(query: string, filters: UiFilters, offset: number) {
   return parameters;
 }
 
-function persistSearch(query: string, filters: UiFilters) {
+function persistSearch(query: string, filters: UiFilters, mode: "keyword" | "hybrid") {
   const parameters = requestParameters(query, filters, 0);
   parameters.delete("limit");
   parameters.delete("offset");
   parameters.set("view", "search");
+  parameters.set("mode", mode);
   try {
     window.history.replaceState(null, "", `${window.location.pathname}?${parameters}`);
   } catch {
@@ -96,6 +98,11 @@ export function SearchView({
   const [results, setResults] = useState<SearchResult[]>([]);
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
+  const [mode, setMode] = useState<"hybrid" | "keyword">(initial.mode);
+  const [cursor, setCursor] = useState<string | undefined>();
+  const [nextCursor, setNextCursor] = useState<string | null>();
+  const [retrievalStatus, setRetrievalStatus] = useState<SearchResponse["retrievalStatus"]>();
+  const [windowLimited, setWindowLimited] = useState(false);
   const [loading, setLoading] = useState(Boolean(initial.query.trim()));
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
@@ -111,20 +118,28 @@ export function SearchView({
 
   useEffect(() => {
     // Debounced so fast typing does not burn through WebKit's history-update budget.
-    const timer = window.setTimeout(() => persistSearch(query, filters), 300);
+    const timer = window.setTimeout(() => persistSearch(query, filters, mode), 300);
     return () => window.clearTimeout(timer);
-  }, [filters, query]);
+  }, [filters, query, mode]);
 
   useEffect(() => {
     const controller = new AbortController();
     if (!query.trim()) return () => controller.abort();
     const timer = window.setTimeout(() => {
       const parameters = requestParameters(query, filters, offset);
+      parameters.set("mode", mode);
+      if (cursor) {
+        parameters.set("cursor", cursor);
+        parameters.set("offset", "0");
+      }
       parameters.set("retry", String(revision));
       void api<SearchResponse>(`/api/search?${parameters}`, { signal: controller.signal })
         .then((response) => {
           setResults((current) => (offset ? [...current, ...response.results] : response.results));
           setHasMore(response.hasMore);
+          setNextCursor(response.nextCursor);
+          setRetrievalStatus(response.retrievalStatus);
+          setWindowLimited(response.windowLimited ?? false);
         })
         .catch((cause) => {
           if (!controller.signal.aborted) setError(apiErrorMessage(cause, "Search could not be completed."));
@@ -137,11 +152,13 @@ export function SearchView({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [filters, offset, query, revision]);
+  }, [filters, offset, query, revision, cursor, mode]);
 
   function updateFilters(update: (current: UiFilters) => UiFilters) {
     setFilters(update);
     setOffset(0);
+    setCursor(undefined);
+    setNextCursor(undefined);
     setResults([]);
     setLoading(Boolean(query.trim()));
     setError("");
@@ -215,6 +232,8 @@ export function SearchView({
           const value = event.target.value;
           setQuery(value);
           setOffset(0);
+          setCursor(undefined);
+          setNextCursor(undefined);
           setResults([]);
           setHasMore(false);
           setLoading(Boolean(value.trim()));
@@ -224,6 +243,32 @@ export function SearchView({
         aria-label="Search workspace"
         autoFocus
       />
+      <label>
+        Search mode
+        <select
+          aria-label="Search mode"
+          value={mode}
+          onChange={(event) => {
+            setMode(event.target.value as "hybrid" | "keyword");
+            setOffset(0);
+            setCursor(undefined);
+            setResults([]);
+            setLoading(Boolean(query.trim()));
+          }}
+        >
+          <option value="hybrid">Keywords and meaning</option>
+          <option value="keyword">Keywords</option>
+        </select>
+      </label>
+      {mode === "hybrid" && (retrievalStatus === "unavailable" || retrievalStatus === "budget_exhausted") && (
+        <p className="muted">Meaning search is temporarily unavailable. Showing keyword matches.</p>
+      )}
+      {mode === "hybrid" && retrievalStatus === "disabled" && (
+        <p className="muted">Meaning search is not configured. Showing keyword matches.</p>
+      )}
+      {windowLimited && (
+        <p className="muted">Showing the best 200 matches. Narrow your search or use Keywords for more results.</p>
+      )}
       <details className="search-filters">
         <summary>Filters{chips.length ? ` · ${chips.length}` : ""}</summary>
         <div className="search-filter-grid">
@@ -372,6 +417,11 @@ export function SearchView({
               onClick={() => {
                 setLoading(true);
                 setError("");
+                if (mode === "hybrid" && cursor) {
+                  setOffset(0);
+                  setCursor(undefined);
+                  setResults([]);
+                }
                 setRevision((current) => current + 1);
               }}
             >
@@ -386,6 +436,7 @@ export function SearchView({
             onClick={() => {
               setLoading(true);
               setOffset(results.length);
+              setCursor(nextCursor ?? undefined);
             }}
           >
             Load more

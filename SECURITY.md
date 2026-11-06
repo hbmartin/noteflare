@@ -27,3 +27,7 @@ Operators must use a strong `BETTER_AUTH_SECRET`, protect and rotate `BOOTSTRAP_
 The location hint for a workspace is an optimization, not a formal data-residency boundary. D1 and other Cloudflare metadata are not constrained by the page Durable Object hint.
 
 See [mandatory account protection](docs/ACCOUNT_SECURITY.md) for operator resets, secret preservation, deployment checks, and the five-minute realtime revocation bound. Anonymous public shares are intentionally outside account authentication.
+
+## Cloudflare platform boundaries
+
+The [platform runbook](docs/implementation/cloudflare-platform-release.md) specifies public/private ingress, Access subject linking, app MFA, Turnstile, generation-fenced publication delivery, share grants, audit durability and key rotation. Authorization remains current in primary D1; vector metadata, replicas, cache entries and Access email claims are not authorization. Public Forms actors may only append validated submissions to their configured table. Audit and heatmap outputs must never contain credentials, raw document bodies or raw reader/IP identifiers.

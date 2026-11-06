@@ -1,3 +1,4 @@
+import { FormsControl } from "./FormsControl";
 import {
   captureTableViewSubmission,
   acknowledgeTableViewSubmission,
@@ -1173,13 +1174,30 @@ export function CollaborativeTablePage({
     <div
       className="table-card"
       key={row.id}
-      draggable={editable && !busy}
+      draggable={view?.kind !== "gallery" && editable && !busy}
       onDragStart={(event) => event.dataTransfer.setData("application/noteflare-row", row.id)}
     >
+      {view?.kind === "gallery" && view.gallery?.preview !== "none" && row.detailPageId && (
+        <img
+          loading="lazy"
+          alt=""
+          src={`/api/pages/${encodeURIComponent(row.detailPageId)}/cover`}
+          style={{ width: "100%", aspectRatio: "8/5", objectFit: "cover" }}
+        />
+      )}
       <button
         className="quiet-button"
-        disabled={!row.detailPageId}
-        onClick={() => row.detailPageId && onSelectPage(row.detailPageId)}
+        disabled={!row.detailPageId && !editable}
+        onClick={() => {
+          if (row.detailPageId) onSelectPage(row.detailPageId);
+          else
+            void api<{ pageId: string }>(
+              `/api/tables/${encodeURIComponent(page.id)}/rows/${encodeURIComponent(row.id)}/page`,
+              { method: "POST", body: JSON.stringify({}) },
+            )
+              .then((result) => onSelectPage(result.pageId))
+              .catch((cause) => setError(apiErrorMessage(cause, "The row page could not be opened.")));
+        }}
       >
         {rowLabel(row)}
       </button>
@@ -1241,6 +1259,9 @@ export function CollaborativeTablePage({
             <h1>{page.title}</h1>
             {metadata}
           </>
+        )}
+        {member.role === "owner" && !page.taskList && !embedded && (
+          <FormsControl pageId={page.id} title={page.title} columns={data.columns} />
         )}
         <div className="table-toolbar">
           <select
@@ -1350,6 +1371,7 @@ export function CollaborativeTablePage({
                 "grid",
                 ...(member.features?.tableBoard ? ["board" as const] : []),
                 ...(member.features?.tableCalendar ? ["calendar" as const] : []),
+                ...(member.features?.tableGallery ? ["gallery" as const] : []),
               ]}
               busy={busy || !editable}
               save={async (payload, form) => {
@@ -1385,7 +1407,18 @@ export function CollaborativeTablePage({
               command={command}
             />
           )}
-        {view?.kind === "board" && groupColumn ? (
+        {view?.kind === "gallery" ? (
+          <div
+            className="table-gallery"
+            style={{
+              display: "grid",
+              gap: 16,
+              gridTemplateColumns: `repeat(auto-fill,minmax(${view.gallery?.cardSize === "small" ? 180 : view.gallery?.cardSize === "large" ? 360 : 260}px,1fr))`,
+            }}
+          >
+            {data.rows.map(card)}
+          </div>
+        ) : view?.kind === "board" && groupColumn ? (
           <div className="table-board">
             {[
               { id: "", label: "Unassigned" },
@@ -1844,6 +1877,7 @@ function viewDraft(view: TableView | null, columns: CollaborativeColumn[]) {
       view?.visibleColumnIds.filter((id) => columns.some((column) => column.id === id)) ??
       columns.map((column) => column.id),
     calculations: view?.calculations ?? {},
+    gallery: view?.gallery ?? { preview: "pageCover" as const, cardSize: "medium" as const },
   };
 }
 
@@ -1882,6 +1916,7 @@ function ViewEditor({
     sorts,
     visibleColumnIds: visible.filter((id) => columns.some((column) => column.id === id)),
     calculations,
+    gallery: draft.gallery,
   };
   const [filterColumn, setFilterColumn] = useTableViewState("view:filter-column", ""),
     [filterValue, setFilterValue] = useTableViewState("view:filter-value", ""),
@@ -1969,7 +2004,7 @@ function ViewEditor({
           ))}
         </select>
       </label>
-      {kind !== "grid" && (
+      {(kind === "board" || kind === "calendar") && (
         <label>
           {kind === "board" ? "Group property" : "Date property"}
           <select
@@ -1990,6 +2025,37 @@ function ViewEditor({
               ))}
           </select>
         </label>
+      )}
+      {kind === "gallery" && (
+        <>
+          <label>
+            Card preview
+            <select
+              value={draft.gallery.preview}
+              onChange={(event) =>
+                updateDraft({ gallery: { ...draft.gallery, preview: event.target.value as "pageCover" | "none" } })
+              }
+            >
+              <option value="pageCover">Page cover</option>
+              <option value="none">None</option>
+            </select>
+          </label>
+          <label>
+            Card size
+            <select
+              value={draft.gallery.cardSize}
+              onChange={(event) =>
+                updateDraft({
+                  gallery: { ...draft.gallery, cardSize: event.target.value as "small" | "medium" | "large" },
+                })
+              }
+            >
+              <option>small</option>
+              <option>medium</option>
+              <option>large</option>
+            </select>
+          </label>
+        </>
       )}
       <label>
         <input

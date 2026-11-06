@@ -8515,7 +8515,7 @@ describe("Slack documents and tasks", () => {
     // path directly with the same bindings and step callback.
     const workflow = Object.assign(Object.create(NotesJobWorkflow.prototype) as object, {
       env: runtime(),
-    }) as unknown as { runObserved: (event: unknown, step: unknown) => Promise<void> };
+    }) as unknown as { runObserved: (requestEnv: Env, event: unknown, step: unknown) => Promise<void> };
     let resumeAttempts = 0;
     const step = {
       async do<T>(name: string, callback: () => Promise<T>) {
@@ -8532,6 +8532,7 @@ describe("Slack documents and tasks", () => {
       },
     };
     await workflow.runObserved(
+      runtime(),
       {
         payload: { jobId: captureId, attempt: 1 },
         instanceId: job!.workflow_instance_id!,
@@ -8585,8 +8586,9 @@ describe("Slack documents and tasks", () => {
     await env.DB.prepare("UPDATE jobs SET status='running' WHERE id=?").bind(captureId).run();
     const workflow = Object.assign(Object.create(NotesJobWorkflow.prototype) as object, {
       env: runtime(),
-    }) as unknown as { runObserved: (event: unknown, step: unknown) => Promise<void> };
+    }) as unknown as { runObserved: (requestEnv: Env, event: unknown, step: unknown) => Promise<void> };
     await workflow.runObserved(
+      runtime(),
       {
         payload: { jobId: captureId, attempt: 1 },
         instanceId: job!.workflow_instance_id!,
@@ -8699,7 +8701,7 @@ describe("Slack documents and tasks", () => {
     delete workflowEnv.WORKFLOW_INLINE;
     const workflow = Object.assign(Object.create(NotesJobWorkflow.prototype) as object, {
       env: workflowEnv,
-    }) as unknown as { runObserved: (event: unknown, step: unknown) => Promise<void> };
+    }) as unknown as { runObserved: (requestEnv: Env, event: unknown, step: unknown) => Promise<void> };
     const step = {
       async do<T>(name: string, callback: () => Promise<T>) {
         const result = await callback();
@@ -8708,6 +8710,7 @@ describe("Slack documents and tasks", () => {
       },
     };
     await workflow.runObserved(
+      workflowEnv,
       {
         payload: { jobId: captureId, attempt: 1 },
         instanceId: job!.workflow_instance_id!,

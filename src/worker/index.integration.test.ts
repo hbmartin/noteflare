@@ -822,7 +822,12 @@ describe("Worker integration", () => {
     expect(await health.json()).toMatchObject({ ok: true, version: "0.1.0" });
     expect(health.headers.get("x-request-id")).toMatch(/^[0-9a-f-]{36}$/);
     expect(health.headers.get("x-worker-version")).toBeTruthy();
-    expect(await install.json()).toEqual({ initialized: false, slackIdentityAvailable: false });
+    expect(await install.json()).toEqual({
+      initialized: false,
+      slackIdentityAvailable: false,
+      turnstile: { enabled: false, siteKey: null },
+      access: { available: false, required: false },
+    });
   });
 
   it("protects readiness and reports sanitized dependency results", async () => {
@@ -6531,53 +6536,59 @@ describe("Worker integration", () => {
     });
   });
 
-  it("reports a zero-change result for an active page as an inconsistent batch result", async () => {
-    const installed = await bootstrap();
-    const operationId = crypto.randomUUID();
-    const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
-    const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
-      const moveResult = results[1];
-      if (!moveResult) return false;
-      moveResult.meta.changes = 0;
-      return true;
-    });
-    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    onTestFinished(() => logged.mockRestore());
-    const context = createExecutionContext();
+  it.each([0, -1, 1.5, NaN])(
+    "reports an invalid move change count (%s) as an inconsistent batch result",
+    async (changeCount) => {
+      const installed = await bootstrap();
+      const operationId = crypto.randomUUID();
+      const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+      const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
+        const moveResult = results[1];
+        if (!moveResult) return false;
+        moveResult.meta.changes = changeCount;
+        return true;
+      });
+      const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      onTestFinished(() => logged.mockRestore());
+      const context = createExecutionContext();
 
-    const response = await worker.fetch(
-      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
-        body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
-      }),
-      intercepted.bindings,
-      context,
-    );
-    const body = await response.json<{ page: Page; replayed: boolean }>();
-    await waitOnExecutionContext(context);
+      const response = await worker.fetch(
+        authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/move`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-notes-operation-id": operationId },
+          body: JSON.stringify({ parentId: null, beforeId: null, afterId: null }),
+        }),
+        intercepted.bindings,
+        context,
+      );
+      const body = await response.json<{ page: Page; replayed: boolean }>();
+      await waitOnExecutionContext(context);
 
-    intercepted.rethrowBatchResultMutationFailure();
-    expect(intercepted.batchResultMutationWasApplied()).toBe(true);
-    expect(response.status).toBe(200);
-    expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
-    expect(delivered).toEqual([
-      {
+      intercepted.rethrowBatchResultMutationFailure();
+      expect(intercepted.batchResultMutationWasApplied()).toBe(true);
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({ replayed: true, page: { id: installed.pageId, revision: 2 } });
+      expect(delivered).toEqual([
+        {
+          workspaceId: installed.workspaceId,
+          event: { type: "pages-upserted", pages: [body.page] },
+        },
+      ]);
+      expect(logged).toHaveBeenCalledOnce();
+      expectStructuredLog(logged, "page_move.batch_result.invalid", {
         workspaceId: installed.workspaceId,
-        event: { type: "pages-upserted", pages: [body.page] },
-      },
-    ]);
-    expect(logged).toHaveBeenCalledOnce();
-    expectStructuredLog(logged, "page_move.batch_result.invalid", {
-      workspaceId: installed.workspaceId,
-      pageId: installed.pageId,
-      operationId,
-      receiptReadPhase: "recovery",
-      recoveredFromReceipt: true,
-      moveErrorName: "InvalidPageMoveBatchResultError",
-      moveErrorMessage: "An active page move unexpectedly changed no rows.",
-    });
-  });
+        pageId: installed.pageId,
+        operationId,
+        receiptReadPhase: "recovery",
+        recoveredFromReceipt: true,
+        moveErrorName: "InvalidPageMoveBatchResultError",
+        moveErrorMessage:
+          changeCount === 0
+            ? "An active page move unexpectedly changed no rows."
+            : "The page move batch returned malformed move metadata.",
+      });
+    },
+  );
 
   it("returns and broadcasts authoritative state when the committed receipt result cannot be decoded", async () => {
     const installed = await bootstrap();

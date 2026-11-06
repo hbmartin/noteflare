@@ -1,3 +1,4 @@
+import { setAuditActor } from "./audit";
 import { sha256Hex } from "../shared/import-integrity";
 import { bytesToBase64Url } from "../shared/security";
 import type { Env, MemberContext } from "./env";
@@ -42,6 +43,9 @@ type IntegrationRow = {
 };
 
 export type IntegrationPage = {
+  cover_attachment_id?: string | null;
+  cover_x?: number;
+  cover_y?: number;
   id: string;
   workspace_id: string;
   space_id: string;
@@ -293,6 +297,7 @@ export async function authenticateIntegration(request: Request, env: Env): Promi
     .bind(tokenHash)
     .first<IntegrationRow & { workspace_name: string; bot_name: string }>();
   if (!row) throw new IntegrationAuthError();
+  setAuditActor({ type: "integration", id: row.id, workspaceId: row.workspace_id });
   const timestamp = Date.now();
   if (!row.last_used_at || timestamp - row.last_used_at >= 5 * 60_000) {
     await env.DB.prepare(

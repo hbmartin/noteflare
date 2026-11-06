@@ -52,3 +52,8 @@ function canonicalTable(columns: CanonicalTableColumn[], rows: CanonicalTableRow
 export function tableContentHash(columns: CanonicalTableColumn[], rows: CanonicalTableRow[]) {
   return sha256Hex(canonicalJson(canonicalTable(columns, rows)));
 }
+
+export function uuidFromHash(hash: string) {
+  const value = `${hash.slice(0, 12)}5${hash.slice(13, 16)}a${hash.slice(17, 32)}`;
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20, 32)}`;
+}

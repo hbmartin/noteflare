@@ -10,6 +10,9 @@ export type PageJsonRow = {
   title: string;
   icon: string | null;
   full_width?: number;
+  cover_attachment_id?: string | null;
+  cover_x?: number;
+  cover_y?: number;
   is_task_list?: number;
   revision: number;
   content_epoch: number;
@@ -32,6 +35,9 @@ export function pageJson(row: PageJsonRow): Page {
     title: row.title,
     icon: row.icon,
     fullWidth: Boolean(row.full_width),
+    cover: row.cover_attachment_id
+      ? { attachmentId: row.cover_attachment_id, x: row.cover_x ?? 0.5, y: row.cover_y ?? 0.5 }
+      : null,
     taskList: Boolean(row.is_task_list),
     revision: row.revision,
     contentEpoch: row.content_epoch,

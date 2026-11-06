@@ -10,6 +10,8 @@ rules:
       - pattern: app.all(...)
       - pattern: notionApi.all(...)
 
+      - pattern: platformApi.on(...)
+      - pattern: platformApi.all(...)
   - id: worker-hono-multiple-handlers
     languages: [typescript]
     message: Worker routes must have one terminal handler; register middleware through registerMetricMiddleware.
@@ -18,6 +20,7 @@ rules:
       - pattern-either:
           - pattern: app.$METHOD($PATH, $MIDDLE, $LAST, ...)
           - pattern: notionApi.$METHOD($PATH, $MIDDLE, $LAST, ...)
+          - pattern: platformApi.$METHOD($PATH, $MIDDLE, $LAST, ...)
       - metavariable-regex:
           metavariable: $METHOD
           regex: ^(get|post|put|delete|patch|options|head|connect|trace)$
@@ -31,6 +34,7 @@ rules:
       - pattern: app[$METHOD](...)
       - pattern: notionApi[$METHOD](...)
 
+      - pattern: platformApi[$METHOD](...)
   - id: worker-hono-use-alias
     languages: [typescript]
     message: Do not alias, bind, or destructure .use; register Worker middleware through registerMetricMiddleware.
@@ -162,6 +166,98 @@ rules:
           - pattern: new $CLASS(..., app[$METHOD](...), ...)
           - pattern: new $CLASS(..., notionApi[$METHOD](...), ...)
 
+      - patterns:
+          - pattern: platformApi
+          - pattern-not-inside: const platformApi = ...
+          - pattern-not-inside: let platformApi = ...
+          - pattern-not-inside: platformApi.$METHOD
+          - pattern-not-inside: platformApi[$METHOD]
+          - pattern-not-inside: registerMetricMiddleware(platformApi, ...)
+          - pattern-not-inside: app.route(..., platformApi, ...)
+      - patterns:
+          - pattern-either:
+              - pattern: platformApi.$METHOD
+              - pattern: platformApi[$METHOD]
+          - pattern-not-inside: platformApi.$METHOD(...)
+          - pattern-not-inside: platformApi[$METHOD](...)
+          - pattern-not: platformApi.use
+          - pattern-not: platformApi["use"]
+      - patterns:
+          - pattern-either:
+              - pattern-inside: registerMetricMiddleware(app, ...)
+              - pattern-inside: registerMetricMiddleware(platformApi, ...)
+              - pattern-inside: app.route(..., platformApi, ...)
+          - pattern-either:
+              - pattern-inside: (...) => ...
+              - pattern-inside: function (...) { ... }
+              - pattern-inside: function $NAME(...) { ... }
+          - pattern-either:
+              - pattern: app
+              - pattern: platformApi
+      - patterns:
+          - pattern-either:
+              - pattern-inside: app.$OUTER(...)
+              - pattern-inside: app[$OUTER](...)
+              - pattern-inside: platformApi.$OUTER(...)
+              - pattern-inside: platformApi[$OUTER](...)
+          - pattern-either:
+              - pattern: $DEST = app.$METHOD
+              - pattern: $DEST = app[$METHOD]
+              - pattern: $DEST = platformApi.$METHOD
+              - pattern: $DEST = platformApi[$METHOD]
+              - pattern: const $DEST = app.$METHOD
+              - pattern: const $DEST = app[$METHOD]
+              - pattern: const $DEST = platformApi.$METHOD
+              - pattern: const $DEST = platformApi[$METHOD]
+              - pattern: let $DEST = app.$METHOD
+              - pattern: let $DEST = app[$METHOD]
+              - pattern: let $DEST = platformApi.$METHOD
+              - pattern: let $DEST = platformApi[$METHOD]
+              - pattern: return app.$METHOD
+              - pattern: return app[$METHOD]
+              - pattern: return platformApi.$METHOD
+              - pattern: return platformApi[$METHOD]
+              - pattern: $CALL(..., app.$METHOD, ...)
+              - pattern: $CALL(..., app[$METHOD], ...)
+              - pattern: $CALL(..., platformApi.$METHOD, ...)
+              - pattern: $CALL(..., platformApi[$METHOD], ...)
+      - patterns:
+          - pattern-either:
+              - pattern-inside: $DEST = ...
+              - pattern-inside: const $DEST = ...
+              - pattern-inside: let $DEST = ...
+              - pattern-inside: return ...
+              - pattern-inside: throw ...
+          - pattern-either:
+              - pattern: app.$METHOD(...)
+              - pattern: platformApi.$METHOD(...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(all|basePath|connect|delete|get|head|mount|notFound|on|onError|options|patch|post|put|query|route|trace|use)$
+      - patterns:
+          - pattern-either:
+              - pattern-inside: $DEST = ...
+              - pattern-inside: const $DEST = ...
+              - pattern-inside: let $DEST = ...
+              - pattern-inside: return ...
+              - pattern-inside: throw ...
+          - pattern-either:
+              - pattern: app[$METHOD](...)
+              - pattern: platformApi[$METHOD](...)
+      - patterns:
+          - pattern-either:
+              - pattern: $CALL(..., app.$METHOD(...), ...)
+              - pattern: $CALL(..., platformApi.$METHOD(...), ...)
+              - pattern: new $CLASS(..., app.$METHOD(...), ...)
+              - pattern: new $CLASS(..., platformApi.$METHOD(...), ...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(all|basePath|connect|delete|get|head|mount|notFound|on|onError|options|patch|post|put|query|route|trace|use)$
+      - pattern-either:
+          - pattern: $CALL(..., app[$METHOD](...), ...)
+          - pattern: $CALL(..., platformApi[$METHOD](...), ...)
+          - pattern: new $CLASS(..., app[$METHOD](...), ...)
+          - pattern: new $CLASS(..., platformApi[$METHOD](...), ...)
   - id: worker-hono-construction
     languages: [typescript]
     message: New Worker Hono apps require explicit review and addition to the middleware policy.
@@ -174,7 +270,8 @@ rules:
 
   - id: worker-hono-constructor-alias
     languages: [typescript]
-    message: Do not alias, store, export, or pass the Hono constructor; new Worker apps must remain visible to the policy.
+    message: Do not alias, store, export, or pass the Hono constructor; new Worker apps must remain visible to the
+      policy.
     severity: ERROR
     pattern-either:
       - patterns:
@@ -213,3 +310,5 @@ rules:
     pattern-either:
       - pattern: import { notionApi as $ALIAS } from "./notion-api"
       - pattern: import * as $MODULE from "./notion-api"
+      - pattern: import { platformApi as $ALIAS } from "./platform-api"
+      - pattern: import * as $MODULE from "./platform-api"

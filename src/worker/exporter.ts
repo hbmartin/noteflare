@@ -31,6 +31,9 @@ const PDF_INLINE_ASSET_LIMIT = 24 * 1024 * 1024;
 
 type ExportOptions = { pageId: string; format: ExportFormat; portable: boolean };
 type ExportPage = {
+  cover_attachment_id?: string | null;
+  cover_x?: number;
+  cover_y?: number;
   id: string;
   workspace_id: string;
   content_epoch: number;
@@ -413,8 +416,10 @@ async function portableExport(
   const assetManifest: Array<{ id: string; path: string; name: string; mime: string }> = [];
   const used = new Set<string>();
   let rewritten = content;
+  let coverPath: string | null = null;
   for (const attachment of attachments.results) {
-    if (referencedAssetIds && !referencedAssetIds.has(attachment.id)) continue;
+    if (referencedAssetIds && !referencedAssetIds.has(attachment.id) && attachment.id !== page.cover_attachment_id)
+      continue;
     await assertExportActive(env, job);
     const object = await env.BUCKET.get(attachment.r2_key);
     if (!object) throw new HttpError(409, "job_failed", `Attachment ${attachment.name} is missing.`);
@@ -425,10 +430,22 @@ async function portableExport(
       attachment.id,
       relative.split("/").map(encodeURIComponent).join("/"),
     );
+    if (attachment.id === page.cover_attachment_id) coverPath = relative;
     entries.push({ path: relative, bytes: new Uint8Array(await object.arrayBuffer()) });
     if (format === "json")
       assetManifest.push({ id: attachment.id, path: relative, name: attachment.name, mime: attachment.mime });
   }
+  if (coverPath)
+    entries.push({
+      path: ".noteflare-page.json",
+      bytes: new TextEncoder().encode(
+        JSON.stringify({
+          schema: "noteflare-page-v1",
+          page: `${fileStem(page.title)}.${format === "markdown" ? "md" : format}`,
+          cover: { path: coverPath, x: page.cover_x ?? 0.5, y: page.cover_y ?? 0.5 },
+        }),
+      ),
+    });
   if (assetManifest.length) {
     entries.push({
       path: "assets/manifest.json",
@@ -510,7 +527,7 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
     await assertExportActive(env, job);
     await deleteR2Prefix(env.BUCKET, `jobs/${job.id}/attempts/${job.attempt}/output/`);
     const page = await env.DB.prepare(
-      `SELECT id, workspace_id, content_epoch, kind, title, is_task_list FROM pages
+      `SELECT id, workspace_id, content_epoch, kind, title, is_task_list, cover_attachment_id, cover_x, cover_y FROM pages
         WHERE id = ? AND workspace_id = ? AND space_id = ? AND import_job_id IS NULL AND is_template = 0`,
     )
       .bind(options.pageId, job.workspace_id, job.space_id)
@@ -536,6 +553,38 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
         : page.kind === "diagram"
           ? await diagramExport(env, page)
           : await tableExport(env, page);
+    if (page.cover_attachment_id) {
+      const coverUrl = `/api/attachments/${page.cover_attachment_id}`;
+      const start = "<!-- noteflare-cover:start -->",
+        end = "<!-- noteflare-cover:end -->";
+      serialized.html = serialized.html.replace(
+        "<body>",
+        `<body>${start}<img src="${escapeHtml(coverUrl)}" alt="Page cover" style="width:100%;height:280px;object-fit:cover;object-position:${(page.cover_x ?? 0.5) * 100}% ${(page.cover_y ?? 0.5) * 100}%">${end}`,
+      );
+      if (serialized.markdown)
+        serialized.markdown = `${start}\n![Page cover](${coverUrl})\n${end}\n\n${serialized.markdown}`;
+      if (serialized.json)
+        serialized.json = JSON.stringify(
+          {
+            ...JSON.parse(serialized.json),
+            cover: { attachmentId: page.cover_attachment_id, x: page.cover_x ?? 0.5, y: page.cover_y ?? 0.5 },
+          },
+          null,
+          2,
+        );
+      if (serialized.document && options.format === "docx")
+        serialized.document = {
+          ...serialized.document,
+          content: [
+            {
+              type: "blockContainer",
+              attrs: { id: crypto.randomUUID() },
+              content: [{ type: "image", attrs: { url: coverUrl, caption: "Page cover" } }],
+            },
+            ...(serialized.document.content ?? []),
+          ],
+        };
+    }
     const diagramAssets = serialized.linkedDiagramAssets;
     await assertExportActive(env, job);
     let bytes: Uint8Array;

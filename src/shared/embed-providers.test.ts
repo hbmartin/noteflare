@@ -19,8 +19,9 @@ describe("embed providers", () => {
       expect(resolveEmbed(provider.fixture) === null).toBe(provider.expanded);
     }
     expect(frameSrc.filter((origin) => origin !== "'self'").sort()).toEqual(
-      embedProviders.map((provider) => provider.origin).sort(),
+      [...embedProviders.map((provider) => provider.origin), "https://challenges.cloudflare.com"].sort(),
     );
+    expect(/script-src ([^;]+);/.exec(headers)?.[1]?.split(" ")).toContain("https://challenges.cloudflare.com");
   });
 
   it("rejects credentialed, ambiguous, non-HTTPS and arbitrary sources", () => {

@@ -1,3 +1,5 @@
+import { appendLocalAudit, flushLocalAudit } from "./audit";
+import { formValues, type FormField } from "../shared/public-forms";
 import {
   deletionCheckpointFailure,
   deletionCheckpointStatement,
@@ -17,7 +19,7 @@ import { DurableObject } from "cloudflare:workers";
 import { REALTIME_GRANT_MS, REALTIME_CLOCK_SKEW_MS, TABLE_RENEWAL_LEAD_MS } from "../shared/realtime-limits";
 import type { Env } from "./env";
 import type { ColumnType } from "../shared/types";
-import { canonicalJson, sha256Hex } from "../shared/import-integrity";
+import { canonicalJson, sha256Hex, uuidFromHash } from "../shared/import-integrity";
 import { TABLE_MAX_ROWS, TABLE_PAGE_MAX, TABLE_BULK_MAX_BODY_BYTES } from "../shared/table-limits";
 import {
   TABLE_COLUMN_TYPES,
@@ -54,6 +56,7 @@ import { calendarDay, moveCalendarDate, validateCalendarZone } from "../shared/t
 import { validateTaskTableCommand } from "../shared/task-table-policy";
 import { acceptedPageDeletionSql } from "./deletion-policy";
 import { logger } from "./observability";
+import { publicTaskRowIds } from "./public-task-rows";
 
 export type ProjectionStatement = { sql: string; binds: (string | number | null)[] };
 const TABLE_ID_PATTERN = /^[\w:-]{1,300}$/;
@@ -106,13 +109,14 @@ export type TableActor = {
   socketExpiresAt?: number;
   socketRenewable?: boolean;
   authGeneration?: number;
-  creation?: { board: boolean; calendar: boolean };
+  creation?: { board: boolean; calendar: boolean; gallery?: boolean };
   authorization?: { sql: string; binds: unknown[] };
   effects?: ProjectionStatement[];
   effectsAfter?: ProjectionStatement[];
   detailPageId?: string;
   allowDeleteDetail?: boolean;
   cancelRowOnPublicationFailure?: string;
+  form?: { id: string; version: number; source: string; principalId?: string; fields?: FormField[] };
   taskMutation?: true;
   taskList?: boolean;
   deletionJob?: string;
@@ -244,6 +248,7 @@ export class TableAuthority extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS people(id TEXT PRIMARY KEY,name TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS conversions(id TEXT PRIMARY KEY,column_id TEXT NOT NULL,type TEXT NOT NULL,revision INTEGER NOT NULL,failures INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS converted_cells(conversion_id TEXT NOT NULL,row_id TEXT NOT NULL,value TEXT NOT NULL,invalid INTEGER NOT NULL,source_revision INTEGER NOT NULL,PRIMARY KEY(conversion_id,row_id));
+      CREATE TABLE IF NOT EXISTS form_limits(key TEXT PRIMARY KEY,window INTEGER NOT NULL,count INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS receipts(actor_id TEXT NOT NULL,operation_id TEXT NOT NULL,hash TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(actor_id,operation_id));
       CREATE TABLE IF NOT EXISTS computed(row_id TEXT NOT NULL,column_id TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(row_id,column_id));
       CREATE TABLE IF NOT EXISTS staged_computed(row_id TEXT NOT NULL,column_id TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(row_id,column_id));
@@ -446,6 +451,36 @@ export class TableAuthority extends DurableObject<Env> {
       signature !== (await tableActorSignature(this.env.BETTER_AUTH_SECRET, actor))
     )
       return fail("Expired table authorization.", 403, "table_forbidden");
+    if (actor.form) {
+      if (
+        this.env.FORMS_ENABLED !== "true" ||
+        !write ||
+        request.method !== "POST" ||
+        new URL(request.url).pathname !== "/form-submissions" ||
+        actor.userId !== `form:${actor.form.id}` ||
+        actor.effects ||
+        actor.effectsAfter ||
+        actor.authorization ||
+        actor.taskMutation ||
+        actor.detailPageId ||
+        actor.deletionJob ||
+        typeof actor.form.source !== "string" ||
+        !/^[a-f0-9]{64}$/.test(actor.form.source)
+      )
+        return fail("Form access is limited to submitting a response.", 403, "form_forbidden");
+      const form =
+        await this.env.DB.prepare(`SELECT f.fields_json,si.user_id principal_id FROM public_forms f JOIN service_identities si ON si.workspace_id=f.workspace_id JOIN pages p ON p.id=f.page_id JOIN table_authority a ON a.page_id=p.id
+        WHERE f.id=? AND f.version=? AND f.active=1 AND (f.expires_at IS NULL OR f.expires_at>?) AND f.page_id=? AND f.workspace_id=?
+        AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_task_list=0 AND a.state='do' AND a.generation=?`)
+          .bind(actor.form.id, actor.form.version, Date.now(), actor.pageId, actor.workspaceId, actor.generation)
+          .first<{ fields_json: string; principal_id: string }>();
+      if (!form || this.repairWork || this.meta().repairIntent)
+        return fail("This form is unavailable.", 403, "form_unavailable");
+      return {
+        ...actor,
+        form: { ...actor.form, fields: JSON.parse(form.fields_json) as FormField[], principalId: form.principal_id },
+      };
+    }
     const page =
       await this.env.DB.prepare(`SELECT p.id,p.is_task_list,wm.role,s.visibility,sm.role space_role,a.state,a.generation FROM pages p JOIN spaces s ON s.id=p.space_id
       JOIN workspace_members wm ON wm.workspace_id=p.workspace_id AND wm.user_id=? LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=wm.user_id
@@ -529,6 +564,7 @@ export class TableAuthority extends DurableObject<Env> {
           "/repair",
           "/repair-status",
           "/export",
+          "/public-query",
           "/delete-row",
         ].includes(path)
       ) {
@@ -636,6 +672,26 @@ export class TableAuthority extends DurableObject<Env> {
           return Response.json(await this.verification());
         }
         if (path === "/verify") return Response.json(await this.verification());
+        if (path === "/public-query") {
+          const meta = this.meta();
+          if (!meta.seeded || meta.projectedRevision !== meta.revision || meta.repairIntent)
+            return fail("Table publication is catching up.", 503, "table_projection_pending");
+          const actor: TableActor = {
+            pageId: meta.pageId,
+            workspaceId: meta.workspaceId,
+            userId: "public-publication",
+            generation: meta.generation,
+            expiresAt: Date.now() + 1000,
+          };
+          const taskRowIds = await publicTaskRowIds(this.env, meta.pageId);
+          const current = this.meta();
+          if (current.revision !== meta.revision || current.generation !== meta.generation)
+            return fail("Table publication is catching up.", 503, "table_projection_pending");
+          const result = this.query(url, actor, taskRowIds);
+          if (result.view?.ownerId || result.invalidView)
+            return fail("The public view is unavailable.", 404, "view_not_found");
+          return Response.json(result);
+        }
         if (path === "/export") {
           const cursor = url.searchParams.get("after");
           const meta = this.meta(),
@@ -667,12 +723,33 @@ export class TableAuthority extends DurableObject<Env> {
           return Response.json({ repair: this.repairStatus(), verification: null }, { status: 202 });
         return Response.json(repaired);
       }
-      const actor = await this.authorize(request, path === "/commands");
+      const actor = await this.authorize(request, path === "/commands" || path === "/form-submissions");
       const meta = this.meta();
       if (meta.pageId !== actor.pageId || meta.generation !== actor.generation || !meta.seeded)
         return fail("Table generation is not active.", 503);
       if (path === "/receipt" && request.method === "GET") {
         return this.receiptResponse(actor, id(url.searchParams.get("operationId"), "Operation ID"));
+      }
+      if (path === "/retrieval-rows" && request.method === "GET") {
+        const raw = url.searchParams.get("ids") ?? "[]";
+        if (raw.length > 10000) return fail("Row lookup is too large.", 413);
+        const input: unknown = JSON.parse(raw);
+        if (!Array.isArray(input) || !input.length || input.length > 40) return fail("Choose between one and 40 rows.");
+        const ids = [...new Set(input.map((value) => id(value)))];
+        const rows = ids.flatMap((rowId) =>
+          this.rows<StoredRow>("SELECT * FROM rows WHERE id=?", rowId).map((row) => this.rowValue(row)),
+        );
+        await this.authorize(request, false);
+        if (this.meta().revision !== meta.revision)
+          return fail("The table changed. Retry retrieval.", 409, "table_revision_conflict");
+        return Response.json({
+          pageId: meta.pageId,
+          generation: meta.generation,
+          revision: meta.revision,
+          columns: this.columns(),
+          rows,
+          nextCursor: null,
+        });
       }
       if (path === "/draft-rows" && request.method === "POST") {
         const raw = await request.text();
@@ -701,6 +778,74 @@ export class TableAuthority extends DurableObject<Env> {
         if (this.meta().revision !== meta.revision)
           return fail("The table changed. Retry draft verification.", 409, "table_revision_conflict");
         return Response.json(result);
+      }
+      if (path === "/form-submissions" && actor.form) {
+        const raw = await request.text();
+        if (new TextEncoder().encode(raw).byteLength > 65536) return fail("Form response is too large.", 413);
+        const input = JSON.parse(raw) as { submissionId: string; values: unknown };
+        if (!/^[a-zA-Z0-9_-]{16,100}$/.test(input.submissionId)) return fail("Invalid submission ID.");
+        const minute = Math.floor(Date.now() / 60000),
+          limitKey = `minute:${actor.form.id}:${actor.form.source}`;
+        this.ctx.storage.sql.exec("DELETE FROM form_limits WHERE window<?", minute - 1440);
+        const attempts =
+          this.rows<{ count: number }>("SELECT count FROM form_limits WHERE key=? AND window=?", limitKey, minute)[0]
+            ?.count ?? 0;
+        if (attempts >= 10) return fail("Too many form attempts. Try again shortly.", 429, "form_rate_limited");
+        this.ctx.storage.sql.exec(
+          "INSERT INTO form_limits VALUES(?,?,1) ON CONFLICT(key) DO UPDATE SET window=excluded.window,count=CASE WHEN window=excluded.window THEN count+1 ELSE 1 END",
+          limitKey,
+          minute,
+        );
+        let values: Record<string, TableValue>;
+        try {
+          values = formValues(actor.form.fields!, this.columns(), input.values);
+        } catch (error) {
+          return fail(error instanceof Error ? error.message : "Invalid form response.", 422, "form_invalid");
+        }
+        const command: TableCommand = {
+          operationId: input.submissionId,
+          kind: "create_row",
+          payload: { id: uuidFromHash(await sha256Hex(`${actor.form.id}:${input.submissionId}`)), values },
+        };
+        const hash = await sha256Hex(canonicalJson(command));
+        await this.validateReferences(actor, command);
+        await this.scheduleAlarm(1000);
+        await this.authorize(request, true);
+        this.ctx.storage.transactionSync(() => {
+          const receipt = this.rows<{ hash: string }>(
+            "SELECT hash FROM receipts WHERE actor_id=? AND operation_id=?",
+            actor.userId,
+            command.operationId,
+          )[0];
+          if (receipt && receipt.hash !== hash)
+            fail("That submission ID describes another response.", 409, "idempotency_key_reused");
+          if (!receipt) {
+            const day = Math.floor(Date.now() / 86400000) * 1440,
+              key = `day:${actor.form!.id}`;
+            const successes =
+              this.rows<{ count: number }>("SELECT count FROM form_limits WHERE key=? AND window=?", key, day)[0]
+                ?.count ?? 0;
+            const configuredLimit = Number(this.env.FORMS_DAILY_LIMIT ?? 100),
+              dailyLimit =
+                Number.isSafeInteger(configuredLimit) && configuredLimit >= 1 && configuredLimit <= 100000
+                  ? configuredLimit
+                  : 100;
+            if (successes >= dailyLimit)
+              fail("This form has reached its daily response limit.", 429, "form_daily_limit");
+            this.ctx.storage.sql.exec(
+              "INSERT INTO form_limits VALUES(?,?,1) ON CONFLICT(key) DO UPDATE SET window=excluded.window,count=CASE WHEN window=excluded.window THEN count+1 ELSE 1 END",
+              key,
+              day,
+            );
+          }
+          this.command(actor, command, hash);
+        });
+        try {
+          await this.project();
+        } catch {
+          await this.scheduleAlarm(1000);
+        }
+        return Response.json({ accepted: true });
       }
       if (path === "/commands") {
         const raw = await request.text();
@@ -1341,9 +1486,14 @@ export class TableAuthority extends DurableObject<Env> {
         );
         projection.push(this.cellProjection(rowId, columnId, value, revision, time));
       }
-      this.ctx.storage.sql.exec("UPDATE rows SET edited_at=?,edited_by=? WHERE id=?", time, actor.userId, rowId);
+      this.ctx.storage.sql.exec(
+        "UPDATE rows SET edited_at=?,edited_by=? WHERE id=?",
+        time,
+        actor.form ? null : actor.userId,
+        rowId,
+      );
       this.ctx.storage.sql.exec("INSERT OR REPLACE INTO row_revisions VALUES(?,?)", rowId, revision);
-      projection.push(...this.rowProjection({ ...row, edited_at: time, edited_by: actor.userId }));
+      projection.push(...this.rowProjection({ ...row, edited_at: time, edited_by: actor.form ? null : actor.userId }));
     };
     if (["define_relation", "set_relation", "delete_relation"].includes(command.kind)) {
       result = this.relations.apply(command, revision, meta.pageId, projection);
@@ -1458,9 +1608,9 @@ export class TableAuthority extends DurableObject<Env> {
         id: rowId,
         position,
         created_at: time,
-        created_by: actor.userId,
+        created_by: actor.form ? actor.form.principalId! : actor.userId,
         edited_at: time,
-        edited_by: actor.userId,
+        edited_by: actor.form ? null : actor.userId,
         detail_page_id:
           typeof p.detailPageId === "string" && actor.detailPageId === p.detailPageId ? id(p.detailPageId) : null,
       };
@@ -1498,6 +1648,17 @@ export class TableAuthority extends DurableObject<Env> {
           });
         }
       result = { rowId, detailPageId: row.detail_page_id };
+    } else if (command.kind === "attach_row_page") {
+      const row = this.row(p.rowId);
+      if (actor.form || !actor.detailPageId || p.detailPageId !== actor.detailPageId)
+        return fail("Use the page service.", 403);
+      if (row.detail_page_id && row.detail_page_id !== actor.detailPageId)
+        return fail("This row already has a page.", 409);
+      rememberRow(row);
+      row.detail_page_id = actor.detailPageId;
+      this.ctx.storage.sql.exec("UPDATE rows SET detail_page_id=? WHERE id=?", row.detail_page_id, row.id);
+      projection.push(...this.rowProjection(row));
+      result = { rowId: row.id, detailPageId: row.detail_page_id };
     } else if (command.kind === "update_cells") {
       setCells(
         id(p.rowId),
@@ -1531,16 +1692,17 @@ export class TableAuthority extends DurableObject<Env> {
         return fail("This table has reached its saved-view limit.");
       if (this.rows("SELECT id FROM views WHERE id=?", viewId).length && !previous) return fail("View not found.", 404);
       const kind = p.kind ?? previous?.kind ?? "grid";
-      if (!["grid", "board", "calendar"].includes(String(kind))) return fail("Unknown view kind.");
+      if (!["grid", "board", "calendar", "gallery"].includes(String(kind))) return fail("Unknown view kind.");
       if (
         previous?.kind !== kind &&
         ((kind === "board" && !(actor.creation?.board ?? this.env.TABLE_BOARD_ENABLED === "true")) ||
-          (kind === "calendar" && !(actor.creation?.calendar ?? this.env.TABLE_CALENDAR_ENABLED === "true")))
+          (kind === "calendar" && !(actor.creation?.calendar ?? this.env.TABLE_CALENDAR_ENABLED === "true")) ||
+          (kind === "gallery" && !(actor.creation?.gallery ?? this.env.TABLE_GALLERY_ENABLED === "true")))
       )
         return fail("This view layout is awaiting release acceptance.", 503, "table_view_creation_disabled");
       const columnId =
         p.columnId === undefined ? (previous?.columnId ?? null) : p.columnId === null ? null : id(p.columnId);
-      if (kind !== "grid") {
+      if (kind === "board" || kind === "calendar") {
         const column = this.column(columnId);
         if (kind === "board" && !["select", "status"].includes(column.type))
           return fail("Boards group by select or status.");
@@ -1570,17 +1732,27 @@ export class TableAuthority extends DurableObject<Env> {
         if (!allowedCalculationKinds(property).includes(calculationKind))
           return fail("This calculation is not supported by the property type.");
       }
+      const gallery = p.gallery ?? previous?.gallery ?? { preview: "pageCover", cardSize: "medium" };
+      if (
+        kind === "gallery" &&
+        (!gallery ||
+          typeof gallery !== "object" ||
+          !["pageCover", "none"].includes(String((gallery as Record<string, unknown>).preview)) ||
+          !["small", "medium", "large"].includes(String((gallery as Record<string, unknown>).cardSize)))
+      )
+        return fail("Invalid gallery settings.");
       const view: TableView = {
         id: viewId,
         name: title(p.name ?? previous?.name),
         kind: kind as TableView["kind"],
         revision: (previous?.revision ?? 0) + 1,
         ownerId: p.personal === undefined ? (previous?.ownerId ?? null) : p.personal ? actor.userId : null,
-        columnId,
+        columnId: kind === "gallery" ? null : columnId,
         filters,
         sorts,
         visibleColumnIds,
         calculations,
+        ...(kind === "gallery" ? { gallery: gallery as NonNullable<TableView["gallery"]> } : {}),
       };
       this.ctx.storage.sql.exec("INSERT OR REPLACE INTO views VALUES(?,?)", view.id, JSON.stringify(view));
       result = { view };
@@ -1862,7 +2034,7 @@ export class TableAuthority extends DurableObject<Env> {
       });
     projection.unshift(...(actor.effects ?? []));
     projection.push(...(actor.effectsAfter ?? []));
-    if (!actor.deletionJob)
+    if (!actor.deletionJob && !actor.form)
       projection.push({
         sql: "INSERT INTO page_contributors(page_id,user_id,first_edit_at,last_edit_at) VALUES(?,?,?,?) ON CONFLICT(page_id,user_id) DO UPDATE SET last_edit_at=max(last_edit_at,excluded.last_edit_at)",
         binds: [meta.pageId, actor.userId, time, time],
@@ -1870,7 +2042,7 @@ export class TableAuthority extends DurableObject<Env> {
     if (!actor.deletionJob)
       projection.push({
         sql: "UPDATE pages SET updated_by=?,updated_at=? WHERE id=?",
-        binds: [actor.userId, time, meta.pageId],
+        binds: [actor.form ? null : actor.userId, time, meta.pageId],
       });
     this.putMeta({ ...meta, revision, schemaRevision });
     const answer: TableCommandResult = {
@@ -1888,6 +2060,24 @@ export class TableAuthority extends DurableObject<Env> {
       hash,
       JSON.stringify(answer),
     );
+    if (this.env.AUDIT_ENABLED === "true")
+      appendLocalAudit(this.ctx.storage.sql, {
+        id: `table:${meta.pageId}:${meta.generation}:${actor.userId}:${command.operationId}`,
+        workspaceId: meta.workspaceId,
+        actorType: actor.form ? "public_form" : "user",
+        actorId: actor.form ? null : actor.userId,
+        action: `table.${command.kind}`,
+        targetType: "table",
+        targetId: meta.pageId,
+        outcome: "success",
+        committedAt: time,
+        metadata: {
+          generation: meta.generation,
+          revision,
+          operationId: command.operationId,
+          ...(actor.form ? { formId: actor.form.id, submissionId: command.operationId } : {}),
+        },
+      });
     const prerequisiteChunks = chunkPrerequisites([...prerequisites.values()]);
     this.ctx.storage.sql.exec(
       "INSERT INTO events(revision,operation_id,value,cancel_row_id) VALUES(?,?,?,?)",
@@ -2198,8 +2388,12 @@ export class TableAuthority extends DurableObject<Env> {
       invalidView,
     };
   }
-  private query(url: URL, actor: TableActor): TableQueryResult {
+  private query(url: URL, actor: TableActor, publicTaskIds: string[] | null = null): TableQueryResult {
     const { meta, columns, views, viewId, view, invalidView, filter, calendar, limit } = this.queryInputs(url, actor);
+    if (publicTaskIds !== null) {
+      filter.sql += " AND r.id IN (SELECT value FROM json_each(?))";
+      filter.binds.push(JSON.stringify(publicTaskIds));
+    }
     const q = url.searchParams.get("q")?.trim().slice(0, 200);
     if (q) {
       const matchedOptions = columns.flatMap((column) =>
@@ -3290,6 +3484,13 @@ export class TableAuthority extends DurableObject<Env> {
       return recover ? this.project(true) : true;
     }
     this.projecting = (async () => {
+      if (this.env.AUDIT_ENABLED === "true") {
+        try {
+          if (await flushLocalAudit(this.env, this.ctx.storage.sql)) await this.scheduleAlarm(1000);
+        } catch {
+          await this.scheduleAlarm(10000);
+        }
+      }
       while (true) {
         const meta = this.meta(),
           event = this.rows<PendingEvent>(
@@ -4092,6 +4293,13 @@ export class TableAuthority extends DurableObject<Env> {
   // fallow-ignore-next-line unused-class-member -- Called by Cloudflare Durable Object runtime.
   async alarm() {
     await this.initializeDeadlines();
+    if (this.env.AUDIT_ENABLED === "true") {
+      try {
+        if (await flushLocalAudit(this.env, this.ctx.storage.sql)) await this.scheduleAlarm(1000);
+      } catch {
+        await this.scheduleAlarm(10000);
+      }
+    }
     this.expireSockets();
     if (this.purged || this.deletionIntent) {
       await this.armAlarm();

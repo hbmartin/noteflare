@@ -36,6 +36,10 @@ Choose the guide for your role. Feature availability depends on environment flag
 - [Editor implementation and rendering evidence](implementation/editor-release.md).
 - [Table authority, views and computed data acceptance](implementation/table-authority-release.md).
 - [Small-team wiki implementation ledger](implementation/small-team-wiki-release.md).
+- [Cloudflare retrieval and read replication](implementation/cloudflare-retrieval.md): semantic indexes, hybrid search, automatic writing sources, and D1 Sessions.
+- [Cloudflare identity and key management](cloudflare-security.md).
+- [Semantic retrieval implementation](implementation/cloudflare-retrieval.md).
+- [Cloudflare platform release](implementation/cloudflare-platform-release.md): optional services, public delivery, retention and live release gates.
 
 ## Planning
 

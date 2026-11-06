@@ -21,6 +21,7 @@ export const SCHEDULED_TASK_NAMES = [
   "table_search_values",
   "search_headings",
   "ai_history",
+  "platform",
 ] as const;
 
 export type ScheduledTaskName = (typeof SCHEDULED_TASK_NAMES)[number];

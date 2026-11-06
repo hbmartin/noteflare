@@ -1,6 +1,7 @@
+import { encryptManaged, decryptManaged } from "./secrets";
 import { sha256Hex } from "../shared/import-integrity";
 import { tracing } from "cloudflare:workers";
-import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256Hex } from "../shared/security";
+import { bytesToBase64Url, constantTimeEqual, hmacSha256Hex } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { publicPageId } from "./integrations";
 import { HttpError, safeHttpError } from "./http";
@@ -63,58 +64,11 @@ function verificationToken() {
   return `secret_${bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
-function encryptionMaterial(env: Env) {
-  const encoded = env.WEBHOOK_ENCRYPTION_KEY;
-  let key: Uint8Array;
-  try {
-    if (!encoded || !/^[A-Za-z0-9_-]{43}$/.test(encoded)) throw new Error("invalid key");
-    key = base64UrlToBytes(encoded);
-    if (key.byteLength !== 32 || bytesToBase64Url(key) !== encoded) throw new Error("invalid key");
-  } catch {
-    throw new HttpError(
-      503,
-      "webhook_encryption_unavailable",
-      "Configure WEBHOOK_ENCRYPTION_KEY as 32 random bytes encoded with unpadded base64url.",
-    );
-  }
-  return { encoded, key: Uint8Array.from(key) };
+async function encryptToken(env: Env, token: string, id: string) {
+  return encryptManaged(env, "webhook", `webhook:${id}`, token);
 }
-
-async function encryptionKey(env: Env) {
-  return crypto.subtle.importKey("raw", encryptionMaterial(env).key, { name: "AES-GCM" }, false, [
-    "encrypt",
-    "decrypt",
-  ]);
-}
-
-async function legacyEncryptionKey(env: Env) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(encryptionMaterial(env).encoded));
-  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["decrypt"]);
-}
-
-async function encryptToken(env: Env, token: string) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = new Uint8Array(
-    await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await encryptionKey(env), new TextEncoder().encode(token)),
-  );
-  const output = new Uint8Array(iv.length + encrypted.length);
-  output.set(iv);
-  output.set(encrypted, iv.length);
-  return bytesToBase64Url(output);
-}
-
-async function decryptToken(env: Env, encrypted: string) {
-  const input = base64UrlToBytes(encrypted);
-  const algorithm = { name: "AES-GCM", iv: input.slice(0, 12) };
-  let plain: ArrayBuffer;
-  try {
-    plain = await crypto.subtle.decrypt(algorithm, await encryptionKey(env), input.slice(12));
-  } catch {
-    // Before the key format was made explicit, configured strings were hashed.
-    // Keep valid, already-formatted deployments able to read their stored tokens.
-    plain = await crypto.subtle.decrypt(algorithm, await legacyEncryptionKey(env), input.slice(12));
-  }
-  return new TextDecoder().decode(plain);
+async function decryptToken(env: Env, ciphertext: string, id: string) {
+  return decryptManaged(env, "webhook", `webhook:${id}`, ciphertext);
 }
 
 export function safeWebhookUrl(value: string) {
@@ -224,7 +178,7 @@ export async function createWebhookSubscription(
     url: safeWebhookUrl(url),
     events_json: JSON.stringify(events(requestedEvents)),
     status: "pending_verification",
-    encrypted_verification_token: await encryptToken(env, token),
+    encrypted_verification_token: await encryptToken(env, token, id),
     verification_token_hash: await sha256Hex(token),
     verified_at: null,
     created_at: timestamp,
@@ -271,7 +225,7 @@ export async function sendWebhookVerification(env: Env, subscriptionId: string) 
     .first<SubscriptionRow>();
   if (!row) return { ok: false as const, error: "Webhook subscription is no longer pending verification." };
   const destination = await storedWebhookUrl(env, row.id, row.url);
-  const token = await decryptToken(env, row.encrypted_verification_token);
+  const token = await decryptToken(env, row.encrypted_verification_token, row.id);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5_000);
   try {
@@ -629,7 +583,7 @@ export async function deliverWebhook(env: Env, deliveryId: string) {
   let requestFailed = false;
   let requestError: unknown;
   try {
-    const token = await decryptToken(env, subscription.encrypted_verification_token);
+    const token = await decryptToken(env, subscription.encrypted_verification_token, subscription.id);
     const signature = `sha256=${await hmacSha256Hex(token, payload)}`;
     requestAttempted = true;
     const response = await traced(tracing, "notes.integration.webhook", { "notes.operation": "delivery" }, () => {

@@ -1,0 +1,2 @@
+pyiceberg[pyarrow]==0.10.0
+pyarrow==22.0.0
