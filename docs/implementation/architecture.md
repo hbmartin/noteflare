@@ -101,18 +101,38 @@ global shortcuts share the native-key classifier. Context changes do not falsely
 end composition, and query timers cannot escape their context/version or effect
 lifetime. Effect disconnection cancels the timer while preserving its original
 deadline. Reconnection waits only the remaining quiet period, or applies the
-current draft once if that deadline elapsed. This effect lifecycle is distinct
+current draft once if that deadline elapsed. Deadlines use monotonic elapsed time,
+so wall-clock adjustments cannot extend the quiet period. This effect lifecycle
+is distinct
 from ordinary browser-tab visibility and online verification. Rendered and
-imperative pending checks share an ownership predicate; retired contexts fail
-closed. Temporary effect disconnection suspends the owned presentation cache
+imperative pending checks share an ownership predicate; imperative calls also
+require a connected effect lifetime. A disconnected render snapshot can remain
+unchanged while imperative calls fail closed. Retired contexts fail closed.
+Temporary effect disconnection suspends the owned presentation cache
 without clearing its drafts. Suspended caches reject writes and acknowledgements;
 owner replacement retires and clears the old cache. An unmounted cache remains
 inactive and can be garbage collected with its component.
 
+Mutation ownership is independent of effect connectivity. Each owner-scoped
+operation has an identity token, an in-flight flag and at most one deferred
+terminal outcome. Settlement releases only the matching token's in-flight state.
+Disconnected completion defers presentation until the same owner reconnects,
+after cache activation and before allowing new mutations. The original caller
+receives its reconciled result, preserving captured success actions such as
+closing settings. Success acknowledges
+only the captured form snapshot and requires current authorized commit coverage;
+rejections retain their original operation identity and manual retry behavior.
+Owner replacement discards deferred presentation. A retired operation cannot clear
+a newer operation's busy state, including after returning to an earlier owner.
+
 Mutation rejection notices are immediate and retain review guidance without
 promising an automatic mutation retry or completed recovery. Known conflict,
-missing-item and permission errors use client-owned copy; other recoverable errors
-keep their specific explanation alongside neutral guidance. Saved-refresh failures
+missing-item errors use client-owned copy. Permission errors retain meaningful
+server explanations with access guidance, without inferring that an entire table
+is read-only from a role-related denial. Other recoverable errors retain their
+specific explanation with neutral guidance. Explanation joining normalizes sentence
+separation, and permission classification uses explicit code membership.
+Saved-refresh failures
 follow current reads and the existing commit watermark. The save-requested
 refresh receipt also associates an adopted earlier execution with that exact
 pending commit. Unrelated earlier reads, retired receipts, replaced commits and
