@@ -4,6 +4,8 @@ Date: 6 November 2026. Base: `65acbbf073ff70ab90353899cef391848a945c1b` (merged 
 
 Implementation commits: `4fbe749` (mutation lifecycle) and `d0f8055` (regressions and shared notice cleanup).
 
+> Follow-up correction: [PR #294 evidence](PR294_FOLLOW_UP.md) replaces the claim below that search changes cannot release busy. The earlier recovery test held an extra mock gate after the real recovery receipt had settled.
+
 ## Behavior
 
 Mutation presentation and the private view cache now activate and suspend in one layout effect. Query/load effects no longer change mutation connectivity. Reconnection re-establishes the read coordinator before consuming a retained response. Owner-scoped identity checks protect newer operations and replacement owners.
