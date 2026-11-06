@@ -1,3 +1,4 @@
+import { noticeSentence } from "./notice-text";
 import { TableAuthorityGate } from "./TableAuthorityGate";
 import type { ReactNode } from "react";
 import { ActionMenu, PageTools } from "./WorkspaceUI";
@@ -283,7 +284,7 @@ function releaseTableLease(pageId: string, leaseToken: string) {
 }
 
 function retryingMessage(message: string) {
-  const sentence = /[.!?…]$/.test(message) ? message : `${message}.`;
+  const sentence = noticeSentence(message);
   return `${sentence} Retrying.`;
 }
 

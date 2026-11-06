@@ -1,7 +1,6 @@
 import { ApiClientError, apiErrorMessage } from "./api";
 
-const permissionCodes = new Set(["read_only", "feature_disabled", "owner_required", "relation_target_unavailable"]);
-const sentence = (text: string) => (/[.!?…]$/.test(text) ? text : `${text}.`);
+import { noticeSentence, tablePermissionCodes } from "./notice-text";
 
 /** Rejection copy describes the failed save; recovery does not retry the mutation. */
 export function tableMutationNotice(cause: ApiClientError, task: boolean) {
@@ -23,7 +22,7 @@ export function tableMutationNotice(cause: ApiClientError, task: boolean) {
     ].includes(cause.code)
   )
     return `The ${subject} is unavailable. Your edit was not saved. Review the table before trying again.`;
-  if (cause.status === 403 && permissionCodes.has(cause.code))
-    return `${sentence(apiErrorMessage(cause, "This action is not permitted with your current access."))} Your edit was not saved. Review the current permissions and available actions before trying again.`;
-  return `${sentence(apiErrorMessage(cause, `The ${subject} update was rejected.`))} Your edit was not saved. Review the table before trying again.`;
+  if (cause.status === 403 && tablePermissionCodes.has(cause.code))
+    return `${noticeSentence(apiErrorMessage(cause, "This action is not permitted with your current access."))} Your edit was not saved. Review the current permissions and available actions before trying again.`;
+  return `${noticeSentence(apiErrorMessage(cause, `The ${subject} update was rejected.`))} Your edit was not saved. Review the table before trying again.`;
 }

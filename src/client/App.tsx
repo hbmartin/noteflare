@@ -1,3 +1,4 @@
+import { noticeSentence } from "./notice-text";
 import { CommentPublicationNotice } from "./CommentPublicationNotice";
 import { isComposingKey } from "./keyboard";
 import { purgeCommentDrafts } from "./comment-drafts";
@@ -257,7 +258,7 @@ function formatErrorMessages(errors: WorkspaceError[]) {
   const messages = new Map<string, string>();
   for (const { message } of errors) {
     const key = errorMessageKey(message);
-    if (!messages.has(key)) messages.set(key, /[.!?…]$/.test(message) ? message : `${message}.`);
+    if (!messages.has(key)) messages.set(key, noticeSentence(message));
   }
   return [...messages.values()].join(" ");
 }
