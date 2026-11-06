@@ -9,6 +9,8 @@ import {
 import { CellDraftPersistenceRetry } from "./CellDraftPersistenceRetry";
 import { useOnlineStatus } from "./online-status";
 import { useTableSearch } from "./use-table-search";
+import { settleTableMutation } from "./table-mutation-lifecycle";
+import { tablePermissionCodes } from "./notice-text";
 import { tableMutationNotice } from "./table-mutation-notice";
 import { RelationPanel } from "./RelationPanel";
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -70,7 +72,8 @@ type MutationCompletion = "committed-current" | "committed-retired";
 type TaskSaveResult =
   | { state: "saved"; completion: MutationCompletion }
   | { state: "rejected"; code?: string }
-  | { state: "uncertain" };
+  | { state: "uncertain" }
+  | { state: "suspended" };
 type TableFetchOptions = {
   signal?: AbortSignal;
   intent?: TableReadIntent;
@@ -98,7 +101,35 @@ type MutationNotice = {
   message: string;
   submission?: CellDraftSubmission;
 };
-type MutationRun = { operation: MutationNotice; inFlight: boolean; terminal?: () => void; retire?: () => void };
+type MutationOutcome =
+  | { kind: "success"; coverage?: TableCoverage; message?: string }
+  | { kind: "failure"; error?: { status: number; code: string; message: string; fallback: boolean; notSent: boolean } };
+type MutationResult = "committed" | "rejected" | "uncertain" | "suspended" | "retired";
+type MutationRun = {
+  operation: MutationNotice;
+  phase: "network" | "handling" | "settled";
+  request: SavedRetry;
+  acknowledgements: TableViewSubmission[];
+  closePanel?: TableViewSubmission;
+  resetView?: string;
+  outcome?: MutationOutcome;
+};
+function mutationFailure(cause: unknown): MutationOutcome {
+  return {
+    kind: "failure",
+    ...(cause instanceof ApiClientError
+      ? {
+          error: {
+            status: cause.status,
+            code: cause.code,
+            message: apiErrorMessage(cause, ""),
+            fallback: cause.messageFromFallback,
+            notSent: cause.notSent,
+          },
+        }
+      : {}),
+  };
+}
 type SavedRetry = {
   owner: TableOwner;
   submission?: CellDraftSubmission;
@@ -114,8 +145,7 @@ function accessFailure(cause: unknown, fromRead: boolean): "denied" | "verify" |
   if (cause.status === 401) return "denied";
   if (cause.status !== 403) return "other";
   if (["table_forbidden", "forbidden"].includes(cause.code)) return "denied";
-  if (["relation_target_unavailable", "feature_disabled", "read_only", "owner_required"].includes(cause.code))
-    return "verify";
+  if (tablePermissionCodes.has(cause.code)) return "verify";
   return fromRead ? "denied" : "verify";
 }
 type CellDraftSubmission = {
@@ -175,14 +205,6 @@ export function CollaborativeTablePage({
     setCacheLifetime({ owner: currentOwner, cache: viewCache });
   }
   const previousViewCache = useRef(viewCache);
-  useLayoutEffect(() => {
-    if (previousViewCache.current !== viewCache) previousViewCache.current.retire();
-    previousViewCache.current = viewCache;
-    viewCache.activate();
-    // A disconnected effect can reconnect with the same owner. Its cache stays
-    // private and inactive until then; owner replacement clears the old values.
-    return () => viewCache.suspend();
-  }, [viewCache]);
   const viewState = viewCache.view(viewId);
 
   const ownership = useRef({
@@ -217,7 +239,7 @@ export function CollaborativeTablePage({
   const [connectionReady, setConnectionReady] = useState(false);
   const [authorizedGeneration, setAuthorizedGeneration] = useState<number | null>(null);
   const [data, setData] = useState<TableQueryResult | null>(null);
-  const [panel, setPanel, acceptPanel] = useTableViewState<"view" | "properties" | null>("panel", null, viewState);
+  const [panel, setPanel] = useTableViewState<"view" | "properties" | null>("panel", null, viewState);
   const [savedRetry, setRetry] = useState<SavedRetry | null>(null);
   const linkedWindow = useRef<TableReadWindow | null>(null);
   const [readSnapshot, setReadSnapshot] = useState<TableReadWindow | null>(null);
@@ -277,7 +299,6 @@ export function CollaborativeTablePage({
     setSaveRefreshStatus("");
     setFreshnessStatus("");
     setBlocked("");
-    mutationRun.current?.retire?.();
     mutationRun.current = null;
     busyRef.current = false;
     setBusy(false);
@@ -351,19 +372,7 @@ export function CollaborativeTablePage({
     );
   };
   const [newTitle, setNewTitle] = useTableViewState("title", "", viewState);
-  const active = useRef(true);
-  const resumeMutation = useCallback(() => {
-    const run = mutationRun.current;
-    if (run && !sameTableOwner(run.operation.owner, retryLifetime.current)) return;
-    busyRef.current = run?.inFlight === true;
-    setBusy(busyRef.current);
-    if (run?.terminal) {
-      const terminal = run.terminal;
-      delete run.terminal;
-      mutationRun.current = null;
-      terminal();
-    }
-  }, []);
+  const active = useRef(false);
   const editable = Boolean(
     online &&
     !search.pending &&
@@ -705,18 +714,15 @@ export function CollaborativeTablePage({
   useEffect(() => {
     if ((incarnation && incarnation.key !== account) || queryOwner.current.queryIdentity !== queryIdentity)
       return undefined;
-    active.current = true;
-    resumeMutation();
     const expected = queryOwner.current;
     void Promise.resolve().then(() => {
       if (active.current && queryOwner.current === expected) void load();
     });
     const requestOwnership = ownership;
     return () => {
-      active.current = false;
       requestOwnership.current.request++;
     };
-  }, [load, queryIdentity, account, incarnation, resumeMutation]);
+  }, [load, queryIdentity, account, incarnation]);
   useEffect(() => {
     const invalidate = (event: Event) => {
       const hostId = queryBase?.match(/^\/api\/pages\/([^/]+)\/linked-tables\//)?.[1];
@@ -744,49 +750,43 @@ export function CollaborativeTablePage({
     return unsubscribe;
   }, [notice]);
   const retryOwner = currentOwner;
-  const beginMutation = (operationId: string, target: string, submission?: CellDraftSubmission): MutationRun => {
+  const beginMutation = (
+    request: SavedRetry,
+    operationId: string,
+    target: string,
+    acknowledgements: TableViewSubmission[] = [],
+    closePanel?: TableViewSubmission,
+    resetView?: string,
+  ): MutationRun => {
     const run: MutationRun = {
-      inFlight: true,
+      phase: "network",
+      request,
+      acknowledgements,
+      closePanel,
+      resetView,
       operation: {
         sequence: ++noticeSequence.current,
         owner: retryOwner,
         operationId,
-        target: submission ? `cell:${submission.key}` : target,
-        submission,
+        target: request.submission ? `cell:${request.submission.key}` : target,
+        submission: request.submission,
         message: "",
       },
     };
     mutationRun.current = run;
     return run;
   };
-  const settleMutation = async <T,>(run: MutationRun, apply: () => T, retired: T): Promise<T> => {
-    run.inFlight = false;
-    if (mutationRun.current !== run || !sameTableOwner(run.operation.owner, retryLifetime.current)) return retired;
-    busyRef.current = false;
-    if (!active.current) {
-      // Resume the original caller too, so its captured success actions are not lost.
-      return new Promise<T>((resolve, reject) => {
-        run.retire = () => resolve(retired);
-        run.terminal = () => {
-          delete run.retire;
-          try {
-            resolve(apply());
-          } catch (cause) {
-            reject(cause);
-          }
-        };
-      });
-    }
-    return apply();
-  };
+  const ownsMutation = (run: MutationRun) =>
+    mutationRun.current === run && sameTableOwner(run.operation.owner, retryLifetime.current);
   const finishMutation = (run: MutationRun) => {
-    if (mutationRun.current !== run || !sameTableOwner(run.operation.owner, retryLifetime.current)) return;
+    if (!ownsMutation(run)) return;
+    run.phase = "settled";
     busyRef.current = false;
     if (active.current) {
       setBusy(false);
       setBlocked((message) => (message === busyMessage ? "" : message));
+      mutationRun.current = null;
     }
-    if (!run.terminal) mutationRun.current = null;
   };
   const completeMutation = (
     operation: MutationNotice,
@@ -817,7 +817,101 @@ export function CollaborativeTablePage({
     });
     return "committed-current";
   };
-  const send = async (command: TableCommand, submission?: CellDraftSubmission, form?: TableViewSubmission) => {
+  const applyMutation = async (run: MutationRun): Promise<MutationResult> => {
+    if (!ownsMutation(run)) return "retired";
+    if (!active.current) return "suspended";
+    const outcome = run.outcome!;
+    delete run.outcome;
+    run.phase = "handling";
+    try {
+      const { operation, request } = run;
+      if (outcome.kind === "success") {
+        for (const acknowledgement of run.acknowledgements) acknowledgeTableViewSubmission(acknowledgement);
+        const completion = completeMutation(operation, outcome.coverage, request.form, outcome.message);
+        if (completion !== "committed-current") return "retired";
+        acknowledgeTableViewSubmission(run.closePanel);
+        if (run.resetView !== undefined && queryOwner.current.queryIdentity === run.resetView) {
+          setViewId("");
+          onViewChanged?.("");
+        }
+        return "committed";
+      }
+      const cause = outcome.error
+        ? new ApiClientError(outcome.error.status, outcome.error.code, outcome.error.message, outcome.error.fallback, {
+            notSent: outcome.error.notSent,
+          })
+        : new TypeError("Mutation response unavailable");
+      const task = request.kind === "task";
+      const message = apiErrorMessage(
+        cause,
+        task ? "The task could not be saved." : "The table update could not be saved.",
+      );
+      setError(message);
+      if (discardDenied(cause)) return "rejected";
+      if (!(cause instanceof ApiClientError) || (cause.status >= 500 && (!task || !cause.notSent))) {
+        setRetry({ ...request, message });
+        return "uncertain";
+      }
+      if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
+        setError("");
+        if (!task || cause.code === "table_revision_conflict" || cause.status === 404 || cause.status === 403) {
+          if (task && request.submission) {
+            const submission = request.submission;
+            submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
+          }
+          retireVerification("invalidate");
+        }
+        reportMutation(operation, tableMutationNotice(cause, task));
+        await linkedReads.current?.recover();
+      }
+      return "rejected";
+    } finally {
+      finishMutation(run);
+    }
+  };
+  const settleMutation = (run: MutationRun, outcome: MutationOutcome): Promise<MutationResult> => {
+    return settleTableMutation(run, outcome, ownsMutation(run), active.current, () => applyMutation(run));
+  };
+  const mutationHandlers = useRef({ connect: () => {}, replay: () => {} });
+  useLayoutEffect(() => {
+    mutationHandlers.current = {
+      connect: () => {
+        const run = mutationRun.current;
+        if (!run || !ownsMutation(run)) return;
+        if (run.phase === "settled") finishMutation(run);
+        else {
+          busyRef.current = true;
+          setBusy(true);
+        }
+      },
+      replay: () => {
+        const run = mutationRun.current;
+        if (active.current && run?.outcome) void applyMutation(run);
+      },
+    };
+  });
+  useLayoutEffect(() => {
+    if (previousViewCache.current !== viewCache) previousViewCache.current.retire();
+    previousViewCache.current = viewCache;
+    viewCache.activate();
+    active.current = true;
+    mutationHandlers.current.connect();
+    return () => {
+      active.current = false;
+      viewCache.suspend();
+    };
+  }, [viewCache, previousViewCache, mutationHandlers]);
+  useEffect(() => {
+    mutationHandlers.current.replay();
+  }, [mutationHandlers]);
+  const send = async (
+    command: TableCommand,
+    submission?: CellDraftSubmission,
+    form?: TableViewSubmission,
+    acknowledgements: TableViewSubmission[] = [],
+    closePanel?: TableViewSubmission,
+    resetView?: string,
+  ) => {
     if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId)) return false;
     if (!canCommit()) {
       setBlocked(busyRef.current ? busyMessage : readinessMessage);
@@ -842,8 +936,15 @@ export function CollaborativeTablePage({
           : ["save_view", "delete_view"].includes(command.kind)
             ? `view:${String(payload.id ?? payload.viewId ?? viewId)}`
             : `${command.kind}:${String(payload.rowId ?? `view:${viewId}`)}`;
-    const run = beginMutation(command.operationId, target, submission);
-    const { operation } = run;
+    const run = beginMutation(
+      { kind: "command", command, owner: retryOwner, submission, form, message: "" },
+      command.operationId,
+      target,
+      acknowledgements,
+      closePanel,
+      resetView,
+    );
+    let outcome: MutationOutcome;
     try {
       const result = await api<TableCommandResult>(commandsPath, {
         method: "POST",
@@ -851,58 +952,41 @@ export function CollaborativeTablePage({
         signal: AbortSignal.timeout(30000),
       });
       submission?.map.acknowledge(submission.key, submission.version, submission.operationId);
-      const completion = await settleMutation(
-        run,
-        () =>
-          completeMutation(
-            operation,
-            result,
-            form,
-            result.result.visibleInView === false
-              ? "Saved. The new row is hidden by this view's filters. Open All rows to see it."
-              : result.projectionPending
-                ? "Saved. Search and task lists are catching up."
-                : undefined,
-          ),
-        "committed-retired" as MutationCompletion,
-      );
-      return completion === "committed-current";
+      outcome = {
+        kind: "success",
+        coverage: readTableCoverage(result),
+        message:
+          result.result.visibleInView === false
+            ? "Saved. The new row is hidden by this view's filters. Open All rows to see it."
+            : result.projectionPending
+              ? "Saved. Search and task lists are catching up."
+              : undefined,
+      };
     } catch (cause) {
-      return await settleMutation(
-        run,
-        async () => {
-          setError(apiErrorMessage(cause, "The table update could not be saved."));
-          if (discardDenied(cause)) return false;
-          if (!(cause instanceof ApiClientError) || cause.status >= 500)
-            setRetry({
-              kind: "command",
-              command,
-              owner: retryOwner,
-              submission,
-              form,
-              message: apiErrorMessage(cause, "The table update could not be saved."),
-            });
-          else if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
-            setError("");
-            retireVerification("invalidate");
-            reportMutation(operation, tableMutationNotice(cause, false));
-            await linkedReads.current?.recover();
-          }
-          return false;
-        },
-        Promise.resolve(false),
-      );
-    } finally {
-      finishMutation(run);
+      outcome = mutationFailure(cause);
     }
+    return (await settleMutation(run, outcome)) === "committed";
   };
   const command = (
     kind: TableCommand["kind"],
     payload: Record<string, unknown>,
     globalRevision = false,
     form?: TableViewSubmission,
-  ) =>
-    send(
+  ) => {
+    const keys: Array<[string, unknown]> =
+      kind === "create_column"
+        ? [
+            ["property:new-name", ""],
+            ["property:new-source", ""],
+          ]
+        : kind === "add_option"
+          ? [[`property:${String(payload.columnId)}:option`, ""]]
+          : kind === "update_column"
+            ? ["name", "source"]
+                .filter((field) => field in payload)
+                .map((field): [string, unknown] => [`property:${String(payload.columnId)}:${field}`, null])
+            : [];
+    return send(
       {
         operationId: crypto.randomUUID(),
         ...(globalRevision && data ? { expectedRevision: data.revision } : {}),
@@ -911,7 +995,14 @@ export function CollaborativeTablePage({
       },
       undefined,
       form,
+      keys.flatMap(([key, reset]) => {
+        const snapshot = captureTableViewSubmission(viewState, key, reset);
+        return snapshot ? [snapshot] : [];
+      }),
+      kind === "save_view" ? captureTableViewSubmission(viewState, "panel", null) : undefined,
+      kind === "delete_view" ? queryIdentity : undefined,
     );
+  };
   const saveTask = async (
     body: Record<string, unknown>,
     rowId?: string,
@@ -934,70 +1025,36 @@ export function CollaborativeTablePage({
       .filter((key) => !["operationId", "expectedRevision"].includes(key))
       .sort();
     const run = beginMutation(
+      { kind: "task", body, rowId, owner: retryOwner, submission, form, message: "" },
       String(body.operationId),
       `task:${rowId ?? `new:${viewId}`}:${JSON.stringify(fields)}`,
-      submission,
     );
-    const { operation } = run;
+    let outcome: MutationOutcome;
     try {
       const result = await api<{ visibleInView?: boolean; generation?: number; revision?: number; replayed?: boolean }>(
         rowId ? `${tasksPath}/${rowId}` : tasksPath,
-        {
-          method: rowId ? "PATCH" : "POST",
-          body: json(body),
-          signal: AbortSignal.timeout(30000),
-        },
+        { method: rowId ? "PATCH" : "POST", body: json(body), signal: AbortSignal.timeout(30000) },
       );
       submission?.map.acknowledge(submission.key, submission.version, submission.operationId);
-      const completion = await settleMutation(
-        run,
-        () =>
-          completeMutation(
-            operation,
-            result,
-            form,
-            result.visibleInView === false
-              ? "Saved. Current filters hide this task. Choose All rows to see it."
-              : undefined,
-          ),
-        "committed-retired" as MutationCompletion,
-      );
-      return { state: "saved", completion };
+      outcome = {
+        kind: "success",
+        coverage: readTableCoverage(result),
+        message:
+          result.visibleInView === false
+            ? "Saved. Current filters hide this task. Choose All rows to see it."
+            : undefined,
+      };
     } catch (cause) {
-      return await settleMutation(
-        run,
-        async (): Promise<TaskSaveResult> => {
-          setError(apiErrorMessage(cause, "The task could not be saved."));
-          if (discardDenied(cause)) return { state: "rejected", code: (cause as ApiClientError).code };
-          if (!(cause instanceof ApiClientError) || (cause.status >= 500 && !cause.notSent)) {
-            setRetry({
-              kind: "task",
-              body,
-              rowId,
-              owner: retryOwner,
-              submission,
-              form,
-              message: apiErrorMessage(cause, "The task could not be saved."),
-            });
-            return { state: "uncertain" };
-          }
-          if (cause.status === 409 || cause.status === 404 || accessFailure(cause, false) === "verify") {
-            setError("");
-            if (cause.code === "table_revision_conflict" || cause.status === 404 || cause.status === 403) {
-              if (submission)
-                submission.map.resetRejectedSubmission(submission.key, submission.version, submission.operationId);
-              retireVerification("invalidate");
-            }
-            reportMutation(operation, tableMutationNotice(cause, true));
-            await linkedReads.current?.recover();
-          }
-          return { state: "rejected", code: cause.code };
-        },
-        Promise.resolve({ state: "rejected", code: "retired" } as TaskSaveResult),
-      );
-    } finally {
-      finishMutation(run);
+      outcome = mutationFailure(cause);
     }
+    const result = await settleMutation(run, outcome);
+    if (result === "suspended") return { state: "suspended" };
+    if (result === "committed") return { state: "saved", completion: "committed-current" };
+    if (result === "uncertain") return { state: "uncertain" };
+    return {
+      state: "rejected",
+      code: result === "retired" ? "retired" : outcome.kind === "failure" ? outcome.error?.code : undefined,
+    };
   };
   const changeCell = async (
     row: CollaborativeRow,
@@ -1349,19 +1406,9 @@ export function CollaborativeTablePage({
               ]}
               busy={busy || !editable}
               save={async (payload, form) => {
-                const saved = await command("save_view", payload, false, form);
-                if (saved) acceptPanel(null);
-                return saved;
+                return command("save_view", payload, false, form);
               }}
-              remove={() =>
-                data.view &&
-                void command("delete_view", { viewId: data.view.id }).then((saved) => {
-                  if (saved) {
-                    setViewId("");
-                    onViewChanged?.("");
-                  }
-                })
-              }
+              remove={() => data.view && void command("delete_view", { viewId: data.view.id })}
             />
           </fieldset>
         )}
@@ -2249,9 +2296,9 @@ function PropertyEditor({
   busy: boolean;
   command: (kind: TableCommand["kind"], payload: Record<string, unknown>, globalRevision?: boolean) => Promise<boolean>;
 }) {
-  const [name, setName, acceptName] = useTableViewState("property:new-name", ""),
+  const [name, setName] = useTableViewState("property:new-name", ""),
     [type, setType] = useTableViewState("property:new-type", "text"),
-    [source, setSource, acceptSource] = useTableViewState("property:new-source", "");
+    [source, setSource] = useTableViewState("property:new-source", "");
   return (
     <section className="table-settings">
       <h3>Properties</h3>
@@ -2266,12 +2313,7 @@ function PropertyEditor({
         onSubmit={(event) => {
           event.preventDefault();
           if (busy) return;
-          void command("create_column", { name, type, ...(type === "formula" ? { source } : {}) }).then((saved) => {
-            if (saved) {
-              acceptName("");
-              acceptSource("");
-            }
-          });
+          void command("create_column", { name, type, ...(type === "formula" ? { source } : {}) });
         }}
       >
         <input
@@ -2332,7 +2374,7 @@ function Property({
       `property:${column.id}:source`,
       null,
     ),
-    [option, setOption, acceptOption] = useTableViewState(`property:${column.id}:option`, ""),
+    [option, setOption] = useTableViewState(`property:${column.id}:option`, ""),
     [clearInvalid, setClearInvalid] = useTableViewState(
       `property:${column.id}:clear-invalid:${column.conversion?.id ?? ""}`,
       false,
@@ -2374,8 +2416,6 @@ function Property({
               columnId: column.id,
               name: nameDraft.value,
               revision: nameDraft.revision,
-            }).then((saved) => {
-              if (saved) acceptName(null);
             });
         }}
       />
@@ -2408,8 +2448,6 @@ function Property({
                 columnId: column.id,
                 revision: sourceDraft.revision,
                 source: sourceDraft.value,
-              }).then((saved) => {
-                if (saved) acceptSource(null);
               })
             }
           >
@@ -2474,9 +2512,7 @@ function Property({
           <button
             disabled={busy || !option}
             onClick={() => {
-              void command("add_option", { columnId: column.id, label: option }).then((saved) => {
-                if (saved) acceptOption("");
-              });
+              void command("add_option", { columnId: column.id, label: option });
             }}
           >
             Add option
