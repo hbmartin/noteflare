@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { Activity } from "react";
+import { Activity, Suspense, useLayoutEffect, useEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { CollaborativeColumn, TableCommand, TableQueryResult, TableView } from "../shared/table-protocol";
@@ -1635,6 +1635,8 @@ it("acknowledges view settings on saved Retry without clearing newer text", asyn
   fireEvent.click(retry);
   await waitFor(() => expect(writes).toHaveLength(2));
   await waitFor(() => expect(screen.queryByRole("button", { name: "Retry saved operation" })).toBeNull());
+  expect(screen.queryByLabelText("View name")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
   expect(screen.getByLabelText("View name")).toHaveValue("Newer settings");
   expect(writes[1]).toEqual(writes[0]);
 });
@@ -3884,64 +3886,79 @@ it.each(["queued", "in-flight", "returned-owner", "unmount"])(
 
 it.each(
   [false, true].flatMap((task) =>
-    ["cell_revision_conflict", "table_revision_required", "deletion_pending"].map((code) => ({ task, code })),
+    ["cell_revision_conflict", "table_revision_required", "deletion_pending"].flatMap((code) =>
+      [false, true].map((replace) => ({ task, code, replace })),
+    ),
   ),
-)("keeps $code recovery busy across search and reconnect; task $task", async ({ task, code }) => {
-  if (task) taskColumnFixture();
-  const module = await import("./linked-table-reads");
-  const createReads = module.linkedTableReads;
-  const handling = mutationGate();
-  let recoveryStarted = 0;
-  const readsSpy = vi.spyOn(module, "linkedTableReads").mockImplementation((options) => {
-    const reads = createReads(options);
-    return {
-      ...reads,
-      recover: async () => {
-        const result = await reads.recover();
-        recoveryStarted++;
-        await handling.promise;
-        return result;
-      },
-    };
-  });
-  const original = vi.mocked(api).getMockImplementation()!;
-  let mutationCount = 0;
-  vi.mocked(api).mockImplementation(async (path, init) => {
-    if (init?.method === "POST" && (path.endsWith("/commands") || path.endsWith("/tasks"))) {
-      mutationCount++;
-      if (mutationCount === 1) throw new ApiClientError(409, code, "Deletion is pending");
-      return { generation: 1, revision: 1, result: {} };
+)(
+  "keeps authorization separate from $code recovery busy; task $task, replace $replace",
+  async ({ task, code, replace }) => {
+    if (task) taskColumnFixture();
+    const original = vi.mocked(api).getMockImplementation()!;
+    const recovery = mutationGate(),
+      replacement = mutationGate();
+    let mutations = 0,
+      oldReads = 0,
+      newReads = 0;
+    let recoverySignal: AbortSignal | null | undefined;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (init?.method === "POST" && (path.endsWith("/commands") || path.endsWith("/tasks"))) {
+        mutations++;
+        throw new ApiClientError(409, code, "Deletion is pending");
+      }
+      if (mutations && !init?.method) {
+        if (path.includes("q=replacement")) {
+          newReads++;
+          await replacement.promise;
+        } else {
+          oldReads++;
+          recoverySignal = init?.signal;
+          await recovery.promise;
+        }
+      }
+      return original(path, init);
+    });
+    try {
+      render(activityMutationTree("visible", task));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+      fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Keep this draft" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+      await waitFor(() => expect(oldReads).toBe(1));
+      expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
+      if (replace) {
+        fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "replacement" } });
+        fireEvent.keyDown(screen.getByLabelText("Search table"), { key: "Enter" });
+      }
+      await waitFor(() => expect(newReads).toBe(replace ? 1 : 0));
+      expect(recoverySignal?.aborted).toBe(replace);
+      await waitFor(() =>
+        expect((screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled).toBe(!replace),
+      );
+      expect(screen.getByRole("button", { name: "Views" })).toBeDisabled();
+      const title = screen.queryByLabelText("New row title");
+      if (title) fireEvent.submit(title.closest("form")!);
+      expect(
+        screen.queryByRole("button", { name: "Add row" }) === null ||
+          (screen.getByRole("button", { name: "Add row" }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+      expect(mutations).toBe(1);
+      await act(async () => {
+        recovery.release();
+        replacement.release();
+      });
+      await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+      expect(screen.getByLabelText("New row title")).toHaveValue("Keep this draft");
+      expect(mutations).toBe(1);
+      expect(oldReads).toBe(1);
+      expect(newReads).toBe(replace ? 1 : 0);
+    } finally {
+      await act(async () => {
+        recovery.release();
+        replacement.release();
+      });
     }
-    return original(path, init);
-  });
-  try {
-    const view = render(activityMutationTree("visible", task));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
-    fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Keep this draft" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add row" }));
-    await waitFor(() => expect(recoveryStarted).toBe(1));
-    expect(screen.getByRole("button", { name: "Add row" })).toBeDisabled();
-    view.rerender(activityMutationTree("hidden", task));
-    view.rerender(activityMutationTree("visible", task));
-    fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "replacement" } });
-    await waitFor(() => expect(vi.mocked(api).mock.calls.some(([path]) => path.includes("q=replacement"))).toBe(true));
-    await act(async () => {});
-    expect(screen.getByRole("button", { name: "Add row" })).toBeDisabled();
-    expect(recoveryStarted).toBe(1);
-    const form = screen.getByLabelText("New row title").closest("form")!;
-    fireEvent.submit(form);
-    expect(screen.getByText("A save is already in progress. Wait for it to finish.")).toBeVisible();
-    expect(mutationCount).toBe(1);
-    await act(async () => handling.release());
-    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
-    expect(screen.queryByText("A save is already in progress. Wait for it to finish.")).toBeNull();
-    expect(screen.getByLabelText("New row title")).toHaveValue("Keep this draft");
-    expect(mutationCount).toBe(1);
-  } finally {
-    handling.release();
-    readsSpy.mockRestore();
-  }
-});
+  },
+);
 
 it.each([false, true])(
   "defers acknowledgement when the response resolves from layout suspension; task %s",
@@ -4102,3 +4119,254 @@ it.each([false, true])(
     }
   },
 );
+
+it.each(["add_option", "save_view", "delete_view"])("retains captured retry success actions for %s", async (kind) => {
+  const changed = vi.fn();
+  render(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "Retry probe" }}
+      member={member}
+      queryBase="/linked"
+      initialViewId="grid"
+      onSelectPage={vi.fn()}
+      onViewChanged={changed}
+    />,
+  );
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  if (kind === "add_option") {
+    fireEvent.click(screen.getByRole("button", { name: "Properties" }));
+    fireEvent.change(screen.getByLabelText("New option for State"), { target: { value: "Urgent" } });
+  } else {
+    fireEvent.click(screen.getByRole("button", { name: "Views" }));
+    if (kind === "save_view")
+      fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Saved settings" } });
+  }
+  failure = new TypeError("Lost response");
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: kind === "add_option" ? "Add option" : kind === "save_view" ? "Save view" : "Delete view",
+    }),
+  );
+  const retry = await screen.findByRole("button", { name: "Retry saved operation" });
+  await waitFor(() => expect(retry).toBeEnabled());
+  fireEvent.click(retry);
+  await waitFor(() => expect(writes).toHaveLength(2));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
+  expect(writes[1]).toEqual(writes[0]);
+  expect((screen.queryByLabelText("New option for State") as HTMLInputElement | null)?.value).toBe(
+    kind === "add_option" ? "" : undefined,
+  );
+  expect(screen.queryByLabelText("View name")).toBeNull();
+  expect(changed.mock.calls).toEqual(kind === "delete_view" ? [[""]] : []);
+  expect(vi.mocked(api).mock.calls.at(-1)?.[0].includes("viewId=grid")).toBe(kind !== "delete_view");
+});
+
+it("resets the deleted view after an applied search change", async () => {
+  const changed = vi.fn();
+  render(
+    <CollaborativeTablePage
+      page={{ id: "table", title: "Delete probe" }}
+      member={member}
+      queryBase="/linked"
+      initialViewId="grid"
+      onSelectPage={vi.fn()}
+      onViewChanged={changed}
+    />,
+  );
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  const release = delayNextCommand();
+  fireEvent.click(screen.getByRole("button", { name: "Delete view" }));
+  await waitFor(() => expect(writes).toHaveLength(1));
+  fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "needle" } });
+  fireEvent.keyDown(screen.getByLabelText("Search table"), { key: "Enter" });
+  await waitFor(() => expect(vi.mocked(api).mock.calls.some(([path]) => path.includes("q=needle"))).toBe(true));
+  vi.mocked(api).mockClear();
+  await act(async () => release());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
+  expect(data.views.some((view) => view.id === "grid")).toBe(false);
+  expect(changed).toHaveBeenCalledExactlyOnceWith("");
+  const paths = vi.mocked(api).mock.calls.map(([path]) => path);
+  expect(new URL(paths.at(-1)!, "https://test").searchParams.get("q")).toBeNull();
+  expect(paths.at(-1)).not.toContain("viewId=grid");
+});
+
+it("mismatched account retirement rejects old completion despite active presentation", async () => {
+  const access = await import("./realtime-access-status");
+  const cache = await import("./table-view-state");
+  const ack = vi.spyOn(cache, "acknowledgeTableViewSubmission");
+  const response = mutationGate();
+  await act(async () => access.setRealtimeAccessAccount("owner\0workspace"));
+  const original = vi.mocked(api).getMockImplementation()!;
+  let count = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method === "POST" && path.endsWith("/commands")) {
+      count++;
+      await response.promise;
+      return { generation: 1, revision: 1, result: {} };
+    }
+    return original(path, init);
+  });
+  try {
+    render(activityMutationTree("visible"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Old owner" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+    await waitFor(() => expect(count).toBe(1));
+    await act(async () => access.setRealtimeAccessAccount("replacement\0workspace"));
+    await act(async () => response.release());
+    expect(ack).not.toHaveBeenCalled();
+    expect(screen.queryByText("Saved. Refreshing the latest table data…")).toBeNull();
+  } finally {
+    ack.mockRestore();
+    await act(async () => {
+      response.release();
+      access.setRealtimeAccessAccount("");
+    });
+  }
+});
+
+it.each([false, true].flatMap((task) => [false, true].map((conflict) => ({ task, conflict }))))(
+  "replays a layout-only Suspense outcome once; task $task, conflict $conflict",
+  async ({ task, conflict }) => {
+    if (task) taskColumnFixture();
+    const response = mutationGate(),
+      suspension = mutationGate(),
+      authorization = mutationGate();
+    const trace: string[] = [];
+    let suspended = false,
+      mutationCount = 0,
+      settled = false,
+      reads = 0;
+    const original = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (init?.method === "POST" && (path.endsWith("/commands") || path.endsWith("/tasks"))) {
+        mutationCount++;
+        await response.promise;
+        settled = true;
+        if (conflict) throw new ApiClientError(409, "cell_revision_conflict", "Cell changed");
+        data.revision = 2;
+        return { generation: 1, revision: 2, result: {} };
+      }
+      if (settled && !init?.method) {
+        reads++;
+        await authorization.promise;
+      }
+      return original(path, init);
+    });
+    function Tracker() {
+      useLayoutEffect(() => {
+        trace.push("layout-on");
+        return () => {
+          trace.push("layout-off");
+        };
+      }, []);
+      useEffect(() => {
+        trace.push("passive-on");
+        return () => {
+          trace.push("passive-off");
+        };
+      }, []);
+      return null;
+    }
+    function Blocker() {
+      if (suspended) throw suspension.promise;
+      return null;
+    }
+    const tree = () => (
+      <Suspense fallback={<p>Boundary waiting</p>}>
+        <Tracker />
+        <CollaborativeTablePage
+          page={{ id: "table", title: "Suspense", taskList: task }}
+          member={member}
+          queryBase="/linked"
+          onSelectPage={vi.fn()}
+        />
+        <Blocker />
+      </Suspense>
+    );
+    const view = render(tree());
+    try {
+      await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+      fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Submitted" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+      await waitFor(() => expect(mutationCount).toBe(1));
+      suspended = true;
+      view.rerender(tree());
+      expect(trace).toEqual(["layout-on", "passive-on", "layout-off"]);
+      await act(async () => response.release());
+      expect(screen.getByLabelText("New row title")).toHaveValue("Submitted");
+      expect(screen.queryByRole("alert", { hidden: true })).toBeNull();
+      suspended = false;
+      await act(async () => {
+        suspension.release();
+        view.rerender(tree());
+      });
+      expect(trace).toEqual(["layout-on", "passive-on", "layout-off", "layout-on"]);
+      await waitFor(() => expect(reads).toBe(1));
+      expect(screen.getByRole("button", { name: "Views" })).toBeDisabled();
+      await act(async () => authorization.release());
+      await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+      expect(screen.queryByText("A save is already in progress. Wait for it to finish.")).toBeNull();
+      expect(screen.getByLabelText("New row title")).toHaveValue(conflict ? "Submitted" : "");
+      expect(mutationCount).toBe(1);
+      expect(reads).toBe(1);
+    } finally {
+      await act(async () => {
+        response.release();
+        suspension.release();
+        authorization.release();
+      });
+    }
+  },
+);
+
+it("retains newer option text when a saved retry acknowledges the original snapshot", async () => {
+  show("grid");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Properties" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Properties" }));
+  fireEvent.change(screen.getByLabelText("New option for State"), { target: { value: "Submitted" } });
+  failure = new TypeError("Lost response");
+  fireEvent.click(screen.getByRole("button", { name: "Add option" }));
+  const retry = await screen.findByRole("button", { name: "Retry saved operation" });
+  await waitFor(() => expect(retry).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("New option for State"), { target: { value: "Newer option" } });
+  fireEvent.click(retry);
+  await waitFor(() => expect(writes).toHaveLength(2));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Properties" })).toBeEnabled());
+  expect(writes[1]).toEqual(writes[0]);
+  expect(screen.getByLabelText("New option for State")).toHaveValue("Newer option");
+});
+
+it.each(["month", "different-view"])("completes view deletion after a %s change", async (change) => {
+  const changed = vi.fn();
+  const tree = (initialViewId: string) => (
+    <CollaborativeTablePage
+      page={{ id: "table", title: "Deletion" }}
+      member={member}
+      queryBase="/linked"
+      initialViewId={initialViewId}
+      onSelectPage={vi.fn()}
+      onViewChanged={changed}
+    />
+  );
+  const view = render(tree("calendar"));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Views" }));
+  const release = delayNextCommand();
+  fireEvent.click(screen.getByRole("button", { name: "Delete view" }));
+  await waitFor(() => expect(writes).toHaveLength(1));
+  if (change === "month") fireEvent.change(screen.getByLabelText("Calendar month"), { target: { value: "2030-02" } });
+  else view.rerender(tree("board"));
+  await waitFor(() =>
+    expect(
+      vi.mocked(api).mock.calls.some(([path]) => path.includes(change === "month" ? "month=2030-02" : "viewId=board")),
+    ).toBe(true),
+  );
+  await act(async () => release());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  expect(writes).toHaveLength(1);
+  expect(changed.mock.calls).toEqual(change === "month" ? [[""]] : []);
+  const query = new URL(vi.mocked(api).mock.calls.at(-1)![0], "https://test").searchParams;
+  expect(query.get("viewId")).toBe(change === "month" ? null : "board");
+});
