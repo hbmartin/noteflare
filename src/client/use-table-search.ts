@@ -38,8 +38,8 @@ function createSearch(context: object, value: string) {
     if (!connected || deadline === undefined || snapshot.query === snapshot.draft) return;
     const expected = snapshot;
     const connection = lifetime;
-    if (deadline <= Date.now()) apply(expected, connection);
-    else timer = setTimeout(() => apply(expected, connection), deadline - Date.now());
+    if (deadline <= performance.now()) apply(expected, connection);
+    else timer = setTimeout(() => apply(expected, connection), deadline - performance.now());
   };
   return {
     snapshot: () => snapshot,
@@ -69,7 +69,7 @@ function createSearch(context: object, value: string) {
       cancel();
       // A newer input supersedes an application that React has not committed yet.
       const expected = { ...snapshot, version: snapshot.version + 1, draft, query: committed };
-      deadline = draft === expected.query ? undefined : Date.now() + 250;
+      deadline = draft === expected.query ? undefined : performance.now() + 250;
       publish(expected);
       if (draft === snapshot.query) return true;
       if (draft === "") apply(expected);

@@ -171,3 +171,36 @@ it("uses the same pending policy after each commit and fails closed for retired 
   agrees();
   expect(retired()).toBe(true);
 });
+
+it.each([-60_000, 60_000])("keeps the remaining quiet period despite a %s ms wall-clock step", async (step) => {
+  const f = fixture();
+  await act(async () => f.current().change("needle"));
+  await advance(100);
+  f.mode("hidden");
+  vi.setSystemTime(Date.now() + step);
+  await advance(50);
+  f.mode("visible");
+  await advance(99);
+  expect(f.queries).toEqual([""]);
+  expect(f.current().pendingNow()).toBe(true);
+  await advance(1);
+  expect(f.queries).toEqual(["", "needle"]);
+  expect(f.current().pendingNow()).toBe(false);
+  f.mode("hidden");
+  vi.setSystemTime(Date.now() - 2 * step);
+  await advance(1000);
+  f.mode("visible");
+  expect(f.queries).toEqual(["", "needle"]);
+});
+it("rejects disconnected input while the imperative liveness guard fails closed", async () => {
+  const f = fixture();
+  const disconnected = f.current();
+  expect(disconnected.pending).toBe(false);
+  f.mode("hidden");
+  await act(async () => disconnected.compositionEnd("Late text"));
+  expect(disconnected.pendingNow()).toBe(true);
+  f.mode("visible");
+  await advance(1000);
+  expect(f.queries).toEqual([""]);
+  expect(f.current().pendingNow()).toBe(false);
+});
