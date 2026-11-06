@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 
 test.use({ serviceWorkers: "block" });
+test.skip(Boolean(process.env.NOTES_E2E_BASE_URL), "Requires the local Vite Activity harness.");
 const fixture = {
   protocolVersion: 1,
   pageId: "activity",

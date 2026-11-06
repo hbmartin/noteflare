@@ -114,16 +114,25 @@ owner replacement retires and clears the old cache. An unmounted cache remains
 inactive and can be garbage collected with its component.
 
 Mutation ownership is independent of effect connectivity. Each owner-scoped
-operation has an identity token, an in-flight flag and at most one deferred
-terminal outcome. Settlement releases only the matching token's in-flight state.
-Disconnected completion defers presentation until the same owner reconnects,
-after cache activation and before allowing new mutations. The original caller
-receives its reconciled result, preserving captured success actions such as
-closing settings. Success acknowledges
-only the captured form snapshot and requires current authorized commit coverage;
-rejections retain their original operation identity and manual retry behavior.
-Owner replacement discards deferred presentation. A retired operation cannot clear
-a newer operation's busy state, including after returning to an earlier owner.
+operation tracks network settlement, outcome handling and at most one plain-data
+terminal outcome. Presentation activates and suspends in the same layout effect
+as its private view cache. Query/load effects do not change that connectivity.
+A disconnected response settles its caller immediately with a suspended result;
+it does not leave a promise waiting for reconnection or final unmount. Boolean
+command consumers receive no successful completion while suspended. Captured
+acknowledgements and explicit success actions run once after cache activation and
+read-coordinator reconnection. They do not resend the mutation.
+
+The matching operation stays busy through connected outcome handling, including
+awaited rejection recovery. Query changes cannot release it. Finalization clears
+only that operation's busy state and matching busy message. Success acknowledges
+only submitted snapshots, preserves newer drafts and requires current authorized
+commit coverage before another mutation. Owner replacement discards retained
+presentation outcomes. Final unmount leaves no reconnect-dependent caller;
+private data can be garbage collected, without an immediate-erasure guarantee.
+A retired operation cannot clear a newer operation's state, including after
+returning to an earlier owner. Ordinary tab visibility is separate from React
+effect disconnection.
 
 Mutation rejection notices are immediate and retain review guidance without
 promising an automatic mutation retry or completed recovery. Known conflict,

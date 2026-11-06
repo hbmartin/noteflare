@@ -3718,7 +3718,7 @@ it.each(
     await waitFor(() => expect(bodies).toHaveLength(1));
     view.rerender(activityMutationTree("hidden", task));
     if (settlement === "hidden") await act(async () => mutation.release());
-    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("alert", { hidden: true })).toBeNull();
     guardReads = true;
     view.rerender(activityMutationTree("visible", task));
     if (settlement === "reconnected") await act(async () => mutation.release());
@@ -3879,5 +3879,226 @@ it.each(["queued", "in-flight", "returned-owner", "unmount"])(
     expect(screen.getByLabelText("New row title")).toHaveValue("New owner submission");
     await act(async () => second.release());
     await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+  },
+);
+
+it.each(
+  [false, true].flatMap((task) =>
+    ["cell_revision_conflict", "table_revision_required", "deletion_pending"].map((code) => ({ task, code })),
+  ),
+)("keeps $code recovery busy across search and reconnect; task $task", async ({ task, code }) => {
+  if (task) taskColumnFixture();
+  const module = await import("./linked-table-reads");
+  const createReads = module.linkedTableReads;
+  const handling = mutationGate();
+  let recoveryStarted = 0;
+  const readsSpy = vi.spyOn(module, "linkedTableReads").mockImplementation((options) => {
+    const reads = createReads(options);
+    return {
+      ...reads,
+      recover: async () => {
+        const result = await reads.recover();
+        recoveryStarted++;
+        await handling.promise;
+        return result;
+      },
+    };
+  });
+  const original = vi.mocked(api).getMockImplementation()!;
+  let mutationCount = 0;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method === "POST" && (path.endsWith("/commands") || path.endsWith("/tasks"))) {
+      mutationCount++;
+      if (mutationCount === 1) throw new ApiClientError(409, code, "Deletion is pending");
+      return { generation: 1, revision: 1, result: {} };
+    }
+    return original(path, init);
+  });
+  try {
+    const view = render(activityMutationTree("visible", task));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+    await waitFor(() => expect(recoveryStarted).toBe(1));
+    expect(screen.getByRole("button", { name: "Add row" })).toBeDisabled();
+    view.rerender(activityMutationTree("hidden", task));
+    view.rerender(activityMutationTree("visible", task));
+    fireEvent.change(screen.getByLabelText("Search table"), { target: { value: "replacement" } });
+    await waitFor(() => expect(vi.mocked(api).mock.calls.some(([path]) => path.includes("q=replacement"))).toBe(true));
+    await act(async () => {});
+    expect(screen.getByRole("button", { name: "Add row" })).toBeDisabled();
+    expect(recoveryStarted).toBe(1);
+    const form = screen.getByLabelText("New row title").closest("form")!;
+    fireEvent.submit(form);
+    expect(screen.getByText("A save is already in progress. Wait for it to finish.")).toBeVisible();
+    expect(mutationCount).toBe(1);
+    await act(async () => handling.release());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+    expect(screen.queryByText("A save is already in progress. Wait for it to finish.")).toBeNull();
+    expect(screen.getByLabelText("New row title")).toHaveValue("Keep this draft");
+    expect(mutationCount).toBe(1);
+  } finally {
+    handling.release();
+    readsSpy.mockRestore();
+  }
+});
+
+it.each([false, true])(
+  "defers acknowledgement when the response resolves from layout suspension; task %s",
+  async (task) => {
+    if (task) taskColumnFixture();
+    const cacheModule = await import("./table-view-state");
+    const createCache = cacheModule.createTableViewCache;
+    const response = mutationGate();
+    let capturedCache: ReturnType<typeof createCache> | undefined;
+    const trace: string[] = [];
+    const cacheSpy = vi.spyOn(cacheModule, "createTableViewCache").mockImplementation(() => {
+      const cache = createCache();
+      capturedCache = cache;
+      return {
+        ...cache,
+        suspend: () => {
+          cache.suspend();
+          trace.push("layout-suspended");
+          response.release();
+        },
+      };
+    });
+    const acknowledge = cacheModule.acknowledgeTableViewSubmission;
+    const ackSpy = vi.spyOn(cacheModule, "acknowledgeTableViewSubmission").mockImplementation((submission, value) => {
+      if (submission) trace.push(submission.state.lifetime.active ? "active-ack" : "inactive-ack");
+      acknowledge(submission, value);
+    });
+    const original = vi.mocked(api).getMockImplementation()!;
+    let mutationCount = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (init?.method === "POST" && (path.endsWith("/commands") || path.endsWith("/tasks"))) {
+        mutationCount++;
+        await response.promise;
+        trace.push("response-resolved");
+        return { generation: 1, revision: 1, result: {} };
+      }
+      return original(path, init);
+    });
+    try {
+      const view = render(activityMutationTree("visible", task));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+      fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Captured title" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+      await waitFor(() => expect(mutationCount).toBe(1));
+      view.rerender(activityMutationTree("hidden", task));
+      await act(async () => {});
+      expect(trace).toEqual(["layout-suspended", "response-resolved"]);
+      expect(capturedCache?.view("").snapshot("title", "").value).toBe("Captured title");
+      expect(screen.queryByRole("alert", { hidden: true })).toBeNull();
+      view.rerender(activityMutationTree("visible", task));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+      expect(screen.getByLabelText("New row title")).toHaveValue("");
+      expect(trace).toContain("active-ack");
+      expect(trace).not.toContain("inactive-ack");
+      expect(mutationCount).toBe(1);
+    } finally {
+      response.release();
+      cacheSpy.mockRestore();
+      ackSpy.mockRestore();
+    }
+  },
+);
+
+it.each([false, true])(
+  "clears a matching busy message after deferred failure even when every read fails; task %s",
+  async (task) => {
+    if (task) taskColumnFixture();
+    const response = mutationGate();
+    const original = vi.mocked(api).getMockImplementation()!;
+    let mutationCount = 0;
+    let failReads = false;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (init?.method === "POST" && (path.endsWith("/commands") || path.endsWith("/tasks"))) {
+        mutationCount++;
+        await response.promise;
+        throw new TypeError("Lost response");
+      }
+      if (failReads) throw new TypeError("Unavailable read");
+      return original(path, init);
+    });
+    const view = render(activityMutationTree("visible", task));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Retain this title" } });
+    const form = screen.getByLabelText("New row title").closest("form")!;
+    fireEvent.submit(form);
+    await waitFor(() => expect(mutationCount).toBe(1));
+    fireEvent.submit(form);
+    expect(screen.getByText("A save is already in progress. Wait for it to finish.")).toBeVisible();
+    view.rerender(activityMutationTree("hidden", task));
+    await act(async () => response.release());
+    failReads = true;
+    view.rerender(activityMutationTree("visible", task));
+    await screen.findByRole("button", { name: "Retry saved operation" });
+    expect(screen.queryByText("A save is already in progress. Wait for it to finish.")).toBeNull();
+    expect(mutationCount).toBe(1);
+  },
+);
+
+it.each(["property", "option"].flatMap((kind) => [false, true].map((newer) => ({ kind, newer }))))(
+  "replays captured $kind acknowledgements after suspension; newer $newer",
+  async ({ kind, newer }) => {
+    const view = render(activityMutationTree("visible"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Properties" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Properties" }));
+    const label = kind === "property" ? "New property name" : "New option for State";
+    fireEvent.change(screen.getByLabelText(label), { target: { value: "Submitted setting" } });
+    const release = delayNextCommand();
+    fireEvent.click(screen.getByRole("button", { name: kind === "property" ? "Add property" : "Add option" }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    if (newer) fireEvent.change(screen.getByLabelText(label), { target: { value: "Newer setting" } });
+    view.rerender(activityMutationTree("hidden"));
+    await act(async () => release());
+    view.rerender(activityMutationTree("visible"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Properties" })).toBeEnabled());
+    expect(screen.getByLabelText(label)).toHaveValue(newer ? "Newer setting" : "");
+    expect(writes).toHaveLength(1);
+  },
+);
+
+it.each([false, true])(
+  "preserves timeout fallback while normalizing a disconnected API failure; task %s",
+  async (task) => {
+    if (task) taskColumnFixture();
+    const original = vi.mocked(api).getMockImplementation()!;
+    const response = mutationGate();
+    let mutationCount = 0;
+    let holdReads = false;
+    const readGate = mutationGate();
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (init?.method === "POST" && (path.endsWith("/commands") || path.endsWith("/tasks"))) {
+        mutationCount++;
+        await response.promise;
+        throw new ApiClientError(503, "storage_unavailable", "Internal timeout detail", false, {
+          cause: new DOMException("Expired", "TimeoutError"),
+        });
+      }
+      if (holdReads && !init?.method) await readGate.promise;
+      return original(path, init);
+    });
+    const view = render(activityMutationTree("visible", task));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+    await waitFor(() => expect(mutationCount).toBe(1));
+    view.rerender(activityMutationTree("hidden", task));
+    await act(async () => response.release());
+    holdReads = true;
+    view.rerender(activityMutationTree("visible", task));
+    await screen.findByRole("button", { name: "Retry saved operation" });
+    try {
+      expect(screen.getByRole("alert")).not.toHaveTextContent("Internal timeout detail");
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        task ? "The task could not be saved." : "The table update could not be saved.",
+      );
+      expect(mutationCount).toBe(1);
+    } finally {
+      await act(async () => readGate.release());
+    }
   },
 );
