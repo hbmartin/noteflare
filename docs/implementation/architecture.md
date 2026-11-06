@@ -121,11 +121,18 @@ A disconnected response settles its caller immediately with a suspended result;
 it does not leave a promise waiting for reconnection or final unmount. Boolean
 command consumers receive no successful completion while suspended. Captured
 acknowledgements and explicit success actions run once after cache activation and
-read-coordinator reconnection. They do not resend the mutation.
+installation of the same owner's read coordinator. Layout reconnection and
+coordinator attachment both attempt replay, consuming an outcome only when all
+prerequisites match. Suspense can disconnect layout effects while leaving passive
+effects mounted; replay does not require passive effects to reconnect. Activity
+also disconnects the passive coordinator. Neither path resends the mutation.
 
 The matching operation stays busy through connected outcome handling, including
-awaited rejection recovery. Query changes cannot release it. Finalization clears
-only that operation's busy state and matching busy message. Success acknowledges
+awaited rejection recovery. A query reset retires the obsolete recovery receipt
+and allows handling to finish. Busy then clears and Refresh is available, while
+saving remains blocked until the replacement query has current authorization and
+required coverage. Finalization clears only the matching operation's busy state
+and busy message. Success acknowledges
 only submitted snapshots, preserves newer drafts and requires current authorized
 commit coverage before another mutation. Owner replacement discards retained
 presentation outcomes. Final unmount leaves no reconnect-dependent caller;
@@ -133,6 +140,14 @@ private data can be garbage collected, without an immediate-erasure guarantee.
 A retired operation cannot clear a newer operation's state, including after
 returning to an earlier owner. Ordinary tab visibility is separate from React
 effect disconnection.
+
+Manual retry retains the exact request, operation ID and captured success intent.
+Each form/property caller owns its acknowledgement snapshots. Retrying a view save
+can close only its captured panel state; retrying an option save cannot erase newer
+input. View deletion resets selection only if the same owner still selects that
+view, regardless of search/month changes. Confirmed task writes whose presentation
+owner retired return saved/committed-retired without applying presentation actions.
+Normalized outcomes retain classification and timeout fallback, not exception chains.
 
 Mutation rejection notices are immediate and retain review guidance without
 promising an automatic mutation retry or completed recovery. Known conflict,

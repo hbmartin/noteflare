@@ -103,38 +103,43 @@ test("@table-activity synthetic late composition is rejected and pending text re
   await expect(page.getByRole("button", { name: "Views", exact: true })).toBeEnabled();
 });
 
-test("@table-activity a held successful mutation clears its submitted form after reconnection", async ({ page }) => {
-  await openHarness(page);
-  let release!: () => void,
-    started = 0,
-    revision = 1;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
+for (const mode of ["effects", "suspense"])
+  test(`@table-activity @table-suspense a held successful mutation clears its form after ${mode} reconnection`, async ({
+    page,
+  }) => {
+    await openHarness(page);
+    let release!: () => void,
+      started = 0,
+      revision = 1;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route("**/api/activity-table**", async (route) => {
+      if (route.request().method() === "POST") {
+        started++;
+        await gate;
+        revision = 2;
+        await route.fulfill({ json: { generation: 1, revision, result: {} } });
+      } else await route.fulfill({ json: { ...fixture, revision, projectedRevision: revision } });
+    });
+    await page.getByLabel("New row title").fill("Submitted while visible");
+    await page.getByRole("button", { name: "Add row", exact: true }).click();
+    await expect.poll(() => started).toBe(1);
+    await page.getByRole("button", { name: `Toggle ${mode}` }).click();
+    await expect(page.locator("html")).toHaveAttribute("data-effects", "disconnected");
+    const finished = page.waitForEvent("requestfinished", (request) =>
+      request.url().endsWith("/api/activity-table/commands"),
+    );
+    release();
+    const request = await finished;
+    expect((await request.response())?.ok()).toBe(true);
+    await page.getByRole("button", { name: `Toggle ${mode}` }).click();
+    await expect(page.getByRole("button", { name: "Add row", exact: true })).toBeEnabled();
+    await expect(page.getByLabel("New row title")).toHaveValue("");
+    await page.getByRole("button", { name: `Toggle ${mode}` }).click();
+    await page.getByRole("button", { name: `Toggle ${mode}` }).click();
+    await expect(page.getByRole("button", { name: "Views", exact: true })).toBeEnabled();
+    expect(started).toBe(1);
+    await expect(page.locator("html")).toHaveAttribute("data-passive-connects", mode === "suspense" ? "1" : "3");
+    if (mode === "suspense") await expect(page.locator("html")).not.toHaveAttribute("data-passive-disconnects");
   });
-  await page.route("**/api/activity-table**", async (route) => {
-    if (route.request().method() === "POST") {
-      started++;
-      await gate;
-      revision = 2;
-      await route.fulfill({ json: { generation: 1, revision, result: {} } });
-    } else await route.fulfill({ json: { ...fixture, revision, projectedRevision: revision } });
-  });
-  await page.getByLabel("New row title").fill("Submitted while visible");
-  await page.getByRole("button", { name: "Add row", exact: true }).click();
-  await expect.poll(() => started).toBe(1);
-  await page.getByRole("button", { name: "Toggle effects" }).click();
-  await expect(page.locator("html")).toHaveAttribute("data-effects", "disconnected");
-  const finished = page.waitForEvent("requestfinished", (request) =>
-    request.url().endsWith("/api/activity-table/commands"),
-  );
-  release();
-  const request = await finished;
-  expect((await request.response())?.ok()).toBe(true);
-  await page.getByRole("button", { name: "Toggle effects" }).click();
-  await expect(page.getByRole("button", { name: "Add row", exact: true })).toBeEnabled();
-  await expect(page.getByLabel("New row title")).toHaveValue("");
-  await page.getByRole("button", { name: "Toggle effects" }).click();
-  await page.getByRole("button", { name: "Toggle effects" }).click();
-  await expect(page.getByRole("button", { name: "Views", exact: true })).toBeEnabled();
-  expect(started).toBe(1);
-});

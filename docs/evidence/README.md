@@ -24,6 +24,7 @@ Dated test and review records preserve the revision, environment, and limits of 
 - [PR #291 follow-up search reconnection and saved-refresh feedback](PR291_FOLLOW_UP.md)
 - [PR #292 follow-up suspended mutations and rejection guidance](PR292_FOLLOW_UP.md)
 - [PR #293 follow-up mutation presentation lifetime](PR293_FOLLOW_UP.md)
+- [PR #294 follow-up replay prerequisites and retained retry actions](PR294_FOLLOW_UP.md)
 - [Documentation and release audit: 12 October 2026](documentation-audit-2026-10-12.md)
 
 - [One-click deployment verification](ONE_CLICK_DEPLOYMENT_VERIFICATION.md): prepared flow, disposable installation and redeployment, and the unresolved native-form release gate.

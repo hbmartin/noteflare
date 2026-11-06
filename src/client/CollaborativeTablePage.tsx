@@ -9,8 +9,8 @@ import {
 import { CellDraftPersistenceRetry } from "./CellDraftPersistenceRetry";
 import { useOnlineStatus } from "./online-status";
 import { useTableSearch } from "./use-table-search";
-import { settleTableMutation } from "./table-mutation-lifecycle";
-import { tablePermissionCodes } from "./notice-text";
+import { settleTableMutation, connectedMutationReads, taskMutationCompletion } from "./table-mutation-lifecycle";
+import { isTablePermissionCode } from "./table-access";
 import { tableMutationNotice } from "./table-mutation-notice";
 import { RelationPanel } from "./RelationPanel";
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -105,13 +105,15 @@ type MutationOutcome =
   | { kind: "success"; coverage?: TableCoverage; message?: string }
   | { kind: "failure"; error?: { status: number; code: string; message: string; fallback: boolean; notSent: boolean } };
 type MutationResult = "committed" | "rejected" | "uncertain" | "suspended" | "retired";
+type MutationSuccessIntent = {
+  acknowledgements?: Array<TableViewSubmission | undefined>;
+  closePanel?: TableViewSubmission;
+  deletedViewId?: string;
+};
 type MutationRun = {
   operation: MutationNotice;
   phase: "network" | "handling" | "settled";
   request: SavedRetry;
-  acknowledgements: TableViewSubmission[];
-  closePanel?: TableViewSubmission;
-  resetView?: string;
   outcome?: MutationOutcome;
 };
 function mutationFailure(cause: unknown): MutationOutcome {
@@ -133,7 +135,7 @@ function mutationFailure(cause: unknown): MutationOutcome {
 type SavedRetry = {
   owner: TableOwner;
   submission?: CellDraftSubmission;
-  form?: TableViewSubmission;
+  success: MutationSuccessIntent;
   message: string;
 } & ({ kind: "command"; command: TableCommand } | { kind: "task"; body: Record<string, unknown>; rowId?: string });
 const busyMessage = "A save is already in progress. Wait for it to finish.";
@@ -145,7 +147,7 @@ function accessFailure(cause: unknown, fromRead: boolean): "denied" | "verify" |
   if (cause.status === 401) return "denied";
   if (cause.status !== 403) return "other";
   if (["table_forbidden", "forbidden"].includes(cause.code)) return "denied";
-  if (tablePermissionCodes.has(cause.code)) return "verify";
+  if (isTablePermissionCode(cause.code)) return "verify";
   return fromRead ? "denied" : "verify";
 }
 type CellDraftSubmission = {
@@ -225,6 +227,11 @@ export function CollaborativeTablePage({
   const canonicalPrefix = useRef({ id: 0, window: null as TableReadWindow | null });
   const connectionPermit = useRef<() => boolean>(() => true);
   const mutationRun = useRef<MutationRun | null>(null);
+  const mutationHandlers = useRef({
+    connect: () => {},
+    replay: () => {},
+    apply: async (_run: MutationRun): Promise<MutationResult> => "suspended",
+  });
   const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
   const noticeSequence = useRef(0);
@@ -244,6 +251,10 @@ export function CollaborativeTablePage({
   const linkedWindow = useRef<TableReadWindow | null>(null);
   const [readSnapshot, setReadSnapshot] = useState<TableReadWindow | null>(null);
   const linkedReads = useRef<ReturnType<typeof linkedTableReads<TableQueryResult>> | null>(null);
+  const mutationCoordinator = useRef<{
+    owner: TableOwner;
+    reads: NonNullable<typeof linkedReads.current>;
+  } | null>(null);
   const publishLinkedWindow = useCallback((value: TableReadWindow | null) => {
     linkedWindow.current = value;
     setReadSnapshot(value);
@@ -667,10 +678,14 @@ export function CollaborativeTablePage({
     }
     const permit = connection?.authorized ?? (() => linkedWindow.current?.verified === true);
     connectionPermit.current = permit;
+    const coordinator = { owner: currentOwner, reads };
+    mutationCoordinator.current = coordinator;
+    mutationHandlers.current.replay();
     return () => {
+      if (mutationCoordinator.current === coordinator) mutationCoordinator.current = null;
       connection?.();
       if (connectionPermit.current === permit) connectionPermit.current = () => false;
-      linkedReads.current = null;
+      if (linkedReads.current === reads) linkedReads.current = null;
       retireVerification("retire");
       unsubscribe();
       reads.dispose();
@@ -750,20 +765,10 @@ export function CollaborativeTablePage({
     return unsubscribe;
   }, [notice]);
   const retryOwner = currentOwner;
-  const beginMutation = (
-    request: SavedRetry,
-    operationId: string,
-    target: string,
-    acknowledgements: TableViewSubmission[] = [],
-    closePanel?: TableViewSubmission,
-    resetView?: string,
-  ): MutationRun => {
+  const beginMutation = (request: SavedRetry, operationId: string, target: string): MutationRun => {
     const run: MutationRun = {
       phase: "network",
       request,
-      acknowledgements,
-      closePanel,
-      resetView,
       operation: {
         sequence: ++noticeSequence.current,
         owner: retryOwner,
@@ -791,11 +796,9 @@ export function CollaborativeTablePage({
   const completeMutation = (
     operation: MutationNotice,
     result: unknown,
-    form?: TableViewSubmission,
+    reads: NonNullable<typeof linkedReads.current>,
     message?: string,
-  ): MutationCompletion => {
-    if (!active.current || !sameTableOwner(operation.owner, retryLifetime.current)) return "committed-retired";
-    acknowledgeTableViewSubmission(form);
+  ) => {
     resolveMutation(operation);
     setSaveExplanation(message ? { ...operation, message } : null);
     setSaveRefreshStatus("Saved. Refreshing the latest table data…");
@@ -804,8 +807,6 @@ export function CollaborativeTablePage({
     commitRequirement.current = commit;
     setCommitNeedsCoverage(true);
     settleVerification(ownership.current.applied);
-    const reads = linkedReads.current;
-    if (!reads) return "committed-current";
     const changedGeneration = Boolean(coverage && coverage.generation !== ownership.current.generation);
     advanceGeneration(coverage);
     if (changedGeneration) retireVerification("invalidate");
@@ -815,22 +816,29 @@ export function CollaborativeTablePage({
       if (receipt.state === "failure" || receipt.state === "denied")
         reportRefreshFailure(commit, receipt.state === "denied");
     });
-    return "committed-current";
   };
   const applyMutation = async (run: MutationRun): Promise<MutationResult> => {
     if (!ownsMutation(run)) return "retired";
-    if (!active.current) return "suspended";
+    const reads = connectedMutationReads(
+      active.current,
+      viewState.lifetime.active,
+      run.operation.owner,
+      mutationCoordinator.current,
+      linkedReads.current,
+      sameTableOwner,
+    );
+    if (!reads) return "suspended";
     const outcome = run.outcome!;
     delete run.outcome;
     run.phase = "handling";
     try {
       const { operation, request } = run;
       if (outcome.kind === "success") {
-        for (const acknowledgement of run.acknowledgements) acknowledgeTableViewSubmission(acknowledgement);
-        const completion = completeMutation(operation, outcome.coverage, request.form, outcome.message);
-        if (completion !== "committed-current") return "retired";
-        acknowledgeTableViewSubmission(run.closePanel);
-        if (run.resetView !== undefined && queryOwner.current.queryIdentity === run.resetView) {
+        const { success } = request;
+        for (const acknowledgement of success.acknowledgements ?? []) acknowledgeTableViewSubmission(acknowledgement);
+        completeMutation(operation, outcome.coverage, reads, outcome.message);
+        acknowledgeTableViewSubmission(success.closePanel);
+        if (success.deletedViewId !== undefined && viewId === success.deletedViewId) {
           setViewId("");
           onViewChanged?.("");
         }
@@ -862,7 +870,7 @@ export function CollaborativeTablePage({
           retireVerification("invalidate");
         }
         reportMutation(operation, tableMutationNotice(cause, task));
-        await linkedReads.current?.recover();
+        await reads.recover();
       }
       return "rejected";
     } finally {
@@ -870,11 +878,13 @@ export function CollaborativeTablePage({
     }
   };
   const settleMutation = (run: MutationRun, outcome: MutationOutcome): Promise<MutationResult> => {
-    return settleTableMutation(run, outcome, ownsMutation(run), active.current, () => applyMutation(run));
+    return settleTableMutation(run, outcome, ownsMutation(run), active.current, () =>
+      mutationHandlers.current.apply(run),
+    );
   };
-  const mutationHandlers = useRef({ connect: () => {}, replay: () => {} });
   useLayoutEffect(() => {
     mutationHandlers.current = {
+      apply: applyMutation,
       connect: () => {
         const run = mutationRun.current;
         if (!run || !ownsMutation(run)) return;
@@ -882,6 +892,7 @@ export function CollaborativeTablePage({
         else {
           busyRef.current = true;
           setBusy(true);
+          if (run.outcome) void applyMutation(run);
         }
       },
       replay: () => {
@@ -901,21 +912,13 @@ export function CollaborativeTablePage({
       viewCache.suspend();
     };
   }, [viewCache, previousViewCache, mutationHandlers]);
-  useEffect(() => {
-    mutationHandlers.current.replay();
-  }, [mutationHandlers]);
-  const send = async (
-    command: TableCommand,
-    submission?: CellDraftSubmission,
-    form?: TableViewSubmission,
-    acknowledgements: TableViewSubmission[] = [],
-    closePanel?: TableViewSubmission,
-    resetView?: string,
-  ) => {
-    if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId)) return false;
-    if (!canCommit()) {
+  const executeMutation = async (request: SavedRetry) => {
+    const { submission } = request;
+    if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId))
+      return { result: "rejected" as const, code: "draft_changed" };
+    if (!sameTableOwner(request.owner, retryLifetime.current) || !canCommit()) {
       setBlocked(busyRef.current ? busyMessage : readinessMessage);
-      return false;
+      return { result: "rejected" as const, code: "not_ready" };
     }
     busyRef.current = true;
     setBusy(true);
@@ -923,70 +926,57 @@ export function CollaborativeTablePage({
     setError("");
     setSaveRefreshStatus("");
     setRetry(null);
-    const payload = command.payload as Record<string, unknown>;
-    const target =
-      command.kind === "update_cells" && Object.keys(payload.values as object).length === 1
+    const task = request.kind === "task";
+    const payload = task ? request.body : (request.command.payload as Record<string, unknown>);
+    const fields = Object.keys(payload)
+      .filter((key) => !["operationId", "expectedRevision", "columnId", "revision"].includes(key))
+      .sort();
+    const target = task
+      ? `task:${request.rowId ?? `new:${viewId}`}:${JSON.stringify(fields)}`
+      : request.command.kind === "update_cells" && Object.keys(payload.values as object).length === 1
         ? `cell:${draftKey(String(payload.rowId), Object.keys(payload.values as object)[0]!)}`
         : payload.columnId
-          ? `column:${String(payload.columnId)}:${command.kind}:${JSON.stringify(
-              Object.keys(payload)
-                .filter((key) => !["columnId", "revision"].includes(key))
-                .sort(),
-            )}`
-          : ["save_view", "delete_view"].includes(command.kind)
+          ? `column:${String(payload.columnId)}:${request.command.kind}:${JSON.stringify(fields)}`
+          : ["save_view", "delete_view"].includes(request.command.kind)
             ? `view:${String(payload.id ?? payload.viewId ?? viewId)}`
-            : `${command.kind}:${String(payload.rowId ?? `view:${viewId}`)}`;
-    const run = beginMutation(
-      { kind: "command", command, owner: retryOwner, submission, form, message: "" },
-      command.operationId,
-      target,
-      acknowledgements,
-      closePanel,
-      resetView,
-    );
+            : `${request.command.kind}:${String(payload.rowId ?? `view:${viewId}`)}`;
+    const run = beginMutation(request, task ? String(request.body.operationId) : request.command.operationId, target);
     let outcome: MutationOutcome;
     try {
-      const result = await api<TableCommandResult>(commandsPath, {
-        method: "POST",
-        body: json(command),
+      const path = task ? (request.rowId ? `${tasksPath}/${request.rowId}` : tasksPath) : commandsPath;
+      const result = await api<TableCommandResult & { visibleInView?: boolean }>(path, {
+        method: task && request.rowId ? "PATCH" : "POST",
+        body: json(task ? request.body : request.command),
         signal: AbortSignal.timeout(30000),
       });
       submission?.map.acknowledge(submission.key, submission.version, submission.operationId);
+      const hidden = task ? result.visibleInView === false : result.result.visibleInView === false;
       outcome = {
         kind: "success",
         coverage: readTableCoverage(result),
-        message:
-          result.result.visibleInView === false
-            ? "Saved. The new row is hidden by this view's filters. Open All rows to see it."
-            : result.projectionPending
-              ? "Saved. Search and task lists are catching up."
-              : undefined,
+        message: hidden
+          ? task
+            ? "Saved. Current filters hide this task. Choose All rows to see it."
+            : "Saved. The new row is hidden by this view's filters. Open All rows to see it."
+          : !task && result.projectionPending
+            ? "Saved. Search and task lists are catching up."
+            : undefined,
       };
     } catch (cause) {
       outcome = mutationFailure(cause);
     }
-    return (await settleMutation(run, outcome)) === "committed";
+    return { result: await settleMutation(run, outcome), outcome };
   };
+  const send = async (command: TableCommand, submission?: CellDraftSubmission, success: MutationSuccessIntent = {}) =>
+    (await executeMutation({ kind: "command", command, owner: retryOwner, submission, success, message: "" }))
+      .result === "committed";
   const command = (
     kind: TableCommand["kind"],
     payload: Record<string, unknown>,
     globalRevision = false,
-    form?: TableViewSubmission,
-  ) => {
-    const keys: Array<[string, unknown]> =
-      kind === "create_column"
-        ? [
-            ["property:new-name", ""],
-            ["property:new-source", ""],
-          ]
-        : kind === "add_option"
-          ? [[`property:${String(payload.columnId)}:option`, ""]]
-          : kind === "update_column"
-            ? ["name", "source"]
-                .filter((field) => field in payload)
-                .map((field): [string, unknown] => [`property:${String(payload.columnId)}:${field}`, null])
-            : [];
-    return send(
+    success: MutationSuccessIntent = {},
+  ) =>
+    send(
       {
         operationId: crypto.randomUUID(),
         ...(globalRevision && data ? { expectedRevision: data.revision } : {}),
@@ -994,66 +984,30 @@ export function CollaborativeTablePage({
         payload,
       },
       undefined,
-      form,
-      keys.flatMap(([key, reset]) => {
-        const snapshot = captureTableViewSubmission(viewState, key, reset);
-        return snapshot ? [snapshot] : [];
-      }),
-      kind === "save_view" ? captureTableViewSubmission(viewState, "panel", null) : undefined,
-      kind === "delete_view" ? queryIdentity : undefined,
+      success,
     );
-  };
   const saveTask = async (
     body: Record<string, unknown>,
     rowId?: string,
     submission?: CellDraftSubmission,
     form?: TableViewSubmission,
   ): Promise<TaskSaveResult> => {
-    if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId))
-      return { state: "rejected", code: "draft_changed" };
-    if (!canCommit()) {
-      setBlocked(busyRef.current ? busyMessage : readinessMessage);
-      return { state: "rejected", code: "not_ready" };
-    }
-    busyRef.current = true;
-    setBusy(true);
-    setBlocked("");
-    setError("");
-    setSaveRefreshStatus("");
-    setRetry(null);
-    const fields = Object.keys(body)
-      .filter((key) => !["operationId", "expectedRevision"].includes(key))
-      .sort();
-    const run = beginMutation(
-      { kind: "task", body, rowId, owner: retryOwner, submission, form, message: "" },
-      String(body.operationId),
-      `task:${rowId ?? `new:${viewId}`}:${JSON.stringify(fields)}`,
-    );
-    let outcome: MutationOutcome;
-    try {
-      const result = await api<{ visibleInView?: boolean; generation?: number; revision?: number; replayed?: boolean }>(
-        rowId ? `${tasksPath}/${rowId}` : tasksPath,
-        { method: rowId ? "PATCH" : "POST", body: json(body), signal: AbortSignal.timeout(30000) },
-      );
-      submission?.map.acknowledge(submission.key, submission.version, submission.operationId);
-      outcome = {
-        kind: "success",
-        coverage: readTableCoverage(result),
-        message:
-          result.visibleInView === false
-            ? "Saved. Current filters hide this task. Choose All rows to see it."
-            : undefined,
-      };
-    } catch (cause) {
-      outcome = mutationFailure(cause);
-    }
-    const result = await settleMutation(run, outcome);
+    const { result, outcome, code } = await executeMutation({
+      kind: "task",
+      body,
+      rowId,
+      owner: retryOwner,
+      submission,
+      success: { acknowledgements: [form] },
+      message: "",
+    });
     if (result === "suspended") return { state: "suspended" };
-    if (result === "committed") return { state: "saved", completion: "committed-current" };
+    const completion = taskMutationCompletion(result, outcome?.kind === "success");
+    if (completion) return { state: "saved", completion };
     if (result === "uncertain") return { state: "uncertain" };
     return {
       state: "rejected",
-      code: result === "retired" ? "retired" : outcome.kind === "failure" ? outcome.error?.code : undefined,
+      code: code ?? (result === "retired" ? "retired" : outcome?.kind === "failure" ? outcome.error?.code : undefined),
     };
   };
   const changeCell = async (
@@ -1133,7 +1087,7 @@ export function CollaborativeTablePage({
         values: titleColumn ? { [titleColumn.id]: newTitle } : {},
       },
       false,
-      form,
+      { acknowledgements: [form] },
     );
   };
   const draftRow = (draft: StoredCellDraft) =>
@@ -1368,14 +1322,7 @@ export function CollaborativeTablePage({
             {error || "The table update could not be confirmed. Review your pending edit or retry the saved operation."}
             {retry && !editable && <p>{readinessMessage}</p>}
             {retry && (
-              <button
-                disabled={busy || !editable}
-                onClick={() =>
-                  void (retry.kind === "command"
-                    ? send(retry.command, retry.submission, retry.form)
-                    : saveTask(retry.body, retry.rowId, retry.submission, retry.form))
-                }
-              >
+              <button disabled={busy || !editable} onClick={() => void executeMutation(retry)}>
                 Retry saved operation
               </button>
             )}
@@ -1406,9 +1353,15 @@ export function CollaborativeTablePage({
               ]}
               busy={busy || !editable}
               save={async (payload, form) => {
-                return command("save_view", payload, false, form);
+                return command("save_view", payload, false, {
+                  acknowledgements: [form],
+                  closePanel: captureTableViewSubmission(viewState, "panel", null),
+                });
               }}
-              remove={() => data.view && void command("delete_view", { viewId: data.view.id })}
+              remove={() =>
+                data.view &&
+                void command("delete_view", { viewId: data.view.id }, false, { deletedViewId: data.view.id })
+              }
             />
           </fieldset>
         )}
@@ -2294,8 +2247,14 @@ function PropertyEditor({
   columns: CollaborativeColumn[];
   fixedColumnIds: string[];
   busy: boolean;
-  command: (kind: TableCommand["kind"], payload: Record<string, unknown>, globalRevision?: boolean) => Promise<boolean>;
+  command: (
+    kind: TableCommand["kind"],
+    payload: Record<string, unknown>,
+    globalRevision?: boolean,
+    success?: MutationSuccessIntent,
+  ) => Promise<boolean>;
 }) {
+  const state = useContext(TableViewStateContext)!;
   const [name, setName] = useTableViewState("property:new-name", ""),
     [type, setType] = useTableViewState("property:new-type", "text"),
     [source, setSource] = useTableViewState("property:new-source", "");
@@ -2313,7 +2272,12 @@ function PropertyEditor({
         onSubmit={(event) => {
           event.preventDefault();
           if (busy) return;
-          void command("create_column", { name, type, ...(type === "formula" ? { source } : {}) });
+          void command("create_column", { name, type, ...(type === "formula" ? { source } : {}) }, false, {
+            acknowledgements: [
+              captureTableViewSubmission(state, "property:new-name"),
+              captureTableViewSubmission(state, "property:new-source"),
+            ],
+          });
         }}
       >
         <input
@@ -2358,8 +2322,14 @@ function Property({
   column: CollaborativeColumn;
   columns: CollaborativeColumn[];
   busy: boolean;
-  command: (kind: TableCommand["kind"], payload: Record<string, unknown>, globalRevision?: boolean) => Promise<boolean>;
+  command: (
+    kind: TableCommand["kind"],
+    payload: Record<string, unknown>,
+    globalRevision?: boolean,
+    success?: MutationSuccessIntent,
+  ) => Promise<boolean>;
 }) {
+  const state = useContext(TableViewStateContext)!;
   const currentSource = column.config?.ast
     ? format(
         (column.config as unknown as FormulaTypeOptions).ast,
@@ -2412,11 +2382,16 @@ function Property({
         onChange={(event) => setNameDraft((current) => ({ ...(current ?? nameDraft), value: event.target.value }))}
         onBlur={() => {
           if (nameDraft.value !== nameDraft.original)
-            void command("update_column", {
-              columnId: column.id,
-              name: nameDraft.value,
-              revision: nameDraft.revision,
-            });
+            void command(
+              "update_column",
+              {
+                columnId: column.id,
+                name: nameDraft.value,
+                revision: nameDraft.revision,
+              },
+              false,
+              { acknowledgements: [captureTableViewSubmission(state, `property:${column.id}:name`, null)] },
+            );
         }}
       />
       <select
@@ -2444,11 +2419,16 @@ function Property({
           <button
             disabled={busy}
             onClick={() =>
-              void command("update_column", {
-                columnId: column.id,
-                revision: sourceDraft.revision,
-                source: sourceDraft.value,
-              })
+              void command(
+                "update_column",
+                {
+                  columnId: column.id,
+                  revision: sourceDraft.revision,
+                  source: sourceDraft.value,
+                },
+                false,
+                { acknowledgements: [captureTableViewSubmission(state, `property:${column.id}:source`, null)] },
+              )
             }
           >
             Update formula
@@ -2512,7 +2492,9 @@ function Property({
           <button
             disabled={busy || !option}
             onClick={() => {
-              void command("add_option", { columnId: column.id, label: option });
+              void command("add_option", { columnId: column.id, label: option }, false, {
+                acknowledgements: [captureTableViewSubmission(state, `property:${column.id}:option`)],
+              });
             }}
           >
             Add option

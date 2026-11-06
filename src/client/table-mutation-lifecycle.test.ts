@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { settleTableMutation } from "./table-mutation-lifecycle";
+import { settleTableMutation, connectedMutationReads, taskMutationCompletion } from "./table-mutation-lifecycle";
 
 describe("settled mutation presentation", () => {
   it.each(["success", "conflict", "denial", "transport"])(
@@ -38,5 +38,52 @@ describe("settled mutation presentation", () => {
     expect(settled).toBe(false);
     finish();
     await expect(result).resolves.toBe("rejected");
+  });
+});
+
+describe("installed mutation coordinator", () => {
+  const owner = { account: "one", incarnation: {} };
+  const reads = {};
+  const sameOwner = (a: typeof owner, b: typeof owner) => a.account === b.account && a.incarnation === b.incarnation;
+  it.each(["disconnected", "inactive-cache", "missing", "stale-reads", "old-owner", "old-incarnation"])(
+    "retains settlement until the %s prerequisite is current",
+    async (reason) => {
+      const installed =
+        reason === "missing"
+          ? null
+          : {
+              reads: reason === "stale-reads" ? {} : reads,
+              owner:
+                reason === "old-owner"
+                  ? { ...owner, account: "two" }
+                  : reason === "old-incarnation"
+                    ? { ...owner, incarnation: {} }
+                    : owner,
+            };
+      const run: { outcome?: string } = {};
+      const apply = vi.fn(async () => "committed");
+      const attempt = () =>
+        connectedMutationReads(
+          reason !== "disconnected",
+          reason !== "inactive-cache",
+          owner,
+          installed,
+          reads,
+          sameOwner,
+        )
+          ? apply()
+          : Promise.resolve("suspended");
+      await expect(settleTableMutation(run, "success", true, true, attempt)).resolves.toBe("suspended");
+      expect(run.outcome).toBe("success");
+      expect(apply).not.toHaveBeenCalled();
+      expect(connectedMutationReads(true, true, owner, { owner, reads }, reads, sameOwner)).toBe(reads);
+    },
+  );
+  it("keeps retired confirmed task success distinct from suspended and rejected responses", () => {
+    expect(taskMutationCompletion("retired", true)).toBe("committed-retired");
+    expect(taskMutationCompletion("committed", true)).toBe("committed-current");
+    for (const result of ["retired", "rejected", "suspended", "uncertain"])
+      expect(taskMutationCompletion(result, false)).toBeUndefined();
+    expect(taskMutationCompletion("suspended", true)).toBeUndefined();
   });
 });
