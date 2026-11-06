@@ -378,7 +378,7 @@ test("operation restrictions retain linked rows and open settings retain unsaved
   await cells.first().fill("Restricted edit remains local");
   await cells.first().press("Enter");
   const rejection =
-    "This table is read-only. Your edit was not saved. Review the current permissions and available actions before trying again.";
+    "This operation is read-only. Your edit was not saved. Review the current permissions and available actions before trying again.";
   await expect(linked.getByText(rejection, { exact: true })).toBeVisible();
   await expect(cells).toHaveCount(500);
   await expect(cells.first()).toBeEnabled();

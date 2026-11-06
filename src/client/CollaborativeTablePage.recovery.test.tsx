@@ -650,8 +650,8 @@ it.each([false, true])("retries the captured %s task operation through a current
 
 it.each([
   ["relation_target_unavailable", "The related table is unavailable."],
-  ["feature_disabled", "This feature is unavailable."],
-  ["read_only", "This table is read-only."],
+  ["feature_disabled", "Relation creation is not enabled."],
+  ["read_only", "Your role in this space is read-only."],
   ["owner_required", "This action requires an owner."],
   ["unknown_operation_denial", "Operation rejected"],
 ])("preserves authorized rows after operation 403 %s", async (code, reason) => {
@@ -669,7 +669,7 @@ it.each([
     if (init?.method === "POST" && path.endsWith("/commands")) {
       writes.push(String(init.body));
       verify = true;
-      throw new ApiClientError(403, code, "Operation rejected");
+      throw new ApiClientError(403, code, reason);
     }
     if (verify && !init?.method) await held;
     return read(path, init);
@@ -679,7 +679,7 @@ it.each([
   fireEvent.blur(input);
   const message =
     code === "unknown_operation_denial"
-      ? `${reason} Your edit was not saved. Review the table before trying again.`
+      ? `${reason}. Your edit was not saved. Review the table before trying again.`
       : `${reason} Your edit was not saved. Review the current permissions and available actions before trying again.`;
   await screen.findByText(message);
   expect(screen.getByLabelText("Search table")).toBeInTheDocument();
@@ -834,7 +834,7 @@ it.each(
         : outcome === 404
           ? `The ${task ? "task" : "table item"} is unavailable. Your edit was not saved. Review the table before trying again.`
           : outcome === 403
-            ? "This table is read-only. Your edit was not saved. Review the current permissions and available actions before trying again."
+            ? "Rejected 403. Your edit was not saved. Review the current permissions and available actions before trying again."
             : "Saved. Refreshing the latest table data…";
     expect(screen.queryByText(initialMessage)).not.toBeNull();
     expect(screen.getByText(initialMessage)).toBeVisible();

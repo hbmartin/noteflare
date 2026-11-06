@@ -1142,12 +1142,19 @@ it.each(["saved", "conflict", "failed-refresh", "newer-edit"] as const)(
     fireEvent.click(await screen.findByRole("button", { name: "Retry saved operation" }));
     await waitFor(() => expect(submissions).toHaveLength(2));
     expect(submissions[1]!.operationId).toBe(submissions[0]!.operationId);
-    let refreshBlocked: boolean | undefined, misleadingMessage: boolean | undefined;
+    let refreshBlocked: boolean | undefined,
+      rejectionVisible: boolean | undefined,
+      retainedText: string | undefined,
+      rejectedCount: number | undefined;
     if (mode === "failed-refresh") {
       await screen.findByText("The table could not be loaded.");
       refreshBlocked = (input as HTMLInputElement).disabled;
-      misleadingMessage =
-        screen.queryByText("The task list changed. Review the latest value before saving again.") !== null;
+      rejectionVisible =
+        screen.queryByText(
+          "The task list changed. Your edit was not saved. Review the latest values before saving again.",
+        ) !== null;
+      rejectedCount = submissions.length;
+      retainedText = (screen.getByLabelText("Recovered cell draft") as HTMLTextAreaElement).value;
       readsFail = false;
       fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     }
@@ -1159,7 +1166,10 @@ it.each(["saved", "conflict", "failed-refresh", "newer-edit"] as const)(
     await waitFor(() => expect(submissions).toHaveLength(conflict ? 3 : 2));
     await waitFor(() => expect(screen.queryByLabelText("Pending cell edits") !== null).toBe(mode === "newer-edit"));
     expect(refreshBlocked).toBe(mode === "failed-refresh" ? true : undefined);
-    expect(misleadingMessage).toBe(mode === "failed-refresh" ? false : undefined);
+    expect(rejectionVisible).toBe(mode === "failed-refresh" ? true : undefined);
+    expect(rejectedCount).toBe(mode === "failed-refresh" ? 2 : undefined);
+    expect(retainedText).toBe(mode === "failed-refresh" ? "Retry text" : undefined);
+
     expect(submissions.length > 2 && submissions[2]!.operationId !== submissions[0]!.operationId).toBe(conflict);
     expect(submissions.at(-1)!.expectedRevision).toBe(conflict ? 2 : 1);
     expect((screen.queryByLabelText("Recovered cell draft") as HTMLTextAreaElement | null)?.value).toBe(
@@ -2660,7 +2670,7 @@ it("retains task rejection guidance when verification fails", async () => {
   await waitFor(() => expect(input).toBeEnabled());
   vi.mocked(api).mockImplementation(async (path) => {
     if (path === "/api/task-lists/table/tasks/row")
-      throw new ApiClientError(409, "row_revision_conflict", "Specific task rejection");
+      throw new ApiClientError(409, "table_revision_conflict", "Specific task rejection");
     throw new TypeError("Refresh unavailable");
   });
   fireEvent.focus(input);
@@ -2671,7 +2681,11 @@ it("retains task rejection guidance when verification fails", async () => {
     screen.getByText("The task list changed. Your edit was not saved. Review the latest values before saving again."),
   ).toBeVisible();
   expect(screen.queryByText("Specific task rejection")).toBeNull();
-  expect(screen.queryByText("The task list changed. Review the latest value before saving again.")).toBeNull();
+  expect(
+    screen.getAllByText(
+      "The task list changed. Your edit was not saved. Review the latest values before saving again.",
+    ),
+  ).toHaveLength(1);
   expect(input).toBeDisabled();
 });
 
