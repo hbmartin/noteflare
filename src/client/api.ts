@@ -1,4 +1,5 @@
 import { observeRealtimeAccessResponse, realtimeAccessAccount } from "./realtime-access-status";
+import { authChallengeHeaders } from "./public-challenge-token";
 import { createAuthClient } from "better-auth/react";
 
 import { twoFactorClient } from "better-auth/client/plugins";
@@ -10,6 +11,16 @@ import { currentAuthorizationAttempt, type AuthorizationAttempt } from "./author
 export const authClient = createAuthClient({
   baseURL: window.location.origin,
   plugins: [twoFactorClient(), passkeyClient()],
+  fetchOptions: {
+    customFetchImpl: (input, init) =>
+      fetch(input, {
+        ...init,
+        headers: authChallengeHeaders(
+          input instanceof Request ? input.url : String(input),
+          init?.headers ?? (input instanceof Request ? input.headers : undefined),
+        ),
+      }),
+  },
 });
 
 export type ApiResponseBodyFailure = "empty" | "read" | "parse";

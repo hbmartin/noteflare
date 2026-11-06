@@ -1,3 +1,5 @@
+import { usePublicChallenge } from "./PublicChallenge";
+import { withAuthChallenge } from "./public-challenge-token";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import QRCode from "react-qr-code";
 import type { SecurityStatus } from "../shared/security";
@@ -26,6 +28,7 @@ export function SecurityScreen({
   onComplete?: () => Promise<void>;
   settings?: boolean;
 }) {
+  const challenge = usePublicChallenge("sign_in");
   const [status, setStatus] = useState<SecurityStatus | null>(initialStatus ?? null);
   const [methods, setMethods] = useState<Methods>({ passkeys: [], browsers: [] });
   const [error, setError] = useState("");
@@ -70,19 +73,23 @@ export function SecurityScreen({
     };
   }, [settings, initialStatus]);
   useEffect(() => {
-    const expiresAt = status?.slackPrimary?.expiresAt;
+    const expiresAt = status?.accessPrimary?.expiresAt ?? status?.slackPrimary?.expiresAt;
     if (!expiresAt || !status?.serverNow) return undefined;
     const timer = window.setTimeout(
       () => {
         setStatus((current) =>
-          current?.slackPrimary?.expiresAt === expiresAt ? { ...current, slackPrimary: undefined } : current,
+          current?.accessPrimary?.expiresAt === expiresAt
+            ? { ...current, accessPrimary: undefined }
+            : current?.slackPrimary?.expiresAt === expiresAt
+              ? { ...current, slackPrimary: undefined }
+              : current,
         );
         void reload().catch((cause) => setError(apiErrorMessage(cause, "Unable to refresh security settings.")));
       },
       Math.max(1000, expiresAt - status.serverNow + 1),
     );
     return () => window.clearTimeout(timer);
-  }, [status?.slackPrimary?.expiresAt, status?.serverNow, reload]);
+  }, [status?.accessPrimary?.expiresAt, status?.slackPrimary?.expiresAt, status?.serverNow, reload]);
 
   async function run(action: () => Promise<void>) {
     setBusy(true);
@@ -118,11 +125,12 @@ export function SecurityScreen({
     }
     if (trust) await securityAction("trust");
     if (settings) setNotice("Account protection verified.");
-    else await onComplete?.();
+    else if (!next.accessIdentity?.required || next.accessIdentity.linked) await onComplete?.();
   }
 
   async function passkeySignIn() {
-    const result = await authClient.signIn.passkey();
+    const result = await withAuthChallenge(challenge.token, () => authClient.signIn.passkey());
+    challenge.reset();
     if (result.error) throw new Error(result.error.message || "Passkey verification was cancelled or failed.");
     await verified();
   }
@@ -148,7 +156,8 @@ export function SecurityScreen({
   const canManage =
     (recoveryEnrollment ? status.recoveryEnrollmentAllowed === true : status.fresh || enrollment) &&
     !status.recoveryKeyAcknowledgmentRequired;
-  const slackPrimary = status.slackPrimary?.available === true;
+  const slackPrimary = status.slackPrimary?.available === true || status.accessPrimary?.available === true;
+  const identityProvider = status.accessPrimary?.available ? "Cloudflare Access" : "Slack";
   const primaryFactorFormVisible =
     codes.length === 0 &&
     resumeKey.length === 0 &&
@@ -165,6 +174,32 @@ export function SecurityScreen({
           {error}
         </p>
       )}
+      {challenge.element}
+      {status.accessIdentity?.available && status.state === "ready" && (
+        <div>
+          <h3>Cloudflare Access</h3>
+          {status.accessIdentity.linked ? (
+            <p>This account is linked to Cloudflare Access. Account protection is still required.</p>
+          ) : (
+            <>
+              <p>Explicitly link the identity signed in at your installation’s Access gateway to this account.</p>
+              <button
+                disabled={busy || !status.fresh}
+                onClick={() =>
+                  void run(async () => {
+                    await api("/api/auth/access/link", { method: "POST", body: json({}) });
+                    await reload();
+                    if (!settings) await onComplete?.();
+                  })
+                }
+              >
+                Link current Access identity
+              </button>
+              {!status.fresh && <p>Verify account protection again to link your identity.</p>}
+            </>
+          )}
+        </div>
+      )}
       <fieldset disabled={busy} className="security-controls">
         {!slackPrimary && hadSlackPrimary && primaryFactorFormVisible && (
           <div>
@@ -173,11 +208,14 @@ export function SecurityScreen({
               type="button"
               onClick={() =>
                 void run(async () => {
-                  const result = await authClient.signIn.social({
-                    provider: "slack",
-                    callbackURL: settings ? "/?view=settings" : "/",
-                    errorCallbackURL: settings ? "/?view=settings&slackAuth=callback" : "/?slackAuth=callback",
-                  });
+                  const result = await withAuthChallenge(challenge.token, () =>
+                    authClient.signIn.social({
+                      provider: "slack",
+                      callbackURL: settings ? "/?view=settings" : "/",
+                      errorCallbackURL: settings ? "/?view=settings&slackAuth=callback" : "/?slackAuth=callback",
+                    }),
+                  );
+                  challenge.reset();
                   if (result.error) throw new Error(result.error.message || "Slack sign-in failed.");
                 })
               }
@@ -185,6 +223,28 @@ export function SecurityScreen({
               Sign in with Slack again
             </button>
           </div>
+        )}
+        {status.accessIdentity?.available && primaryFactorFormVisible && !status.accessPrimary?.available && (
+          <button
+            type="button"
+            disabled={!challenge.ready}
+            onClick={() =>
+              void run(async () => {
+                try {
+                  await api("/api/auth/access/sign-in", {
+                    method: "POST",
+                    headers: { "x-turnstile-token": challenge.token },
+                    body: json({}),
+                  });
+                  await reload();
+                } finally {
+                  challenge.reset();
+                }
+              })
+            }
+          >
+            Verify primary factor with Cloudflare Access
+          </button>
         )}
         {resumeKey ? (
           <>
@@ -301,7 +361,7 @@ export function SecurityScreen({
               >
                 <p>If your ten-minute setup session expires, resume here within 24 hours of recovery.</p>
                 {slackPrimary ? (
-                  <p>Your recent Slack sign-in confirms the primary factor for this recovery step.</p>
+                  <p>Your recent {identityProvider} sign-in confirms the primary factor for this recovery step.</p>
                 ) : (
                   <label>
                     Password to resume recovery
@@ -371,7 +431,9 @@ export function SecurityScreen({
                       }
                     >
                       {slackPrimary ? (
-                        <p>Your recent Slack sign-in confirms the primary factor for authenticator setup.</p>
+                        <p>
+                          Your recent {identityProvider} sign-in confirms the primary factor for authenticator setup.
+                        </p>
                       ) : (
                         <label>
                           Account password
@@ -529,7 +591,7 @@ export function SecurityScreen({
                     }
                   >
                     {slackPrimary ? (
-                      <p>Your recent Slack sign-in confirms the primary factor for recovery.</p>
+                      <p>Your recent {identityProvider} sign-in confirms the primary factor for recovery.</p>
                     ) : (
                       <label>
                         Account password
@@ -558,7 +620,7 @@ export function SecurityScreen({
         {!enrollment && !setup && (
           <>
             {status.passkeys > 0 && (
-              <button type="button" onClick={() => void run(passkeySignIn)}>
+              <button type="button" disabled={!challenge.ready} onClick={() => void run(passkeySignIn)}>
                 Verify with passkey
               </button>
             )}

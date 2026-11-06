@@ -110,7 +110,7 @@ export type TableFilter =
 export type TableView = {
   id: string;
   name: string;
-  kind: "grid" | "board" | "calendar";
+  kind: "grid" | "board" | "calendar" | "gallery";
   revision: number;
   ownerId: string | null;
   columnId: string | null;
@@ -119,6 +119,7 @@ export type TableView = {
   visibleColumnIds: string[];
   invalid?: boolean;
   calculations?: Record<string, CalculationKind>;
+  gallery?: { preview: "pageCover" | "none"; cardSize: "small" | "medium" | "large" };
 };
 export type TableCommand = {
   operationId: string;
@@ -132,6 +133,7 @@ export type TableCommand = {
     | "delete_column"
     | "add_option"
     | "delete_option"
+    | "attach_row_page"
     | "create_row"
     | "update_cells"
     | "delete_row"

@@ -283,3 +283,24 @@ void renamedNotionApi;
 // ruleid: worker-hono-known-app-import-alias
 import * as notionModule from "./notion-api";
 void notionModule;
+
+// Platform subapp follows the same registration and escape boundary.
+declare const platformApi: any;
+// ruleid: worker-hono-direct-middleware-registration
+platformApi.on("GET", "*", middleware);
+// ruleid: worker-hono-multiple-handlers
+platformApi.get("/platform", middleware, handler);
+// ruleid: worker-hono-computed-registration
+platformApi[method]("/platform", handler);
+// ruleid: worker-hono-app-escape
+const platformAlias = platformApi;
+void platformAlias;
+// ruleid: worker-hono-app-escape
+platformApi.get("/leak", () => leak(platformApi));
+// ok: worker-hono-app-escape
+app.route("/api", platformApi);
+// ok: worker-hono-multiple-handlers
+platformApi.get("/platform", handler);
+// ruleid: worker-hono-known-app-import-alias
+import { platformApi as renamedPlatform } from "./platform-api";
+void renamedPlatform;

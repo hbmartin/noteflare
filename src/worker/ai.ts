@@ -23,8 +23,10 @@ import { HttpError, sha256, assertSameOrigin } from "./http";
 import { chatgptAccessToken, chatgptConfigured } from "./ai-auth";
 import { seal, unseal } from "./ai-auth";
 import { readAiSource } from "./ai-sources";
-import { pageForMember, spaceVisibleSql } from "./page-access";
-import { requireSecurity } from "./security";
+import { automaticAiSources, readableAiSourceIds } from "./ai-retrieval";
+import type { AiRetrievalStatus } from "../shared/ai";
+import { pageForMember } from "./page-access";
+import { conversationLockSql, pollAiGenerationAccess, type AiGenerationAccessRequest } from "./ai-generation-access";
 import { providerModels, invalidateProviderModels } from "./ai-models";
 import { readRoomContent } from "./ai-sources";
 import type { DocumentContentEnvelope } from "../shared/types";
@@ -60,6 +62,7 @@ type MessageRow = {
   funding: AiMessage["funding"];
   quality: AiMessage["quality"];
   sources_json: string;
+  retrieval_status?: AiRetrievalStatus;
   created_at: number;
 };
 const json = (value: unknown) => Response.json(value, { headers: { "cache-control": "private, no-store" } });
@@ -152,9 +155,6 @@ async function conversationRow(env: Env, member: MemberContext, id: string) {
   if (!row) throw new HttpError(404, "conversation_not_found", "This conversation was deleted or expired.");
   return row;
 }
-function conversationLockSql(workspace: string, user: string, conversation: string, role = "?") {
-  return `EXISTS(SELECT 1 FROM ai_conversation_pages cp LEFT JOIN pages p ON p.id=cp.page_id AND p.workspace_id=${workspace} LEFT JOIN spaces s ON s.id=p.space_id AND s.workspace_id=p.workspace_id LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=${user} WHERE cp.conversation_id=${conversation} AND (p.id IS NULL OR p.archived_at IS NOT NULL OR p.import_job_id IS NOT NULL OR s.id IS NULL OR NOT ${spaceVisibleSql(role)}))`;
-}
 async function conversationLocked(env: Env, member: MemberContext, id: string) {
   const row = await env.DB.prepare(`SELECT ${conversationLockSql("?", "?", "?")} locked`)
     .bind(member.workspace.id, member.user.id, id, member.role)
@@ -195,6 +195,7 @@ function messageJson(row: MessageRow): AiMessage {
     funding: row.funding,
     quality: row.quality,
     sources: JSON.parse(row.sources_json),
+    retrievalStatus: row.retrieval_status ?? "disabled",
     createdAt: row.created_at,
   };
 }
@@ -435,7 +436,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
     throw new HttpError(503, "chatgpt_unavailable", "ChatGPT plan funding is not configured for this installation.");
   const model = settings.models[input.funding][input.quality];
   if (!model.id) throw new HttpError(422, "ai_model_unconfigured", "An owner must configure this quality mode.");
-  const hash = await sha256(JSON.stringify(input));
+  const hash = await sha256(JSON.stringify({ ...input, retrieval: input.retrieval === "off" ? "off" : undefined }));
   const existing = await env.DB.prepare(
     "SELECT r.workspace_id,r.user_id,r.request_hash receipt_hash,m.* FROM ai_requests r LEFT JOIN ai_messages m ON m.id=r.id WHERE r.id=?",
   )
@@ -469,6 +470,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
         conversationId: existing.conversation_id,
         messageId: existing.id,
         sources: JSON.parse(existing.sources_json),
+        retrievalStatus: existing.retrieval_status ?? "disabled",
         changedPageIds: [],
         canApply: page.effective_role !== "viewer",
         quota: await quota(env, member, settings),
@@ -509,7 +511,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
     savedPrompt.length + history.reduce((total, message) => total + message.prompt.length + message.output.length, 0);
   for (const source of input.sources) {
     const snapshot = await readAiSource(env, member, source);
-    sources.push(snapshot);
+    sources.push({ ...snapshot, provenance: "explicit", scope: source.scope });
     characters += snapshot.text.length;
     if (characters > Math.min(AI_MAX_CHARACTERS, model.maxCharacters))
       throw new HttpError(
@@ -534,7 +536,29 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       "ai_context_too_large",
       "The provider's context limit is smaller than this request. Narrow its sources or start a new conversation.",
     );
-  const providerInput = [
+  let retrievalStatus: AiRetrievalStatus = "disabled";
+  if (input.retrieval !== "off") {
+    const current = sources.find((source) => source.pageId === page.id);
+    const automatic = await automaticAiSources(
+      env,
+      member,
+      `${page.title}\n${savedPrompt}\n${current?.text.slice(0, 6000) ?? ""}`,
+      sources,
+      Math.min(AI_MAX_CHARACTERS, model.maxCharacters, providerModel.maxCharacters) - characters,
+    );
+    retrievalStatus = automatic.status;
+    sources.push(...automatic.sources);
+  }
+  // Recheck the complete evidence set after optional retrieval; a primary ACL
+  // failure cannot be hidden by an embedding outage or an old member snapshot.
+  const readableSources = await readableAiSourceIds(
+    env,
+    member,
+    sources.map((source) => source.pageId),
+  );
+  if (sources.some((source) => !readableSources.has(source.pageId)))
+    throw new HttpError(403, "source_access_changed", "Access to a source changed. Review the sources and try again.");
+  const buildProviderInput = () => [
     ...history.flatMap((message) => [
       { role: "user", content: `Action: ${AI_ACTIONS[message.action]}\n${message.prompt}` },
       ...(message.status === "complete" ? [{ role: "assistant", content: message.output }] : []),
@@ -542,6 +566,16 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
     { role: "user", content: JSON.stringify({ instruction: savedPrompt, currentPageId: page.id, sources }) },
   ];
   const instructions = aiInstructions(input);
+  let providerInput = buildProviderInput();
+  while (
+    providerModel.contextTokens &&
+    new TextEncoder().encode(instructions + JSON.stringify(providerInput)).length + 4096 >
+      providerModel.contextTokens &&
+    sources.at(-1)?.provenance === "retrieved"
+  ) {
+    sources.pop();
+    providerInput = buildProviderInput();
+  }
   // UTF-8 bytes bound byte-fallback tokenizers conservatively; leave room for
   // output and protocol overhead when the plan advertises a context window.
   if (
@@ -610,6 +644,12 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       input.operationId,
       claim,
     ),
+    env.DB.prepare(`UPDATE ai_messages SET retrieval_status=? WHERE id=? AND ${claimedSql}`).bind(
+      retrievalStatus,
+      input.operationId,
+      input.operationId,
+      claim,
+    ),
     env.DB.prepare(
       `UPDATE ai_conversations SET sources_json=?,updated_at=? WHERE id=? AND updated_at>? AND ${claimedSql}`,
     ).bind(
@@ -620,7 +660,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       input.operationId,
       claim,
     ),
-    ...input.sources.map((source) =>
+    ...sources.map((source) =>
       env.DB.prepare(`INSERT OR IGNORE INTO ai_conversation_pages SELECT ?,? WHERE ${claimedSql}`).bind(
         conversationId,
         source.pageId,
@@ -667,6 +707,15 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       );
     })
     .map((source) => source.pageId);
+  const accessRequest: AiGenerationAccessRequest = {
+    workspaceId: member.workspace.id,
+    userId: member.user.id,
+    sessionId: member.session.id,
+    conversationId,
+    messageId: input.operationId,
+    sourceIds: sources.map((source) => source.pageId),
+    headers: [...request.headers.entries()].filter(([name]) => name === "cf-access-jwt-assertion"),
+  };
   return streamResponse(async (send, signal) => {
     let output = "",
       completed = false,
@@ -694,16 +743,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       return false;
     };
     const checkAccess = async () => {
-      // Identity was authenticated once at dispatch. Revalidate the live session,
-      // protection and grants without rebuilding Better Auth on every tick.
-      await requireSecurity(env, member.user.id, member.session.id);
-      const row = await env.DB.prepare(
-        `SELECT m.status,m.created_at,wm.user_id member_id,${conversationLockSql("c.workspace_id", "c.user_id", "c.id", "wm.role")} locked FROM (SELECT ? workspace_id,? user_id) actor LEFT JOIN workspace_members wm ON wm.workspace_id=actor.workspace_id AND wm.user_id=actor.user_id LEFT JOIN ai_conversations c ON c.id=? AND c.workspace_id=actor.workspace_id AND c.user_id=actor.user_id LEFT JOIN ai_messages m ON m.id=? AND m.conversation_id=c.id`,
-      )
-        .bind(member.workspace.id, member.user.id, conversationId, input.operationId)
-        .first<{ status: string | null; created_at: number | null; member_id: string | null; locked: number }>();
-      if (row && (!row.member_id || row.locked))
-        throw new HttpError(403, "conversation_locked", "A referenced page or workspace is no longer accessible.");
+      const row = await pollAiGenerationAccess(env, accessRequest);
       if (
         !row ||
         row.status !== "running" ||
@@ -761,6 +801,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
         conversationId,
         messageId: input.operationId,
         sources: sources.map(sourceMetadata),
+        retrievalStatus,
         changedPageIds,
         canApply: page.effective_role !== "viewer",
         quota: await quota(env, member, settings),

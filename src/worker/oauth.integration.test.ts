@@ -22,6 +22,7 @@ import { mcpRequest, pruneStagedMcpPages } from "./mcp";
 import { sha256 } from "./http";
 import { seal, unseal } from "./ai-auth";
 import { sourceRateLimitKey } from "./source-rate-limit";
+import { withAuditRequest } from "./audit";
 import type { Env } from "./env";
 import { protectedCommentBlockIds } from "./comments";
 import type { DocumentContentEnvelope, ProseMirrorJson } from "../shared/types";
@@ -144,10 +145,11 @@ async function connect(cookie: string) {
   return { clientId, grantId, token, ...me, page: tree.pages[0]! };
 }
 
-async function issueCode(cookie: string) {
+async function issueCode(cookie: string, scope = "pages:read") {
   const clientId = await register();
   const verifier = "v".repeat(43);
   const params = new URLSearchParams(authorizationParams(clientId));
+  params.set("scope", scope);
   params.set("code_challenge", await challenge(verifier));
   params.set("decision", "approve");
   const approval = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
@@ -324,6 +326,64 @@ async function seedCommentBlocks(connection: Awaited<ReturnType<typeof connect>>
 }
 
 describe("OAuth MCP foundation", () => {
+  it("issues and rotates tokens and publishes an MCP page with audit and semantic triggers enabled", async () => {
+    const cookie = await bootstrap(),
+      code = await issueCode(cookie, "pages:read pages:write"),
+      bindings = { ...env, AUDIT_ENABLED: "true" } satisfies Env;
+    const tokenRequest = (values: Record<string, string>) =>
+      withAuditRequest(bindings, "oauth-trigger-counts", (auditEnv) =>
+        oauthToken(
+          new Request(`${ORIGIN}/oauth/token`, {
+            method: "POST",
+            headers: { "content-type": "application/x-www-form-urlencoded" },
+            body: form(values),
+          }),
+          auditEnv,
+        ),
+      );
+    const issued = await tokenRequest(code.tokenRequest);
+    expect(issued.status).toBe(200);
+    const tokens = await issued.json<{ access_token: string; refresh_token: string }>();
+    const rotated = await tokenRequest({
+      grant_type: "refresh_token",
+      client_id: code.clientId,
+      refresh_token: tokens.refresh_token,
+      resource: RESOURCE,
+    });
+    expect(rotated.status).toBe(200);
+    const replacement = await rotated.json<{ access_token: string }>();
+    const tree = await (
+      await SELF.fetch(`${ORIGIN}/api/pages/tree`, { headers: { cookie, origin: ORIGIN } })
+    ).json<{ pages: Array<{ spaceId: string }> }>();
+    const input = {
+      space_id: tree.pages[0]!.spaceId,
+      title: "Audited MCP creation",
+      markdown: "Published content remains searchable.",
+      operation_id: "audited-trigger-publication",
+    };
+    const create = () =>
+      withAuditRequest(bindings, "mcp-trigger-counts", (auditEnv) =>
+        toolCall(replacement.access_token, "create_page", input, auditEnv),
+      );
+    const published = await create();
+    expect(published.result.isError).not.toBe(true);
+    expect(await create()).toEqual(published);
+    const page = await env.DB.prepare("SELECT id,import_job_id FROM pages WHERE title=?")
+      .bind(input.title)
+      .first<{ id: string; import_job_id: string | null }>();
+    expect(page).toMatchObject({ id: expect.any(String), import_job_id: null });
+    expect(
+      await env.DB.prepare("SELECT pending FROM semantic_dirty WHERE page_id=?").bind(page!.id).first("pending"),
+    ).toBe(1);
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) count FROM audit_events WHERE target_id=? AND action IN ('page.insert','page.update')",
+      )
+        .bind(page!.id)
+        .first<number>("count"),
+    ).toBeGreaterThan(0);
+    expect((await tokenRequest(code.tokenRequest)).status).toBe(400);
+  });
   it("rejects an unknown comment block without creating a thread or operation receipt", async () => {
     const cookie = await bootstrap();
     const connection = await connect(cookie);

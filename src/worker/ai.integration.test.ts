@@ -28,6 +28,11 @@ import { requireMember } from "./auth";
 import { readAiSource, fetchDiagramSource, fetchTableSource } from "./ai-sources";
 import { pruneAi } from "./ai";
 import { enableTableAuthority, tableCommand } from "./table-service";
+import {
+  aiGenerationAccessObjectName,
+  authorizeAiGeneration,
+  type AiGenerationAccessRequest,
+} from "./ai-generation-access";
 /* oxlint-disable vitest/no-standalone-expect -- Fixture setup validates authenticated bootstrap and mocked provider credentials. */
 
 const ORIGIN = "http://example.test";
@@ -120,7 +125,7 @@ function eventReader(body: ReadableStream<Uint8Array>) {
     cancel: () => frames.return(undefined),
   };
 }
-async function liveGeneration() {
+async function liveGeneration(legacyPrimaryChecks = false, overrides: Partial<Env> = {}) {
   let upstream!: ReadableStreamDefaultController<Uint8Array>, ready!: () => void;
   const started = new Promise<void>((resolve) => {
     ready = resolve;
@@ -152,8 +157,10 @@ async function liveGeneration() {
     }),
   );
   const value = input(),
-    context = createExecutionContext();
-  const response = await worker.fetch(request("/api/ai/generate", "POST", value), bindings(), context),
+    context = createExecutionContext(),
+    runtime = { ...bindings(), ...overrides };
+  if (legacyPrimaryChecks) delete runtime.PLATFORM;
+  const response = await worker.fetch(request("/api/ai/generate", "POST", value), runtime, context),
     reader = eventReader(response.body!);
   const start = await reader.read("start");
   await started;
@@ -483,6 +490,104 @@ describe("AI writing dispatch and quota", () => {
     expect(event).toMatchObject({ type: "error", status: kind === "session" ? 401 : 403 });
     await live.reader.cancel();
   });
+  it("isolates sustained stream authorization from the initiating D1 budget and stops after source revocation", async () => {
+    const original = env.DB.prepare.bind(env.DB),
+      initiatingQueries: string[] = [],
+      coordinatorQueries: string[] = [];
+    // Give the initiating Worker its own binding wrapper: cloudflare:test shares
+    // the underlying D1 binding object with DOs, so spying on it alone conflates
+    // queries from separate invocations.
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            initiatingQueries.push(sql);
+            return original(sql);
+          };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const live = await liveGeneration(false, { DB: database });
+    initiatingQueries.length = 0;
+    const accessRequest: AiGenerationAccessRequest = {
+      workspaceId: member.workspace.id,
+      userId: member.user.id,
+      sessionId: member.session.id,
+      conversationId: live.start.conversationId,
+      messageId: live.value.operationId,
+      sourceIds: [page.id],
+      headers: [],
+    };
+    const coordinator = env.PLATFORM!.get(env.PLATFORM!.idFromName(aiGenerationAccessObjectName(member.workspace.id)));
+    vi.spyOn(env.DB, "prepare").mockImplementation((sql: string) => {
+      coordinatorQueries.push(sql);
+      return original(sql);
+    });
+    // Sixty independent polls execute 120 fresh primary reads. They must not
+    // accumulate against the original Worker's 50-query Free-plan allowance.
+    for (let poll = 0; poll < 60; poll++)
+      expect(await coordinator.authorizeAiGeneration(accessRequest)).toMatchObject({
+        allowed: true,
+        state: { status: "running" },
+      });
+    expect(initiatingQueries).toHaveLength(0);
+    expect(coordinatorQueries.length).toBeGreaterThanOrEqual(120);
+    const before = await runInDurableObject(coordinator, async (_instance, state) => ({
+      alarm: await state.storage.getAlarm(),
+      stored: (await state.storage.list()).size,
+    }));
+    expect(before).toEqual({ alarm: null, stored: 0 });
+    await original("UPDATE pages SET archived_at=1 WHERE id=?").bind(page.id).run();
+    expect(await coordinator.authorizeAiGeneration(accessRequest)).toEqual({
+      allowed: false,
+      status: 403,
+      code: "conversation_locked",
+    });
+    // The live stream uses the same RPC on its next one-second timer tick.
+    await waitOnExecutionContext(live.context);
+    expect(await live.reader.read("error")).toMatchObject({ status: 403, code: "conversation_locked" });
+    expect(initiatingQueries.filter((sql) => sql.trimStart().startsWith("SELECT"))).toHaveLength(0);
+    await live.reader.cancel();
+  });
+  it("binds internal authorization to the workspace, protected session and cumulative evidence set", async () => {
+    const live = await liveGeneration();
+    const accessRequest: AiGenerationAccessRequest = {
+      workspaceId: member.workspace.id,
+      userId: member.user.id,
+      sessionId: member.session.id,
+      conversationId: live.start.conversationId,
+      messageId: live.value.operationId,
+      sourceIds: [page.id],
+      headers: [],
+    };
+    const coordinator = env.PLATFORM!.get(env.PLATFORM!.idFromName(aiGenerationAccessObjectName(member.workspace.id)));
+    expect(
+      await coordinator.authorizeAiGeneration({ ...accessRequest, workspaceId: "another-workspace" }),
+    ).toMatchObject({ allowed: false, status: 403 });
+    expect(await coordinator.authorizeAiGeneration({ ...accessRequest, sessionId: "revoked-session" })).toMatchObject({
+      allowed: false,
+      status: 401,
+    });
+    expect(
+      await coordinator.authorizeAiGeneration({ ...accessRequest, sourceIds: ["unreserved-source"] }),
+    ).toMatchObject({ allowed: false, status: 403 });
+    expect(
+      await authorizeAiGeneration(
+        {
+          ...bindings(),
+          AUTH_MODE: "access_required",
+          ACCESS_TEAM_DOMAIN: "https://test.cloudflareaccess.com",
+          ACCESS_AUD: "test-audience",
+        },
+        accessRequest,
+      ),
+    ).toMatchObject({ allowed: false, status: 401, code: "access_required" });
+    live.send({ type: "response.completed", response: { status: "completed" } });
+    await waitOnExecutionContext(live.context);
+    expect(await live.reader.read("complete")).toEqual({ type: "complete" });
+    await live.reader.cancel();
+  });
   it.each(["cancelled", "expired"])("prevents a late completion after the request is %s", async (kind) => {
     const live = await liveGeneration();
     live.send({ type: "response.output_text.delta", delta: "Partial saved text" });
@@ -512,7 +617,9 @@ describe("AI writing dispatch and quota", () => {
     await live.reader.cancel();
   });
   it("uses two SQL queries for the final live authorization check", async () => {
-    const live = await liveGeneration();
+    // Explicitly exercise the documented legacy-binding fallback, including its
+    // query budget. Normal deployments use the separate coordinator invocation.
+    const live = await liveGeneration(true);
     const original = env.DB.prepare.bind(env.DB),
       queries: string[] = [];
     vi.spyOn(env.DB, "prepare").mockImplementation((sql: string) => {
@@ -527,7 +634,7 @@ describe("AI writing dispatch and quota", () => {
     await live.reader.cancel();
   });
   it.each(["waiting", "retrying"])("serializes final authorization with polling while %s", async (kind) => {
-    const live = await liveGeneration();
+    const live = await liveGeneration(true);
     let release!: () => void, started!: () => void;
     const held = new Promise<void>((resolve) => {
       release = resolve;
@@ -629,7 +736,7 @@ describe("AI writing dispatch and quota", () => {
     expect(writes).toHaveLength(0);
   });
   it.each([1, 3])("withholds deltas during access failures and %i attempts", async (failures) => {
-    const live = await liveGeneration();
+    const live = await liveGeneration(true);
     const original = env.DB.prepare.bind(env.DB);
     let attempts = 0,
       firstFailure!: () => void;

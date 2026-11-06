@@ -1153,6 +1153,71 @@ describe("Notion-compatible API", () => {
     });
   });
 
+  it("filters directory membership removed after a replica read", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('directory-removed','Removed member','removed@example.test',0,0)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) SELECT workspace_id,'directory-removed','viewer',0 FROM pages WHERE id=?",
+      ).bind(installed.pageId),
+    ]);
+    const removeMember = vi.fn(async () => {
+      await env.DB.prepare("DELETE FROM workspace_members WHERE user_id='directory-removed'").run();
+    });
+    const directoryStatement = (statement: D1PreparedStatement): D1PreparedStatement =>
+      new Proxy(statement, {
+        get(target, property) {
+          if (property === "bind") return (...values: unknown[]) => directoryStatement(target.bind(...values));
+          if (property === "all")
+            return async () => {
+              const rows = await target.all();
+              await removeMember();
+              return rows;
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "withSession")
+          return (constraint: D1SessionBookmark) => {
+            const session = target.withSession(constraint);
+            return new Proxy(session, {
+              get(current, key) {
+                if (key === "prepare")
+                  return (sql: string) => {
+                    const statement = current.prepare(sql);
+                    return sql.includes("JOIN user ON user.id = member.user_id")
+                      ? directoryStatement(statement)
+                      : statement;
+                  };
+                const value = Reflect.get(current, key, current);
+                return typeof value === "function" ? value.bind(current) : value;
+              },
+            });
+          };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      notionRequest(createdIntegration.token, "/users"),
+      { ...env, DB: database, D1_READ_REPLICATION_ENABLED: "true" },
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(response.status).toBe(200);
+    const directory = await response.json<{ results: Array<{ id: string }> }>();
+    expect(removeMember).toHaveBeenCalledTimes(1);
+    expect(directory.results.map((row) => row.id)).not.toContain("directory-removed");
+    expect(directory.results.length).toBeGreaterThan(0);
+  });
+
   it("limits a well-shaped invalid token before authentication reaches D1", async () => {
     const sourceLimit = { limit: vi.fn(async () => ({ success: false })) } as unknown as RateLimit;
     const prepare = vi.fn(() => env.DB.prepare("SELECT 1"));

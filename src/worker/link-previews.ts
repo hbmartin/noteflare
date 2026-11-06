@@ -1,3 +1,4 @@
+import { sanitizedPreview } from "./images";
 import type { Env } from "./env";
 import { HttpError, sha256 } from "./http";
 import { logger } from "./observability";
@@ -351,17 +352,24 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
         const image = await fetchPublic(publicUrl(parsed.image, page.url.href), signal);
         const mime = image.response.headers.get("content-type")?.split(";", 1)[0]?.toLowerCase() ?? "";
         if (image.response.ok && IMAGE_MIMES.has(mime)) {
-          const bytes = await boundedBytes(image.response, MAX_IMAGE);
+          let bytes = await boundedBytes(image.response, MAX_IMAGE);
+          let outputMime = mime;
           if (rasterSignature(mime, bytes)) {
+            if (env.IMAGES_ENABLED === "true") {
+              const sanitized = await sanitizedPreview(env, bytes);
+              if (!sanitized) throw new Error("preview_transform_unavailable");
+              bytes = sanitized;
+              outputMime = "image/webp";
+            }
             const key = `link-previews/${workspaceId}/${id}/${crypto.randomUUID()}`;
             // Reserve the key for cleanup before writing R2; D1 and R2 cannot commit atomically.
             await env.DB.prepare("INSERT OR IGNORE INTO link_preview_image_gc (image_key,queued_at) VALUES (?,?)")
               .bind(key, Date.now() + 5 * 60_000)
               .run();
             stagedKey = key;
-            await putImage(env, key, bytes, mime, signal);
+            await putImage(env, key, bytes, outputMime, signal);
             imageKey = key;
-            imageMime = mime;
+            imageMime = outputMime;
             stagedKey = null;
           }
         }

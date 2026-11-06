@@ -65,10 +65,18 @@ const HistoryMessage = memo(
         <p>{message.prompt}</p>
         <WritingPreview markdown={message.output} />
         <small>{message.status === "complete" ? "Complete" : "Partial — copy only"}</small>
+        {message.retrievalStatus && message.retrievalStatus !== "available" && (
+          <p className="muted">
+            {message.retrievalStatus === "disabled"
+              ? "Automatic source retrieval was disabled for this result."
+              : "Automatic source retrieval was unavailable. This result used the selected sources."}
+          </p>
+        )}
         <ul>
           {message.sources.map((source) => (
             <li key={source.pageId}>
               <a href={source.url}>{source.title}</a>
+              {source.provenance === "retrieved" ? " · Automatically retrieved" : ""}
             </li>
           ))}
         </ul>
@@ -86,6 +94,7 @@ const HistoryMessage = memo(
       a.funding === b.funding &&
       a.quality === b.quality &&
       a.status === b.status &&
+      a.retrievalStatus === b.retrievalStatus &&
       JSON.stringify(a.sources) === JSON.stringify(b.sources)
     );
   },
@@ -125,6 +134,7 @@ export function WritingPanel({
   const [status, setStatus] = useState<AiStatus | null>(null),
     [pages, setPages] = useState<Page[]>([]),
     [sources, setSources] = useState<AiSource[]>([targetSource(initialTarget, pageId)]);
+  const [retrieval, setRetrieval] = useState<"auto" | "off">("auto");
   const [funding, setFunding] = useState<AiFunding | null>(null),
     [quality, setQuality] = useState<AiQuality>("fast"),
     [action, setAction] = useState<AiGenerate["action"]>("rewrite"),
@@ -818,6 +828,7 @@ export function WritingPanel({
       funding,
       quality,
       sources,
+      retrieval,
     });
     if (!input.success) {
       setError(input.error.issues[0]?.message ?? "Check the writing request.");
@@ -869,6 +880,10 @@ export function WritingPanel({
           setResultSources(event.sources);
           const quota = recordQuota(event.quota);
           setStatus((current) => (current ? { ...current, quota } : null));
+          if (retrieval === "auto" && event.retrievalStatus === "disabled")
+            setNotice("Automatic source retrieval is not configured. This result uses your selected sources.");
+          if (event.retrievalStatus === "unavailable" || event.retrievalStatus === "budget_exhausted")
+            setNotice("Automatic source retrieval is temporarily unavailable. This result uses your selected sources.");
           if (event.changedPageIds.length) setNotice("Some sources changed. This result uses their latest contents.");
         } else if (event.type === "delta") {
           outputBuffer.current += event.text;
@@ -1140,6 +1155,15 @@ export function WritingPanel({
               placeholder="Describe what you want, or use a preset action"
             />
           </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={retrieval === "auto"}
+              disabled={busy}
+              onChange={(event) => setRetrieval(event.target.checked ? "auto" : "off")}
+            />
+            Automatically find supporting pages (up to 5)
+          </label>
           <WritingSources
             sources={sources}
             pages={pages}
@@ -1178,6 +1202,7 @@ export function WritingPanel({
                     {resultSources.map((source) => (
                       <li key={source.pageId}>
                         <a href={source.url}>{source.title}</a>
+                        {source.provenance === "retrieved" ? " · Automatically retrieved" : ""}
                       </li>
                     ))}
                   </ul>

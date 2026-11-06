@@ -54,6 +54,7 @@ import { projectDocument, type ProseMirrorJson } from "../shared/document-projec
 import { diffDocuments } from "../shared/block-diff";
 import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
+import { ReadingInsights } from "./ReadingInsights";
 import {
   createCollaboration,
   loadOfflineCopy,
@@ -1408,6 +1409,9 @@ export function EditorPage({
           {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
         </aside>
       </div>
+      {member.features?.heatmaps && (
+        <ReadingInsights key={`${page.id}:${member.user.id}`} pageId={page.id} userId={member.user.id} />
+      )}
     </main>
   );
 }

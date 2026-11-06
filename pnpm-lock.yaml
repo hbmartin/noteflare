@@ -36,6 +36,9 @@ importers:
       '@blocknote/react':
         specifier: 0.55.0
         version: 0.55.0(patch_hash=087641801177852834cc9b65beb03780ed4334f49e9c7a7cbbff458bf9c0a8fc)(@floating-ui/dom@1.8.0)(@types/hast@3.0.5)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(y-prosemirror@1.3.7(patch_hash=52279c23db061b2dacc1d445393f55a4142abac3d202c350b9579fb496e044a9)(prosemirror-model@1.25.12)(prosemirror-state@1.4.4)(prosemirror-view@1.42.6)(y-protocols@1.0.7(yjs@13.6.33))(yjs@13.6.33))(y-protocols@1.0.7(yjs@13.6.33))(yjs@13.6.33)
+      '@huggingface/tokenizers':
+        specifier: 0.2.0
+        version: 0.2.0
       '@mantine/core':
         specifier: 9.7.1
         version: 9.7.1(@mantine/hooks@9.7.1(react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -986,6 +989,9 @@ packages:
 
   '@hexagon/base64@1.1.28':
     resolution: {integrity: sha512-lhqDEAvWixy3bZ+UOYbPwUbBkwBq5C1LAJ/xPC8Oi+lL54oyakv/npbA0aU2hgCsx/1NUd4IBvV03+aUBWxerw==}
+
+  '@huggingface/tokenizers@0.2.0':
+    resolution: {integrity: sha512-LidMHe1FpcSYH4vcSjXooda34pC0M8m1gmDOv7SQi6Iv+ib1zX7J3sHBCC9/3FPCkn2k1b55FneVqMRxrr99pg==}
 
   '@iconify/types@2.0.0':
     resolution: {integrity: sha512-+wluvCrRhXrhyOmRDJ3q8mux9JkKy5SJ/v8ol2tu4FVjyYvtEzkc/3pK15ET6RKg4b4w4BmTk1+gsCUhf21Ykg==}
@@ -4610,6 +4616,8 @@ snapshots:
       prosemirror-view: 1.42.6
 
   '@hexagon/base64@1.1.28': {}
+
+  '@huggingface/tokenizers@0.2.0': {}
 
   '@iconify/types@2.0.0': {}
 

@@ -403,3 +403,7 @@ managed by the workflow; they persist across deploys and are set once, manually,
 See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md) for the gate's behavior, the credentials, the
 optional manual-approval gate, how to switch to manual releases, and what Workers Builds, gradual
 deployments, or a staging environment would trade instead. Successful named-production deploy records are in the [status audit](evidence/documentation-audit-2026-10-12.md). They do not establish every optional integration or the portable native-form gate.
+
+## Optional Cloudflare platform services
+
+Follow the [platform release runbook](implementation/cloudflare-platform-release.md) after the minimal deployment is verified. The public Worker uses a separate hostname and private publication bucket; it must not be placed behind Access. Configure resource IDs and credentials explicitly. No optional paid subscription is created by deployment validation.

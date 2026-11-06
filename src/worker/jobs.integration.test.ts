@@ -34,6 +34,7 @@ import {
 } from "./jobs";
 import worker from "./index";
 import { withObservabilityContext } from "./observability";
+import { withAuditRequest } from "./audit";
 
 type InstalledWorkspace = { cookie: string; pageId: string; userId: string; workspaceId: string };
 
@@ -1511,7 +1512,7 @@ describe("job execution", () => {
       get(target, property, receiver) {
         if (property === "prepare") {
           return (query: string) => {
-            if (query.includes("SELECT id, workspace_id, content_epoch, kind, title, is_task_list FROM pages")) {
+            if (query.includes("SELECT id, workspace_id, content_epoch, kind, title, is_task_list")) {
               return { bind: () => ({ first: async () => Promise.reject(diagnostic) }) };
             }
             return target.prepare(query);
@@ -3241,13 +3242,20 @@ describe("job execution", () => {
         return callback();
       },
     };
-    await runImport(env, job, step as Parameters<typeof runImport>[2]);
+    await withAuditRequest({ ...env, AUDIT_ENABLED: "true" }, "import-publication-counts", (auditEnv) =>
+      runImport(auditEnv, job, step as Parameters<typeof runImport>[2]),
+    );
     expect(
       await env.DB.prepare(`SELECT parent_id, import_job_id FROM pages WHERE id = ?`).bind(stagedId).first(),
     ).toMatchObject({ parent_id: installed.pageId, import_job_id: null });
     expect((await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(job.id).first())?.status).toBe(
       "succeeded",
     );
+    expect(
+      await env.DB.prepare("SELECT COUNT(*) count FROM audit_events WHERE target_id=? AND action='page.update'")
+        .bind(stagedId)
+        .first<number>("count"),
+    ).toBeGreaterThan(0);
   });
 
   it("keeps a published child out of the sidebar when its parent is a row-detail page", async () => {
@@ -4862,17 +4870,22 @@ describe("job execution", () => {
     );
     const privateSpace = (await privateResponse.json<{ space: { id: string } }>()).space;
     const broadcasts: Array<{ type?: string; pages?: Array<{ title: string }> }> = [];
-    const bindings = bindingsWith({
+    // The audit wrapper copies bindings; keep the fixture-only inline flag as an
+    // enumerable property, like real environment configuration.
+    const bindings = {
+      ...bindingsWith({
+        WORKSPACE_EVENTS: {
+          getByName: () => ({
+            fetch: async (eventRequest: Request) => {
+              broadcasts.push(await eventRequest.json());
+              return new Response(null, { status: 204 });
+            },
+          }),
+        },
+      }),
+      AUDIT_ENABLED: "true",
       WORKFLOW_INLINE: "true",
-      WORKSPACE_EVENTS: {
-        getByName: () => ({
-          fetch: async (eventRequest: Request) => {
-            broadcasts.push(await eventRequest.json());
-            return new Response(null, { status: 204 });
-          },
-        }),
-      },
-    });
+    } satisfies Env;
     const encoder = new TextEncoder();
     const tableId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const zip = createZip([
@@ -4970,6 +4983,11 @@ describe("job execution", () => {
         .bind(table.table.rows[0]!.detailPageId)
         .first(),
     ).toMatchObject({ source_role: "table_row_detail" });
+    expect(
+      await env.DB.prepare("SELECT COUNT(*) count FROM audit_events WHERE target_id=? AND action='page.insert'")
+        .bind(table.table.rows[0]!.detailPageId)
+        .first<number>("count"),
+    ).toBeGreaterThan(0);
     const pageBroadcast = broadcasts.find((event) => event.type === "pages-upserted");
     expect(pageBroadcast?.pages?.map((page) => page.title)).toEqual(
       expect.arrayContaining(["Tech Tasks", "Personal Home"]),

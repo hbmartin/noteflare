@@ -1,3 +1,4 @@
+import { encryptionConfigured, encryptManaged, decryptManaged } from "./secrets";
 import { slackAccessAuthorization, SlackInstallationAuthError } from "./slack-identity";
 import {
   slackRefreshableAuthError,
@@ -18,7 +19,7 @@ import type {
   SlackStatus,
 } from "../shared/types";
 import { tracing } from "cloudflare:workers";
-import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256 } from "../shared/security";
+import { bytesToBase64Url, constantTimeEqual, hmacSha256 } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { DeliveryInProgressError } from "./delivery-claim";
@@ -42,7 +43,6 @@ export { SLACK_REDRIVE_STALE_MS } from "./slack-outbox";
 
 const OAUTH_STATE_TTL_MS = 10 * 60_000;
 const REQUEST_WINDOW_SECONDS = 5 * 60;
-const TOKEN_VERSION = "v1";
 const SLACK_BOT_SCOPES = [
   "commands",
   "chat:write",
@@ -425,7 +425,7 @@ export function slackScopeHealth(scopes: string | readonly string[]) {
 
 function configured(env: Env) {
   return Boolean(
-    env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET && env.SLACK_SIGNING_SECRET && env.SLACK_TOKEN_ENCRYPTION_KEY,
+    env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET && env.SLACK_SIGNING_SECRET && encryptionConfigured(env, "slack"),
   );
 }
 
@@ -436,7 +436,10 @@ export function slackConfigurationStatus(env: Env) {
       ["SLACK_CLIENT_ID", env.SLACK_CLIENT_ID],
       ["SLACK_CLIENT_SECRET", env.SLACK_CLIENT_SECRET],
       ["SLACK_SIGNING_SECRET", env.SLACK_SIGNING_SECRET],
-      ["SLACK_TOKEN_ENCRYPTION_KEY", env.SLACK_TOKEN_ENCRYPTION_KEY],
+      [
+        "SLACK_TOKEN_ENCRYPTION_KEY or SLACK_ENCRYPTION_KEYS",
+        encryptionConfigured(env, "slack") ? "configured" : undefined,
+      ],
     ]
       .filter(([, value]) => !value)
       .map(([name]) => name!),
@@ -466,14 +469,6 @@ async function hexDigest(value: string) {
   return Array.from(await sha256(value), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function encryptionKey(env: Env) {
-  requireSlackConfiguration(env);
-  return crypto.subtle.importKey("raw", await sha256(env.SLACK_TOKEN_ENCRYPTION_KEY!), "AES-GCM", false, [
-    "encrypt",
-    "decrypt",
-  ]);
-}
-
 // Only definite API rejections prove that no message was created. Transport and
 // malformed-response failures must retain the sending checkpoint for reconciliation.
 export function definiteSlackRejection(error: unknown): error is SlackApiError {
@@ -494,28 +489,13 @@ export function definiteSlackRejection(error: unknown): error is SlackApiError {
   );
 }
 
-export async function encryptSlackToken(env: Env, token: string) {
-  const nonce = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = new Uint8Array(
-    await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: nonce },
-      await encryptionKey(env),
-      new TextEncoder().encode(token),
-    ),
-  );
-  return `${TOKEN_VERSION}.${bytesToBase64Url(nonce)}.${bytesToBase64Url(ciphertext)}`;
+export async function encryptSlackToken(env: Env, token: string, workspaceId?: string) {
+  requireSlackConfiguration(env);
+  return encryptManaged(env, "slack", workspaceId ? `slack:${workspaceId}` : "slack-token", token);
 }
-
-export async function decryptSlackToken(env: Env, ciphertext: string) {
-  const [version, rawNonce, rawCiphertext] = ciphertext.split(".");
-  if (version !== TOKEN_VERSION || !rawNonce || !rawCiphertext)
-    throw new Error("The Slack token ciphertext is invalid.");
-  const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: base64UrlToBytes(rawNonce) },
-    await encryptionKey(env),
-    base64UrlToBytes(rawCiphertext),
-  );
-  return new TextDecoder().decode(plaintext);
+export async function decryptSlackToken(env: Env, ciphertext: string, workspaceId?: string) {
+  requireSlackConfiguration(env);
+  return decryptManaged(env, "slack", workspaceId ? `slack:${workspaceId}` : "slack-token", ciphertext);
 }
 
 export async function createSlackOAuthUrl(env: Env, member: MemberContext) {
@@ -627,8 +607,8 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
         result.team.id,
         result.team.name ?? "Slack workspace",
         result.bot_user_id,
-        await encryptSlackToken(env, result.access_token),
-        result.refresh_token ? await encryptSlackToken(env, result.refresh_token) : null,
+        await encryptSlackToken(env, result.access_token, member.workspace.id),
+        result.refresh_token ? await encryptSlackToken(env, result.refresh_token, member.workspace.id) : null,
         result.expires_in ? timestamp + result.expires_in * 1000 : null,
         result.scope ?? "",
         member.user.id,
@@ -1497,7 +1477,7 @@ export async function usableBotToken(
     !forceRefresh &&
     (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000)
   ) {
-    return decryptSlackToken(env, installation.bot_token_ciphertext);
+    return decryptSlackToken(env, installation.bot_token_ciphertext, installation.workspace_id);
   }
   if (!Number.isSafeInteger(installation.generation))
     throw new Error("Slack installation generation is unavailable for token refresh.");
@@ -1551,7 +1531,7 @@ export async function usableBotToken(
     if (current.bot_token_ciphertext !== oldCiphertext) {
       Object.assign(installation, current);
       requireUsableSlackHealth(installation);
-      return decryptSlackToken(env, current.bot_token_ciphertext);
+      return decryptSlackToken(env, current.bot_token_ciphertext, current.workspace_id);
     }
     if (current.credential_revision !== oldRevision || current.bot_refresh_token_ciphertext !== oldRefreshCiphertext)
       throw new SlackInstallationChangedError();
@@ -1573,7 +1553,11 @@ export async function usableBotToken(
   if (!claimed) throw new SlackTokenRefreshInProgressError();
   try {
     // Decryption failures belong to infrastructure, outside the request boundary.
-    const refreshToken = await decryptSlackToken(env, installation.bot_refresh_token_ciphertext);
+    const refreshToken = await decryptSlackToken(
+      env,
+      installation.bot_refresh_token_ciphertext,
+      installation.workspace_id,
+    );
     const response = await fetch("https://slack.com/api/oauth.v2.access", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -1635,7 +1619,7 @@ export async function usableBotToken(
           if (current.bot_token_ciphertext !== oldCiphertext) {
             Object.assign(installation, current);
             requireUsableSlackHealth(installation);
-            return decryptSlackToken(env, current.bot_token_ciphertext);
+            return decryptSlackToken(env, current.bot_token_ciphertext, current.workspace_id);
           }
           if (
             current.credential_revision !== oldRevision ||
@@ -1666,7 +1650,7 @@ export async function usableBotToken(
           }
           Object.assign(installation, current);
           requireUsableSlackHealth(installation);
-          return decryptSlackToken(env, current.bot_token_ciphertext);
+          return decryptSlackToken(env, current.bot_token_ciphertext, current.workspace_id);
         }
         installation.auth_error = slackStoredError(error);
         throw error;
@@ -1678,9 +1662,9 @@ export async function usableBotToken(
       );
     }
     const updatedAt = Date.now();
-    const accessTokenCiphertext = await encryptSlackToken(env, result.access_token!);
+    const accessTokenCiphertext = await encryptSlackToken(env, result.access_token!, installation.workspace_id);
     const refreshTokenCiphertext = result.refresh_token
-      ? await encryptSlackToken(env, result.refresh_token)
+      ? await encryptSlackToken(env, result.refresh_token, installation.workspace_id)
       : installation.bot_refresh_token_ciphertext;
     const expiry =
       typeof result.expires_in === "string" && /^\d+$/.test(result.expires_in)
@@ -1735,7 +1719,7 @@ export async function usableBotToken(
       if (current.bot_token_ciphertext === oldCiphertext) throw new Error("Slack token refresh was not persisted.");
       Object.assign(installation, current);
       requireUsableSlackHealth(installation);
-      return decryptSlackToken(env, current.bot_token_ciphertext);
+      return decryptSlackToken(env, current.bot_token_ciphertext, current.workspace_id);
     }
     installation.bot_token_ciphertext = accessTokenCiphertext;
     installation.bot_refresh_token_ciphertext = refreshTokenCiphertext;
@@ -1820,7 +1804,7 @@ export async function slackApi<Method extends SlackApiMethod>(
     const read = SLACK_READ_METHODS.has(method);
     const token =
       method === "auth.revoke"
-        ? await decryptSlackToken(env, installation.bot_token_ciphertext)
+        ? await decryptSlackToken(env, installation.bot_token_ciphertext, installation.workspace_id)
         : (preparedToken ?? (await usableBotToken(env, installation, signal, options.tokenRefreshMode)));
     signal?.throwIfAborted();
     const dispatchPayload = (beforeDispatch ? await beforeDispatch() : undefined) ?? payload;

@@ -1,3 +1,4 @@
+import { withAuditRequest, setAuditActor } from "./audit";
 import { pruneDocumentChanges } from "./document-changes";
 import { tableTemplateSnapshot, type TableSnapshot } from "./table-service";
 import { metadataColumns, type TableFilter, type TableValue, type TableView } from "../shared/table-protocol";
@@ -731,6 +732,27 @@ async function cloneTemplateAttachments(env: Env, job: JobRow, options: Template
       }
     }
   }
+  const cover = await env.DB.prepare(
+    "SELECT cover_attachment_id,cover_x,cover_y FROM pages WHERE id=? AND workspace_id=?",
+  )
+    .bind(options.sourcePageId, job.workspace_id)
+    .first<{ cover_attachment_id: string | null; cover_x: number; cover_y: number }>();
+  const clonedCover = cover?.cover_attachment_id ? ids.get(cover.cover_attachment_id) : null;
+  if (cover?.cover_attachment_id && !clonedCover)
+    throw new HttpError(409, "job_failed", "The template cover changed while cloning. Retry the clone.");
+  await env.DB.prepare(`UPDATE pages SET cover_attachment_id=?,cover_x=?,cover_y=? WHERE id=? AND import_job_id=? AND content_epoch=?
+    AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND attempt=? AND status='running')`)
+    .bind(
+      clonedCover ?? null,
+      cover?.cover_x ?? 0.5,
+      cover?.cover_y ?? 0.5,
+      options.targetPageId,
+      job.id,
+      job.attempt,
+      job.id,
+      job.attempt,
+    )
+    .run();
   await updateJob(env, job, { current: 2, total: 4, label: "Initializing page" });
   await notifyJobs(env, job.workspace_id);
   return ids;
@@ -1537,62 +1559,63 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
           "notes.job_id": event.payload.jobId,
           "notes.job_attempt": event.payload.attempt,
         },
-        () => this.runObserved(event, step),
+        () => withAuditRequest(this.env, correlationId, (requestEnv) => this.runObserved(requestEnv, event, step)),
       ),
     );
   }
 
-  private async runObserved(event: Readonly<WorkflowEvent<JobWorkflowParams>>, step: WorkflowStep) {
+  private async runObserved(requestEnv: Env, event: Readonly<WorkflowEvent<JobWorkflowParams>>, step: WorkflowStep) {
     const { jobId } = event.payload;
     const attempt =
       event.payload.attempt ??
       (await step.do("resolve legacy job attempt", async () => {
-        return resolveJobWorkflowAttempt(this.env, event);
+        return resolveJobWorkflowAttempt(requestEnv, event);
       }));
     // A missing row means this is an obsolete legacy workflow instance. It must
     // not attach itself to whichever attempt happens to be current now.
     if (attempt === null) return;
     const identity = { id: jobId, attempt };
     try {
-      const job = await step.do("load job", async () => claimJobWorkflowRun(this.env, event, attempt));
+      const job = await step.do("load job", async () => claimJobWorkflowRun(requestEnv, event, attempt));
       if (!job) return;
+      setAuditActor({ type: "user", id: job.requested_by, workspaceId: job.workspace_id });
       if (job.type === "template_clone") {
-        await runTemplateClone(this.env, job, step);
+        await runTemplateClone(requestEnv, job, step);
         return;
       }
       if (job.type === "comment_migration") {
-        await runCommentMigration(this.env, job, step);
+        await runCommentMigration(requestEnv, job, step);
         return;
       }
       if (job.type === "export") {
-        await runExport(this.env, job, step);
+        await runExport(requestEnv, job, step);
         return;
       }
       if (job.type === "import") {
-        await runImport(this.env, job, step);
+        await runImport(requestEnv, job, step);
         return;
       }
       const total = await step.do("count pages", async () => {
-        await assertJobActive(this.env, identity);
-        const count = await this.env.DB.prepare(
+        await assertJobActive(requestEnv, identity);
+        const count = await requestEnv.DB.prepare(
           `SELECT COUNT(*) count FROM pages WHERE workspace_id = ?
             AND import_job_id IS NULL AND is_template = 0`,
         )
           .bind(job.workspace_id)
           .first<{ count: number }>();
-        await updateJob(this.env, identity, { total: count?.count ?? 0, label: "Reindexing pages" });
-        await notifyJobs(this.env, job.workspace_id);
+        await updateJob(requestEnv, identity, { total: count?.count ?? 0, label: "Reindexing pages" });
+        await notifyJobs(requestEnv, job.workspace_id);
         return count?.count ?? 0;
       });
       let indexed = 0;
       let afterId = "";
       for (let batchIndex = 0; indexed < total; batchIndex += 1) {
         const result = await step.do(`reindex batch ${batchIndex + 1}`, async () => {
-          await assertJobActive(this.env, identity);
-          const batch = await reindexPageBatch(this.env, job.workspace_id, afterId);
+          await assertJobActive(requestEnv, identity);
+          const batch = await reindexPageBatch(requestEnv, job.workspace_id, afterId);
           const nextCount = indexed + batch.count;
-          await updateJob(this.env, identity, { current: nextCount, total, label: "Reindexing pages" });
-          await notifyJobs(this.env, job.workspace_id);
+          await updateJob(requestEnv, identity, { current: nextCount, total, label: "Reindexing pages" });
+          await notifyJobs(requestEnv, job.workspace_id);
           return batch;
         });
         if (!result.count) break;
@@ -1600,18 +1623,18 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         afterId = result.lastId;
       }
       await step.do("complete job", async () => {
-        await assertJobActive(this.env, identity);
-        await updateJob(this.env, identity, {
+        await assertJobActive(requestEnv, identity);
+        await updateJob(requestEnv, identity, {
           status: "succeeded",
           current: indexed,
           total,
           label: "Complete",
           resultJson: JSON.stringify({ warnings: [] }),
         });
-        await notifyJobs(this.env, job.workspace_id);
+        await notifyJobs(requestEnv, job.workspace_id);
       });
     } catch (error) {
-      const current = await this.env.DB.prepare(
+      const current = await requestEnv.DB.prepare(
         `SELECT * FROM jobs WHERE id=? AND attempt>=? AND COALESCE(workflow_instance_id,id)=?`,
       )
         .bind(jobId, attempt, event.instanceId)
@@ -1621,16 +1644,16 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
       if (!current) return;
       if (current?.status === "canceling" || current?.status === "canceled") {
         if (current.status === "canceling")
-          await finishPendingJobCleanup(this.env, current, { terminateWorkflow: false });
+          await finishPendingJobCleanup(requestEnv, current, { terminateWorkflow: false });
         return;
       }
       if (current.status !== "running") return;
-      const recovery = await shouldRequeueCapture(this.env, current, error);
+      const recovery = await shouldRequeueCapture(requestEnv, current, error);
       if (recovery) {
-        await replaceCaptureWorkflow(this.env, current, "running", recovery === "lookup_failed");
+        await replaceCaptureWorkflow(requestEnv, current, "running", recovery === "lookup_failed");
         return;
       }
-      await failJobWithCleanup(this.env, current, error);
+      await failJobWithCleanup(requestEnv, current, error);
       throw error;
     }
   }

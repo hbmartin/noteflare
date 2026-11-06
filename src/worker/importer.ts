@@ -48,6 +48,7 @@ const MAX_ARCHIVE_ENTRIES = 5_000;
 
 type ImportAsset = { source: string; name: string; mime: string; bytes: Uint8Array };
 type ImportPage = {
+  cover?: { source: string; x: number; y: number };
   source: string;
   id: string;
   parentId: string | null;
@@ -574,9 +575,51 @@ function ownerFor(source: string, owners: ReadonlyMap<string, string>, grouping:
   return null;
 }
 
+function portableCoverMetadata(entries: readonly ZipEntry[]) {
+  const covers = new Map<string, { source: string; x: number; y: number }>();
+  for (const entry of entries) {
+    if (!entry.path.endsWith(".noteflare-page.json") || entry.bytes.byteLength > 65536) continue;
+    try {
+      const value = JSON.parse(new TextDecoder().decode(entry.bytes)) as {
+        schema?: unknown;
+        page?: unknown;
+        cover?: { path?: unknown; x?: unknown; y?: unknown };
+      };
+      if (
+        value.schema !== "noteflare-page-v1" ||
+        typeof value.page !== "string" ||
+        typeof value.cover?.path !== "string"
+      )
+        continue;
+      const pagePath = normalizedRelativePath(entry.path, value.page),
+        assetPath = normalizedRelativePath(entry.path, value.cover.path);
+      const x = value.cover.x,
+        y = value.cover.y;
+      if (
+        !pagePath ||
+        !assetPath ||
+        typeof x !== "number" ||
+        typeof y !== "number" ||
+        !Number.isFinite(x) ||
+        !Number.isFinite(y) ||
+        x < 0 ||
+        x > 1 ||
+        y < 0 ||
+        y > 1
+      )
+        continue;
+      covers.set(pagePath, { source: assetPath, x, y });
+    } catch {
+      /* Ignore unknown metadata; normal content import still applies. */
+    }
+  }
+  return covers;
+}
+
 async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Array): Promise<ImportBundle> {
   const entries = await nestedEntries(bytes);
   const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+  const covers = portableCoverMetadata(entries);
   const documentEntries = entries.filter((entry) => {
     const ext = extension(entry.path);
     const parent = parentPath(entry.path);
@@ -632,7 +675,10 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   const parsePage = (entry: NotionPageEntry) => {
     let parsed = parsedPages.get(entry.path);
     if (!parsed) {
-      parsed = extension(entry.path).startsWith(".htm") ? htmlToDocument(entry.text) : markdownToDocument(entry.text);
+      const source = covers.has(entry.path)
+        ? entry.text.replace(/\x3c!-- noteflare-cover:start -->[\s\S]*?\x3c!-- noteflare-cover:end -->/g, "")
+        : entry.text;
+      parsed = extension(entry.path).startsWith(".htm") ? htmlToDocument(source) : markdownToDocument(source);
       parsedPages.set(entry.path, parsed);
     }
     return parsed;
@@ -653,7 +699,9 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
     const csv = csvByDatabase.get(`${parentPath(entry.path)}/${rawStem}`);
     const parentSource = ownerFor(entry.path, owners, grouping);
     const groupKey = groupKeyBySource.get(entry.path)!;
-    const sourceText = entry.text;
+    const sourceText = covers.has(entry.path)
+      ? entry.text.replace(/\x3c!-- noteflare-cover:start -->[\s\S]*?\x3c!-- noteflare-cover:end -->/g, "")
+      : entry.text;
     const parsed = parsePage(entry);
     issues.push(...parsed.issues);
     if (csv) matchedCsv.add(csv.path);
@@ -729,9 +777,29 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
   }
 
   const linkStats = { resolved: 0, unresolved: 0 };
-  for (const page of pages) await hydrateDocumentAssets(job, page, byPath, pageIds, issues, linkStats);
+  for (const page of pages) {
+    await hydrateDocumentAssets(job, page, byPath, pageIds, issues, linkStats);
+    const cover = covers.get(page.source),
+      asset = cover ? byPath.get(cover.source) : null;
+    if (
+      cover &&
+      asset &&
+      /^image\/(png|jpeg|webp|avif|gif)$/.test(mimeFor(cover.source)) &&
+      asset.bytes.byteLength <= 10 * 1024 * 1024
+    ) {
+      page.cover = cover;
+      if (!page.assets.some((item) => item.source === cover.source))
+        page.assets.push({
+          source: cover.source,
+          name: cover.source.split("/").at(-1)!,
+          mime: mimeFor(cover.source),
+          bytes: asset.bytes,
+        });
+    }
+  }
   const assetPaths = entries.filter(
-    (entry) => !knownSources.has(entry.path) && extension(entry.path) !== ".csv",
+    (entry) =>
+      !knownSources.has(entry.path) && extension(entry.path) !== ".csv" && !entry.path.endsWith(".noteflare-page.json"),
   ).length;
   const pageById = new Map(pages.map((page) => [page.id, page]));
   const depth = (page: ImportPage) => {
@@ -1018,6 +1086,26 @@ async function stageAttachments(env: Env, job: JobRow, page: ImportPage) {
       if (replay?.r2_key !== key) await env.BUCKET.delete(key);
       if (!replay || replay.r2_key !== key) throw error;
     }
+  }
+  if (page.cover) {
+    const id = await stableId(job.id, "attachment", `${page.source}:${page.cover.source}`);
+    await env.DB.prepare(`UPDATE pages SET cover_attachment_id=?,cover_x=?,cover_y=? WHERE id=? AND import_job_id=? AND content_epoch=?
+      AND EXISTS(SELECT 1 FROM attachments WHERE id=? AND page_id=? AND workspace_id=?)
+      AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND attempt=? AND status='running')`)
+      .bind(
+        id,
+        page.cover.x,
+        page.cover.y,
+        page.id,
+        job.id,
+        job.attempt,
+        id,
+        page.id,
+        job.workspace_id,
+        job.id,
+        job.attempt,
+      )
+      .run();
   }
 }
 

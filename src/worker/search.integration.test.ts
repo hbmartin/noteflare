@@ -328,6 +328,18 @@ describe("search v2", () => {
     ).json<SearchResponse>();
     expect(renamed.results).toEqual([]);
   });
+  it("searches long literal queries without exceeding D1's LIKE pattern limit", async () => {
+    const installed = await bootstrap();
+    const title = "Long literal searchable title with over fifty characters and punctuation %_";
+    const page = await createPage(installed.cookie, title, installed.generalId);
+    const search = await SELF.fetch(request(installed.cookie, `/api/search?q=${encodeURIComponent(title)}`));
+    expect(search.status).toBe(200);
+    expect((await search.json<SearchResponse>()).results[0]?.page.id).toBe(page.id);
+    const titles = await SELF.fetch(request(installed.cookie, `/api/search/titles?q=${encodeURIComponent(title)}`));
+    expect(titles.status).toBe(200);
+    expect((await titles.json<{ suggestions: SearchTitleSuggestion[] }>()).suggestions[0]?.page.id).toBe(page.id);
+  });
+
   it("filters diagrams in full search and title suggestions", async () => {
     const installed = await bootstrap();
     const diagram = await createPage(installed.cookie, "Service topology", installed.generalId, "diagram");

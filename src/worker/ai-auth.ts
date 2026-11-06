@@ -1,3 +1,4 @@
+import { encryptionConfigured, sealManaged, unsealManaged } from "./secrets";
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
 import { base64UrlToBytes, bytesToBase64Url } from "../shared/security";
 import type { Env, MemberContext } from "./env";
@@ -45,7 +46,7 @@ export async function unseal<T>(secret: string, context: string, value: string):
 export function chatgptConfigured(env: Env) {
   return (
     env.CHATGPT_CONNECTION_ENABLED === "true" &&
-    !!env.AI_TOKEN_ENCRYPTION_KEY &&
+    encryptionConfigured(env, "ai") &&
     (env.CHATGPT_CLIENT_ID ?? "").startsWith("oaiapp_") &&
     (env.CHATGPT_TOKEN_AUTH_METHOD === "none" ||
       (env.CHATGPT_TOKEN_AUTH_METHOD === "client_secret_basic" && !!env.CHATGPT_CLIENT_SECRET)) &&
@@ -131,7 +132,7 @@ export async function startChatgptConnection(env: Env, member: MemberContext) {
       member.user.id,
       member.session.id,
       await sha256(browser),
-      await seal(env.AI_TOKEN_ENCRYPTION_KEY!, `ai-state:${hash}`, verifier),
+      await sealManaged(env, `ai-state:${hash}`, verifier),
       nonce,
       Date.now() + 10 * 60_000,
     )
@@ -174,7 +175,7 @@ export async function finishChatgptConnection(
       "The ChatGPT connection expired or does not belong to this browser. Start again.",
     );
   const config = await discovery();
-  const verifier = await unseal<string>(env.AI_TOKEN_ENCRYPTION_KEY!, `ai-state:${hash}`, record.verifier_ciphertext);
+  const verifier = await unsealManaged<string>(env, `ai-state:${hash}`, record.verifier_ciphertext);
   const response = await exchange(
     env,
     config.token_endpoint,
@@ -234,7 +235,7 @@ export async function finishChatgptConnection(
       member.user.id,
       identity.sub!,
       label.slice(0, 320),
-      await seal(env.AI_TOKEN_ENCRYPTION_KEY!, tokenContext(member), {
+      await sealManaged(env, tokenContext(member), {
         access_token: value.access_token,
         refresh_token: value.refresh_token,
         scope: value.scope,
@@ -264,8 +265,7 @@ export async function chatgptAccessToken(env: Env, member: MemberContext) {
   let current = await read();
   if (!current) throw new HttpError(424, "chatgpt_reconnect", "Connect your ChatGPT account to use plan funding.");
   if (current.expires_at > Date.now() + 60_000)
-    return (await unseal<Tokens>(env.AI_TOKEN_ENCRYPTION_KEY!, tokenContext(member), current.tokens_ciphertext))
-      .access_token;
+    return (await unsealManaged<Tokens>(env, tokenContext(member), current.tokens_ciphertext)).access_token;
   const lease = crypto.randomUUID();
   const claimed = await env.DB.prepare(
     "UPDATE ai_connections SET refresh_lease=?,refresh_lease_until=? WHERE workspace_id=? AND user_id=? AND tokens_ciphertext=? AND (refresh_lease_until IS NULL OR refresh_lease_until<?)",
@@ -278,14 +278,13 @@ export async function chatgptAccessToken(env: Env, member: MemberContext) {
       current = await read();
       if (!current) throw new HttpError(424, "chatgpt_reconnect", "Reconnect ChatGPT to continue.");
       if (current.expires_at > Date.now() + 60_000)
-        return (await unseal<Tokens>(env.AI_TOKEN_ENCRYPTION_KEY!, tokenContext(member), current.tokens_ciphertext))
-          .access_token;
+        return (await unsealManaged<Tokens>(env, tokenContext(member), current.tokens_ciphertext)).access_token;
       if (!current.refresh_lease) break;
     }
     throw new HttpError(503, "chatgpt_refresh_pending", "ChatGPT is reconnecting. Retry shortly.");
   }
   try {
-    const tokens = await unseal<Tokens>(env.AI_TOKEN_ENCRYPTION_KEY!, tokenContext(member), current.tokens_ciphertext);
+    const tokens = await unsealManaged<Tokens>(env, tokenContext(member), current.tokens_ciphertext);
     const response = await exchange(
       env,
       (await discovery()).token_endpoint,
@@ -314,7 +313,7 @@ export async function chatgptAccessToken(env: Env, member: MemberContext) {
       "UPDATE ai_connections SET tokens_ciphertext=?,expires_at=?,refresh_lease=NULL,refresh_lease_until=NULL WHERE workspace_id=? AND user_id=? AND refresh_lease=?",
     )
       .bind(
-        await seal(env.AI_TOKEN_ENCRYPTION_KEY!, tokenContext(member), {
+        await sealManaged(env, tokenContext(member), {
           access_token: value.access_token,
           refresh_token: value.refresh_token,
           scope: value.scope,

@@ -41,3 +41,7 @@ Source and integration rate limits apply before and after authentication. Consul
 - Notion SDK methods outside the route matrix are unsupported. Test the specific methods your integration needs against a synthetic pilot installation.
 
 The [historical feasibility assessment](research/notion-api-feasibility-2026-08-23.md) preserves the earlier architecture discussion; it is not a current compatibility reference.
+
+## Platform application APIs
+
+The application exposes owner-only `/api/platform`, `/api/platform/keys`, `/api/audit` and archive routes. Page endpoints add `/cover`, `/forms`, `/related` and `/heatmap`; space publication settings use `/api/spaces/:spaceId/publications`. Search keeps keyword behavior when mode is omitted and accepts `mode=hybrid` with user-scoped five-minute cursors. AI writing accepts retrieval auto/off, default auto. Public Forms accept submissionId, formVersion, values and turnstileToken. See the [platform release runbook](implementation/cloudflare-platform-release.md) for authorization and failure behavior.

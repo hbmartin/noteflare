@@ -264,7 +264,26 @@ import {
   workspaceMcpSettings,
 } from "./oauth";
 import { mcpRequest, pruneStagedMcpPages } from "./mcp";
-import { normalizeQueuedTitles, parseSearchRequest, searchPages, searchTitles } from "./search";
+import { normalizeQueuedTitles, parseSearchRequest, searchWithMode, searchTitles, relatedPages } from "./search";
+import { beginReadSession } from "./read-session";
+import { platformApi } from "./platform-api";
+import { withAuditRequest } from "./audit";
+import { consumePlatformQueue } from "./platform-jobs";
+import { platformHandlers, wakePlatform } from "./platform-coordinator";
+import { formsSettingsResponse } from "./forms";
+import { publicationSettingsResponse, hostnameSettingsResponse } from "./publications";
+import { mediaResponse, coverResponse } from "./images";
+import { rowPageResponse } from "./row-pages";
+import { turnstileConfiguration, verifyPublicChallenge } from "./turnstile";
+import { accessConfiguration, enforceAccessBoundary } from "./access";
+import {
+  getShareAccess,
+  authorizeShareRequest,
+  publicShareChallenge,
+  unlockShare,
+  consumeShareExchange,
+} from "./share-access";
+export { PlatformCoordinator } from "./platform-coordinator";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import {
   createShare,
@@ -393,11 +412,13 @@ const PAGE_MOVE_RECEIPT_PAGE_COLUMNS = {
   archivedAt: "archived_at",
   createdAt: "created_at",
   updatedAt: "updated_at",
-} as const satisfies { [Field in keyof Page]-?: keyof PageJsonRow };
+} as const satisfies { [Field in Exclude<keyof Page, "cover">]-?: keyof PageJsonRow };
 
 const PAGE_MOVE_RECEIPT_PAGE_JSON_SQL = `json_object(${Object.entries(PAGE_MOVE_RECEIPT_PAGE_COLUMNS)
   .map(([field, column]) => `'${field}', ${column}`)
-  .join(", ")})`;
+  .join(
+    ", ",
+  )}, 'cover', CASE WHEN cover_attachment_id IS NULL THEN NULL ELSE json_object('attachmentId',cover_attachment_id,'x',cover_x,'y',cover_y) END)`;
 const PAGE_MOVE_RECEIPT_INVALID_LOG_MESSAGE = "Page move receipt was invalid.";
 const PAGE_MOVE_RECEIPT_UNREADABLE_LOG_MESSAGE = "Page move receipt could not be read.";
 const PAGE_MOVE_BATCH_RESULT_INVALID_LOG_MESSAGE = "Page move batch result was invalid or inconsistent.";
@@ -459,6 +480,17 @@ function pageMoveReceiptSnapshotV1(value: unknown): Page {
     position: page.position,
     title: page.title,
     icon: page.icon,
+    cover:
+      page.cover &&
+      typeof page.cover === "object" &&
+      "attachmentId" in page.cover &&
+      typeof page.cover.attachmentId === "string"
+        ? {
+            attachmentId: page.cover.attachmentId,
+            x: "x" in page.cover && typeof page.cover.x === "number" ? page.cover.x : 0.5,
+            y: "y" in page.cover && typeof page.cover.y === "number" ? page.cover.y : 0.5,
+          }
+        : null,
     revision: page.revision,
     contentEpoch: page.contentEpoch,
     isTemplate: page.isTemplate === true || page.isTemplate === 1,
@@ -893,6 +925,9 @@ function clientTelemetryReport(body: Record<string, unknown>): ClientTelemetryRe
 
 function shareOptions(body: Record<string, unknown>) {
   return {
+    ...(typeof body.password === "string" || body.password === null ? { password: body.password } : {}),
+    ...(typeof body.expiresAt === "number" || body.expiresAt === null ? { expiresAt: body.expiresAt } : {}),
+    ...(typeof body.revokeAccess === "boolean" ? { revokeAccess: body.revokeAccess } : {}),
     ...(typeof body.includeSubpages === "boolean" ? { includeSubpages: body.includeSubpages } : {}),
     ...(typeof body.allowIndexing === "boolean" ? { allowIndexing: body.allowIndexing } : {}),
     ...(typeof body.showToc === "boolean" ? { showToc: body.showToc } : {}),
@@ -1242,7 +1277,12 @@ app.post("/api/telemetry/client-errors", async (c) => {
 
 app.get("/api/install", async (c) => {
   const state = await c.env.DB.prepare(`SELECT 1 initialized FROM install_state WHERE id = 1`).first();
-  return c.json({ initialized: Boolean(state), slackIdentityAvailable: await slackIdentityAvailability(c.env) });
+  return c.json({
+    initialized: Boolean(state),
+    slackIdentityAvailable: await slackIdentityAvailability(c.env),
+    turnstile: turnstileConfiguration(c.env),
+    access: accessConfiguration(c.env),
+  });
 });
 
 app.post("/api/install/bootstrap", async (c) => {
@@ -1594,6 +1634,7 @@ app.get("/api/me", async (c) => {
     workspace: member.workspace,
     role: member.role,
     features: {
+      heatmaps: c.env.HEATMAPS_ENABLED === "true",
       expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true",
       offlineEditing: false,
       blockLinks: c.env.BLOCK_LINKS_ENABLED === "true",
@@ -1603,6 +1644,7 @@ app.get("/api/me", async (c) => {
       tableBoard: c.env.TABLE_BOARD_ENABLED === "true",
       tableCalendar: c.env.TABLE_CALENDAR_ENABLED === "true",
       tableRelations: c.env.TABLE_RELATIONS_ENABLED === "true",
+      tableGallery: c.env.TABLE_GALLERY_ENABLED === "true",
       diffDigests: c.env.DIFF_DIGESTS_ENABLED === "true",
       workspaceActivity: c.env.WORKSPACE_ACTIVITY_ENABLED === "true",
     },
@@ -3274,9 +3316,11 @@ app.post("/api/pages/:id/exports", async (c) => {
 
 app.get("/api/pages/tree", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
+  const database = await beginReadSession(c.env, member, "tree");
   const archived = c.req.query("archived") === "true";
-  const rows = await c.env.DB.prepare(
-    `SELECT p.* FROM pages p
+  const rows = await database
+    .prepare(
+      `SELECT p.* FROM pages p
       JOIN spaces s ON s.id = p.space_id
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE p.workspace_id = ? AND p.archived_at IS ${archived ? "NOT " : ""}NULL
@@ -3292,7 +3336,7 @@ app.get("/api/pages/tree", async (c) => {
        )
        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
      ORDER BY p.position, p.id`,
-  )
+    )
     .bind(member.user.id, member.workspace.id, member.role)
     .all<PageRow>();
   return c.json({ pages: rows.results.map(pageJson) });
@@ -4335,7 +4379,9 @@ app.post("/api/pages/:id/move", async (c) => {
       throw new InvalidPageMoveBatchResultError("The page move batch returned an unexpected number of results.");
     }
     const moveChanges = results[moveResultIndex]?.meta?.changes;
-    if (moveChanges !== 0 && moveChanges !== 1) {
+    // D1 includes trigger writes in this count. The page predicate is unique;
+    // the committed receipt below verifies the actual mutation and its result.
+    if (typeof moveChanges !== "number" || !Number.isSafeInteger(moveChanges) || moveChanges < 0) {
       throw new InvalidPageMoveBatchResultError("The page move batch returned malformed move metadata.");
     }
     if (moveChanges === 0) {
@@ -4959,12 +5005,16 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
 
 app.get("/api/search", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  return c.json(await searchPages(c.env.DB, member, parseSearchRequest(c.req.url)));
+  return c.json(await searchWithMode(c.env, member, parseSearchRequest(c.req.url)));
 });
+
+app.get("/api/pages/:id/related", async (c) =>
+  c.json(await relatedPages(c.env, await requireMember(c.req.raw, c.env), c.req.param("id"))),
+);
 
 app.get("/api/search/titles", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  return c.json(await searchTitles(c.env.DB, member, c.req.url));
+  return c.json(await searchTitles(await beginReadSession(c.env, member, "search"), member, c.req.url));
 });
 
 app.post("/api/link-previews", async (c) => {
@@ -5285,8 +5335,10 @@ app.get("/api/pages/:id/verification", async (c) => {
 app.get("/api/pages/:id/backlinks", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
-  const rows = await c.env.DB.prepare(
-    `SELECT source.*, reference.excerpt
+  const database = await beginReadSession(c.env, member, "backlinks");
+  const rows = await database
+    .prepare(
+      `SELECT source.*, reference.excerpt
        FROM page_references reference JOIN pages source ON source.id = reference.source_page_id
        JOIN spaces s ON s.id = source.space_id
        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
@@ -5294,7 +5346,7 @@ app.get("/api/pages/:id/backlinks", async (c) => {
         AND source.import_job_id IS NULL AND source.is_template = 0
         AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
       ORDER BY source.updated_at DESC, source.id`,
-  )
+    )
     .bind(member.user.id, page.id, member.workspace.id, member.role)
     .all<PageRow & { excerpt: string }>();
   return c.json({ backlinks: rows.results.map((row) => ({ page: pageJson(row), excerpt: row.excerpt })) });
@@ -7017,6 +7069,31 @@ app.put("/api/tables/:pageId/cells/:rowId/:columnId", async (c) => {
   return c.json({ revision });
 });
 
+registerMetricMiddleware(app, "/share/*", async (c, next) => {
+  const url = new URL(c.req.url);
+  if (c.env.PUBLIC_BASE_URL && new URL(c.env.PUBLIC_BASE_URL).origin !== url.origin) {
+    const destination = new URL(url.pathname + url.search, c.env.PUBLIC_BASE_URL);
+    return new Response(null, { status: 307, headers: { location: destination.href, "cache-control": "no-store" } });
+  }
+  const parts = url.pathname.split("/").filter(Boolean),
+    key = parts[1];
+  if (!key) return c.text("Not found", 404, { "cache-control": "no-store" });
+  const share = await getShareAccess(c.env, key);
+  if (
+    !share ||
+    share.revoked_at !== null ||
+    (share.expires_at !== null && share.expires_at !== undefined && share.expires_at <= Date.now())
+  )
+    return c.text("Not found", 404, { "cache-control": "no-store" });
+  if (parts[2] !== "unlock" && !(await authorizeShareRequest(c.env, c.req.raw, share)))
+    return publicShareChallenge(c.env, c.req.raw, key);
+  await next();
+  return undefined;
+});
+app.get("/share/:key/unlock", (c) => publicShareChallenge(c.env, c.req.raw, c.req.param("key")));
+app.post("/share/:key/unlock", (c) => unlockShare(c.env, c.req.raw, c.req.param("key")));
+app.get("/share/:key/unlock/exchange", (c) => consumeShareExchange(c.env, c.req.raw, c.req.param("key")));
+
 app.get("/share/:key/assets/:attachmentId", async (c) => {
   const share = await resolveSharedPage(c.env, c.req.param("key"), c.req.query("page"));
   if (!share) return c.text("Not found", 404);
@@ -7054,7 +7131,10 @@ async function publicPageResponse(c: Context<{ Bindings: Env }>, pageId?: string
   if (!share) return c.text("Not found", 404);
   let html: string | null;
   try {
-    html = await renderPublicShare(c.env, share, key, new URL(c.req.url).origin);
+    html = await renderPublicShare(c.env, share, key, new URL(c.req.url).origin, {
+      ...(c.req.query("cursor") ? { cursor: c.req.query("cursor")! } : {}),
+      ...(c.req.query("view") ? { viewId: c.req.query("view")! } : {}),
+    });
   } catch (error) {
     if (error instanceof HttpError && error.code === "share_content_unavailable")
       return c.html(
@@ -7088,6 +7168,32 @@ app.get(
 );
 
 app.route("/v1", notionApi);
+app.route("/api", platformApi);
+app.get("/api/pages/:pageId/forms", (c) => formsSettingsResponse(c.req.raw, c.env, c.req.param("pageId")));
+app.put("/api/pages/:pageId/forms", (c) => formsSettingsResponse(c.req.raw, c.env, c.req.param("pageId")));
+app.get("/api/spaces/:spaceId/publications", (c) =>
+  publicationSettingsResponse(c.req.raw, c.env, c.req.param("spaceId")),
+);
+app.put("/api/spaces/:spaceId/publications", (c) =>
+  publicationSettingsResponse(c.req.raw, c.env, c.req.param("spaceId")),
+);
+app.get("/api/publications/:publicationId/hostnames", (c) =>
+  hostnameSettingsResponse(c.req.raw, c.env, c.req.param("publicationId")),
+);
+app.post("/api/publications/:publicationId/hostnames", (c) =>
+  hostnameSettingsResponse(c.req.raw, c.env, c.req.param("publicationId")),
+);
+app.delete("/api/publications/:publicationId/hostnames", (c) =>
+  hostnameSettingsResponse(c.req.raw, c.env, c.req.param("publicationId")),
+);
+app.get("/api/media/:attachmentId/:preset", (c) =>
+  mediaResponse(c.req.raw, c.env, c.req.param("attachmentId"), c.req.param("preset")),
+);
+app.get("/api/pages/:pageId/cover", (c) => coverResponse(c.req.raw, c.env, c.req.param("pageId")));
+app.patch("/api/pages/:pageId/cover", (c) => coverResponse(c.req.raw, c.env, c.req.param("pageId")));
+app.post("/api/tables/:tableId/rows/:rowId/page", (c) =>
+  rowPageResponse(c.req.raw, c.env, c.req.param("tableId"), c.req.param("rowId")),
+);
 
 app.notFound(async (c) => {
   if (new URL(c.req.url).pathname.startsWith("/api/")) {
@@ -7294,6 +7400,7 @@ async function handlePartyRequest(request: Request, env: Env) {
         const headers = new Headers(incoming.headers);
         for (const name of [
           "x-notes-user-id",
+          "x-notes-workspace-id",
           "x-notes-role",
           "x-notes-expires-at",
           "x-notes-internal",
@@ -7301,6 +7408,7 @@ async function handlePartyRequest(request: Request, env: Env) {
         ])
           headers.delete(name);
         headers.set("x-notes-user-id", member.user.id);
+        headers.set("x-notes-workspace-id", member.workspace.id);
         headers.set("x-notes-role", connectionRole ?? member.role);
         headers.set("x-notes-expires-at", String(expiresAt));
         headers.set("x-notes-auth-generation", String(authGeneration));
@@ -7535,18 +7643,30 @@ export default {
         const startedAt = performance.now();
         let response: Response;
         try {
-          const handle = async () => {
-            const party = await handlePartyRequest(request, env);
-            if (party) return party;
-            return withRealtimeAccessTracking(
-              env,
-              () => app.fetch(request, env, context),
-              async (workspaceId) => {
-                const member = await requireMember(request, env);
-                return member.role === "owner" && member.workspace.id === workspaceId;
-              },
-            );
-          };
+          const handle = async () =>
+            withAuditRequest(env, requestId, async (requestEnv) => {
+              try {
+                await enforceAccessBoundary(request, requestEnv);
+                await verifyPublicChallenge(request, requestEnv);
+              } catch (error) {
+                if (error instanceof HttpError)
+                  return Response.json(
+                    { error: { code: error.code, message: error.message, details: error.details } },
+                    { status: error.status, headers: { "cache-control": "no-store" } },
+                  );
+                throw error;
+              }
+              const party = await handlePartyRequest(request, requestEnv);
+              if (party) return party;
+              return withRealtimeAccessTracking(
+                requestEnv,
+                () => app.fetch(request, requestEnv, context),
+                async (workspaceId) => {
+                  const member = await requireMember(request, requestEnv);
+                  return member.role === "owner" && member.workspace.id === workspaceId;
+                },
+              );
+            });
           response = context.tracing
             ? await context.tracing.enterSpan("notes.route_request", async (span) => {
                 span.setAttribute("notes.request_id", requestId);
@@ -7576,6 +7696,21 @@ export default {
           throw error;
         }
         const headers = new Headers(response.headers);
+        if (
+          response.status < 400 &&
+          ["POST", "PATCH", "PUT", "DELETE"].includes(request.method) &&
+          env.PLATFORM &&
+          (env.SEMANTIC_SEARCH_ENABLED === "true" ||
+            env.PUBLIC_PUBLISHING_ENABLED === "true" ||
+            env.AUDIT_ENABLED === "true" ||
+            env.HEATMAPS_ENABLED === "true" ||
+            new URL(request.url).pathname.startsWith("/api/platform/keys"))
+        )
+          context.waitUntil(
+            wakePlatform(env).catch(() =>
+              logger.warn("platform.wake.failed", "platform", "Scheduled recovery will retry platform work"),
+            ),
+          );
         if (!new URL(request.url).pathname.startsWith("/share/")) headers.set("X-Robots-Tag", "noindex, nofollow");
         headers.set("x-request-id", requestId);
         headers.set("x-worker-version", env.CF_VERSION_METADATA?.id ?? "local");
@@ -7603,55 +7738,70 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext) {
     const correlationId = crypto.randomUUID();
     return withObservabilityContext(env, { trigger: "scheduled", correlationId }, async () => {
-      await syncRound2Configuration(env);
-      const runners: Record<ScheduledTaskName, ScheduledTask["run"]> = {
-        archive_disconnects: () => processDueArchiveDisconnects(env),
-        deletion_jobs: () => processDueDeletionJobs(env),
-        upload_reaps: () => processDueUploadReaps(env),
-        page_move_receipts: () => pruneExpiredPageMoveReceipts(env.DB),
-        queued_jobs: () => recoverQueuedJobs(env),
-        notion_markdown_tasks: () => recoverNotionMarkdownTasks(env),
-        outbox: async () => {
-          await sweepOutbox(env);
-          await purgeExpiredSlackSearchSessions(env);
-        },
-        link_previews: () => pruneLinkPreviews(env),
-        slack_redrive: () => runSlackMaintenance(env),
-        job_artifacts: () => expireJobArtifacts(env),
-        notification_digests: () => sendDueNotificationDigests(env),
-        document_changes: () => pruneDocumentChanges(env),
-        date_reminders: () => processDueDateReminders(env),
-        slack_digests: async () => {
-          await dueRound2Digests(env);
-        },
-        slack_security_records: async () => {
-          await env.DB.prepare("DELETE FROM workspace_activity WHERE created_at<?")
-            .bind(Date.now() - 30 * 86400_000)
-            .run();
-          await pruneSlackSecurityRecords(env);
-        },
-        webhook_history: () => pruneWebhookHistory(env),
-        search_headings: () => backfillSearchHeadings(env),
-        security_state: () => runSecurityMaintenance(env),
-        oauth_security_records: () => pruneOAuthSecurityRecords(env),
-        mcp_staged_pages: () => pruneStagedMcpPages(env),
-        table_search_values: async () => {
-          await backfillTableSearchValues(env);
-          await normalizeQueuedTitles(env.DB);
-        },
-        ai_history: () => pruneAi(env),
-      };
-      const tasks: ScheduledTask[] = SCHEDULED_TASK_NAMES.map((name) => ({ name, run: runners[name] }));
-      await executeScheduledTasks(env, context, tasks);
-      logger.info("scheduled.run.completed", "scheduler", "Scheduled maintenance completed", {
-        taskCount: tasks.length,
+      await withAuditRequest(env, correlationId, async (scheduledEnv) => {
+        await syncRound2Configuration(scheduledEnv);
+        const runners: Record<ScheduledTaskName, ScheduledTask["run"]> = {
+          archive_disconnects: () => processDueArchiveDisconnects(scheduledEnv),
+          deletion_jobs: () => processDueDeletionJobs(scheduledEnv),
+          upload_reaps: () => processDueUploadReaps(scheduledEnv),
+          page_move_receipts: () => pruneExpiredPageMoveReceipts(scheduledEnv.DB),
+          queued_jobs: () => recoverQueuedJobs(scheduledEnv),
+          notion_markdown_tasks: () => recoverNotionMarkdownTasks(scheduledEnv),
+          outbox: async () => {
+            await sweepOutbox(scheduledEnv);
+            await purgeExpiredSlackSearchSessions(scheduledEnv);
+          },
+          link_previews: () => pruneLinkPreviews(scheduledEnv),
+          slack_redrive: () => runSlackMaintenance(scheduledEnv),
+          job_artifacts: () => expireJobArtifacts(scheduledEnv),
+          notification_digests: () => sendDueNotificationDigests(scheduledEnv),
+          document_changes: () => pruneDocumentChanges(scheduledEnv),
+          date_reminders: () => processDueDateReminders(scheduledEnv),
+          slack_digests: async () => {
+            await dueRound2Digests(scheduledEnv);
+          },
+          slack_security_records: async () => {
+            await scheduledEnv.DB.prepare("DELETE FROM workspace_activity WHERE created_at<?")
+              .bind(Date.now() - 30 * 86400_000)
+              .run();
+            await pruneSlackSecurityRecords(scheduledEnv);
+          },
+          webhook_history: () => pruneWebhookHistory(scheduledEnv),
+          search_headings: () => backfillSearchHeadings(scheduledEnv),
+          security_state: () => runSecurityMaintenance(scheduledEnv),
+          oauth_security_records: () => pruneOAuthSecurityRecords(scheduledEnv),
+          mcp_staged_pages: () => pruneStagedMcpPages(scheduledEnv),
+          table_search_values: async () => {
+            await backfillTableSearchValues(scheduledEnv);
+            await normalizeQueuedTitles(scheduledEnv.DB);
+          },
+          ai_history: () => pruneAi(scheduledEnv),
+          platform: () => wakePlatform(scheduledEnv),
+        };
+        const tasks: ScheduledTask[] = SCHEDULED_TASK_NAMES.map((name) => ({ name, run: runners[name] }));
+        await executeScheduledTasks(scheduledEnv, context, tasks);
+        logger.info("scheduled.run.completed", "scheduler", "Scheduled maintenance completed", {
+          taskCount: tasks.length,
+        });
       });
     });
   },
   async queue(batch: MessageBatch<DeliveryQueueMessage>, env: Env, context?: ExecutionContext) {
+    // Queue bodies may be exposed through accessors; capture and normalize each once.
+    const bodies = batch.messages.map((message) => message.body);
     await Promise.all(
-      batch.messages.map(async (message) => {
-        const body = deliveryQueueMessageBody(message.body);
+      batch.messages.map(async (message, index) => {
+        const rawBody = bodies[index];
+        if (
+          rawBody &&
+          typeof rawBody === "object" &&
+          "platformJobId" in rawBody &&
+          typeof rawBody.platformJobId === "string"
+        ) {
+          await consumePlatformQueue(env, { ...batch, messages: [message] }, platformHandlers, [rawBody]);
+          return;
+        }
+        const body = deliveryQueueMessageBody(rawBody);
         const correlationId = body?.correlationId ?? (body && "outboxId" in body ? body.outboxId : message.id);
         await withObservabilityContext(env, { trigger: "queue", correlationId }, async () => {
           const startedAt = performance.now();
@@ -7660,7 +7810,10 @@ export default {
               context?.tracing,
               "notes.outbox.delivery",
               { "messaging.queue": batch.queue, "messaging.attempt": message.attempts },
-              () => consumeDeliveryMessage(env, message, body),
+              () =>
+                withAuditRequest(env, correlationId, (deliveryEnv) =>
+                  consumeDeliveryMessage(deliveryEnv, message, body),
+                ),
             );
             recordMetric(env, {
               event: "queue.delivery",

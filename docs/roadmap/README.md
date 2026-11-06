@@ -117,3 +117,7 @@ Historical: this is the baseline the Round 1 plans were written against. Each it
 [Phase 11](11-document-ideas.md) implements block links, live diagram embeds, and document diff digests. All three are deployed with checked-in production controls off, pending their independent live exit matrices. [AI writing](../AI_WRITING.md) and the [ChatGPT plugin](../CHATGPT_PLUGIN.md) have merged implementations; owner settings, hosted provider approval, plugin registration, and installed-client acceptance are separate rollout gates.
 
 The Phase 11 release order is IDEAS #17, #65, then #62. Verification/freshness and workspace export/backups remain outside that increment.
+
+## Coordinated Cloudflare platform release
+
+The [Cloudflare platform implementation](../implementation/cloudflare-platform-release.md) covers retrieval, public caching/publishing, Turnstile/Forms, read Sessions, Access, Images/covers/galleries, audit/heatmaps, Secrets Store rotation and custom hostnames. Local implementation and tests do not establish live release acceptance; the minimal Free and optional-services deployment gates remain explicit.

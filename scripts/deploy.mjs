@@ -9,6 +9,7 @@ import { unstable_readConfig } from "wrangler";
 import { emptyDatabaseSchema, emptyMigrationHistory, main as migrate, queryRows } from "./migrate-d1.mjs";
 
 import { metadataIntegrityCheck } from "./integrity.mjs";
+import { validatePlatformConfiguration } from "./platform-config.mjs";
 
 const require = createRequire(import.meta.url);
 const manifestPath = ".wrangler/noteflare-build.json";
@@ -507,6 +508,7 @@ export function portableOverrides(
 
 async function prepare(forced, dryRun) {
   const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
+  validatePlatformConfiguration(root);
   const production = unstable_readConfig({ config: "wrangler.jsonc", env: "production" }, { hideWarnings: true });
   const name = process.env.WRANGLER_CI_OVERRIDE_NAME || root.name;
   let connection, settings;
@@ -529,6 +531,7 @@ async function prepare(forced, dryRun) {
   });
   if (target) {
     const config = unstable_readConfig({ config: "wrangler.jsonc", env: target }, { hideWarnings: true });
+    validatePlatformConfiguration(config);
     validateDeliveryQueues(config);
     return {
       target,
@@ -632,6 +635,7 @@ async function build(context) {
   });
   const configPath = outputConfig();
   const generated = unstable_readConfig({ config: configPath, env: "" }, { hideWarnings: true });
+  validatePlatformConfiguration(generated);
   validateDeliveryQueues(generated);
   if (generated.name !== context.name || generated.vars.BETTER_AUTH_URL !== context.origin)
     throw new Error("Vite output does not match the prepared deployment target.");
@@ -835,6 +839,7 @@ export async function main(argv) {
     inspectSecrets: async () => {
       const names = await connection.api(`/workers/scripts/${manifest.name}/secrets`, { allowMissing: true });
       if (names !== null && !Array.isArray(names)) throw new Error("Invalid Worker secret listing.");
+      validatePlatformConfiguration(config, { secretNames: (names ?? []).map((entry) => entry.name) });
       return (names ?? []).map((entry) => entry.name);
     },
     integrityCheck: () => metadataIntegrityCheck((sql) => queryD1(connection.api, integrityDB, sql)),

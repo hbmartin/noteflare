@@ -1,3 +1,5 @@
+import { imageDerivative } from "./images";
+import { readSession, type ReadDatabase } from "./read-session";
 import { trackRealtimeWorkspace } from "./realtime-access";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
@@ -489,7 +491,13 @@ async function pageObject(env: Env, page: IntegrationPage, origin: string, prelo
     last_edited_time: iso(page.updated_at),
     created_by: actorObject(page.created_by, creatorName),
     last_edited_by: actorObject(page.updated_by, editorName),
-    cover: null,
+    cover: page.cover_attachment_id
+      ? {
+          type: "file",
+          file: { url: `${origin}/v1/pages/${id}/cover` },
+          noteflare: { attachment_id: page.cover_attachment_id, x: page.cover_x ?? 0.5, y: page.cover_y ?? 0.5 },
+        }
+      : null,
     icon,
     parent: parentId ? { type: "page_id", page_id: parentId } : { type: "workspace", workspace: true },
     in_trash: page.archived_at !== null,
@@ -1272,12 +1280,81 @@ notionApi.get("/pages/:pageId/properties/:propertyId", async (c) => {
   });
 });
 
+// This bearer-authenticated URL rechecks integration grants on every image read.
+notionApi.get("/pages/:pageId/cover", async (c) => {
+  const principal = c.get("principal");
+  capability(principal, "readContent");
+  const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
+  if (!page.cover_attachment_id) throw new NotionError(404, "object_not_found", "Cover not found.");
+  const attachment = await c.env.DB.prepare("SELECT 1 FROM attachments WHERE id=? AND page_id=? AND workspace_id=?")
+    .bind(page.cover_attachment_id, page.id, principal.workspaceId)
+    .first();
+  if (!attachment) throw new NotionError(404, "object_not_found", "Cover not found.");
+  return imageDerivative(c.env, page.cover_attachment_id, "cover-v1", {
+    x: page.cover_x ?? 0.5,
+    y: page.cover_y ?? 0.5,
+  });
+});
+async function integrationCover(env: Env, page: IntegrationPage, value: unknown, origin: string) {
+  if (value === undefined) return undefined;
+  if (value === null) return { attachmentId: null, x: 0.5, y: 0.5 };
+  if (typeof value !== "object" || Array.isArray(value))
+    throw new NotionError(400, "validation_error", "Choose an uploaded image belonging to this page.");
+  const cover = value as {
+    type?: unknown;
+    file?: { url?: unknown };
+    noteflare?: { attachment_id?: unknown; x?: unknown; y?: unknown };
+  };
+  let attachmentId = cover.noteflare?.attachment_id;
+  if (attachmentId === undefined && typeof cover.file?.url === "string") {
+    try {
+      const url = new URL(cover.file.url, origin);
+      if (url.origin === origin) attachmentId = /^\/api\/attachments\/([^/]+)$/.exec(url.pathname)?.[1];
+    } catch {
+      throw new NotionError(400, "validation_error", "Choose a valid page attachment URL.");
+    }
+  }
+  if (typeof attachmentId !== "string")
+    throw new NotionError(
+      400,
+      "validation_error",
+      "Set cover.noteflare.attachment_id to an image uploaded to this page.",
+    );
+  const x = cover.noteflare?.x ?? 0.5,
+    y = cover.noteflare?.y ?? 0.5;
+  if (
+    typeof x !== "number" ||
+    typeof y !== "number" ||
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    x > 1 ||
+    y < 0 ||
+    y > 1
+  )
+    throw new NotionError(400, "validation_error", "Cover focal points must be between zero and one.");
+  const found = await env.DB.prepare("SELECT mime,size FROM attachments WHERE id=? AND page_id=? AND workspace_id=?")
+    .bind(attachmentId, page.id, page.workspace_id)
+    .first<{ mime: string; size: number }>();
+  if (!found || !/^image\/(png|jpeg|webp|avif|gif)$/.test(found.mime) || found.size > 10 * 1024 * 1024)
+    throw new NotionError(400, "validation_error", "Choose a page image of at most 10 MiB.");
+  return { attachmentId, x, y };
+}
+
 notionApi.post("/pages", async (c) => {
   const principal = c.get("principal");
   capability(principal, "insertContent");
   const input = await body(c.req.raw);
-  if (input.cover !== undefined || input.template !== undefined || input.is_locked !== undefined) {
-    throw new NotionError(400, "validation_error", "Covers, templates, and locking are not supported.");
+  if (
+    (input.cover !== undefined && input.cover !== null) ||
+    input.template !== undefined ||
+    input.is_locked !== undefined
+  ) {
+    throw new NotionError(
+      400,
+      "validation_error",
+      "Create the page and upload its cover image before setting a cover. Templates and locking are not supported.",
+    );
   }
   const parent = (input.parent ?? {}) as Record<string, unknown>;
   let parentPage: IntegrationPage | null = null;
@@ -1497,6 +1574,9 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
     workspaceEvent = { type: "workspace-invalidated" };
   } else {
     const inTrash = mode === "trash" ? true : input.in_trash;
+    const cover = await integrationCover(c.env, page, input.cover, new URL(c.req.url).origin);
+    if (cover !== undefined && inTrash !== undefined)
+      throw new NotionError(400, "validation_error", "Change a cover separately from archiving or restoring a page.");
     const titleProperty = ((input.properties ?? {}) as Record<string, unknown>).title as
       | Record<string, unknown>
       | undefined;
@@ -1562,8 +1642,23 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
       inTrash === undefined
         ? c.env.DB.prepare(
             `UPDATE pages SET title = COALESCE(?, title), icon = CASE WHEN ? THEN ? ELSE icon END,
+                cover_attachment_id=CASE WHEN ? THEN ? ELSE cover_attachment_id END,
+                cover_x=CASE WHEN ? THEN ? ELSE cover_x END, cover_y=CASE WHEN ? THEN ? ELSE cover_y END,
                 revision = revision + 1, updated_by = ?, updated_at = ? WHERE id = ?`,
-          ).bind(title, icon !== undefined ? 1 : 0, icon ?? null, principal.botUserId, timestamp, page.id)
+          ).bind(
+            title,
+            icon !== undefined ? 1 : 0,
+            icon ?? null,
+            cover !== undefined ? 1 : 0,
+            cover?.attachmentId ?? null,
+            cover !== undefined ? 1 : 0,
+            cover?.x ?? 0.5,
+            cover !== undefined ? 1 : 0,
+            cover?.y ?? 0.5,
+            principal.botUserId,
+            timestamp,
+            page.id,
+          )
         : inTrash
           ? c.env.DB.prepare(
               `WITH RECURSIVE tree(id) AS (
@@ -1728,15 +1823,31 @@ notionApi.get("/blocks/:blockId/children", async (c) => {
   const selected = blocks.slice(offset, offset + size + 1);
   const results = await Promise.all(selected.map((block) => blockObject(c.env, owner, block, metadata)));
   if (page) {
-    const childPages = await c.env.DB.prepare(
-      `SELECT * FROM pages WHERE parent_id = ? AND workspace_id = ? AND archived_at IS NULL AND kind = 'document'
+    const childPages = await (
+      await integrationReadDatabase(c.env, principal)
+    )
+      .prepare(
+        `SELECT * FROM pages WHERE parent_id = ? AND workspace_id = ? AND archived_at IS NULL AND kind = 'document'
         AND import_job_id IS NULL AND is_template=0
         ORDER BY position, id LIMIT ? OFFSET ?`,
-    )
+      )
       .bind(page.id, principal.workspaceId, size + 1, Math.max(0, offset - blocks.length))
       .all<IntegrationPage>();
     if (offset + results.length >= blocks.length) {
-      for (const child of childPages.results.slice(0, size + 1 - results.length)) {
+      const currentChildren = await primaryIntegrationPages(
+        c.env,
+        principal,
+        childPages.results.map((child) => child.id),
+      );
+      const byId = new Map(
+        currentChildren.filter((child) => child.parent_id === page.id).map((child) => [child.id, child]),
+      );
+      for (const child of childPages.results
+        .flatMap((candidate) => {
+          const fresh = byId.get(candidate.id);
+          return fresh ? [fresh] : [];
+        })
+        .slice(0, size + 1 - results.length)) {
         results.push({
           object: "block",
           id: await publicPageId(c.env, child.id),
@@ -1753,6 +1864,8 @@ notionApi.get("/blocks/:blockId/children", async (c) => {
       }
     }
   }
+  await freshIntegrationCapability(c.env, principal, "readContent");
+  await accessiblePage(c.env, principal, owner.id);
   return c.json(listEnvelope(results, offset, size, "block"));
 });
 
@@ -1889,20 +2002,57 @@ notionApi.delete("/blocks/:blockId", async (c) => {
   return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
 });
 
+async function integrationReadDatabase(env: Env, principal: IntegrationPrincipal) {
+  const database = readSession(env, "v1");
+  const current = await database
+    .prepare("SELECT id FROM integrations WHERE id=? AND workspace_id=? AND revoked_at IS NULL")
+    .bind(principal.integrationId, principal.workspaceId)
+    .first();
+  if (!current) throw new IntegrationAuthError();
+  return database;
+}
+async function freshIntegrationCapability(
+  env: Env,
+  principal: IntegrationPrincipal,
+  name: "readContent" | "readComments" | "userInformation",
+) {
+  const current = await activeIntegrationPrincipal(env, principal.integrationId);
+  if (!current || current.workspaceId !== principal.workspaceId) throw new IntegrationAuthError();
+  if (name === "userInformation") {
+    if (current.userInformation === "none")
+      throw new NotionError(403, "restricted_resource", "User information capability is required.");
+  } else capability(current, name);
+  return current;
+}
+async function primaryIntegrationPages(env: Env, principal: IntegrationPrincipal, ids: string[]) {
+  if (!ids.length) return [];
+  return (
+    await env.DB.prepare(`WITH RECURSIVE granted(id) AS (
+    SELECT root_page_id FROM integration_grants g JOIN pages p ON p.id=g.root_page_id AND p.archived_at IS NULL WHERE integration_id=?
+    UNION SELECT child.id FROM pages child JOIN granted parent ON child.parent_id=parent.id
+  ) SELECT p.* FROM pages p JOIN granted ON granted.id=p.id WHERE p.workspace_id=? AND p.id IN (SELECT value FROM json_each(?)) AND p.import_job_id IS NULL AND p.archived_at IS NULL`)
+      .bind(principal.integrationId, principal.workspaceId, JSON.stringify(ids))
+      .all<IntegrationPage>()
+  ).results;
+}
+
 notionApi.post("/search", async (c) => {
   const principal = c.get("principal");
   capability(principal, "readContent");
   const input = await body(c.req.raw);
   const { size, offset } = pagination(input);
   const query = typeof input.query === "string" ? input.query.slice(0, 200) : "";
-  const rows = await c.env.DB.prepare(
-    `WITH RECURSIVE granted(id) AS (
+  const rows = await (
+    await integrationReadDatabase(c.env, principal)
+  )
+    .prepare(
+      `WITH RECURSIVE granted(id) AS (
        SELECT root_page_id FROM integration_grants WHERE integration_id = ?
        UNION SELECT child.id FROM pages child JOIN granted parent ON child.parent_id = parent.id
      ) SELECT page.* FROM pages page JOIN granted ON granted.id = page.id
        WHERE page.workspace_id = ? AND page.kind = 'document' AND page.archived_at IS NULL AND page.import_job_id IS NULL
          AND page.title LIKE ? ESCAPE '\\' ORDER BY page.updated_at DESC, page.id LIMIT ? OFFSET ?`,
-  )
+    )
     .bind(
       principal.integrationId,
       principal.workspaceId,
@@ -1912,8 +2062,19 @@ notionApi.post("/search", async (c) => {
     )
     .all<IntegrationPage>();
   const origin = new URL(c.req.url).origin;
-  const pageData = await preloadPageObjectData(c.env, rows.results, origin);
-  const results = await Promise.all(rows.results.map((page) => pageObject(c.env, page, origin, pageData)));
+  await freshIntegrationCapability(c.env, principal, "readContent");
+  const freshPages = await primaryIntegrationPages(
+    c.env,
+    principal,
+    rows.results.map((page) => page.id),
+  );
+  const byId = new Map(freshPages.map((page) => [page.id, page]));
+  const visiblePages = rows.results.flatMap((page) => {
+    const fresh = byId.get(page.id);
+    return fresh ? [fresh] : [];
+  });
+  const pageData = await preloadPageObjectData(c.env, visiblePages, origin);
+  const results = await Promise.all(visiblePages.map((page) => pageObject(c.env, page, origin, pageData)));
   return c.json(listEnvelope(results, offset, size));
 });
 
@@ -1956,21 +2117,38 @@ notionApi.get("/users", async (c) => {
     page_size: c.req.query("page_size"),
     start_cursor: c.req.query("start_cursor"),
   });
-  const rows = await c.env.DB.prepare(
-    `SELECT user.id, user.name, user.email, user.image, user.account_type FROM workspace_members member
+  const rows = await (
+    await integrationReadDatabase(c.env, principal)
+  )
+    .prepare(
+      `SELECT user.id, user.name, user.email, user.image, user.account_type FROM workspace_members member
        JOIN user ON user.id = member.user_id WHERE member.workspace_id = ? AND user.account_type = 'person'
       ORDER BY user.name, user.id LIMIT ? OFFSET ?`,
-  )
+    )
     .bind(principal.workspaceId, size + 1, offset)
     .all<{ id: string; name: string; email: string; image: string | null; account_type: string }>();
-  return c.json(
-    listEnvelope(
-      rows.results.map((row) => userObject(row, principal)),
-      offset,
-      size,
-      "user",
-    ),
+  const current = await freshIntegrationCapability(c.env, principal, "userInformation");
+  const membership = await c.env.DB.prepare(
+    "SELECT user_id FROM workspace_members WHERE workspace_id=? AND user_id IN (SELECT value FROM json_each(?))",
+  )
+    .bind(principal.workspaceId, JSON.stringify(rows.results.map((row) => row.id)))
+    .all<{ user_id: string }>();
+  const memberIds = new Set(membership.results.map((row) => row.user_id));
+  // Preserve the replica's page boundary while filtering identities removed
+  // since its causal fence. Empty pages may still have a next cursor.
+  const envelope = listEnvelope(
+    rows.results.map((row) => userObject(row, current)),
+    offset,
+    size,
+    "user",
   );
+  return c.json({
+    ...envelope,
+    results: rows.results
+      .slice(0, size)
+      .filter((row) => memberIds.has(row.id))
+      .map((row) => userObject(row, current)),
+  });
 });
 
 notionApi.get("/users/:userId", async (c) => {
@@ -2065,13 +2243,14 @@ function enqueueCommentMutation(c: Context<ApiContext>, pageId: string) {
   enqueueWebhooks(c);
 }
 
-async function commentRows(env: Env, where: string, binds: unknown[], orderBy = "") {
-  return env.DB.prepare(
-    `SELECT comment.id, comment.thread_id, thread.block_id, thread.page_id, comment.user_id, comment.body_json,
+async function commentRows(env: Env, where: string, binds: unknown[], orderBy = "", database: ReadDatabase = env.DB) {
+  return database
+    .prepare(
+      `SELECT comment.id, comment.thread_id, thread.block_id, thread.page_id, comment.user_id, comment.body_json,
             comment.plain_text, comment.deleted_at, comment.created_at, comment.updated_at
        FROM comments comment JOIN comment_threads thread ON thread.id = comment.thread_id
       WHERE ${where}${orderBy ? ` ORDER BY ${orderBy}` : ""}`,
-  )
+    )
     .bind(...binds)
     .all<ApiCommentRow>();
 }
@@ -2095,7 +2274,10 @@ notionApi.get("/comments", async (c) => {
     `thread.page_id = ? AND thread.block_id IS ? AND comment.deleted_at IS NULL`,
     [internalPage.id, matchId],
     "comment.created_at",
+    await integrationReadDatabase(c.env, principal),
   );
+  await freshIntegrationCapability(c.env, principal, "readComments");
+  await accessiblePage(c.env, principal, internalPage.id);
   return c.json({
     object: "list",
     results: rows.results.map(commentObject),

@@ -196,3 +196,7 @@ History expires after 30 days without an explicit conversation open or writing r
 Preserve `AI_TOKEN_ENCRYPTION_KEY` separately through the approved secret-management process when restoring D1 connections or OAuth state. A D1 export does not back up Worker secrets. An incorrect or lost key requires connection recovery/migration or member reconnection, not replacement of ciphertext with plaintext. `OPENAI_API_KEY` is an upstream credential configured separately.
 
 After restoration, retain the normal expiry checks and verify scheduled cleanup. Old expired history must remain unavailable; abandoned running work must become failed without restarting inference. Check current source permissions before revealing restored history and verify quota/idempotency behavior against the [writing specification](specs/ai-writing.md).
+
+## Platform recovery
+
+Back up platform intents, chunk manifests, publication generations, audit archive manifests and key-rotation progress with D1. Preserve private R2 publications and audit archives. Retain every historical encryption key needed by a recoverable backup. Queue replay alone is insufficient: resume from durable intents. Verify archive bytes and a historical ciphertext restore before retiring a key. See [platform recovery and rollback](implementation/cloudflare-platform-release.md#acceptance-and-rollback).

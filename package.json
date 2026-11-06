@@ -65,6 +65,7 @@
     "@blocknote/core": "0.55.0",
     "@blocknote/mantine": "0.55.0",
     "@blocknote/react": "0.55.0",
+    "@huggingface/tokenizers": "0.2.0",
     "@mantine/core": "9.7.1",
     "@mantine/hooks": "9.7.1",
     "@modelcontextprotocol/ext-apps": "2.0.3",

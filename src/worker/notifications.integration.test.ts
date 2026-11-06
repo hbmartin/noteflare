@@ -761,7 +761,12 @@ describe("notification feed and subscriptions", () => {
       email: { available: false },
       slack: {
         available: false,
-        missing: ["SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET", "SLACK_SIGNING_SECRET", "SLACK_TOKEN_ENCRYPTION_KEY"],
+        missing: [
+          "SLACK_CLIENT_ID",
+          "SLACK_CLIENT_SECRET",
+          "SLACK_SIGNING_SECRET",
+          "SLACK_TOKEN_ENCRYPTION_KEY or SLACK_ENCRYPTION_KEYS",
+        ],
       },
     });
 

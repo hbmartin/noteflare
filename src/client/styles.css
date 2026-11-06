@@ -4549,3 +4549,98 @@ pre.writing-preview,
 .live-diagram-embed .react-flow__handle {
   visibility: hidden;
 }
+
+/* Public publishing controls share the settings and table mutation surfaces. */
+.page-cover {
+  margin: 0 auto 1.25rem;
+  width: min(100%, 1200px);
+}
+.page-cover > img {
+  display: block;
+  border-radius: 10px;
+  background: var(--panel, #f4f3ef);
+}
+.page-cover details {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+}
+.page-cover label {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.75rem 0;
+}
+.page-cover input[type="range"] {
+  width: min(100%, 360px);
+}
+.forms-control {
+  margin: 0.5rem 0 1rem;
+}
+.forms-control section {
+  max-width: 760px;
+  padding: 1rem;
+  border: 1px solid var(--line, #ddd);
+  border-radius: 10px;
+}
+.forms-control label,
+.settings-section label {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.75rem 0;
+}
+.forms-control fieldset,
+.settings-section fieldset {
+  min-width: 0;
+  padding: 0.75rem;
+  margin: 1rem 0;
+  border: 1px solid var(--line, #ddd);
+  border-radius: 8px;
+}
+.forms-control button,
+.settings-section button {
+  margin: 0.35rem 0.5rem 0.35rem 0;
+}
+.forms-control input:not([type="checkbox"]),
+.forms-control textarea,
+.forms-control select,
+.settings-section input:not([type="checkbox"]):not([type="color"]),
+.settings-section textarea,
+.settings-section select {
+  width: 100%;
+  min-width: 0;
+}
+.settings-section pre {
+  max-width: 100%;
+  overflow: auto;
+  font-size: 0.8rem;
+}
+.settings-section output {
+  display: block;
+  margin: 1rem 0;
+}
+.table-gallery {
+  align-items: start;
+  padding: 0.5rem 0;
+}
+.table-gallery > article,
+.table-gallery .table-card {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line, #ddd);
+  border-radius: 10px;
+  background: var(--panel, transparent);
+}
+.table-gallery img {
+  width: 100%;
+  aspect-ratio: 8/5;
+  object-fit: cover;
+  display: block;
+  border-radius: 6px;
+}
+@media (max-width: 560px) {
+  .table-gallery {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  .forms-control section {
+    padding: 0.65rem;
+  }
+}

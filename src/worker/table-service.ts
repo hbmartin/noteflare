@@ -30,7 +30,7 @@ import {
 } from "./table-projection";
 export type { TableSnapshot } from "./table-projection";
 
-type TableRegistry = {
+export type TableRegistry = {
   page_id: string;
   state: "d1" | "seeding" | "do" | "repairing";
   generation: number;
@@ -78,6 +78,17 @@ export async function tableFetch(
   const request = resolvedTableRequest(member, pageId, await pageForMember(env, member, pageId));
   return fetchResolvedTable(env, request, await tableRegistry(env, pageId), path, method, body, extras);
 }
+/** Reuse request-local primary reads for bounded retrieval. The authority still
+ * validates the signed actor against live grants before and after its read. */
+export function tableReadResolved(
+  env: Env,
+  member: MemberContext,
+  page: PageRow,
+  registry: TableRegistry | null,
+  path: `/retrieval-rows?${string}`,
+) {
+  return fetchResolvedTable(env, resolvedTableRequest(member, page.id, page), registry, path);
+}
 async function fetchResolvedTable(
   env: Env,
   { member, pageId, page }: ReturnType<typeof resolvedTableRequest>,
@@ -111,7 +122,11 @@ async function fetchResolvedTable(
       ? { socketExpiresAt, socketRenewable: socketExpiresAt < member.session.expiresAt.getTime() }
       : {}),
     authGeneration,
-    creation: { board: env.TABLE_BOARD_ENABLED === "true", calendar: env.TABLE_CALENDAR_ENABLED === "true" },
+    creation: {
+      board: env.TABLE_BOARD_ENABLED === "true",
+      calendar: env.TABLE_CALENDAR_ENABLED === "true",
+      gallery: env.TABLE_GALLERY_ENABLED === "true",
+    },
     ...extras,
   };
   return env.TABLE.getByName(pageId).fetch(

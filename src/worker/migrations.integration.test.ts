@@ -1552,23 +1552,6 @@ describe("D1 migrations", () => {
     expect(await env.DB.prepare(`SELECT issuer FROM account WHERE id = 'slack-account'`).first()).toEqual({
       issuer: "slack",
     });
-    const auth = createAuth(env as unknown as Env, true);
-    const authRequest = (path: string, body: object) =>
-      new Request(`http://example.test/api/auth/${path}`, {
-        method: "POST",
-        headers: { origin: "http://example.test", "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-    const email = "new-password-user@example.test";
-    const password = "password123";
-    expect((await auth.handler(authRequest("sign-up/email", { name: "New User", email, password }))).status).toBe(200);
-    expect((await auth.handler(authRequest("sign-in/email", { email, password }))).status).toBe(200);
-    expect(
-      await env.DB.prepare(
-        `SELECT issuer FROM account WHERE providerId = 'credential' AND accountId != 'owner'`,
-      ).first(),
-    ).toEqual({ issuer: "local:credential" });
-
     expect(
       await env.DB.prepare(
         `SELECT verification_method, migration_state, verified_at, better_auth_account_id
@@ -1596,6 +1579,26 @@ describe("D1 migrations", () => {
       .run();
     await env.DB.prepare(`DELETE FROM session WHERE id = 'session'`).run();
     expect(await env.DB.prepare(`SELECT 1 FROM slack_primary_factor_proofs`).first()).toBeNull();
+
+    // Historical assertions use the 0035 schema; the current auth implementation requires
+    // the full schema, including the service-identity guard added by later migrations.
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    const auth = createAuth(env as unknown as Env, true);
+    const authRequest = (path: string, body: object) =>
+      new Request(`http://example.test/api/auth/${path}`, {
+        method: "POST",
+        headers: { origin: "http://example.test", "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const email = "new-password-user@example.test";
+    const password = "password123";
+    expect((await auth.handler(authRequest("sign-up/email", { name: "New User", email, password }))).status).toBe(200);
+    expect((await auth.handler(authRequest("sign-in/email", { email, password }))).status).toBe(200);
+    expect(
+      await env.DB.prepare(
+        `SELECT issuer FROM account WHERE providerId = 'credential' AND accountId != 'owner'`,
+      ).first(),
+    ).toEqual({ issuer: "local:credential" });
   });
 
   it("backfills every legacy page into a General space and guards cross-space parents", async () => {

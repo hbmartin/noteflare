@@ -5,6 +5,16 @@ import { SecurityScreen } from "./SecurityScreen";
 import { ApiClientError, api, authClient } from "./api";
 import type { SecurityStatus } from "../shared/security";
 
+vi.mock("./PublicChallenge", () => ({
+  usePublicChallenge: () => ({
+    token: "",
+    ready: true,
+    access: { available: false, required: false },
+    reset: () => {},
+    element: null,
+  }),
+}));
+
 vi.mock("./api", async (original) => ({
   ...(await original<typeof import("./api")>()),
   api: vi.fn(),

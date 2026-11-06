@@ -1,3 +1,6 @@
+import { setAuditActor } from "./audit";
+import { accessPlugin } from "./access";
+import { requireAccessIdentity, verifyAccessAssertion } from "./access-identity";
 import { trackRealtimeUser, deleteRejectedSession } from "./realtime-access";
 import { betterAuth } from "better-auth";
 import { passwordService } from "./password-service";
@@ -234,6 +237,14 @@ async function finishSlackAuthentication(env: Env, ctx: GenericEndpointContext, 
   }
 }
 
+async function isServiceIdentity(env: Env, userId: string) {
+  return !!(await env.DB.prepare("SELECT 1 FROM service_identities WHERE user_id=?").bind(userId).first());
+}
+async function requireLoginIdentity(env: Env, userId: string) {
+  if (await isServiceIdentity(env, userId))
+    throw new APIError("FORBIDDEN", { code: "login_not_allowed", message: "This identity cannot sign in." });
+}
+
 export function createAuth(env: Env, allowRegistration = false) {
   return betterAuth({
     database: env.DB,
@@ -321,6 +332,9 @@ export function createAuth(env: Env, allowRegistration = false) {
     databaseHooks: {
       account: {
         create: {
+          before: async (account) => {
+            await requireLoginIdentity(env, account.userId);
+          },
           after: async (account, ctx) => {
             if (!ctx || account.providerId !== "slack") return;
             const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
@@ -350,6 +364,9 @@ export function createAuth(env: Env, allowRegistration = false) {
           },
         },
         create: {
+          before: async (session) => {
+            await requireLoginIdentity(env, session.userId);
+          },
           after: async (session, ctx) => {
             if (!ctx) return;
             try {
@@ -369,6 +386,45 @@ export function createAuth(env: Env, allowRegistration = false) {
     },
     hooks: {
       before: createAuthMiddleware(async (ctx) => {
+        // A form's database attribution principal must never acquire browser capabilities,
+        // even if a session or credential was accidentally introduced outside these hooks.
+        if (ctx.path !== "/sign-out") {
+          const current = await getSessionFromCtx(ctx, { disableRefresh: true });
+          if (current) await requireLoginIdentity(env, current.user.id);
+        }
+        if (env.AUTH_MODE === "access_required") {
+          try {
+            const assertion = await verifyAccessAssertion(env, ctx.headers ?? new Headers());
+            // A linked browser session cannot be used under another gateway identity,
+            // including account-protection endpoints which do not call getMember.
+            if (
+              !ctx.path.startsWith("/sign-in/") &&
+              !["/access/sign-in", "/sign-out", "/get-session"].includes(ctx.path)
+            ) {
+              const current = await getSessionFromCtx(ctx, { disableRefresh: true });
+              if (current) {
+                const linked = await env.DB.prepare(
+                  "SELECT subject FROM access_identities WHERE issuer=? AND user_id=?",
+                )
+                  .bind(assertion.issuer, current.user.id)
+                  .first<{ subject: string }>();
+                if (linked && linked.subject !== assertion.subject)
+                  throw new HttpError(
+                    403,
+                    "access_identity_mismatch",
+                    "Sign in through the Access identity linked to this account.",
+                  );
+              }
+            }
+          } catch (error) {
+            if (error instanceof HttpError)
+              throw new APIError(
+                error.status === 503 ? "SERVICE_UNAVAILABLE" : error.status === 403 ? "FORBIDDEN" : "UNAUTHORIZED",
+                { code: error.code, message: error.message },
+              );
+            throw error;
+          }
+        }
         if (ctx.path === "/link-social" && ctx.body?.provider === "slack") {
           if (
             ctx.body.idToken !== undefined ||
@@ -483,6 +539,7 @@ export function createAuth(env: Env, allowRegistration = false) {
       }),
     },
     plugins: [
+      accessPlugin(env),
       ...(env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET
         ? [
             genericOAuth({
@@ -555,8 +612,17 @@ export function createAuth(env: Env, allowRegistration = false) {
 }
 
 async function getMember(request: Request, env: Env): Promise<MemberContext | null> {
-  const session = await createAuth(env).api.getSession({ headers: request.headers });
+  const session = await createAuth(env)
+    .api.getSession({ headers: request.headers })
+    .catch((error: unknown) => {
+      if (isAPIError(error) && error.body?.code === "login_not_allowed")
+        throw new HttpError(403, "login_not_allowed", "This identity cannot sign in.");
+      throw error;
+    });
   if (!session) return null;
+  if (await isServiceIdentity(env, session.user.id))
+    throw new HttpError(403, "login_not_allowed", "This identity cannot sign in.");
+  const accessExpiresAt = await requireAccessIdentity(env, request.headers, session.user.id);
   const assuranceExpiresAt = await requireSecurity(env, session.user.id, session.session.id);
 
   const row = await env.DB.prepare(
@@ -584,7 +650,9 @@ async function getMember(request: Request, env: Env): Promise<MemberContext | nu
     user: { id: session.user.id, name: session.user.name, email: session.user.email },
     session: {
       id: session.session.id,
-      expiresAt: new Date(Math.min(session.session.expiresAt.getTime(), assuranceExpiresAt)),
+      expiresAt: new Date(
+        Math.min(session.session.expiresAt.getTime(), assuranceExpiresAt, accessExpiresAt ?? Infinity),
+      ),
     },
     workspace: {
       id: row.workspace_id,
@@ -598,6 +666,7 @@ async function getMember(request: Request, env: Env): Promise<MemberContext | nu
 export async function requireMember(request: Request, env: Env) {
   const member = await getMember(request, env);
   if (!member) throw new HttpError(401, "unauthorized", "Sign in to continue.");
+  setAuditActor({ type: "user", id: member.user.id, workspaceId: member.workspace.id });
   return member;
 }
 

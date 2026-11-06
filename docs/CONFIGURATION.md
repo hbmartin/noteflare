@@ -460,3 +460,41 @@ Verify and Repair process one bounded batch: at most five receipts, five history
 Responses report checked, confirmed, blocked, pending, and paused work, with `nextCursor` and `retryAt` for
 continued verification. Recent uncertain sends remain incomplete through the 60-second settle window without
 making history calls. After settling, incomplete searches retain timestamp progress and their fixed search window.
+
+## Cloudflare platform options
+
+See [the coordinated release runbook](implementation/cloudflare-platform-release.md) for dependency order, Free allowances and deployment gates. No optional paid resources are automatically provisioned.
+
+| Name                         | Meaning                                                                                                                                                                         |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PLATFORM`                   | SQLite PlatformCoordinator binding; durable background recovery in separate alarm invocations.                                                                                  |
+| `PLATFORM_QUEUE`             | Optional dedicated Queue producer/consumer; use batch size one. D1 intents survive queue expiry.                                                                                |
+| `AI`                         | Optional Workers AI binding; required when semantic retrieval is enabled.                                                                                                       |
+| `SEMANTIC_INDEX`             | Optional Vectorize index; 384 dimensions, cosine similarity. Create indexed spaceId metadata before backfill.                                                                   |
+| `SEMANTIC_MAX_STORED_CHUNKS` | Active vector chunk budget; default 10000, reserve replacement headroom.                                                                                                        |
+| `SEMANTIC_DAILY_TOKEN_LIMIT` | Application embedding token budget; default 100000. Not equivalent to the account neuron quota.                                                                                 |
+| `SEMANTIC_DAILY_QUERY_LIMIT` | Daily query embedding ceiling; default 2000.                                                                                                                                    |
+| `D1_READ_REPLICATION_ROUTES` | Comma-separated tree,backlinks,search,v1; omit a route for primary-only rollback.                                                                                               |
+| `AUTH_MODE`                  | local (default) or access_required. Enforced mode requires a canonical custom app origin.                                                                                       |
+| `ACCESS_TEAM_DOMAIN`         | Trusted HTTPS cloudflareaccess.com issuer origin.                                                                                                                               |
+| `ACCESS_AUD`                 | Access application audience; distinct per environment.                                                                                                                          |
+| `TURNSTILE_SITE_KEY`         | Public widget key. Configure app/public challenge hostnames.                                                                                                                    |
+| `TURNSTILE_SECRET_KEY`       | Worker secret for Siteverify. Verification failures fail closed.                                                                                                                |
+| `PUBLIC_BASE_URL`            | Canonical custom HTTPS public origin, separate from the private app.                                                                                                            |
+| `PUBLICATIONS_BUCKET`        | Separate private R2 publication bucket. Never alias the original attachment bucket.                                                                                             |
+| `IMAGES`                     | Optional Images binding for persisted sanitized derivatives.                                                                                                                    |
+| `FORMS_DAILY_LIMIT`          | Successful submissions per form/day; default 100. Idempotent retries do not count twice.                                                                                        |
+| `CF_ZONE_ID`                 | Cloudflare zone used for customer hostname provisioning.                                                                                                                        |
+| `CF_ACCOUNT_ID`              | Cloudflare account identifier for optional platform operations.                                                                                                                 |
+| `CF_SAAS_API_TOKEN`          | Secret with scoped custom hostname permissions for the configured zone.                                                                                                         |
+| `CF_CACHE_PURGE_API_TOKEN`   | Optional zone-scoped Cache Purge token on the private Worker; requires `CF_ZONE_ID`, `PUBLIC_BASE_URL` and `PLATFORM`. Batched cleanup never replaces access-generation checks. |
+| `SAAS_CNAME_TARGET`          | Operator-owned fallback CNAME target for verified customer subdomains.                                                                                                          |
+| `SLACK_ENCRYPTION_KEYS`      | Optional Secrets Store keyring binding for Slack; separate values per environment.                                                                                              |
+| `WEBHOOK_ENCRYPTION_KEYS`    | Optional Secrets Store keyring binding for webhook ciphertext.                                                                                                                  |
+| `AI_ENCRYPTION_KEYS`         | Optional Secrets Store keyring binding for AI credentials.                                                                                                                      |
+| `AUDIT_BUCKET`               | Optional private R2 archive bucket; defaults to the existing private BUCKET under audit/.                                                                                       |
+| `AUDIT_HOT_DAYS`             | Searchable audit retention; default 30, range 1–365 days; archive verification precedes pruning.                                                                                |
+| `AUDIT_ARCHIVE_DAYS`         | Verified R2 audit archive retention; default 365, range 1–3650 days.                                                                                                            |
+| `AUDIT_PIPELINE`             | Optional Basin audit stream binding. A send acknowledgement is not archive proof.                                                                                               |
+| `HEATMAP_PIPELINE`           | Optional Basin aggregate-only analytics stream binding.                                                                                                                         |
+| `HEATMAP_HMAC_KEY`           | Separate secret of at least 32 characters for page/week reader pseudonyms; never exported.                                                                                      |

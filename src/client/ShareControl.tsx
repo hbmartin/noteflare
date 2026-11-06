@@ -8,6 +8,9 @@ type Share = {
   showToc: boolean;
   showLastUpdated: boolean;
   views: number;
+  hasPassword: boolean;
+  expiresAt: number | null;
+  accessGeneration: number;
 };
 
 export function ShareControl({ pageId, owner }: { pageId: string; owner: boolean }) {
@@ -80,6 +83,25 @@ export function ShareControl({ pageId, owner }: { pageId: string; owner: boolean
     } catch (cause) {
       setShare(previous);
       setError(apiErrorMessage(cause, "Sharing settings could not be updated."));
+    }
+  }
+
+  async function updateAccess(body: object) {
+    setLoading(true);
+    try {
+      setShare(
+        (
+          await api<{ share: Share }>(`/api/pages/${encodeURIComponent(pageId)}/share`, {
+            method: "PATCH",
+            body: json(body),
+          })
+        ).share,
+      );
+      setError("");
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "Sharing access could not be updated."));
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -156,11 +178,73 @@ export function ShareControl({ pageId, owner }: { pageId: string; owner: boolean
             <label>
               <input
                 type="checkbox"
+                disabled={share.hasPassword}
                 checked={share.allowIndexing}
                 onChange={(event) => void update("allowIndexing", event.target.checked)}
               />{" "}
               Allow search-engine indexing
             </label>
+            <form
+              key={`password-${share.accessGeneration}`}
+              onSubmit={(event) => {
+                event.preventDefault();
+                const password = String(new FormData(event.currentTarget).get("password") || "");
+                void updateAccess({ password });
+              }}
+            >
+              <label>
+                {share.hasPassword ? "Replace share password" : "Protect with a password"}
+                <input
+                  name="password"
+                  type="password"
+                  autoComplete="new-password"
+                  minLength={8}
+                  maxLength={256}
+                  required
+                />
+              </label>
+              <button disabled={loading}>{share.hasPassword ? "Change password" : "Set password"}</button>
+              {share.hasPassword && (
+                <button type="button" disabled={loading} onClick={() => void updateAccess({ password: null })}>
+                  Remove password
+                </button>
+              )}
+            </form>
+            <form
+              key={`expiry-${share.accessGeneration}`}
+              onSubmit={(event) => {
+                event.preventDefault();
+                const value = String(new FormData(event.currentTarget).get("expiresAt") || "");
+                void updateAccess({ expiresAt: value ? new Date(value).getTime() : null });
+              }}
+            >
+              <label>
+                Expires at (your local time)
+                <input
+                  name="expiresAt"
+                  type="datetime-local"
+                  defaultValue={
+                    share.expiresAt
+                      ? new Date(share.expiresAt - new Date(share.expiresAt).getTimezoneOffset() * 60000)
+                          .toISOString()
+                          .slice(0, 16)
+                      : ""
+                  }
+                />
+              </label>
+              <button disabled={loading}>Save expiration</button>
+            </form>
+            {share.hasPassword && (
+              <>
+                <p className="muted-copy">
+                  Unlocks last up to 24 hours. Changing the password, expiration, or page scope revokes existing
+                  unlocks.
+                </p>
+                <button disabled={loading} onClick={() => void updateAccess({ revokeAccess: true })}>
+                  Revoke all unlocks
+                </button>
+              </>
+            )}
             <p className="muted-copy">{share.views.toLocaleString()} successful page views</p>
             <button className="text-danger" onClick={() => void revoke()}>
               Revoke public link
