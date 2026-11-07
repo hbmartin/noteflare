@@ -382,6 +382,21 @@ describe("OAuth MCP foundation", () => {
         .bind(page!.id)
         .first<number>("count"),
     ).toBeGreaterThan(0);
+    const attribution = await env.DB.prepare(
+      "SELECT actor_type,actor_id,workspace_id FROM audit_events WHERE target_id=? AND action='page.insert'",
+    )
+      .bind(page!.id)
+      .all<{ actor_type: string; actor_id: string | null; workspace_id: string }>();
+    const creator = await env.DB.prepare("SELECT created_by,workspace_id FROM pages WHERE id=?")
+      .bind(page!.id)
+      .first<{ created_by: string; workspace_id: string }>();
+    expect(attribution.results).toEqual([
+      expect.objectContaining({
+        actor_type: "user",
+        actor_id: creator!.created_by,
+        workspace_id: creator!.workspace_id,
+      }),
+    ]);
     expect((await tokenRequest(code.tokenRequest)).status).toBe(400);
   });
   it("rejects an unknown comment block without creating a thread or operation receipt", async () => {

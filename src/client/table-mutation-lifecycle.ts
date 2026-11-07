@@ -24,10 +24,3 @@ export function connectedMutationReads<Owner, Reads>(
     ? installed.reads
     : null;
 }
-
-/** Confirmed writes remain saved even when their presentation owner has retired. */
-export function taskMutationCompletion(result: string, success: boolean) {
-  if (result === "committed") return "committed-current" as const;
-  if (result === "retired" && success) return "committed-retired" as const;
-  return undefined;
-}

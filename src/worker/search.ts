@@ -25,27 +25,29 @@ const SEARCH_OFFSET_MAX = 1_000;
 
 /** Forward-only normalization repair. Triggers provide immediate substring reads;
  * the queue handles Unicode NFKC unavailable in SQLite's built-in lower(). */
-export async function normalizeQueuedTitles(database: ReadDatabase, workspaceId?: string) {
+export async function normalizeQueuedTitles(database: ReadDatabase, workspaceId?: string, limit = 8) {
   const rows = await database
     .prepare(
       `SELECT p.id,p.title,p.updated_at,p.is_template,p.import_job_id FROM page_title_normalization_queue q
-     JOIN pages p ON p.id=q.page_id WHERE (? IS NULL OR p.workspace_id=?) ORDER BY p.id LIMIT 8`,
+     JOIN pages p ON p.id=q.page_id WHERE (? IS NULL OR p.workspace_id=?) ORDER BY p.id LIMIT ?`,
     )
-    .bind(workspaceId ?? null, workspaceId ?? null)
+    .bind(workspaceId ?? null, workspaceId ?? null, Math.min(500, Math.max(1, limit)))
     .all<{ id: string; title: string; updated_at: number; is_template: number; import_job_id: string | null }>();
-  for (let index = 0; index < rows.results.length; index += 25) {
-    await database.batch(
-      rows.results.slice(index, index + 25).flatMap((row) => [
-        database
-          .prepare(`UPDATE page_title_titles SET normalized_title=? WHERE page_id=? AND EXISTS(
-        SELECT 1 FROM pages p WHERE p.id=? AND p.title=? AND p.updated_at=? AND p.is_template=0 AND p.import_job_id IS NULL)`)
-          .bind(normalizedTitle(row.title), row.id, row.id, row.title, row.updated_at),
-        database
-          .prepare(`DELETE FROM page_title_normalization_queue WHERE page_id=? AND EXISTS(
-        SELECT 1 FROM pages p WHERE p.id=? AND p.title=? AND p.updated_at=?)`)
-          .bind(row.id, row.id, row.title, row.updated_at),
-      ]),
-    );
+  if (rows.results.length) {
+    const payload = JSON.stringify(rows.results.map((row) => ({ ...row, normalized: normalizedTitle(row.title) })));
+    await database.batch([
+      database
+        .prepare(`UPDATE page_title_titles AS t SET normalized_title=json_extract(input.value,'$.normalized')
+        FROM json_each(?) input JOIN pages p ON p.id=json_extract(input.value,'$.id')
+        WHERE t.page_id=p.id AND p.title=json_extract(input.value,'$.title') AND p.updated_at=json_extract(input.value,'$.updated_at')
+        AND p.is_template=0 AND p.import_job_id IS NULL`)
+        .bind(payload),
+      database
+        .prepare(`DELETE FROM page_title_normalization_queue WHERE page_id IN(
+        SELECT p.id FROM json_each(?) input JOIN pages p ON p.id=json_extract(input.value,'$.id')
+        WHERE p.title=json_extract(input.value,'$.title') AND p.updated_at=json_extract(input.value,'$.updated_at'))`)
+        .bind(payload),
+    ]);
   }
   const pending = await database
     .prepare(`SELECT count(*) count FROM page_title_normalization_queue q
@@ -432,7 +434,9 @@ export async function searchWithMode(
   member: MemberContext,
   request: ReturnType<typeof parseSearchRequest>,
 ): Promise<SearchResponse> {
-  if (request.mode !== "hybrid") {
+  if (request.mode !== "hybrid" || env.SEMANTIC_SEARCH_ENABLED !== "true" || !env.AI || !env.SEMANTIC_INDEX) {
+    if (request.cursor)
+      throw new HttpError(409, "search_cursor_expired", "Meaning search is unavailable. Start the search again.");
     // Repair stays on primary. A session is introduced only for the read phase.
     await normalizeQueuedTitles(env.DB, member.workspace.id);
     return searchPages(await beginReadSession(env, member), member, request, true);

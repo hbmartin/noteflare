@@ -2,6 +2,8 @@ import { FormsControl } from "./FormsControl";
 import {
   captureTableViewSubmission,
   acknowledgeTableViewSubmission,
+  acknowledgeTableViewGroup,
+  tableViewSubmissionCurrent,
   type TableViewSubmission,
   createTableViewCache,
   TableViewStateContext,
@@ -10,7 +12,7 @@ import {
 import { CellDraftPersistenceRetry } from "./CellDraftPersistenceRetry";
 import { useOnlineStatus } from "./online-status";
 import { useTableSearch } from "./use-table-search";
-import { settleTableMutation, connectedMutationReads, taskMutationCompletion } from "./table-mutation-lifecycle";
+import { settleTableMutation, connectedMutationReads } from "./table-mutation-lifecycle";
 import { isTablePermissionCode } from "./table-access";
 import { tableMutationNotice } from "./table-mutation-notice";
 import { RelationPanel } from "./RelationPanel";
@@ -69,12 +71,6 @@ export type CollaborativeTableProps = {
   onViewChanged?: (id: string) => void;
   embedded?: boolean;
 };
-type MutationCompletion = "committed-current" | "committed-retired";
-type TaskSaveResult =
-  | { state: "saved"; completion: MutationCompletion }
-  | { state: "rejected"; code?: string }
-  | { state: "uncertain" }
-  | { state: "suspended" };
 type TableFetchOptions = {
   signal?: AbortSignal;
   intent?: TableReadIntent;
@@ -108,9 +104,15 @@ type MutationOutcome =
 type MutationResult = "committed" | "rejected" | "uncertain" | "suspended" | "retired";
 type MutationSuccessIntent = {
   acknowledgements?: Array<TableViewSubmission | undefined>;
-  closePanel?: TableViewSubmission;
+  acknowledgementGroup?: Array<TableViewSubmission | undefined>;
   deletedViewId?: string;
 };
+type TableMutationCommand = (
+  kind: TableCommand["kind"],
+  payload: Record<string, unknown>,
+  globalRevision?: boolean,
+  success?: MutationSuccessIntent,
+) => Promise<boolean>;
 type MutationRun = {
   operation: MutationNotice;
   phase: "network" | "handling" | "settled";
@@ -837,8 +839,15 @@ export function CollaborativeTablePage({
       if (outcome.kind === "success") {
         const { success } = request;
         for (const acknowledgement of success.acknowledgements ?? []) acknowledgeTableViewSubmission(acknowledgement);
-        completeMutation(operation, outcome.coverage, reads, outcome.message);
-        acknowledgeTableViewSubmission(success.closePanel);
+        const newerSettings =
+          !!success.acknowledgementGroup && !tableViewSubmissionCurrent(success.acknowledgementGroup[0]);
+        if (success.acknowledgementGroup) acknowledgeTableViewGroup(success.acknowledgementGroup);
+        completeMutation(
+          operation,
+          outcome.coverage,
+          reads,
+          newerSettings ? "Saved the earlier submission. Newer settings are still unsaved." : outcome.message,
+        );
         if (success.deletedViewId !== undefined && viewId === success.deletedViewId) {
           setViewId("");
           onViewChanged?.("");
@@ -916,10 +925,10 @@ export function CollaborativeTablePage({
   const executeMutation = async (request: SavedRetry) => {
     const { submission } = request;
     if (submission && !submission.map.owns(submission.key, submission.version, submission.operationId))
-      return { result: "rejected" as const, code: "draft_changed" };
+      return { result: "rejected" as const };
     if (!sameTableOwner(request.owner, retryLifetime.current) || !canCommit()) {
       setBlocked(busyRef.current ? busyMessage : readinessMessage);
-      return { result: "rejected" as const, code: "not_ready" };
+      return { result: "rejected" as const };
     }
     busyRef.current = true;
     setBusy(true);
@@ -929,15 +938,16 @@ export function CollaborativeTablePage({
     setRetry(null);
     const task = request.kind === "task";
     const payload = task ? request.body : (request.command.payload as Record<string, unknown>);
-    const fields = Object.keys(payload)
-      .filter((key) => !["operationId", "expectedRevision", "columnId", "revision"].includes(key))
-      .sort();
+    const fields = () =>
+      Object.keys(payload)
+        .filter((key) => !["operationId", "expectedRevision", "columnId", "revision"].includes(key))
+        .sort();
     const target = task
-      ? `task:${request.rowId ?? `new:${viewId}`}:${JSON.stringify(fields)}`
+      ? `task:${request.rowId ?? `new:${viewId}`}:${JSON.stringify(fields())}`
       : request.command.kind === "update_cells" && Object.keys(payload.values as object).length === 1
         ? `cell:${draftKey(String(payload.rowId), Object.keys(payload.values as object)[0]!)}`
         : payload.columnId
-          ? `column:${String(payload.columnId)}:${request.command.kind}:${JSON.stringify(fields)}`
+          ? `column:${String(payload.columnId)}:${request.command.kind}:${JSON.stringify(fields())}`
           : ["save_view", "delete_view"].includes(request.command.kind)
             ? `view:${String(payload.id ?? payload.viewId ?? viewId)}`
             : `${request.command.kind}:${String(payload.rowId ?? `view:${viewId}`)}`;
@@ -966,7 +976,7 @@ export function CollaborativeTablePage({
     } catch (cause) {
       outcome = mutationFailure(cause);
     }
-    return { result: await settleMutation(run, outcome), outcome };
+    return { result: await settleMutation(run, outcome) };
   };
   const send = async (command: TableCommand, submission?: CellDraftSubmission, success: MutationSuccessIntent = {}) =>
     (await executeMutation({ kind: "command", command, owner: retryOwner, submission, success, message: "" }))
@@ -992,8 +1002,8 @@ export function CollaborativeTablePage({
     rowId?: string,
     submission?: CellDraftSubmission,
     form?: TableViewSubmission,
-  ): Promise<TaskSaveResult> => {
-    const { result, outcome, code } = await executeMutation({
+  ): Promise<boolean> => {
+    const { result } = await executeMutation({
       kind: "task",
       body,
       rowId,
@@ -1002,14 +1012,7 @@ export function CollaborativeTablePage({
       success: { acknowledgements: [form] },
       message: "",
     });
-    if (result === "suspended") return { state: "suspended" };
-    const completion = taskMutationCompletion(result, outcome?.kind === "success");
-    if (completion) return { state: "saved", completion };
-    if (result === "uncertain") return { state: "uncertain" };
-    return {
-      state: "rejected",
-      code: code ?? (result === "retired" ? "retired" : outcome?.kind === "failure" ? outcome.error?.code : undefined),
-    };
+    return result === "committed";
   };
   const changeCell = async (
     row: CollaborativeRow,
@@ -1044,7 +1047,7 @@ export function CollaborativeTablePage({
           row.id,
           submission,
         );
-        return result.state === "saved" && result.completion === "committed-current";
+        return result;
       }
     }
     return send(
@@ -1177,14 +1180,18 @@ export function CollaborativeTablePage({
       draggable={view?.kind !== "gallery" && editable && !busy}
       onDragStart={(event) => event.dataTransfer.setData("application/noteflare-row", row.id)}
     >
-      {view?.kind === "gallery" && view.gallery?.preview !== "none" && row.detailPageId && (
-        <img
-          loading="lazy"
-          alt=""
-          src={`/api/pages/${encodeURIComponent(row.detailPageId)}/cover`}
-          style={{ width: "100%", aspectRatio: "8/5", objectFit: "cover" }}
-        />
-      )}
+      {member.features?.images &&
+        view?.kind === "gallery" &&
+        view.gallery?.preview !== "none" &&
+        row.detailCover &&
+        row.detailPageId && (
+          <img
+            loading="lazy"
+            alt=""
+            src={`/api/pages/${encodeURIComponent(row.detailPageId)}/cover`}
+            style={{ width: "100%", aspectRatio: "8/5", objectFit: "cover" }}
+          />
+        )}
       <button
         className="quiet-button"
         disabled={!row.detailPageId && !editable}
@@ -1376,8 +1383,7 @@ export function CollaborativeTablePage({
               busy={busy || !editable}
               save={async (payload, form) => {
                 return command("save_view", payload, false, {
-                  acknowledgements: [form],
-                  closePanel: captureTableViewSubmission(viewState, "panel", null),
+                  acknowledgementGroup: [form, captureTableViewSubmission(viewState, "panel", null)],
                 });
               }}
               remove={() =>
@@ -2313,12 +2319,7 @@ function PropertyEditor({
   columns: CollaborativeColumn[];
   fixedColumnIds: string[];
   busy: boolean;
-  command: (
-    kind: TableCommand["kind"],
-    payload: Record<string, unknown>,
-    globalRevision?: boolean,
-    success?: MutationSuccessIntent,
-  ) => Promise<boolean>;
+  command: TableMutationCommand;
 }) {
   const state = useContext(TableViewStateContext)!;
   const [name, setName] = useTableViewState("property:new-name", ""),
@@ -2388,12 +2389,7 @@ function Property({
   column: CollaborativeColumn;
   columns: CollaborativeColumn[];
   busy: boolean;
-  command: (
-    kind: TableCommand["kind"],
-    payload: Record<string, unknown>,
-    globalRevision?: boolean,
-    success?: MutationSuccessIntent,
-  ) => Promise<boolean>;
+  command: TableMutationCommand;
 }) {
   const state = useContext(TableViewStateContext)!;
   const currentSource = column.config?.ast

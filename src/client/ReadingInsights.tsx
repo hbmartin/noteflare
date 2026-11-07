@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, apiErrorMessage, json } from "./api";
+import { api, apiErrorMessage, json, ApiClientError } from "./api";
 type Context = { enabled: boolean; revision: string | null; sections: { id: string; label: string }[] };
 type Summary = {
   sections: { revision: string; sectionId: string; weekStart: number; readers: number; dwellSeconds: number }[];
@@ -30,6 +30,8 @@ export function ReadingInsights({ pageId, userId }: { pageId: string; userId: st
   useEffect(() => {
     if (!context?.enabled || !context.revision || !optedIn) return undefined;
     const readings = new Map<string, { id: string; dwellSeconds: number; scrollPercent: number }>();
+    let mounted = true,
+      retired = false;
     let lastActive = Date.now(),
       lastTick = Date.now(),
       lastFlush = Date.now();
@@ -37,14 +39,26 @@ export function ReadingInsights({ pageId, userId }: { pageId: string; userId: st
       lastActive = Date.now();
     };
     const flush = () => {
-      if (!readings.size) return;
+      if (retired || !readings.size) return;
       const values = [...readings.values()];
       for (let start = 0; start < values.length; start += 25)
         void api(`/api/pages/${pageId}/heatmap`, {
           method: "POST",
           body: json({ revision: context.revision, sections: values.slice(start, start + 25) }),
           keepalive: true,
-        }).catch(() => undefined);
+        }).catch((cause: unknown) => {
+          if (!mounted || retired || !(cause instanceof ApiClientError) || cause.code !== "heatmap_revision_changed")
+            return;
+          retired = true;
+          readings.clear();
+          void api<Context>(`/api/pages/${pageId}/heatmap/context`)
+            .then((next) => {
+              if (mounted) setContext(next.revision !== context.revision ? next : null);
+            })
+            .catch(() => {
+              if (mounted) setContext(null);
+            });
+        });
     };
     const visibility = () => {
       lastTick = Date.now();
@@ -58,7 +72,7 @@ export function ReadingInsights({ pageId, userId }: { pageId: string; userId: st
       const now = Date.now(),
         seconds = Math.min(10, (now - lastTick) / 1000);
       lastTick = now;
-      if (document.visibilityState !== "visible" || now - lastActive > 60000) return;
+      if (retired || document.visibilityState !== "visible" || now - lastActive > 60000) return;
       const headings = context.sections
         .map((section) => ({ section, node: document.querySelector(`[data-id="${CSS.escape(section.id)}"]`) }))
         .filter((value): value is { section: { id: string; label: string }; node: Element } => !!value.node);
@@ -89,6 +103,7 @@ export function ReadingInsights({ pageId, userId }: { pageId: string; userId: st
       window.removeEventListener("keydown", activity);
       window.removeEventListener("scroll", activity, true);
       flush();
+      mounted = false;
     };
   }, [context, optedIn, pageId]);
   if (!context?.enabled) return null;

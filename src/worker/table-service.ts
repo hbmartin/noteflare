@@ -164,6 +164,28 @@ async function queryTableRead<T extends TableQueryCoverage>(
     await tableFetch(env, member, pageId, `${path}${query ? `?${query}` : ""}`),
   );
   const page = await pageForMember(env, member, pageId);
+  if (path === "/query" && env.IMAGES_ENABLED === "true" && env.IMAGES) {
+    const table = result as unknown as TableQueryResult;
+    const ids = table.rows.flatMap((row) => (row.detailPageId ? [row.detailPageId] : []));
+    const covers = ids.length
+      ? (
+          await env.DB.prepare(`SELECT p.id,p.cover_attachment_id,p.cover_x,p.cover_y
+      FROM pages p JOIN spaces s ON s.id=p.space_id
+      WHERE p.id IN(SELECT value FROM json_each(?)) AND p.workspace_id=?
+      AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.cover_attachment_id IS NOT NULL
+      AND (?='owner' OR s.visibility='workspace' OR EXISTS(SELECT 1 FROM space_members m WHERE m.space_id=s.id AND m.user_id=?))`)
+            .bind(JSON.stringify(ids), member.workspace.id, member.role, member.user.id)
+            .all<{ id: string; cover_attachment_id: string; cover_x: number; cover_y: number }>()
+        ).results
+      : [];
+    const byId = new Map(
+      covers.map((cover) => [
+        cover.id,
+        { attachmentId: cover.cover_attachment_id, x: cover.cover_x, y: cover.cover_y },
+      ]),
+    );
+    for (const row of table.rows) row.detailCover = row.detailPageId ? (byId.get(row.detailPageId) ?? null) : null;
+  }
   return { ...result, taskList: Boolean(page.is_task_list), canEdit: page.effective_role !== "viewer" };
 }
 export async function queryTable(env: Env, member: MemberContext, pageId: string, query = "") {

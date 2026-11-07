@@ -6,7 +6,7 @@ import { HttpError } from "./http";
 import { consumeFixedWindow } from "./rate-limit";
 import { sourceRateLimitKey } from "./source-rate-limit";
 import { verifyTurnstile } from "./turnstile";
-import { escapePublic, publicHtml, PUBLIC_STYLE } from "./public-utils";
+import { escapePublic, publicHtml, publicShareHandoff, PUBLIC_STYLE } from "./public-utils";
 
 export type ShareAccess = {
   id: string;
@@ -228,10 +228,7 @@ export async function unlockShare(env: Env, request: Request, key: string): Prom
     .run();
   const target = new URL(`/share/${encodeURIComponent(key)}/unlock/exchange`, `https://${hostname}`);
   target.searchParams.set("code", code);
-  return new Response(null, {
-    status: 303,
-    headers: { location: target.href, "cache-control": "no-store", "referrer-policy": "no-referrer" },
-  });
+  return publicShareHandoff(target);
 }
 export async function consumeShareExchange(env: Env, request: Request, key: string): Promise<Response> {
   const url = new URL(request.url),

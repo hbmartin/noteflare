@@ -1,3 +1,4 @@
+import { publicReadFailure } from "./public-utils";
 import {
   prepareCommentSubmission,
   publishCommentSubmission,
@@ -1635,6 +1636,8 @@ app.get("/api/me", async (c) => {
     role: member.role,
     features: {
       heatmaps: c.env.HEATMAPS_ENABLED === "true",
+      images: c.env.IMAGES_ENABLED === "true" && !!c.env.IMAGES,
+      semanticSearch: c.env.SEMANTIC_SEARCH_ENABLED === "true" && !!c.env.AI && !!c.env.SEMANTIC_INDEX,
       expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true",
       offlineEditing: false,
       blockLinks: c.env.BLOCK_LINKS_ENABLED === "true",
@@ -7136,15 +7139,8 @@ async function publicPageResponse(c: Context<{ Bindings: Env }>, pageId?: string
       ...(c.req.query("view") ? { viewId: c.req.query("view")! } : {}),
     });
   } catch (error) {
-    if (error instanceof HttpError && error.code === "share_content_unavailable")
-      return c.html(
-        '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared content unavailable</title><body><p>Shared content is temporarily unavailable. Please try again shortly.</p></body></html>',
-        503,
-        {
-          "cache-control": "no-store",
-          "retry-after": "5",
-        },
-      );
+    const failure = publicReadFailure(error, c.req.url);
+    if (failure) return failure;
     throw error;
   }
   if (!html) return c.text("Not found", 404);
@@ -7773,7 +7769,7 @@ export default {
           mcp_staged_pages: () => pruneStagedMcpPages(scheduledEnv),
           table_search_values: async () => {
             await backfillTableSearchValues(scheduledEnv);
-            await normalizeQueuedTitles(scheduledEnv.DB);
+            await normalizeQueuedTitles(scheduledEnv.DB, undefined, 500);
           },
           ai_history: () => pruneAi(scheduledEnv),
           platform: () => wakePlatform(scheduledEnv),

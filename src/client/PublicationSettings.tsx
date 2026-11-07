@@ -11,6 +11,9 @@ type Site = {
   active: number;
   needs_build: number;
   build_error: string | null;
+  content_version?: number;
+  build_content_version?: number | null;
+  build_checkpoint_json?: string | null;
   config: PublicationConfig;
   roots: string[];
 };
@@ -148,6 +151,17 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
             <output>
               Building the latest version. Older content stays available until the new version is ready; changed access
               closes the site while it rebuilds.
+              {sites.find((site) => site.id === siteId)?.build_checkpoint_json && (
+                <>
+                  {" "}
+                  Pages completed:{" "}
+                  {JSON.parse(sites.find((site) => site.id === siteId)!.build_checkpoint_json!).offset ?? 0}.
+                </>
+              )}
+              {(sites.find((site) => site.id === siteId)?.content_version ?? 0) >
+                (sites.find((site) => site.id === siteId)?.build_content_version ?? Infinity) && (
+                <> Newer edits are queued for the next version.</>
+              )}
             </output>
           ) : null}
           <fieldset>

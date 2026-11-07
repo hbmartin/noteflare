@@ -20,6 +20,11 @@ export type Publication = {
   manifest_key: string | null;
   needs_build: number;
   build_error: string | null;
+  content_version: number;
+  built_content_version: number;
+  build_content_version: number | null;
+  build_checkpoint_json: string | null;
+  dependencies_ready: number;
 };
 export type PublicationPage = {
   id: string;
@@ -47,7 +52,9 @@ export async function publicationPages(env: Env, pub: Publication): Promise<Publ
  eligible(id,depth) AS (SELECT root_id,max(depth) FROM ancestors GROUP BY root_id HAVING min(allowed)=1 AND max(parent_id IS NULL)=1),
  tree(id,depth) AS (SELECT id,depth FROM eligible UNION SELECT p.id,t.depth+1 FROM pages p JOIN tree t ON p.parent_id=t.id
  WHERE p.space_id=? AND p.workspace_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0 AND t.depth<51)
- SELECT DISTINCT p.*,t.depth publication_depth FROM tree t JOIN pages p ON p.id=t.id ORDER BY p.position,p.id LIMIT 5001`,
+ SELECT DISTINCT p.id,p.workspace_id,p.space_id,p.parent_id,p.kind,p.title,p.icon,substr(p.plain_text,1,280) plain_text,
+ p.content_epoch,p.indexed_seq,p.updated_at,p.cover_attachment_id,p.cover_x,p.cover_y,t.depth publication_depth
+ FROM tree t JOIN pages p ON p.id=t.id ORDER BY p.position,p.id LIMIT 5001`,
   )
     .bind(pub.space_id, pub.id, pub.workspace_id, pub.space_id, pub.workspace_id, pub.space_id, pub.workspace_id)
     .all<PublicationPage & { publication_depth: number }>();
@@ -158,7 +165,7 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
     now = Date.now();
   const mutation = existing
     ? env.DB.prepare(
-        "UPDATE publications SET config_json=?,active=?,generation=generation+1,access_generation=access_generation+1,needs_build=1,updated_at=? WHERE id=? AND generation=?",
+        "UPDATE publications SET config_json=?,active=?,generation=generation+1,access_generation=access_generation+1,content_version=content_version+1,build_checkpoint_json=NULL,build_content_version=NULL,needs_build=1,updated_at=? WHERE id=? AND generation=?",
       ).bind(JSON.stringify(config), Number(input.active === true), now, id, existing.generation)
     : env.DB.prepare(
         "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -196,7 +203,11 @@ async function queuePublication(env: Env, pub: Publication) {
       kind: "publication",
       key: pub.id,
       generation: String(pub.generation),
-      payload: { publicationId: pub.id, generation: pub.generation },
+      payload: {
+        publicationId: pub.id,
+        generation: pub.generation,
+        ...(pub.build_checkpoint_json ? JSON.parse(pub.build_checkpoint_json) : {}),
+      },
     });
 }
 export async function enqueuePendingPublications(env: Env) {

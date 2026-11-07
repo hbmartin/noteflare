@@ -2522,6 +2522,9 @@ describe("per-table authority", () => {
       ),
     ]);
     await enableTableAuthority(env, member, pageId);
+    await changeProjection(pageId, [
+      { sql: "UPDATE table_select_options SET label='Unrepaired' WHERE column_id='many-options'", binds: [] },
+    ]);
     const requests = await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
       const internal = instance as unknown as { env: Env; resumeRepair(): Promise<unknown> };
       const original = internal.env;
@@ -2556,7 +2559,7 @@ describe("per-table authority", () => {
     });
     expect(requests).toBeLessThan(30);
     const published = await env.DB.prepare(
-      "SELECT count(*) count FROM table_select_options WHERE column_id='many-options'",
+      "SELECT count(*) count FROM table_select_options WHERE column_id='many-options' AND label<>'Unrepaired'",
     ).first<{ count: number }>();
     expect(published!.count).toBeGreaterThan(0);
     expect(published!.count).toBeLessThanOrEqual(100);
@@ -2676,7 +2679,7 @@ describe("per-table authority", () => {
     await write(pageId, member, "create_column", { id: "title", name: "Title", type: "text" });
     await write(pageId, member, "create_row", { id: "row-a", values: { title: "Canonical" } });
     await env.DB.prepare(
-      "CREATE TRIGGER permanent_parity_mismatch AFTER INSERT ON table_cells BEGIN UPDATE table_cells SET text_value='Corrupt',json_value=json_quote('Corrupt') WHERE row_id=NEW.row_id AND column_id=NEW.column_id; END",
+      "CREATE TRIGGER permanent_parity_mismatch AFTER UPDATE ON table_cells WHEN NEW.text_value IS NOT 'Corrupt' BEGIN UPDATE table_cells SET text_value='Corrupt',json_value=json_quote('Corrupt') WHERE row_id=NEW.row_id AND column_id=NEW.column_id; END",
     ).run();
     const stub = env.TABLE.getByName(pageId);
     try {
@@ -2877,7 +2880,7 @@ describe("per-table authority", () => {
     await write(pageId, member, "create_column", { id: "title", name: "Title", type: "text" });
     await write(pageId, member, "create_row", { id: "row-a", values: { title: "Canonical" } });
     await env.DB.prepare(
-      "CREATE TRIGGER corrupt_repair_projection AFTER INSERT ON table_cells WHEN NEW.row_id='row-a' BEGIN UPDATE table_cells SET text_value='Corrupt',json_value=json_quote('Corrupt') WHERE row_id=NEW.row_id AND column_id=NEW.column_id; END",
+      "CREATE TRIGGER corrupt_repair_projection AFTER UPDATE ON table_cells WHEN NEW.row_id='row-a' AND NEW.text_value IS NOT 'Corrupt' BEGIN UPDATE table_cells SET text_value='Corrupt',json_value=json_quote('Corrupt') WHERE row_id=NEW.row_id AND column_id=NEW.column_id; END",
     ).run();
     const stub = env.TABLE.getByName(pageId);
     try {

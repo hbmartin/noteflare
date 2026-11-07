@@ -1,10 +1,15 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api } from "./api";
+import { api, ApiClientError } from "./api";
 import { ReadingInsights } from "./ReadingInsights";
 
-vi.mock("./api", () => ({ api: vi.fn(), json: JSON.stringify, apiErrorMessage: () => "Unavailable" }));
+vi.mock("./api", async (original) => ({
+  ...(await original<typeof import("./api")>()),
+  api: vi.fn(),
+  json: JSON.stringify,
+  apiErrorMessage: () => "Unavailable",
+}));
 const context = { enabled: true, revision: "revision-1", sections: [{ id: "heading", label: "Heading" }] };
 beforeEach(() => {
   vi.useFakeTimers();
@@ -36,6 +41,33 @@ async function mount() {
 }
 
 describe("reading insights privacy", () => {
+  it("retires old counters and refreshes context once after a revision rejection", async () => {
+    localStorage.setItem("reading-insights:user", "yes");
+    let reads = 0;
+    vi.mocked(api).mockImplementation(async (path, options) => {
+      if (options?.method === "POST") throw new ApiClientError(409, "heatmap_revision_changed", "Refresh context");
+      if (path.endsWith("/context")) return { ...context, revision: ++reads === 1 ? "revision-1" : "revision-2" };
+      return {};
+    });
+    await mount();
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    await act(async () => fireEvent(document, new Event("visibilitychange")));
+    expect(reads).toBe(2);
+    expect(submissions()).toHaveLength(1);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    await act(async () => fireEvent(document, new Event("visibilitychange")));
+    const next = JSON.parse(String(submissions().at(-1)![1]!.body));
+    expect(next.revision).toBe("revision-2");
+    expect(next.sections[0].dwellSeconds).toBe(10);
+    // The unchanged revision returned by this second refresh stops collection.
+    await act(() => vi.advanceTimersByTimeAsync(120_000));
+    expect(reads).toBe(3);
+    expect(submissions()).toHaveLength(2);
+  });
   it("requires explicit reader opt-in before collecting any summaries", async () => {
     await mount();
     await act(() => vi.advanceTimersByTimeAsync(120_000));

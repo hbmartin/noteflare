@@ -3,7 +3,7 @@ import type { Publication, PublicationPage } from "./publications";
 import type { DocumentContentEnvelope, ProseMirrorJson } from "../shared/types";
 import { collectTransclusions, serializeDocument } from "../shared/document-projection";
 import { putPublicationObject } from "./publication-storage";
-import { enqueuePlatformJob } from "./platform-jobs";
+import { publicationInput, advancePublication } from "./publication-state";
 
 export class PublicationContentError extends Error {}
 
@@ -22,7 +22,7 @@ const decode = (value: string) =>
     /&(amp|lt|gt|quot|#39);/g,
     (_, entity: string) => ({ amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'" })[entity]!,
   );
-async function projection(env: Env, page: PublicationPage) {
+async function readProjection(env: Env, page: PublicationPage) {
   const metadata = await env.DB.prepare(
     "SELECT r2_key,sequence FROM document_projections WHERE page_id=? AND content_epoch=?",
   )
@@ -42,6 +42,11 @@ async function projection(env: Env, page: PublicationPage) {
   )
     throw new PublicationContentError("A document projection changed.");
   return envelope.document;
+}
+function projection(env: Env, pub: Publication, page: PublicationPage) {
+  return publicationInput(env, pub, `publications/${pub.id}/${pub.generation}/${page.id}/source.json`, () =>
+    readProjection(env, page),
+  );
 }
 /** Complete authorized synced content across bounded jobs before any page can enter a manifest. */
 export async function expandPublicationDocument(
@@ -93,7 +98,7 @@ export async function expandPublicationDocument(
       },
     );
   };
-  if (!input.stateKey) state.html = render(await projection(env, page), page.id, []);
+  if (!input.stateKey) state.html = render(await projection(env, pub, page), page.id, []);
   for (let processed = 0; state.pending.length && processed < 8; processed++) {
     const ref = state.pending.shift()!,
       identity = JSON.stringify([ref.sourcePageId, ref.blockId]);
@@ -104,7 +109,7 @@ export async function expandPublicationDocument(
     const source = allowed.get(ref.sourcePageId);
     if (!source || source.kind !== "document")
       throw new PublicationContentError("A published synced source is unavailable.");
-    const sourceDocument = await projection(env, source),
+    const sourceDocument = await projection(env, pub, source),
       block = collectTransclusions(sourceDocument).sources.find((item) => item.blockId === ref.blockId);
     if (!block) throw new PublicationContentError("A published synced source block is unavailable.");
     const replacement = render({ type: "doc", content: [{ type: "blockGroup", content: block.content }] }, source.id, [
@@ -121,13 +126,7 @@ export async function expandPublicationDocument(
   if (state.pending.length) {
     const stateKey = `${prefix}/${page.id}/expansion-${++state.round}.json`;
     await putPublicationObject(env, pub, stateKey, JSON.stringify(state));
-    await enqueuePlatformJob(env, {
-      workspaceId: pub.workspace_id,
-      kind: "publication",
-      key: `${pub.id}:${offset}:document:${state.round}`,
-      generation: String(pub.generation),
-      payload: { publicationId: pub.id, generation: pub.generation, offset, documentStateKey: stateKey },
-    });
+    await advancePublication(env, pub, { offset, documentStateKey: stateKey });
     return null;
   }
   return { html: state.html, assets: state.assets };

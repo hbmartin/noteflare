@@ -7,7 +7,8 @@ this document does not certify that an account has provisioned or enabled these 
 
 ## Configuration and dependency order
 
-Apply migrations `0105` onward before uploading the new application Worker. Deploy the SQLite
+Apply migrations `0105` onward before uploading the new application Worker. Migration `0111` repairs installations
+that already applied `0105`–`0110`; do not edit or replay those earlier migrations. Deploy the SQLite
 `PlatformCoordinator` class with migration tag `v5`. Optional services remain disabled in the portable configuration.
 Paid services are never provisioned by the platform configuration validator. Keep staging, production and local
 resources separate, including encryption keyrings, R2 buckets, queues, indexes, Access audiences and hostnames.
@@ -52,9 +53,13 @@ shares. Do not copy bootstrap, OAuth, Slack, webhook or AI credentials to the pu
 Public delivery performs current primary-D1 checks before looking up an internally cached body. Browser responses
 remain `no-store`. Cache keys include the hostname and content/access generations. Access changes invalidate
 eligibility synchronously; cache deletion is only cleanup. An optional zone-scoped Cache Purge token enables durable, coalesced global cleanup, bounded to one batch per maintenance invocation and at least 60 seconds apart. Without it, internal cache entries expire after 24 hours. Immutable publication manifests switch atomically after
-the build completes. Ordinary edits can keep serving the previous authorized version; permission changes block
+the build completes. Builds retain immutable page inputs and a durable checkpoint; ordinary content changes mark
+a follow-up version pending rather than restarting the current build. Captures are per page, not a whole-site
+point-in-time transaction. Ordinary edits can keep serving the previous authorized version; permission changes block
 old snapshots until rebuilding completes. Selected roots and their current descendants define publication scope.
-Shared table views determine public filters and visible fields; personal views are never published. Migrate large legacy tables to TableAuthority before publishing them: canonical tables use bounded 100-row parts, while legacy snapshot fallback has a 20,000-row guard and cannot provide the same bounded processing cost.
+Shared table views determine public filters and visible fields; personal views are never published. Legacy tables use bounded 100-row grid reads with position/ID keyset pagination. Saved views require explicit
+TableAuthority migration. Migrated publication tables retain a frozen schema/view/row snapshot across 100-row
+parts, so later edits cannot tear a build. Old legacy offset cursors require restarting pagination.
 
 Publication builds process nested synced blocks in resumable groups of eight. They do not activate a partial
 manifest. Cycles and explicit limits (20 nested levels, 1,000 references or 5 MiB of expanded content per document)
@@ -174,3 +179,46 @@ Access IdP/device policy and passkey-origin migration; and Basin sink reconcilia
 Keep per-feature controls, per-route replication rollback, durable pending jobs, old encryption keys and previous
 safe publication manifests. Disable a failing optional service first. Do not delete job manifests, switch keys
 without keeping legacy decryptors, or restore an old access generation to make an outdated publication readable.
+
+## Review-fix upgrade and rollback
+
+Place public delivery routes in maintenance while applying `0111_platform_review_repairs.sql` and updating the
+application and public Workers together. Restore public traffic only after both new Workers are running. The
+old public Worker uses workspace-wide cache versions, which 0111 replaces with per-share versions; it must not
+serve cached responses during that mixed-version interval. Existing publications keep their manifests and
+conservative access invalidation until a new build installs complete
+page/ancestor/view/attachment dependencies. Affected access reductions still block old HTML, feeds and assets
+synchronously; unrelated moves and unreferenced attachment cleanup stop fencing every site after that transition.
+Ordinary content uses logical generation keys without hostname-wide purge requests. Live shares use per-share
+content generations. Disabled semantic indexing retains one coalesced dirty record; active work still receives
+cancellation generations. Existing disabled Forms remain disabled until an owner reviews and republishes them.
+
+For an application-code rollback, disable `PUBLIC_PUBLISHING_ENABLED` on the application Worker before restoring
+pre-0111 application code. Keep the updated public Worker running so delivery continues using per-share cache
+versions and current access checks. Rolling back the public Worker additionally requires a maintenance window,
+a forward compatibility migration restoring workspace-wide share invalidation, and invalidating the old cache
+namespace before traffic resumes. Retain D1 checkpoints, dependencies, private publication storage and
+TableAuthority snapshot tables. Do not run the old
+publication builder against new checkpoints or reset generation counters. Resume with a forward deployment,
+then re-enable publishing after checking a completed manifest and live access revocation. Existing attachment
+shares preserve original raster delivery when Images is disabled; explicit derivative routes retain their safe
+cached-derivative/placeholder fallback. Old manifests and active build generations remain protected from cleanup.
+
+The member response advertises ready `images` and `semanticSearch` capabilities. Missing fields mean unavailable.
+Keyword search remains the default when semantic search is disabled or missing bindings. Related pages run only
+on opening, page selection or explicit refresh. Foreground title repair handles eight queued titles; each cron
+pass handles up to 500 through guarded set-based statements. Owner publication settings show completed pages
+and whether newer edits await another version. Existing platform metrics retain job duration, retries and backlog.
+
+Review-fix verification on November 7, 2026: `pnpm check` passed with 3,486 unit/component tests (one intentional
+skip) and 2,627 Worker integration tests across 48 files. All coverage thresholds passed: Worker lines 84.82%,
+functions 87.79%, branches 74.83%. The Chromium custom-domain unlock test passed with the actual response CSP.
+Final Worker dry builds measured 1,947.04 KiB gzip for the application and 731.05 KiB for public delivery.
+Legacy 6,000-row and 22,001-row grid fixtures execute six D1 queries per page; 500-title repair passes execute four
+statements and drain 5,000 queued titles in ten passes. Upgrade tests preserve old publications and disabled form
+intent, retain conservative access fences, and measure fewer writes for edits outside public scopes.
+
+Before enabling optional services broadly, measure optimized Worker startup, total D1 statements and row-write
+amplification on a controlled account. Verify the minimal configuration, ongoing edits without Queue, image
+rollback, warm-cache access revocation, custom-domain password unlock in Chromium, and recovery after lost queue
+messages. Local tests and dry builds do not certify production product quotas or paid-service costs.

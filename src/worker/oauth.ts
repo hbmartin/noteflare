@@ -1,3 +1,4 @@
+import { setAuditActor } from "./audit";
 import { escapeHtml } from "./html";
 import type { Env, MemberContext } from "./env";
 import { requireMember, requireOwner } from "./auth";
@@ -157,6 +158,7 @@ export async function mcpAccess(request: Request, env: Env, required: readonly M
     return null;
   const scopes = new Set(row.scopes.split(" ").filter((scope): scope is McpScope => SCOPE_SET.has(scope)));
   if (required.some((scope) => !scopes.has(scope))) return null;
+  setAuditActor({ type: "user", id: row.user_id, workspaceId: row.workspace_id });
   return {
     grantId: row.grant_id,
     clientId: row.client_id,

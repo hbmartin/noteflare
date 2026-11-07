@@ -1,4 +1,5 @@
 import { createAuth, requireMember } from "./auth";
+import { countedD1 } from "../../tests/helpers/count-d1";
 import { enrollAccount, responseCookies } from "../../tests/helpers/security";
 import { sha256Hex } from "../shared/import-integrity";
 import { requireSecurity } from "./security";
@@ -178,7 +179,9 @@ describe("public share access", () => {
       }),
       key,
     );
-    const exchangeUrl = handoff.headers.get("location")!;
+    expect(handoff.status).toBe(200);
+    expect(handoff.headers.get("content-security-policy")).toContain("form-action 'self'");
+    const exchangeUrl = (await handoff.text()).match(/href="([^"]+)"/)![1]!.replaceAll("&amp;", "&");
     const grant = await consumeShareExchange(configured, new Request(exchangeUrl), key);
     expect(grant.headers.get("location")).toBe(`/share/${key}/pages/page`);
     const cookie = grant.headers.get("set-cookie")!.split(";")[0]!;
@@ -405,6 +408,32 @@ describe("Access account protection", () => {
 });
 
 describe("non-login form identities", () => {
+  it("looks up a member session and service-identity exclusion once per authorization", async () => {
+    await seed();
+    const signup = await createAuth(testEnv, true).handler(
+      post("http://example.test/api/auth/sign-up/email", {
+        email: "counted@example.test",
+        name: "Counted member",
+        password: "password123",
+      }),
+    );
+    expect(signup.status).toBe(200);
+    const cookie = await enrollAccount(signup);
+    const user = await env.DB.prepare("SELECT id FROM user WHERE email='counted@example.test'").first<{ id: string }>();
+    await env.DB.prepare(
+      "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'editor',1)",
+    )
+      .bind(user!.id)
+      .run();
+    const counter = countedD1(env.DB);
+    const request = new Request("http://example.test/api/me", { headers: { cookie } });
+    expect((await requireMember(request, { ...testEnv, DB: counter.database })).user.id).toBe(user!.id);
+    expect(counter.statements.filter((sql) => /\bfrom\s+"?session"?\s/i.test(sql))).toHaveLength(1);
+    expect(counter.statements.filter((sql) => sql.includes("FROM service_identities"))).toHaveLength(1);
+    counter.statements.length = 0;
+    await requireMember(request, { ...testEnv, DB: counter.database });
+    expect(counter.statements.filter((sql) => /\bfrom\s+"?session"?\s/i.test(sql))).toHaveLength(1);
+  });
   it("rejects credentials, new sessions, and pre-existing sessions for attribution principals", async () => {
     await seed();
     const auth = createAuth(testEnv, true);

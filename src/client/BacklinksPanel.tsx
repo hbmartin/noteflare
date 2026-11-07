@@ -6,9 +6,11 @@ export function BacklinksPanel({
   pageId,
   revision,
   onSelect,
+  semanticEnabled = false,
 }: {
   pageId: string;
   revision: number;
+  semanticEnabled?: boolean;
   onSelect: (pageId: string) => void;
 }) {
   const [result, setResult] = useState<{
@@ -17,13 +19,15 @@ export function BacklinksPanel({
     backlinks: Backlink[];
     error: string;
   }>(() => ({ pageId, revision, backlinks: [], error: "" }));
+  const [relatedRefresh, setRelatedRefresh] = useState(0);
   const [relatedResult, setRelatedResult] = useState<{
     pageId: string;
-    revision: number;
     related: SearchResult[];
+    refresh: number;
     status?: SearchResponse["retrievalStatus"];
   }>();
   useEffect(() => {
+    if (!semanticEnabled) return undefined;
     const controller = new AbortController();
     void api<{ related: SearchResult[]; retrievalStatus: SearchResponse["retrievalStatus"] }>(
       `/api/pages/${pageId}/related`,
@@ -33,17 +37,21 @@ export function BacklinksPanel({
         if (!controller.signal.aborted)
           setRelatedResult({
             pageId,
-            revision,
+            refresh: relatedRefresh,
             related: data.related ?? [],
             status: data.retrievalStatus ?? "disabled",
           });
       })
       .catch(() => {
-        if (!controller.signal.aborted) setRelatedResult({ pageId, revision, related: [], status: "unavailable" });
+        if (!controller.signal.aborted)
+          setRelatedResult({ pageId, refresh: relatedRefresh, related: [], status: "unavailable" });
       });
     return () => controller.abort();
-  }, [pageId, revision]);
-  const related = relatedResult?.pageId === pageId && relatedResult.revision === revision ? relatedResult : undefined;
+  }, [pageId, relatedRefresh, semanticEnabled]);
+  const related =
+    semanticEnabled && relatedResult?.pageId === pageId && relatedResult.refresh === relatedRefresh
+      ? relatedResult
+      : undefined;
   const currentResult = result.pageId === pageId && result.revision === revision;
   const backlinks = currentResult ? result.backlinks : [];
   const error = currentResult ? result.error : "";
@@ -81,6 +89,7 @@ export function BacklinksPanel({
       {related && related.status !== "disabled" && (
         <section aria-label="Related pages">
           <h2>Related pages</h2>
+          <button onClick={() => setRelatedRefresh((value) => value + 1)}>Refresh related pages</button>
           <p className="muted">Pages with similar content.</p>
           <div className="backlink-list">
             {related.related.map((item) => (

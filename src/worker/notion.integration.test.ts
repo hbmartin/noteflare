@@ -34,6 +34,7 @@ async function bootstrap() {
       password: "password123",
     }),
   });
+  if (!response.ok) throw new Error(`Bootstrap failed (${response.status}): ${await response.text()}`);
   const cookie = await enrollAccount(response);
   const tree = await (
     await SELF.fetch(authenticated(cookie, "/api/pages/tree"))

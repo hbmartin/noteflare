@@ -22,10 +22,16 @@ import { tableActorSignature, type TableActor } from "./table-authority";
 import { formFields } from "../shared/public-forms";
 import type { TableQueryResult } from "../shared/table-protocol";
 import { publicTablePage } from "./public-table";
+import { countedD1 } from "../../tests/helpers/count-d1";
 let tableId = "";
 beforeEach(async () => {
   tableId = crypto.randomUUID();
   await reset();
+  let objects = await env.BUCKET.list({ prefix: "publications/" });
+  while (objects.objects.length) {
+    await env.BUCKET.delete(objects.objects.map((object) => object.key));
+    objects = await env.BUCKET.list({ prefix: "publications/" });
+  }
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
   await env.DB.batch([
     env.DB.prepare("DELETE FROM public_cache_purge_control"),
@@ -106,6 +112,13 @@ async function fixturePublication(override: Partial<Env> = {}) {
   return (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
 }
 describe("public publication delivery", () => {
+  it("keeps ordered build metadata bounded instead of copying full document text", async () => {
+    const pub = await fixturePublication();
+    await env.DB.prepare("UPDATE pages SET plain_text=? WHERE id='root'").bind("Text ".repeat(10000)).run();
+    const pages = await publicationPages(configured(), pub);
+    expect(pages.find((page) => page.id === "root")?.plain_text).toBe("Text ".repeat(56));
+  });
+
   it("serves committed snapshots and blocks cached descendants and feeds immediately after ancestor archive", async () => {
     const pub = await fixturePublication();
     expect(pub.manifest_key).toBeTruthy();
@@ -157,7 +170,7 @@ describe("public publication delivery", () => {
     expect(await env.BUCKET.head("active-artifact")).not.toBeNull();
     expect(await env.BUCKET.head("building-artifact")).not.toBeNull();
     await env.DB.prepare("DELETE FROM publications WHERE id='site'").run();
-    await cleanupPublicationArtifacts(configured());
+    for (let pass = 0; pass < 5; pass++) await cleanupPublicationArtifacts(configured());
     expect(await env.BUCKET.head("active-artifact")).toBeNull();
     expect(await env.BUCKET.head("building-artifact")).toBeNull();
   });
@@ -279,6 +292,8 @@ describe("public publication delivery", () => {
     await env.DB.prepare("UPDATE document_projections SET sequence=2 WHERE page_id='child'").run();
     await env.DB.prepare("UPDATE pages SET indexed_seq=2 WHERE id='child'").run();
     const next = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(next.generation).toBe(pub.generation + 1);
+    expect(next.build_checkpoint_json).toBeNull();
     await expect(
       processPublicationBuildJob(configured(), { publicationId: "site", generation: next.generation, offset: 0 }),
     ).rejects.toThrow("cycle");
@@ -314,6 +329,14 @@ describe("public publication delivery", () => {
     expect((await publicFetch("/sites/public-key/rss.xml")).status).toBe(200);
     await env.DB.prepare("UPDATE table_views SET value_json=? WHERE page_id='view-table'")
       .bind(JSON.stringify({ id: "shared", visibleColumnIds: [], filters: null }))
+      .run();
+    // This new table/view is absent from the active manifest and has not been consumed by a build.
+    expect((await publicFetch("/sites/public-key/rss.xml")).status).toBe(200);
+    await env.DB.prepare(
+      `INSERT INTO publication_dependencies SELECT id,active_generation,'view',json_array('view-table','shared') FROM publications WHERE id='site'`,
+    ).run();
+    await env.DB.prepare("UPDATE table_views SET value_json=? WHERE page_id='view-table'")
+      .bind(JSON.stringify({ id: "shared", visibleColumnIds: ["different"], filters: null }))
       .run();
     expect((await publicFetch("/sites/public-key/rss.xml")).status).toBe(503);
     const before = await env.DB.prepare("SELECT access_generation FROM publications WHERE id='site'").first<number>(
@@ -543,5 +566,381 @@ describe("anonymous TableAuthority forms", () => {
     await expect(tableInternal(configured(), tableId, "/public-query?viewId=private")).rejects.toThrow(
       "View not found",
     );
+  });
+});
+
+describe("platform review regressions", () => {
+  it("serves original shared images through both public paths with Images disabled", async () => {
+    await insertPage("image-page").run();
+    const { createShare, resolveSharedPage, publicAttachment } = await import("./shares");
+    const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+    await env.BUCKET.put("image-original", bytes);
+    await env.DB.prepare(
+      "INSERT INTO attachments(id,workspace_id,page_id,name,mime,size,r2_key,created_by,created_at) VALUES('original-image','workspace','image-page','photo.png','image/png',8,'image-original','owner',1)",
+    ).run();
+    const share = await createShare(configured(), member, "image-page", "https://public.example.test", {});
+    const key = new URL(share.url).pathname.split("/").at(-1)!;
+    const source = (await resolveSharedPage(configured(), key))!;
+    const direct = (await publicAttachment({ ...configured(), IMAGES_ENABLED: "false" }, source, "original-image"))!;
+    expect(direct.headers.get("content-type")).toBe("image/png");
+    expect(direct.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(new Uint8Array(await direct.arrayBuffer())).toEqual(bytes);
+    const delivered = await publicFetch(`/share/${key}/assets/original-image`);
+    expect(delivered.headers.get("content-type")).toBe("image/png");
+    expect(new Uint8Array(await delivered.arrayBuffer())).toEqual(bytes);
+  });
+
+  it("uses normal keyword pagination and snippets for disabled hybrid requests", async () => {
+    await insertPage("keyword-page").run();
+    await env.DB.prepare("UPDATE pages SET plain_text='A needle in the document' WHERE id='keyword-page'").run();
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM page_search_v2 WHERE page_id='keyword-page'"),
+      env.DB.prepare(
+        "INSERT INTO page_search_v2(page_id,workspace_id,space_id,title,tags,body,comments,attachments) VALUES('keyword-page','workspace','workspace-general','Keyword page','','A needle in the document','','')",
+      ),
+    ]);
+    const { parseSearchRequest, searchWithMode } = await import("./search");
+    const result = await searchWithMode(
+      { ...configured(), SEMANTIC_SEARCH_ENABLED: "false" },
+      member,
+      parseSearchRequest("https://app.test/api/search?q=needle&mode=hybrid"),
+    );
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0]!.snippet).toEqual({ source: "body", text: "A needle in the document" });
+    expect(await env.DB.prepare("SELECT count(*) count FROM semantic_search_sessions").first("count")).toBe(0);
+    expect(result.nextCursor).toBeUndefined();
+  });
+
+  it.each([6000, 22001])(
+    "reads a %i-row legacy grid with constant query count and stable keyset pagination",
+    async (size) => {
+      await insertPage(tableId, null, "table").run();
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO table_state VALUES(?,1)").bind(tableId),
+        env.DB.prepare(
+          "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('large-title',?,'Title','text',0)",
+        ).bind(tableId),
+        env.DB.prepare(`WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<?)
+        INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) SELECT 'large-'||i,?,i,'owner',1,1 FROM n`).bind(
+          size - 1,
+          tableId,
+        ),
+        env.DB.prepare(
+          "INSERT INTO table_cells(row_id,column_id,text_value,updated_at) SELECT id,'large-title',id,1 FROM table_rows WHERE page_id=?",
+        ).bind(tableId),
+      ]);
+      const source = configured();
+      const { database, statements } = countedD1(source.DB);
+      const first = await publicTablePage({ ...source, DB: database }, tableId, undefined, undefined);
+      expect(first.rows).toHaveLength(100);
+      expect(first.rows[0]?.cells["large-title"]).toBe("large-0");
+      expect(first.rowCount).toBe(size);
+      expect(statements).toHaveLength(6);
+      await env.DB.prepare("UPDATE table_state SET revision=revision+1 WHERE page_id=?").bind(tableId).run();
+      statements.length = 0;
+      const second = await publicTablePage({ ...source, DB: database }, tableId, undefined, first.nextCursor!);
+      expect(second.rows[0]?.id).toBe("large-100");
+      expect(statements).toHaveLength(6);
+      statements.length = 0;
+      const last = await publicTablePage(
+        { ...source, DB: database },
+        tableId,
+        undefined,
+        btoa(JSON.stringify({ version: 2, position: size - 101, id: `large-${size - 101}` })),
+      );
+      expect(last.rows).toHaveLength(100);
+      expect(last.rows.at(-1)?.id).toBe(`large-${size - 1}`);
+      expect(last.nextCursor).toBeNull();
+      expect(statements).toHaveLength(6);
+      await expect(
+        publicTablePage(source, tableId, undefined, btoa(JSON.stringify({ revision: 1, offset: 100 }))),
+      ).rejects.toMatchObject({ code: "table_cursor_stale" });
+      await expect(publicTablePage(source, tableId, "shared", undefined)).rejects.toMatchObject({
+        code: "table_authority_required",
+      });
+    },
+  );
+
+  it("refuses legacy reads if seeding starts between registry lookup and the transactional read", async () => {
+    await insertPage(tableId, null, "table").run();
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            await target.prepare("INSERT INTO table_authority(page_id,state) VALUES(?,'seeding')").bind(tableId).run();
+            return target.batch(statements);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(
+      publicTablePage({ ...configured(), DB: database }, tableId, undefined, undefined),
+    ).rejects.toMatchObject({ code: "table_seed_pending" });
+  });
+
+  it("leaves publications online after unrelated moves and unreferenced attachment cleanup", async () => {
+    const before = await fixturePublication();
+    await insertPage("unrelated-parent").run();
+    await env.DB.prepare("UPDATE pages SET parent_id='unrelated-parent' WHERE id='outside'").run();
+    await env.DB.prepare(
+      "INSERT INTO attachments(id,workspace_id,page_id,name,mime,size,r2_key,created_by,created_at) VALUES('abandoned','workspace','root','unused.png','image/png',1,'unused','owner',1)",
+    ).run();
+    await env.DB.prepare("DELETE FROM attachments WHERE id='abandoned'").run();
+    const after = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(after.access_generation).toBe(before.access_generation);
+    expect(after.needs_build).toBe(0);
+    expect((await publicFetch("/sites/public-key")).status).toBe(200);
+  });
+
+  it("finishes a no-Queue build under ongoing compactions and recovers a lost wakeup from its checkpoint", async () => {
+    const initial = await fixturePublication();
+    await env.DB.prepare("DELETE FROM platform_jobs WHERE kind='publication'").run();
+    const compact = async (sequence: number) => {
+      const key = `projection/root/${sequence}`;
+      await env.BUCKET.put(
+        key,
+        JSON.stringify({
+          schemaVersion: 1,
+          pageId: "root",
+          contentEpoch: 1,
+          sequence,
+          document: {
+            type: "doc",
+            content: [{ type: "paragraph", content: [{ type: "text", text: `Root revision ${sequence}` }] }],
+          },
+        }),
+      );
+      await env.DB.batch([
+        env.DB.prepare("UPDATE document_projections SET sequence=?,r2_key=? WHERE page_id='root'").bind(sequence, key),
+        env.DB.prepare("UPDATE pages SET indexed_seq=? WHERE id='root'").bind(sequence),
+      ]);
+    };
+    await compact(2);
+    const next = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    const bindings = configured();
+    delete bindings.PLATFORM_QUEUE;
+    const { enqueuePendingPublications } = await import("./publications");
+    const { recoverPlatformJobs } = await import("./platform-jobs");
+    const handlers = {
+      publication: async (jobEnv: Env, job: { payload: unknown }) => processPublicationBuildJob(jobEnv, job.payload),
+    };
+    await enqueuePendingPublications(bindings);
+    await recoverPlatformJobs(bindings, handlers, 1);
+    expect(
+      await env.DB.prepare("SELECT build_checkpoint_json FROM publications WHERE id='site'").first<string>(
+        "build_checkpoint_json",
+      ),
+    ).toContain('"offset":1');
+    await env.DB.prepare("DELETE FROM platform_jobs WHERE kind='publication'").run();
+    await compact(3);
+    await enqueuePendingPublications(bindings);
+    await recoverPlatformJobs(bindings, handlers, 1);
+    const completed = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(completed.active_generation).toBe(next.generation);
+    expect(completed.active_generation).not.toBe(initial.active_generation);
+    expect(completed.needs_build).toBe(1);
+    expect(completed.generation).toBe(next.generation + 1);
+    expect(completed.build_checkpoint_json).toBeNull();
+    await processPublicationBuildJob(bindings, { publicationId: "site", generation: next.generation });
+    expect(await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first("generation")).toBe(
+      completed.generation,
+    );
+    expect((await publicFetch("/sites/public-key")).status).toBe(200);
+  });
+
+  it("keeps the first diagram capture when a duplicate delivery finishes after activation", async () => {
+    await fixturePublication();
+    await env.DB.batch([
+      insertPage("diagram", "root", "diagram"),
+      env.DB.prepare("UPDATE pages SET position='00' WHERE id='diagram'"),
+      env.DB.prepare(
+        `INSERT INTO diagram_projections VALUES('diagram',1,1,1,'diagram-source','hash',1,'diagram-live','hash',1,1)`,
+      ),
+    ]);
+    await env.BUCKET.put("diagram-live", "<svg>Original</svg>");
+    const generation = await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first<number>(
+      "generation",
+    );
+    let entered!: () => void, release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const pause = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const delayed = configured();
+    delayed.BUCKET = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "get")
+          return async (key: string) => {
+            if (key === "diagram-live") {
+              entered();
+              await pause;
+            }
+            return target.get(key);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const pending = processPublicationBuildJob(delayed, { publicationId: "site", generation });
+    try {
+      await blocked;
+      for (let page = 0; page < 3; page++)
+        await processPublicationBuildJob(configured(), { publicationId: "site", generation });
+      expect(
+        await env.DB.prepare("SELECT active_generation FROM publications WHERE id='site'").first("active_generation"),
+      ).toBe(generation);
+      await env.BUCKET.put("diagram-live", "<svg>Newer content</svg>");
+    } finally {
+      release();
+      await pending;
+    }
+    expect(await (await env.BUCKET.get(`publications/site/${generation}/diagram/diagram.svg`))!.text()).toBe(
+      "<svg>Original</svg>",
+    );
+    const completed = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(completed.built_content_version).toBe(completed.content_version);
+    const htmlKey = `publications/site/${generation}/diagram/1.html`;
+    const html = await (await env.BUCKET.get(htmlKey))!.text();
+    await putPublicationObject(configured(), completed, htmlKey, "Late duplicate");
+    expect(await (await env.BUCKET.get(htmlKey))!.text()).toBe(html);
+  });
+
+  it("freezes table values across 100-row build parts", async () => {
+    const { stub } = await formFixture();
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.transactionSync(() => {
+        for (let i = 0; i < 201; i++) {
+          state.storage.sql.exec("INSERT INTO rows VALUES(?,?,1,'owner',1,'owner',NULL)", `snapshot-row-${i}`, i);
+          state.storage.sql.exec(
+            "INSERT INTO cells VALUES(?,?,?,1)",
+            `snapshot-row-${i}`,
+            "title",
+            JSON.stringify(`Original ${i}`),
+          );
+        }
+      });
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT OR REPLACE INTO table_projection_context SELECT page_id,generation FROM table_authority WHERE page_id=?",
+      ).bind(tableId),
+      env.DB.prepare(`WITH RECURSIVE n(i) AS(SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<200)
+        INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) SELECT 'snapshot-row-'||i,?,i,'owner',1,1 FROM n`).bind(
+        tableId,
+      ),
+      env.DB.prepare(
+        "INSERT INTO table_cells(row_id,column_id,text_value,updated_at) SELECT id,'title','Original '||position,1 FROM table_rows WHERE page_id=?",
+      ).bind(tableId),
+      env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(tableId),
+    ]);
+    const config = publicationConfig({ title: "Snapshot table", homePageId: tableId }, [tableId]);
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,created_by,created_at,updated_at) VALUES('table-site','workspace','workspace-general','table-site',?,1,'owner',1,1)",
+      ).bind(JSON.stringify(config)),
+      env.DB.prepare("INSERT INTO publication_roots VALUES('table-site',?)").bind(tableId),
+    ]);
+    await processPublicationBuildJob(configured(), { publicationId: "table-site", generation: 1 });
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "update_cells",
+      payload: { rowId: "snapshot-row-100", values: { title: "NEW VALUE" }, expectedCellRevisions: { title: 1 } },
+    });
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as unknown as { project(): Promise<unknown> }).project();
+    });
+    // Deliver stale wakeup payloads; durable checkpoints, not their offset, determine progress.
+    await processPublicationBuildJob(configured(), { publicationId: "table-site", generation: 1, offset: 0 });
+    await processPublicationBuildJob(configured(), { publicationId: "table-site", generation: 1, offset: 0 });
+    const pub = (await env.DB.prepare("SELECT * FROM publications WHERE id='table-site'").first<Publication>())!;
+    expect(pub.active_generation).toBe(1);
+    expect(pub.needs_build).toBe(1);
+    const manifest = await (await env.BUCKET.get(pub.manifest_key!))!.json<{ pages: { parts: string[] }[] }>();
+    expect(manifest.pages[0]!.parts).toHaveLength(3);
+    const second = await (await env.BUCKET.get(manifest.pages[0]!.parts[1]!))!.text();
+    expect(second).toContain("Original 100");
+    expect(second).not.toContain("NEW VALUE");
+  });
+
+  it("does not disable a form when an unrelated column is deleted or unchanged headers are repaired", async () => {
+    await formFixture();
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "create_column",
+      payload: { id: "unused", name: "Unused", type: "text" },
+    });
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "delete_column",
+      payload: { columnId: "unused" },
+    });
+    expect(await env.DB.prepare("SELECT active FROM public_forms WHERE id='form'").first("active")).toBe(1);
+    const { repairTableProjection } = await import("./table-service");
+    await repairTableProjection(configured(), member, tableId);
+    for (let phase = 0; phase < 20; phase++) {
+      expect(await env.DB.prepare("SELECT active FROM public_forms WHERE id='form'").first("active")).toBe(1);
+      if (
+        (await env.DB.prepare("SELECT state FROM table_authority WHERE page_id=?").bind(tableId).first("state")) ===
+        "do"
+      )
+        break;
+      await runInDurableObject(env.TABLE.getByName(tableId), async (instance) => {
+        await (instance as unknown as { resumeRepair(): Promise<unknown> }).resumeRepair();
+      });
+    }
+    expect(await env.DB.prepare("SELECT active FROM public_forms WHERE id='form'").first("active")).toBe(1);
+    expect(await env.DB.prepare("SELECT version FROM public_forms WHERE id='form'").first("version")).toBe(1);
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "delete_column",
+      payload: { columnId: "title" },
+    });
+    expect(await env.DB.prepare("SELECT active FROM public_forms WHERE id='form'").first("active")).toBe(0);
+  });
+
+  it("coalesces disabled semantic backlog without allowing an in-flight index to commit stale content", async () => {
+    await insertPage("dirty").run();
+    const generation = await env.DB.prepare(
+      "SELECT generation FROM semantic_dirty WHERE page_id='dirty'",
+    ).first<number>("generation");
+    await env.DB.prepare("UPDATE pages SET title='First change' WHERE id='dirty'").run();
+    await env.DB.prepare("UPDATE pages SET title='Second change' WHERE id='dirty'").run();
+    expect(
+      await env.DB.prepare("SELECT generation FROM semantic_dirty WHERE page_id='dirty'").first("generation"),
+    ).toBe(generation);
+    const { enqueuePlatformJob } = await import("./platform-jobs");
+    await enqueuePlatformJob(configured(), {
+      workspaceId: "workspace",
+      kind: "semantic",
+      key: "dirty",
+      generation: String(generation),
+      payload: {},
+    });
+    await env.DB.prepare("UPDATE pages SET title='Invalidate active indexing' WHERE id='dirty'").run();
+    expect(
+      await env.DB.prepare("SELECT generation FROM semantic_dirty WHERE page_id='dirty'").first("generation"),
+    ).toBe(generation! + 1);
+  });
+
+  it("normalizes 5,000 titles in ten bounded set-based background passes", async () => {
+    await env.DB.prepare(`WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<4999)
+      INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+      SELECT 'normalize-'||i,'workspace','workspace-general','document','a0','Ａ title '||i,'owner',1,1 FROM n`).run();
+    const { normalizeQueuedTitles } = await import("./search");
+    const { database, statements } = countedD1(env.DB);
+    for (let pass = 0; pass < 10; pass++) {
+      statements.length = 0;
+      expect((await normalizeQueuedTitles(database, "workspace", 500)).inspected).toBe(500);
+      expect(statements).toHaveLength(4);
+    }
+    expect(await env.DB.prepare("SELECT count(*) count FROM page_title_normalization_queue").first("count")).toBe(0);
+    expect(
+      await env.DB.prepare("SELECT normalized_title FROM page_title_titles WHERE page_id='normalize-0'").first(
+        "normalized_title",
+      ),
+    ).toBe("a title 0");
   });
 });

@@ -58,6 +58,18 @@ export function captureTableViewSubmission(
   const snapshot = state.values.get(key);
   return snapshot ? { state, key, snapshot, reset } : undefined;
 }
+export function tableViewSubmissionCurrent(submission: TableViewSubmission | undefined) {
+  return (
+    !!submission &&
+    submission.state.lifetime.active &&
+    submission.state.values.get(submission.key) === submission.snapshot
+  );
+}
+/** A dependent group is checked before any reset changes its captured snapshots. */
+export function acknowledgeTableViewGroup(submissions: Array<TableViewSubmission | undefined>) {
+  if (!submissions.every(tableViewSubmissionCurrent)) return;
+  for (const submission of submissions) acknowledgeTableViewSubmission(submission);
+}
 export function acknowledgeTableViewSubmission(
   submission: TableViewSubmission | undefined,
   value: unknown = submission?.reset,

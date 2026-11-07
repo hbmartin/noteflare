@@ -69,6 +69,8 @@ export type MemberContext = {
 export type ClientMemberContext = Omit<MemberContext, "session"> & {
   features?: {
     heatmaps?: boolean;
+    images?: boolean;
+    semanticSearch?: boolean;
     expandedEmbeds: boolean;
     offlineEditing?: boolean;
     workspaceActivity?: boolean;

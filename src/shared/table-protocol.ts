@@ -94,6 +94,7 @@ export type CollaborativeRow = {
   cellRevisions: Record<string, number>;
   computedCells?: Record<string, ComputedValue>;
   detailPageId: string | null;
+  detailCover?: { attachmentId: string; x: number; y: number } | null;
   createdAt: number;
   createdBy: string | null;
   editedAt: number;

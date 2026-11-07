@@ -2,7 +2,7 @@ import type { AiSourceSnapshot } from "../shared/ai";
 import type { Env, MemberContext } from "./env";
 import { semanticMatches, type RetrievalStatus } from "./semantic";
 import { readSemanticSource } from "./semantic-source";
-import { SEMANTIC_VERSION } from "./semantic-chunks";
+import { SEMANTIC_VERSION } from "./semantic-model";
 import { HttpError, sha256 } from "./http";
 import { pageReadableSql, spaceVisibleSql } from "./page-access";
 import { ACCEPTED_PAGE_DELETION_SQL } from "./deletion-policy";

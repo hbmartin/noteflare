@@ -1635,9 +1635,8 @@ it("acknowledges view settings on saved Retry without clearing newer text", asyn
   fireEvent.click(retry);
   await waitFor(() => expect(writes).toHaveLength(2));
   await waitFor(() => expect(screen.queryByRole("button", { name: "Retry saved operation" })).toBeNull());
-  expect(screen.queryByLabelText("View name")).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Views" }));
   expect(screen.getByLabelText("View name")).toHaveValue("Newer settings");
+  expect(screen.getByText("Saved the earlier submission. Newer settings are still unsaved.")).toBeVisible();
   expect(writes[1]).toEqual(writes[0]);
 });
 it("retains a deliberate canonical extent across an unchanged refresh", async () => {
@@ -3831,8 +3830,8 @@ it.each([false, true])(
     await act(async () => release());
     view.rerender(tree("visible"));
     await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
-    expect(screen.queryByLabelText("View name")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Views" }));
+    expect(screen.queryByLabelText("View name") !== null).toBe(newer);
+    if (!newer) fireEvent.click(screen.getByRole("button", { name: "Views" }));
     expect(screen.getByLabelText("View name")).toHaveValue(newer ? "Newer settings" : "Saved settings");
     expect(screen.queryByText("These settings changed while you were editing.") !== null).toBe(newer);
   },
@@ -3935,12 +3934,12 @@ it.each(
         expect((screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled).toBe(!replace),
       );
       expect(screen.getByRole("button", { name: "Views" })).toBeDisabled();
-      const title = screen.queryByLabelText("New row title");
-      if (title) fireEvent.submit(title.closest("form")!);
-      expect(
-        screen.queryByRole("button", { name: "Add row" }) === null ||
-          (screen.getByRole("button", { name: "Add row" }) as HTMLButtonElement).disabled,
-      ).toBe(true);
+      const visible = task && !replace;
+      const title = screen.queryByLabelText("New row title") as HTMLInputElement | null;
+      const add = screen.queryByRole("button", { name: "Add row" }) as HTMLButtonElement | null;
+      expect(title?.value ?? null).toBe(visible ? "Keep this draft" : null);
+      expect(add?.disabled ?? null).toBe(visible ? true : null);
+      if (visible) fireEvent.submit(screen.getByLabelText("New row title").closest("form")!);
       expect(mutations).toBe(1);
       await act(async () => {
         recovery.release();
@@ -3959,6 +3958,55 @@ it.each(
     }
   },
 );
+
+it.each([false, true])("keeps recovery settlement busy across hide/reveal; task %s", async (task) => {
+  if (task) taskColumnFixture();
+  const module = await import("./linked-table-reads"),
+    createReads = module.linkedTableReads;
+  const handling = mutationGate();
+  let started = false,
+    mutations = 0;
+  const spy = vi.spyOn(module, "linkedTableReads").mockImplementation((options) => {
+    const reads = createReads(options);
+    return {
+      ...reads,
+      recover: async () => {
+        const result = await reads.recover();
+        started = true;
+        await handling.promise;
+        return result;
+      },
+    };
+  });
+  const original = vi.mocked(api).getMockImplementation()!;
+  vi.mocked(api).mockImplementation(async (path, init) => {
+    if (init?.method === "POST" && (path.endsWith("/commands") || path.endsWith("/tasks"))) {
+      mutations++;
+      throw new ApiClientError(409, "cell_revision_conflict", "Changed");
+    }
+    return original(path, init);
+  });
+  try {
+    const view = render(activityMutationTree("visible", task));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Views" })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Preserve recovery draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+    await waitFor(() => expect(started).toBe(true));
+    view.rerender(activityMutationTree("hidden", task));
+    view.rerender(activityMutationTree("visible", task));
+    await waitFor(() => expect(screen.getByLabelText("New row title")).toHaveValue("Preserve recovery draft"));
+    expect(screen.getByRole("button", { name: "Add row" })).toBeDisabled();
+    fireEvent.submit(screen.getByLabelText("New row title").closest("form")!);
+    expect(screen.getByText("A save is already in progress. Wait for it to finish.")).toBeVisible();
+    expect(mutations).toBe(1);
+    await act(async () => handling.release());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add row" })).toBeEnabled());
+    expect(screen.getByLabelText("New row title")).toHaveValue("Preserve recovery draft");
+  } finally {
+    await act(async () => handling.release());
+    spy.mockRestore();
+  }
+});
 
 it.each([false, true])(
   "defers acknowledgement when the response resolves from layout suspension; task %s",

@@ -195,7 +195,7 @@ describe("linked task query metadata", () => {
     fireEvent.change(screen.getByLabelText("New row title"), { target: { value: "Hidden task" } });
     fireEvent.click(screen.getByRole("button", { name: "Add row" }));
     expect(await screen.findByText("Saved. Current filters hide this task. Choose All rows to see it.")).toBeVisible();
-    expect(screen.getByLabelText("New row title")).toHaveValue("");
+    expect(await screen.findByLabelText("New row title")).toHaveValue("");
   });
 
   it.each(["create", "edit"] as const)(
