@@ -4,7 +4,7 @@ import { readTableCoverage } from "../shared/table-coverage";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { decodeTableResponse, tableReadPages } from "./table-transport";
-import { pageForMember, requirePageEditor, type PageRow } from "./page-access";
+import { pageForMember, requirePageEditor, pageReadableSql, spaceVisibleSql, type PageRow } from "./page-access";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import {
   normalizedColumnName,
@@ -170,11 +170,12 @@ async function queryTableRead<T extends TableQueryCoverage>(
     const covers = ids.length
       ? (
           await env.DB.prepare(`SELECT p.id,p.cover_attachment_id,p.cover_x,p.cover_y
-      FROM pages p JOIN spaces s ON s.id=p.space_id
+      FROM pages p JOIN spaces s ON s.id=p.space_id AND s.workspace_id=p.workspace_id
+      LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=?
       WHERE p.id IN(SELECT value FROM json_each(?)) AND p.workspace_id=?
-      AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.cover_attachment_id IS NOT NULL
-      AND (?='owner' OR s.visibility='workspace' OR EXISTS(SELECT 1 FROM space_members m WHERE m.space_id=s.id AND m.user_id=?))`)
-            .bind(JSON.stringify(ids), member.workspace.id, member.role, member.user.id)
+      AND ${pageReadableSql()} AND p.cover_attachment_id IS NOT NULL
+      AND ${spaceVisibleSql()}`)
+            .bind(member.user.id, JSON.stringify(ids), member.workspace.id, member.role)
             .all<{ id: string; cover_attachment_id: string; cover_x: number; cover_y: number }>()
         ).results
       : [];

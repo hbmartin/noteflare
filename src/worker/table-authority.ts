@@ -1,3 +1,4 @@
+import { registerPublicationSnapshot } from "./publication-snapshots";
 import { appendLocalAudit, flushLocalAudit } from "./audit";
 import { formValues, type FormField } from "../shared/public-forms";
 import {
@@ -148,7 +149,7 @@ type RepairIntent = {
   mismatches?: number;
   revision?: number;
   headerStep?: number;
-  headerFormat?: 1;
+  headerFormat?: 1 | 2;
   rowCursor?: string;
 };
 type Meta = TableActor & {
@@ -225,6 +226,7 @@ function validSocketGrant(
 
 export class TableAuthority extends DurableObject<Env> {
   private readonly relations: CanonicalRelations;
+  private snapshotWork: Promise<unknown> = Promise.resolve();
   private projecting: Promise<boolean> | null = null;
   private repairWork: Promise<unknown> | null = null;
   private deletionIntent: DeletionIntent | null = null;
@@ -254,10 +256,18 @@ export class TableAuthority extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS staged_computed(row_id TEXT NOT NULL,column_id TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(row_id,column_id));
       CREATE TABLE IF NOT EXISTS events(revision INTEGER PRIMARY KEY,operation_id TEXT NOT NULL,value TEXT NOT NULL,cancel_row_id TEXT,next_step INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS projection_steps(revision INTEGER NOT NULL,position INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(revision,position));`);
+    ctx.storage.sql
+      .exec(`CREATE TABLE IF NOT EXISTS publication_snapshots(id TEXT PRIMARY KEY,publication_id TEXT NOT NULL,generation INTEGER NOT NULL,created_at INTEGER NOT NULL,metadata TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS publication_snapshot_rows(snapshot_id TEXT NOT NULL,ordinal INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(snapshot_id,ordinal));`);
     const deletion = this.rows<{ value: string }>("SELECT value FROM meta WHERE id=2")[0];
     if (deletion) {
       this.deletionIntent = JSON.parse(deletion.value) as DeletionIntent;
       this.purged = this.deletionIntent.purged;
+      if (this.purged)
+        ctx.storage.transactionSync(() => {
+          ctx.storage.sql.exec("DELETE FROM publication_snapshot_rows");
+          ctx.storage.sql.exec("DELETE FROM publication_snapshots");
+        });
     }
   }
   private rows<T>(sql: string, ...binds: (string | number | null)[]): T[] {
@@ -2351,8 +2361,84 @@ export class TableAuthority extends DurableObject<Env> {
       binds: [JSON.stringify(compiled.binds)],
     };
   }
+  private withSnapshotWork<T>(work: () => Promise<T>): Promise<T> {
+    const pending = this.snapshotWork.then(work);
+    this.snapshotWork = pending.catch(() => {});
+    return pending;
+  }
+  private publicationSnapshot(url: URL): Promise<TableQueryResult> {
+    return this.withSnapshotWork(() => this.capturePublicationSnapshot(url));
+  }
+  /** Binding-only maintenance RPC. No public HTTP route invokes it. */
+  async releasePublicationSnapshot(handle: string): Promise<{ released: boolean }> {
+    return this.withSnapshotWork(async () => {
+      const saved = this.rows<{ publication_id: string; generation: number }>(
+        "SELECT publication_id,generation FROM publication_snapshots WHERE id=?",
+        handle,
+      )[0];
+      if (!saved) return { released: true };
+      const registration = await this.env.DB.prepare(
+        "SELECT access_generation FROM publication_table_snapshots WHERE handle=?",
+      )
+        .bind(handle)
+        .first<{ access_generation: number }>();
+      const live = await this.env.DB.prepare(
+        "SELECT 1 FROM publications WHERE id=? AND generation=? AND (? IS NULL OR access_generation=?) AND active=1 AND needs_build=1",
+      )
+        .bind(
+          saved.publication_id,
+          saved.generation,
+          registration?.access_generation ?? null,
+          registration?.access_generation ?? null,
+        )
+        .first();
+      if (live) return { released: false };
+      return this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          `DELETE FROM publication_snapshot_rows WHERE snapshot_id=? AND ordinal IN(
+          SELECT ordinal FROM publication_snapshot_rows WHERE snapshot_id=? ORDER BY ordinal LIMIT 500)`,
+          handle,
+          handle,
+        );
+        if (this.rows("SELECT 1 FROM publication_snapshot_rows WHERE snapshot_id=? LIMIT 1", handle).length)
+          return { released: false };
+        this.ctx.storage.sql.exec("DELETE FROM publication_snapshots WHERE id=?", handle);
+        return { released: true };
+      });
+    });
+  }
+  /** Backfill legacy captures from namespace inventory, including objects with no surviving page row. */
+  async reconcilePublicationSnapshots(after = ""): Promise<{ next: string | null }> {
+    return this.withSnapshotWork(async () => {
+      const snapshots = this.rows<{
+        id: string;
+        publication_id: string;
+        generation: number;
+        created_at: number;
+        metadata: string;
+      }>("SELECT * FROM publication_snapshots WHERE id>? ORDER BY id LIMIT 10", after);
+      for (const saved of snapshots) {
+        const metadata = JSON.parse(saved.metadata) as { pageId: string };
+        const access = await this.env.DB.prepare(
+          "SELECT access_generation FROM publications WHERE id=? AND generation=?",
+        )
+          .bind(saved.publication_id, saved.generation)
+          .first<number>("access_generation");
+        await registerPublicationSnapshot(this.env, {
+          handle: saved.id,
+          objectId: this.ctx.id.toString(),
+          pageId: metadata.pageId,
+          publicationId: saved.publication_id,
+          generation: saved.generation,
+          accessGeneration: access ?? -1,
+          createdAt: saved.created_at,
+        });
+      }
+      return { next: snapshots.length === 10 ? snapshots.at(-1)!.id : null };
+    });
+  }
   /** Internal immutable inputs: later edits cannot invalidate pagination for a build. */
-  private async publicationSnapshot(url: URL): Promise<TableQueryResult> {
+  private async capturePublicationSnapshot(url: URL): Promise<TableQueryResult> {
     const handle = url.searchParams.get("handle") ?? "",
       publicationId = url.searchParams.get("publicationId") ?? "";
     const generation = Number(url.searchParams.get("publicationGeneration")),
@@ -2371,31 +2457,22 @@ export class TableAuthority extends DurableObject<Env> {
         .bind(publicationId, generation, access, meta.pageId)
         .first();
     if (!eligible) return fail("Publication snapshot has retired.", 409, "publication_changed");
-    this.ctx.storage.sql
-      .exec(`CREATE TABLE IF NOT EXISTS publication_snapshots(id TEXT PRIMARY KEY,publication_id TEXT NOT NULL,generation INTEGER NOT NULL,created_at INTEGER NOT NULL,metadata TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS publication_snapshot_rows(snapshot_id TEXT NOT NULL,ordinal INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(snapshot_id,ordinal));`);
-    // Retain inputs for live builds; expired/cancelled inputs are bounded cleanup work.
-    const expired = this.rows<{ id: string; publication_id: string; generation: number }>(
-      "SELECT id,publication_id,generation FROM publication_snapshots WHERE created_at<? LIMIT 1",
-      Date.now() - 7 * 86400_000,
-    )[0];
-    if (
-      expired &&
-      !(await this.env.DB.prepare(
-        "SELECT 1 FROM publications WHERE id=? AND generation=? AND active=1 AND needs_build=1",
-      )
-        .bind(expired.publication_id, expired.generation)
-        .first())
-    ) {
-      this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec("DELETE FROM publication_snapshot_rows WHERE snapshot_id=?", expired.id);
-        this.ctx.storage.sql.exec("DELETE FROM publication_snapshots WHERE id=?", expired.id);
-      });
-    }
+    await registerPublicationSnapshot(this.env, {
+      handle,
+      objectId: this.ctx.id.toString(),
+      pageId: meta.pageId,
+      publicationId,
+      generation,
+      accessGeneration: access,
+      createdAt: Date.now(),
+    });
     let saved = this.rows<{ metadata: string }>("SELECT metadata FROM publication_snapshots WHERE id=?", handle)[0];
+    if (!saved && url.searchParams.has("cursor"))
+      return fail("The frozen table capture is unavailable. Restart this build.", 409, "publication_snapshot_missing");
     if (!saved) {
       const taskIds = await publicTaskRowIds(this.env, meta.pageId);
       this.ctx.storage.transactionSync(() => {
+        this.requireActive();
         const current = this.meta();
         if (!current.seeded || current.projectedRevision !== current.revision || current.repairIntent)
           fail("Table publication is catching up.", 503, "table_projection_pending");
@@ -2410,7 +2487,7 @@ export class TableAuthority extends DurableObject<Env> {
         const { columns, views, view, invalidView, filter } = this.queryInputs(url, actor);
         if (view?.ownerId || invalidView) fail("The public view is unavailable.", 404, "view_not_found");
         if (taskIds !== null) {
-          filter.sql += " AND r.id IN(SELECT value FROM json_each(?))";
+          filter.sql += ` AND r.id IN(SELECT value FROM json_each(?${filter.binds.length + 1}))`;
           filter.binds.push(JSON.stringify(taskIds));
         }
         const order =
@@ -2422,16 +2499,16 @@ export class TableAuthority extends DurableObject<Env> {
         // Materialize in SQLite, keeping JavaScript memory bounded to one output page.
         this.ctx.storage.sql.exec(
           `INSERT INTO publication_snapshot_rows(snapshot_id,ordinal,value)
-          SELECT ?,row_number() OVER(ORDER BY ${order.join(",")})-1,json_object(
-            'id',r.id,'position',r.position,'revision',coalesce((SELECT revision FROM row_revisions WHERE id=r.id),?),
+          SELECT ?${filter.binds.length + 1},row_number() OVER(ORDER BY ${order.join(",")})-1,json_object(
+            'id',r.id,'position',r.position,'revision',coalesce((SELECT revision FROM row_revisions WHERE id=r.id),?${filter.binds.length + 2}),
             'cells',json((SELECT json_group_object(column_id,json(value)) FROM cells WHERE row_id=r.id)),
             'cellRevisions',json((SELECT json_group_object(column_id,revision) FROM cells WHERE row_id=r.id)),
             'computedCells',json((SELECT json_group_object(column_id,json(value)) FROM computed WHERE row_id=r.id)),
             'detailPageId',r.detail_page_id,'createdAt',r.created_at,'createdBy',r.created_by,'editedAt',r.edited_at,'editedBy',r.edited_by)
           FROM rows r WHERE ${filter.sql}`,
+          ...filter.binds,
           handle,
           current.revision,
-          ...filter.binds,
         );
         const rowCount = this.rows<{ count: number }>(
           "SELECT count(*) count FROM publication_snapshot_rows WHERE snapshot_id=?",
@@ -2872,7 +2949,7 @@ export class TableAuthority extends DurableObject<Env> {
     let meta = await authorize();
     if (this.deletionIntent && !this.deletionIntent.stopped) {
       await Promise.allSettled(
-        [this.projecting, this.repairWork].filter((work): work is Promise<unknown> => work !== null),
+        [this.projecting, this.repairWork, this.snapshotWork].filter((work): work is Promise<unknown> => work !== null),
       );
       meta = await authorize();
     }
@@ -2997,7 +3074,7 @@ export class TableAuthority extends DurableObject<Env> {
     this.ctx.storage.sql.exec("INSERT OR REPLACE INTO meta VALUES(2,?)", JSON.stringify(this.deletionIntent));
     await this.clearWorkAlarm();
     await Promise.allSettled(
-      [this.projecting, this.repairWork].filter((work): work is Promise<unknown> => work !== null),
+      [this.projecting, this.repairWork, this.snapshotWork].filter((work): work is Promise<unknown> => work !== null),
     );
     await this.authorizeDeletion(body, "stop");
     this.deletionIntent.stopped = true;
@@ -3025,7 +3102,7 @@ export class TableAuthority extends DurableObject<Env> {
     };
     this.ctx.storage.sql.exec("INSERT OR REPLACE INTO meta VALUES(2,?)", JSON.stringify(this.deletionIntent));
     await Promise.allSettled(
-      [this.projecting, this.repairWork].filter((work): work is Promise<unknown> => work !== null),
+      [this.projecting, this.repairWork, this.snapshotWork].filter((work): work is Promise<unknown> => work !== null),
     );
     await this.authorizeDeletion(body, "purge");
     await this.clearWorkAlarm();
@@ -3033,6 +3110,8 @@ export class TableAuthority extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       this.deletionIntent!.purged = true;
       for (const table of [
+        "publication_snapshot_rows",
+        "publication_snapshots",
         "relation_stats",
         "relation_cells",
         "relation_definitions",
@@ -3833,6 +3912,7 @@ export class TableAuthority extends DurableObject<Env> {
       ...this.relations.headerProjection(meta.pageId),
       ...(!seedBaseline
         ? [
+            { sql: "UPDATE table_columns SET name_key=NULL WHERE page_id=?", binds: [meta.pageId] },
             {
               sql: "DELETE FROM table_columns WHERE page_id=? AND id NOT IN(SELECT value FROM json_each(?))",
               binds: [meta.pageId, JSON.stringify(this.columns().map((column) => column.id))],
@@ -4035,7 +4115,18 @@ export class TableAuthority extends DurableObject<Env> {
         ),
       ),
     );
-    const cells: ProjectionStatement[] = [];
+    const cells: ProjectionStatement[] = rows.map((row) => ({
+      sql: "DELETE FROM table_cells WHERE row_id=? AND row_id IN(SELECT id FROM table_rows WHERE page_id=?) AND column_id NOT IN(SELECT value FROM json_each(?))",
+      binds: [
+        row.id,
+        meta.pageId,
+        JSON.stringify(
+          this.rows<{ column_id: string }>("SELECT column_id FROM cells WHERE row_id=?", row.id).map(
+            (cell) => cell.column_id,
+          ),
+        ),
+      ],
+    }));
     for (const row of rows)
       for (const cell of this.rows<{ column_id: string; value: string; revision: number }>(
         "SELECT * FROM cells WHERE row_id=?",
@@ -4175,7 +4266,7 @@ export class TableAuthority extends DurableObject<Env> {
         for (let offset = 0; offset < headers.length; offset += REPAIR_ENTITY_LIMIT)
           batches.push(...projectionBatches(compactProjection(headers.slice(offset, offset + REPAIR_ENTITY_LIMIT))));
         // Old cursors counted compacted batches containing an unbounded number of entities.
-        if (intent.headerFormat !== 1) setIntent({ ...intent, headerStep: 0, headerFormat: 1 });
+        if (intent.headerFormat !== 2) setIntent({ ...intent, headerStep: 0, headerFormat: 2 });
         for (let position = intent.headerStep ?? 0; position < batches.length; position++) {
           const records = batches[position]!.flatMap(insertRecords);
           for (const table of ["table_columns", "table_select_options"]) {

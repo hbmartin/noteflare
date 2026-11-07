@@ -164,6 +164,9 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
               )}
             </output>
           ) : null}
+          {sites.find((site) => site.id === siteId)?.build_error && (
+            <p role="alert">{sites.find((site) => site.id === siteId)!.build_error}</p>
+          )}
           <fieldset>
             <legend>Pages to publish</legend>
             {available.map((page) => (

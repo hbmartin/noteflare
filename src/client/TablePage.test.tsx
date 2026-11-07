@@ -166,6 +166,33 @@ async function renderActiveEditor() {
 }
 
 describe("TablePage", () => {
+  it("enables Related pages on opening and keeps workspace invalidations inference-free", async () => {
+    vi.mocked(api).mockImplementation(async (path) =>
+      path.endsWith("/related")
+        ? { related: [], retrievalStatus: "available" }
+        : path.endsWith("/backlinks")
+          ? { backlinks: [] }
+          : { table },
+    );
+    const props = {
+      page,
+      member: { ...member("viewer"), features: { expandedEmbeds: false, semanticSearch: true } },
+      onPageChanged: vi.fn(),
+      onSelectPage: vi.fn(),
+      backlinksRevision: 0,
+    };
+    const view = render(<TablePage {...props} />);
+    await screen.findByDisplayValue("Ready");
+    fireEvent.click(screen.getByRole("button", { name: "Backlinks" }));
+    await screen.findByRole("button", { name: "Refresh related pages" });
+    const related = () => vi.mocked(api).mock.calls.filter(([path]) => path.endsWith("/related"));
+    expect(related()).toHaveLength(1);
+    view.rerender(<TablePage {...props} backlinksRevision={1} />);
+    await waitFor(() =>
+      expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith("/backlinks"))).toHaveLength(2),
+    );
+    expect(related()).toHaveLength(1);
+  });
   let randomSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {

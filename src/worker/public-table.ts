@@ -1,9 +1,11 @@
 import type { Env } from "./env";
 import { tableInternal, tableRegistry } from "./table-service";
-import type { CollaborativeColumn, TableQueryResult } from "../shared/table-protocol";
-import { versionedPropertyConfig, TABLE_PROTOCOL_VERSION } from "../shared/table-protocol";
+import type { TableQueryResult } from "../shared/table-protocol";
+import { TABLE_PROTOCOL_VERSION } from "../shared/table-protocol";
 import { HttpError } from "./http";
-import { buildTableRowQuery, tableRowBinds, collectRowCells } from "./table-read";
+import { buildTableRowQuery, tableRowBinds, PUBLIC_TABLE_ROW_ELIGIBILITY } from "./table-read";
+
+import { decodeProjectionColumns, decodeProjectionRow } from "./table-projection-values";
 
 type Cursor = { version: 2; position: number; id: string };
 export async function publicTablePage(
@@ -11,9 +13,16 @@ export async function publicTablePage(
   pageId: string,
   viewId: string | undefined,
   cursor: string | undefined,
+  legacyOnly = false,
 ): Promise<TableQueryResult> {
   const registry = await tableRegistry(env, pageId);
   if (registry?.state === "do" || registry?.state === "repairing") {
+    if (legacyOnly)
+      throw new HttpError(
+        409,
+        "publication_table_source_changed",
+        "The table migrated. Restart this publication build.",
+      );
     const params = new URLSearchParams({ limit: "100" });
     if (viewId) params.set("viewId", viewId);
     if (cursor) params.set("cursor", cursor);
@@ -42,15 +51,16 @@ export async function publicTablePage(
       throw new HttpError(400, "table_cursor_invalid", "Restart pagination with a valid table cursor.");
     }
   }
-  const query = buildTableRowQuery(pageId, [], {
-    limit: "100",
-    ...(after ? { afterId: after.id, afterPosition: String(after.position) } : {}),
-  });
+  const query = buildTableRowQuery(
+    pageId,
+    [],
+    {
+      limit: "100",
+      ...(after ? { afterId: after.id, afterPosition: String(after.position) } : {}),
+    },
+    { publicRows: true },
+  );
   // All statements share one D1 transaction; a writer cannot tear a row/cell page.
-  const publicTask = ` AND (coalesce((SELECT is_task_list FROM pages WHERE id=r.page_id),0)=0 OR EXISTS(
-    SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id
-    WHERE link.row_id=r.id AND detail.archived_at IS NULL AND detail.import_job_id IS NULL))`;
-  const selected = query.sql.replace("ORDER BY r.position", `${publicTask} ORDER BY r.position`);
   const [state, columns, options, rows, count] = await env.DB.batch<Record<string, unknown>>([
     env.DB.prepare(
       `SELECT s.revision,a.state,a.generation FROM pages p LEFT JOIN table_state s ON s.page_id=p.id LEFT JOIN table_authority a ON a.page_id=p.id WHERE p.id=?`,
@@ -60,48 +70,35 @@ export async function publicTablePage(
       "SELECT o.* FROM table_select_options o JOIN table_columns c ON c.id=o.column_id WHERE c.page_id=? ORDER BY o.position,o.id",
     ).bind(pageId),
     env.DB.prepare(`SELECT r.id row_id,r.position row_position,r.created_at,r.created_by,r.updated_at,r.updated_by,r.row_revision,link.page_id detail_page_id,c.column_id,c.text_value,c.number_value,c.boolean_value,c.date_value,c.select_value,c.json_value,c.cell_revision
-      FROM (${selected}) chosen JOIN table_rows r ON r.id=chosen.id LEFT JOIN table_row_pages link ON link.row_id=r.id
+      FROM (${query.sql}) chosen JOIN table_rows r ON r.id=chosen.id LEFT JOIN table_row_pages link ON link.row_id=r.id
       LEFT JOIN table_cells c ON c.row_id=r.id ORDER BY ${query.orderSql.replaceAll("page_rows.", "chosen.")},c.column_id`).bind(
       ...tableRowBinds(query, 101),
     ),
-    env.DB.prepare(`SELECT count(*) count FROM table_rows r WHERE r.page_id=? ${publicTask}`).bind(pageId),
+    env.DB.prepare(`SELECT count(*) count FROM table_rows r WHERE r.page_id=? ${PUBLIC_TABLE_ROW_ELIGIBILITY}`).bind(
+      pageId,
+    ),
   ]);
   const metadata = state!.results[0] as
     | { revision: number; state: string | null; generation: number | null }
     | undefined;
   if (metadata?.state && metadata.state !== "d1")
     throw new HttpError(503, "table_seed_pending", "This table changed authority. Restart the public view.");
-  const decodedColumns = columns!.results.map((column) => ({
-    id: String(column.id),
-    name: String(column.name),
-    type: column.type as CollaborativeColumn["type"],
-    position: Number(column.position),
-    revision: Number(column.property_revision),
-    generation: Number(column.property_generation),
-    config: versionedPropertyConfig(JSON.parse(String(column.config_json ?? "{}"))),
-    options: options!.results
-      .filter((option) => option.column_id === column.id)
-      .map((option) => ({
-        id: String(option.id),
-        label: String(option.label),
-        position: Number(option.position),
-        color: String(option.color),
-      })),
-  }));
-  const values = collectRowCells(rows!.results);
-  const metadataById = new Map(rows!.results.map((row) => [String(row.row_id), row]));
-  const page = values.slice(0, 100).map((row) => {
-    const raw = metadataById.get(row.id)!;
-    return {
-      ...row,
-      cellRevisions: {},
-      revision: Number(raw.row_revision),
-      createdAt: Number(raw.created_at),
-      createdBy: raw.created_by as string | null,
-      editedAt: Number(raw.updated_at),
-      editedBy: raw.updated_by as string | null,
-    };
+  const decodedColumns = decodeProjectionColumns(columns!.results, options!.results);
+  const grouped = new Map<string, Record<string, unknown>[]>();
+  for (const row of rows!.results) {
+    const id = String(row.row_id);
+    const cells = grouped.get(id) ?? [];
+    cells.push(row);
+    grouped.set(id, cells);
+  }
+  const values = [...grouped.values()].map((cells) => {
+    const raw = cells[0]!;
+    return decodeProjectionRow(
+      { ...raw, id: raw.row_id, position: raw.row_position },
+      cells.filter((cell) => typeof cell.column_id === "string"),
+    );
   });
+  const page = values.slice(0, 100);
   const last = page.at(-1);
   return {
     protocolVersion: TABLE_PROTOCOL_VERSION,

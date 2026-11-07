@@ -433,6 +433,17 @@ describe("non-login form identities", () => {
     counter.statements.length = 0;
     await requireMember(request, { ...testEnv, DB: counter.database });
     expect(counter.statements.filter((sql) => /\bfrom\s+"?session"?\s/i.test(sql))).toHaveLength(1);
+    await env.DB.prepare("UPDATE session SET expiresAt=? WHERE userId=?")
+      .bind(new Date(Date.now() + 3600_000).toISOString(), user!.id)
+      .run();
+    counter.statements.length = 0;
+    await requireMember(request, { ...testEnv, DB: counter.database });
+    expect(counter.statements.filter((sql) => /\bfrom\s+"?session"?\s/i.test(sql))).toHaveLength(1);
+    expect(counter.statements.filter((sql) => sql.includes("FROM service_identities"))).toHaveLength(1);
+    const refreshed = await env.DB.prepare("SELECT expiresAt FROM session WHERE userId=?")
+      .bind(user!.id)
+      .first<string>("expiresAt");
+    expect(new Date(refreshed!).getTime()).toBeGreaterThan(Date.now() + 2 * 86400_000);
   });
   it("rejects credentials, new sessions, and pre-existing sessions for attribution principals", async () => {
     await seed();
@@ -469,10 +480,20 @@ describe("non-login form identities", () => {
     expect(await env.DB.prepare("SELECT count(*) AS n FROM session WHERE userId=?").bind(user!.id).first()).toEqual(
       sessionCount,
     );
+    await env.DB.prepare("UPDATE session SET expiresAt=? WHERE userId=?")
+      .bind(new Date(Date.now() + 3600_000).toISOString(), user!.id)
+      .run();
+    const expiry = await env.DB.prepare("SELECT expiresAt FROM session WHERE userId=?")
+      .bind(user!.id)
+      .first("expiresAt");
     const oldSession = await auth.handler(
       new Request("http://example.test/api/auth/get-session", { headers: { cookie } }),
     );
     expect(oldSession.status).toBe(403);
+    expect(oldSession.headers.get("set-cookie") ?? "").not.toContain("session_token=");
+    expect(await env.DB.prepare("SELECT expiresAt FROM session WHERE userId=?").bind(user!.id).first("expiresAt")).toBe(
+      expiry,
+    );
     await expect(
       requireMember(new Request("http://example.test/api/me", { headers: { cookie } }), testEnv),
     ).rejects.toMatchObject({ status: 403 });

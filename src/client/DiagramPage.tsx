@@ -1307,7 +1307,12 @@ export function DiagramPage({
           />
         ) : null}
         {panel === "backlinks" ? (
-          <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />
+          <BacklinksPanel
+            pageId={page.id}
+            revision={backlinksRevision}
+            onSelect={onSelectPage}
+            semanticEnabled={member.features?.semanticSearch === true}
+          />
         ) : null}
       </div>
     </main>

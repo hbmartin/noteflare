@@ -2,9 +2,28 @@ import type { Env } from "./env";
 import { publicationPages, type Publication, type PublicationPage } from "./publications";
 import type { PublicationConfig } from "../shared/publications";
 import { putPublicationObject } from "./publication-storage";
+import { recordMetric } from "./observability";
 import { enqueuePlatformJob } from "./platform-jobs";
 
-export type PublicationCheckpoint = { offset: number; part?: number; tableCursor?: string; documentStateKey?: string };
+export type PublicationCheckpoint = {
+  version: 2;
+  offset: number;
+  part?: number;
+  tableCursor?: string;
+  documentStateKey?: string;
+  tableSource?: { kind: "legacy" } | { kind: "snapshot"; handle: string };
+};
+export async function retirePublicationBuild(env: Env, pub: Publication, reason: "content" | "authority") {
+  const changed = await env.DB.prepare(`UPDATE publications SET generation=generation+1,needs_build=1,
+    build_content_version=NULL,build_checkpoint_json=NULL,build_error=NULL,build_failure_checkpoint_json=NULL
+    WHERE id=? AND generation=? AND access_generation=? AND active=1 AND needs_build=1
+    AND build_checkpoint_json IS ?`)
+    .bind(pub.id, pub.generation, pub.access_generation, pub.build_checkpoint_json)
+    .run();
+  if (changed.meta.changes)
+    recordMetric(env, { event: `publication.restart.${reason}`, component: "platform", attempts: 1 });
+}
+
 export async function publicationDependencies(
   env: Env,
   pub: Publication,
@@ -65,12 +84,24 @@ export async function publicationInputs(env: Env, pub: Publication) {
   });
 }
 /** A checkpoint is authoritative; queue payloads are only wakeups and may be stale. */
-export async function advancePublication(env: Env, pub: Publication, next: PublicationCheckpoint) {
-  const changed = await env.DB.prepare(`UPDATE publications SET build_checkpoint_json=? WHERE id=? AND generation=?
+export async function advancePublication(
+  env: Env,
+  pub: Publication,
+  next: Omit<PublicationCheckpoint, "version">,
+  enqueue = true,
+) {
+  const changed =
+    await env.DB.prepare(`UPDATE publications SET build_checkpoint_json=?,build_error=NULL,build_failure_checkpoint_json=NULL WHERE id=? AND generation=?
     AND access_generation=? AND active=1 AND build_checkpoint_json IS ?`)
-    .bind(JSON.stringify(next), pub.id, pub.generation, pub.access_generation, pub.build_checkpoint_json ?? null)
-    .run();
-  if (changed.meta.changes)
+      .bind(
+        JSON.stringify({ ...next, version: 2 }),
+        pub.id,
+        pub.generation,
+        pub.access_generation,
+        pub.build_checkpoint_json ?? null,
+      )
+      .run();
+  if (changed.meta.changes && enqueue)
     await enqueuePlatformJob(env, {
       workspaceId: pub.workspace_id,
       kind: "publication",
@@ -78,4 +109,5 @@ export async function advancePublication(env: Env, pub: Publication, next: Publi
       generation: String(pub.generation),
       payload: { publicationId: pub.id, generation: pub.generation, ...next },
     });
+  return Boolean(changed.meta.changes);
 }

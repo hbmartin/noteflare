@@ -3,8 +3,8 @@ import type { Env } from "./env";
 import { HttpError } from "./http";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import type { ColumnType } from "../shared/types";
+import { decodeProjectionColumns, decodeProjectionRow } from "./table-projection-values";
 import {
-  versionedPropertyConfig,
   metadataColumns,
   type CollaborativeColumn,
   type CollaborativeRow,
@@ -28,18 +28,7 @@ export async function projectionColumns(env: Env, pageId: string): Promise<Colla
       .bind(pageId)
       .all<{ id: string; column_id: string; label: string; position: number; color: string }>(),
   ]);
-  return columns.results.map((column) => ({
-    id: column.id,
-    name: column.name,
-    type: column.type,
-    position: column.position,
-    revision: column.property_revision,
-    generation: column.property_generation,
-    config: versionedPropertyConfig(column.config_json ? JSON.parse(column.config_json) : {}),
-    options: options.results
-      .filter((option) => option.column_id === column.id)
-      .map((option) => ({ id: option.id, label: option.label, position: option.position, color: option.color })),
-  }));
+  return decodeProjectionColumns(columns.results, options.results);
 }
 
 export type TableSnapshot = {
@@ -84,33 +73,12 @@ export async function projectionRows(env: Env, pageId: string, after: string | n
           cell_revision: number;
         }>()
     : { results: [] };
-  return rows.results.map((row) => {
-    const values = cells.results.filter((cell) => cell.row_id === row.id);
-    return {
-      id: row.id,
-      revision: row.row_revision,
-      position: row.position,
-      cells: Object.fromEntries(
-        values.map((cell) => [
-          cell.column_id,
-          cell.json_value !== null
-            ? JSON.parse(cell.json_value)
-            : (cell.text_value ??
-              cell.number_value ??
-              (cell.boolean_value === null ? null : Boolean(cell.boolean_value)) ??
-              cell.date_value ??
-              cell.select_value ??
-              null),
-        ]),
-      ),
-      cellRevisions: Object.fromEntries(values.map((cell) => [cell.column_id, cell.cell_revision])),
-      detailPageId: row.detail_page_id,
-      createdAt: row.created_at,
-      createdBy: row.created_by,
-      editedAt: row.updated_at,
-      editedBy: row.updated_by,
-    };
-  });
+  return rows.results.map((row) =>
+    decodeProjectionRow(
+      row,
+      cells.results.filter((cell) => cell.row_id === row.id),
+    ),
+  );
 }
 
 /** Compare the actual disposable projection, including typed values and computed source stamps. */

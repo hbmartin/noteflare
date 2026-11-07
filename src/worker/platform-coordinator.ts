@@ -99,6 +99,10 @@ export class PlatformCoordinator extends DurableObject<Env> {
     const pending =
       phase < 10 ||
       (await this.env.DB.prepare(`SELECT 1 WHERE EXISTS(SELECT 1 FROM platform_jobs LIMIT 1)
+        OR EXISTS(SELECT 1 FROM publication_table_snapshots snapshot LEFT JOIN publications publication
+          ON publication.id=snapshot.publication_id AND publication.generation=snapshot.generation
+          AND publication.access_generation=snapshot.access_generation
+          WHERE publication.id IS NULL OR publication.active=0 OR publication.needs_build=0 LIMIT 1)
         OR (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE archive_id IS NULL LIMIT 1))
         OR (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE basin_exported_at IS NULL LIMIT 1))`)
         .bind(this.env.AUDIT_ENABLED === "true" ? 1 : 0, this.env.BASIN_ENABLED === "true" ? 1 : 0)

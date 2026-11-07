@@ -304,6 +304,27 @@ describe("public publication delivery", () => {
       "cycle",
     );
     expect(await (await publicFetch("/sites/public-key")).text()).toContain("Content root");
+    await env.BUCKET.put(
+      "projection/child",
+      JSON.stringify({
+        schemaVersion: 1,
+        pageId: "child",
+        contentEpoch: 1,
+        sequence: 3,
+        document: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Cycle fixed" }] }] },
+      }),
+    );
+    await env.DB.prepare("UPDATE document_projections SET sequence=3 WHERE page_id='child'").run();
+    await env.DB.prepare("UPDATE pages SET indexed_seq=3 WHERE id='child'").run();
+    const { enqueuePendingPublications } = await import("./publications");
+    await enqueuePendingPublications(configured());
+    const restarted = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(restarted.generation).toBe(next.generation + 1);
+    expect(restarted.access_generation).toBe(next.access_generation);
+    expect(restarted.active_generation).toBe(pub.active_generation);
+    await processPublicationBuildJob(configured(), { publicationId: "site", generation: restarted.generation });
+    await processPublicationBuildJob(configured(), { publicationId: "site", generation: restarted.generation });
+    expect(await (await publicFetch("/sites/public-key/p/child")).text()).toContain("Cycle fixed");
   });
   it("refuses unverified hostnames and unrelated site paths even on verified hosts", async () => {
     await fixturePublication();
@@ -570,6 +591,344 @@ describe("anonymous TableAuthority forms", () => {
 });
 
 describe("platform review regressions", () => {
+  it("retires a legacy publication cursor at migration without taking its active manifest offline", async () => {
+    const initial = await fixturePublication();
+    await insertPage(tableId, "root", "table").run();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE pages SET position='z' WHERE id=?").bind(tableId),
+      env.DB.prepare("INSERT INTO table_state VALUES(?,1)").bind(tableId),
+      env.DB.prepare(
+        "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('legacy-title',?,'Title','text',0)",
+      ).bind(tableId),
+      env.DB.prepare(`WITH RECURSIVE n(i) AS(SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<100)
+        INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) SELECT 'legacy-'||i,?,i,'owner',1,1 FROM n`).bind(
+        tableId,
+      ),
+      env.DB.prepare(
+        "INSERT INTO table_cells(row_id,column_id,text_value,updated_at) SELECT id,'legacy-title',id,1 FROM table_rows WHERE page_id=?",
+      ).bind(tableId),
+    ]);
+    const generation = (await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first<number>(
+      "generation",
+    ))!;
+    for (let i = 0; i < 3; i++) await processPublicationBuildJob(configured(), { publicationId: "site", generation });
+    const checkpoint = JSON.parse(
+      (await env.DB.prepare("SELECT build_checkpoint_json FROM publications WHERE id='site'").first<string>(
+        "build_checkpoint_json",
+      ))!,
+    );
+    expect(checkpoint.tableSource).toEqual({ kind: "legacy" });
+    expect(checkpoint.tableCursor).toBeTruthy();
+    await enableTableAuthority(configured(), member, tableId);
+    const migrated = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(migrated.generation).toBe(generation + 1);
+    expect(migrated.access_generation).toBe(initial.access_generation);
+    expect(migrated.active_generation).toBe(initial.active_generation);
+    expect((await publicFetch("/sites/public-key")).status).toBe(200);
+    await processPublicationBuildJob(configured(), { publicationId: "site", generation });
+    for (let i = 0; i < 4; i++)
+      await processPublicationBuildJob(configured(), { publicationId: "site", generation: migrated.generation });
+    const complete = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(complete.active_generation).toBe(migrated.generation);
+    const manifest = await (await env.BUCKET.get(complete.manifest_key!))!.json<{
+      pages: { id: string; parts: string[] }[];
+    }>();
+    expect(manifest.pages.find((page) => page.id === tableId)!.parts).toHaveLength(2);
+    await env.DB.prepare("UPDATE pages SET title='Capture again' WHERE id=?").bind(tableId).run();
+    const rebuilding = (await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first<number>(
+      "generation",
+    ))!;
+    for (let i = 0; i < 3; i++)
+      await processPublicationBuildJob(configured(), { publicationId: "site", generation: rebuilding });
+    const frozen = JSON.parse(
+      (await env.DB.prepare("SELECT build_checkpoint_json FROM publications WHERE id='site'").first<string>(
+        "build_checkpoint_json",
+      ))!,
+    ).tableSource;
+    expect(frozen.kind).toBe("snapshot");
+    await runInDurableObject(env.TABLE.getByName(tableId), (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM publication_snapshot_rows WHERE snapshot_id=?", frozen.handle);
+      state.storage.sql.exec("DELETE FROM publication_snapshots WHERE id=?", frozen.handle);
+    });
+    await processPublicationBuildJob(configured(), { publicationId: "site", generation: rebuilding });
+    expect(await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first("generation")).toBe(
+      rebuilding + 1,
+    );
+    expect((await publicFetch("/sites/public-key")).status).toBe(200);
+  });
+
+  it("ignores a delayed build failure after a duplicate has activated the checkpoint", async () => {
+    await fixturePublication();
+    await env.DB.prepare("UPDATE pages SET indexed_seq=2 WHERE id='root'").run();
+    const generation = (await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first<number>(
+      "generation",
+    ))!;
+    await processPublicationBuildJob(configured(), { publicationId: "site", generation });
+    let entered!: () => void, release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+        entered = resolve;
+      }),
+      gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    const delayed = configured();
+    delayed.BUCKET = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "get")
+          return async (key: string) => {
+            if (key === "projection/root") {
+              entered();
+              await gate;
+              throw new Error("lost source read");
+            }
+            return target.get(key);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const pending = processPublicationBuildJob(delayed, { publicationId: "site", generation });
+    try {
+      await blocked;
+      await processPublicationBuildJob(configured(), { publicationId: "site", generation });
+    } finally {
+      release();
+      await expect(pending).rejects.toThrow("lost source read");
+    }
+    expect(
+      await env.DB.prepare(
+        "SELECT active_generation,build_error,build_failure_checkpoint_json FROM publications WHERE id='site'",
+      ).first(),
+    ).toEqual({ active_generation: generation, build_error: null, build_failure_checkpoint_json: null });
+  });
+
+  it("rejects legacy, missing, private, and out-of-scope publication views", async () => {
+    const { validatePublicationTableViews } = await import("./publications");
+    await insertPage(tableId, null, "table").run();
+    await env.DB.prepare("INSERT INTO table_state VALUES(?,1)").bind(tableId).run();
+    const config = publicationConfig({ title: "Views", homePageId: tableId, tableViews: { [tableId]: "shared" } }, [
+      tableId,
+    ]);
+    await expect(validatePublicationTableViews(configured(), config, async () => true)).rejects.toMatchObject({
+      code: "table_authority_required",
+    });
+    await expect(validatePublicationTableViews(configured(), config, async () => false)).rejects.toMatchObject({
+      code: "publication_view",
+    });
+    await enableTableAuthority(configured(), member, tableId);
+    await expect(validatePublicationTableViews(configured(), config, async () => true)).rejects.toBeInstanceOf(Error);
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "save_view",
+      payload: { id: "shared", name: "Shared" },
+    });
+    await expect(validatePublicationTableViews(configured(), config, async () => true)).resolves.toBeUndefined();
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "save_view",
+      payload: { id: "personal", name: "Personal", personal: true },
+    });
+    config.tableViews[tableId] = "personal";
+    await expect(validatePublicationTableViews(configured(), config, async () => true)).rejects.toBeInstanceOf(Error);
+  });
+  it("decodes JSON-valued legacy cells and their revisions within six reads", async () => {
+    await insertPage(tableId, null, "table").run();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO table_state VALUES(?,1)").bind(tableId),
+      env.DB.prepare(
+        "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('people',?,'People','person',0),('tags',?,'Tags','multi_select',1)",
+      ).bind(tableId, tableId),
+      env.DB.prepare(
+        "INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at,row_revision) VALUES('json-row',?,0,'owner',1,2,7)",
+      ).bind(tableId),
+      env.DB.prepare(
+        "INSERT INTO table_cells(row_id,column_id,json_value,cell_revision,updated_at) VALUES('json-row','people','[\"owner\"]',3,1),('json-row','tags','[\"a\",\"b\"]',4,1)",
+      ),
+    ]);
+    const counter = countedD1(env.DB);
+    const result = await publicTablePage({ ...configured(), DB: counter.database }, tableId, undefined, undefined);
+    expect(result.rows[0]).toMatchObject({
+      cells: { people: ["owner"], tags: ["a", "b"] },
+      cellRevisions: { people: 3, tags: 4 },
+      revision: 7,
+    });
+    expect(counter.statements).toHaveLength(6);
+  });
+
+  it("backfills old snapshot cleanup intent, protects live captures, and resumes bounded cleanup after deletion", async () => {
+    const { stub } = await formFixture();
+    await fixturePublication();
+    const handle = "a".repeat(64);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO publication_snapshots VALUES(?,?,?,?,?)",
+        handle,
+        "site",
+        1,
+        1,
+        JSON.stringify({ pageId: tableId }),
+      );
+      for (let i = 0; i < 1201; i++)
+        state.storage.sql.exec(
+          "INSERT INTO publication_snapshot_rows VALUES(?,?,?)",
+          handle,
+          i,
+          '{"cells":{"private":"retained"}}',
+        );
+    });
+    await env.DB.prepare("UPDATE publications SET needs_build=1 WHERE id='site'").run();
+    expect(await stub.reconcilePublicationSnapshots()).toEqual({ next: null });
+    expect(await stub.releasePublicationSnapshot(handle)).toEqual({ released: false });
+    const { cleanupPublicationSnapshots } = await import("./publication-snapshots");
+    await cleanupPublicationSnapshots(configured());
+    const count = () =>
+      runInDurableObject(
+        stub,
+        (_instance, state) =>
+          state.storage.sql.exec<{ n: number }>("SELECT count(*) n FROM publication_snapshot_rows").one().n,
+      );
+    expect(await count()).toBe(1201);
+    await env.DB.prepare("UPDATE publications SET active=0 WHERE id='site'").run();
+    await cleanupPublicationSnapshots(configured());
+    expect(await count()).toBe(701);
+    await env.DB.prepare("DELETE FROM publications WHERE id='site'").run();
+    expect(await env.DB.prepare("SELECT handle FROM publication_table_snapshots").first("handle")).toBe(handle);
+    await env.DB.prepare("UPDATE publication_table_snapshots SET next_attempt_at=0").run();
+    await cleanupPublicationSnapshots(configured());
+    expect(await count()).toBe(201);
+    await env.DB.prepare("UPDATE publication_table_snapshots SET next_attempt_at=0").run();
+    await cleanupPublicationSnapshots(configured());
+    expect(await count()).toBe(0);
+    expect(await env.DB.prepare("SELECT handle FROM publication_table_snapshots").first()).toBeNull();
+    expect(await stub.releasePublicationSnapshot(handle)).toEqual({ released: true });
+  });
+
+  it("freezes a filtered saved view with explicitly numbered filter parameters", async () => {
+    const { stub } = await formFixture();
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "create_row",
+      payload: { values: { title: "Keep" } },
+    });
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "create_row",
+      payload: { values: { title: "Exclude" } },
+    });
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "save_view",
+      payload: {
+        id: "filtered",
+        name: "Filtered",
+        filters: { kind: "condition", columnId: "title", operator: "eq", value: "Keep" },
+      },
+    });
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as unknown as { project(): Promise<unknown> }).project();
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,created_by,created_at,updated_at) VALUES('filter-site','workspace','workspace-general','filter-site',?,1,'owner',1,1)",
+      ).bind(
+        JSON.stringify(
+          publicationConfig({ title: "Filtered", homePageId: tableId, tableViews: { [tableId]: "filtered" } }, [
+            tableId,
+          ]),
+        ),
+      ),
+      env.DB.prepare("INSERT INTO publication_roots VALUES('filter-site',?)").bind(tableId),
+    ]);
+    await processPublicationBuildJob(configured(), { publicationId: "filter-site", generation: 1 });
+    const pub = (await env.DB.prepare("SELECT * FROM publications WHERE id='filter-site'").first<Publication>())!;
+    expect(pub.active_generation).toBe(1);
+    expect(await (await env.BUCKET.get(`publications/filter-site/1/${tableId}/1.html`))!.text()).toContain("Keep");
+    expect(await (await env.BUCKET.get(`publications/filter-site/1/${tableId}/1.html`))!.text()).not.toContain(
+      "Exclude",
+    );
+    const { cleanupPublicationSnapshots } = await import("./publication-snapshots");
+    await cleanupPublicationSnapshots(configured());
+    expect(await env.DB.prepare("SELECT handle FROM publication_table_snapshots").first()).toBeNull();
+  });
+
+  it("invalidates shared navigation ordering without writing versions for private reorders", async () => {
+    await fixturePublication();
+    const { createShare } = await import("./shares");
+    await createShare(configured(), member, "root", "https://public.example.test", { includeSubpages: true });
+    const generation = () =>
+      env.DB.prepare("SELECT content_generation FROM share_links").first<number>("content_generation");
+    const before = await generation();
+    await env.DB.prepare("UPDATE pages SET position='a2' WHERE id='outside'").run();
+    expect(await generation()).toBe(before);
+    await env.DB.prepare("UPDATE pages SET position='a2' WHERE id='child'").run();
+    expect(await generation()).toBe(before! + 1);
+    await env.DB.prepare("UPDATE pages SET position=position WHERE id='child'").run();
+    expect(await generation()).toBe(before! + 1);
+  });
+
+  it("serves originals for existing publication presets when processing is unavailable", async () => {
+    await fixturePublication();
+    await env.DB.prepare(
+      "INSERT INTO attachments(id,workspace_id,page_id,name,mime,size,r2_key,created_by,created_at) VALUES('cover','workspace','root','photo.png','image/png',8,'cover-original','owner',1)",
+    ).run();
+    await env.BUCKET.put("cover-original", new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]));
+    const pub = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    const manifest = await (await env.BUCKET.get(pub.manifest_key!))!.json<{ assets: Record<string, string> }>();
+    manifest.assets.cover = "root";
+    await env.BUCKET.put(pub.manifest_key!, JSON.stringify(manifest));
+    for (const preset of ["cover-v1", "gallery-v1", "logo-v1"]) {
+      const response = await publicFetch(`/sites/public-key/assets/cover/${preset}`);
+      expect(response.headers.get("content-type")).toBe("image/png");
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+      expect((await response.arrayBuffer()).byteLength).toBe(8);
+    }
+    const context = createExecutionContext();
+    const failing = {
+      ...configured(),
+      IMAGES_ENABLED: "true",
+      IMAGES: {
+        input: () => ({
+          transform: () => ({ output: async () => ({ response: () => new Response("failed", { status: 503 }) }) }),
+        }),
+      },
+    } as unknown as Env;
+    const failed = await fetchPublic(
+      new Request("https://public.example.test/sites/public-key/assets/cover/cover-v1"),
+      failing,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(failed.headers.get("content-type")).toBe("image/svg+xml");
+    expect(await failed.text()).toContain("Image unavailable");
+    // Turning processing off must not reuse the placeholder cached under the enabled mode.
+    expect((await publicFetch("/sites/public-key/assets/cover/cover-v1")).headers.get("content-type")).toBe(
+      "image/png",
+    );
+  });
+
+  it("does not reuse a historical public-pages cache entry after the counter scope changes", async () => {
+    await insertPage("cache-image").run();
+    await env.BUCKET.put("cache-original", "fresh image");
+    await env.DB.prepare(
+      "INSERT INTO attachments(id,workspace_id,page_id,name,mime,size,r2_key,created_by,created_at) VALUES('cache-image-file','workspace','cache-image','image.png','image/png',11,'cache-original','owner',1)",
+    ).run();
+    const { createShare } = await import("./shares");
+    const share = await createShare(configured(), member, "cache-image", "https://public.example.test", {});
+    const key = new URL(share.url).pathname.split("/").at(-1)!;
+    const row = (await env.DB.prepare("SELECT id,access_generation,content_generation FROM share_links WHERE url_key=?")
+      .bind(key)
+      .first<{ id: string; access_generation: number; content_generation: number }>())!;
+    const path = `/share/${key}/assets/cache-image-file`;
+    const url = new URL("https://public.example.test" + path);
+    url.searchParams.set("__public_generation", `share:${row.id}:${row.access_generation}:${row.content_generation}`);
+    const cache = await caches.open("public-pages");
+    await cache.put(
+      new Request(url),
+      new Response("historical body", { headers: { "cache-control": "public,max-age=86400" } }),
+    );
+    expect(await (await cache.match(url))!.text()).toBe("historical body");
+    expect(new TextDecoder().decode(await (await publicFetch(path)).arrayBuffer())).toBe("fresh image");
+  });
   it("serves original shared images through both public paths with Images disabled", async () => {
     await insertPage("image-page").run();
     const { createShare, resolveSharedPage, publicAttachment } = await import("./shares");
