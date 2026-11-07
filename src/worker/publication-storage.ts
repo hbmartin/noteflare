@@ -14,7 +14,8 @@ export async function putPublicationObject(
  ON CONFLICT(r2_key) DO UPDATE SET generation=max(generation,excluded.generation),created_at=excluded.created_at`)
     .bind(key, pub.id, pub.generation, Date.now())
     .run();
-  await env.PUBLICATIONS_BUCKET.put(key, value, options);
+  // Generation keys are immutable, including when a delayed duplicate finishes after activation.
+  await env.PUBLICATIONS_BUCKET.put(key, value, { onlyIf: { etagDoesNotMatch: "*" }, ...options });
 }
 export async function cleanupPublicationArtifacts(env: Env) {
   if (!env.PUBLICATIONS_BUCKET) return;
@@ -29,6 +30,8 @@ export async function cleanupPublicationArtifacts(env: Env) {
     await env.PUBLICATIONS_BUCKET.delete(row.r2_key);
     await env.DB.prepare("DELETE FROM publication_artifacts WHERE r2_key=?").bind(row.r2_key).run();
   }
+  await env.DB.prepare(`DELETE FROM publication_dependencies WHERE rowid IN(SELECT d.rowid FROM publication_dependencies d JOIN publications p ON p.id=d.publication_id
+    WHERE d.generation<>p.generation AND d.generation<>coalesce(p.active_generation,0) LIMIT 500)`).run();
   await env.DB.prepare(`DELETE FROM publication_build_entries WHERE rowid IN (SELECT e.rowid FROM publication_build_entries e JOIN publications p ON p.id=e.publication_id
  WHERE e.generation<>p.generation AND e.generation<>coalesce(p.active_generation,0) LIMIT 100)`).run();
 }

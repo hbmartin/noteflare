@@ -24,11 +24,11 @@ function dateFromTimestamp(value: string | null) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function initialSearchState() {
+function initialSearchState(semanticEnabled: boolean) {
   const parameters = new URLSearchParams(window.location.search);
   return {
     query: parameters.get("q") ?? "",
-    mode: parameters.get("mode") === "keyword" ? ("keyword" as const) : ("hybrid" as const),
+    mode: semanticEnabled && parameters.get("mode") !== "keyword" ? ("hybrid" as const) : ("keyword" as const),
     filters: {
       spaceId: parameters.get("space") ?? "",
       tagIds: parameters.getAll("tag"),
@@ -87,12 +87,14 @@ export function SearchView({
   spaces,
   tags,
   onSelect,
+  semanticEnabled = false,
 }: {
   spaces: Space[];
   tags: Tag[];
   onSelect: (id: string) => void;
+  semanticEnabled?: boolean;
 }) {
-  const [initial] = useState(initialSearchState);
+  const [initial] = useState(() => initialSearchState(semanticEnabled));
   const [query, setQuery] = useState(initial.query);
   const [filters, setFilters] = useState(initial.filters);
   const [results, setResults] = useState<SearchResult[]>([]);
@@ -107,6 +109,18 @@ export function SearchView({
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
   const [members, setMembers] = useState<SearchMember[]>([]);
+  const [previousCapability, setPreviousCapability] = useState(semanticEnabled);
+  if (previousCapability !== semanticEnabled) {
+    setPreviousCapability(semanticEnabled);
+    if (!semanticEnabled) setMode("keyword");
+    setCursor(undefined);
+    setNextCursor(undefined);
+    setOffset(0);
+    setResults([]);
+    setRetrievalStatus(undefined);
+    setWindowLimited(false);
+    setLoading(Boolean(query.trim()));
+  }
 
   useEffect(() => {
     const controller = new AbortController();
@@ -127,7 +141,7 @@ export function SearchView({
     if (!query.trim()) return () => controller.abort();
     const timer = window.setTimeout(() => {
       const parameters = requestParameters(query, filters, offset);
-      parameters.set("mode", mode);
+      parameters.set("mode", semanticEnabled ? mode : "keyword");
       if (cursor) {
         parameters.set("cursor", cursor);
         parameters.set("offset", "0");
@@ -152,7 +166,7 @@ export function SearchView({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [filters, offset, query, revision, cursor, mode]);
+  }, [filters, offset, query, revision, cursor, mode, semanticEnabled]);
 
   function updateFilters(update: (current: UiFilters) => UiFilters) {
     setFilters(update);
@@ -256,7 +270,7 @@ export function SearchView({
             setLoading(Boolean(query.trim()));
           }}
         >
-          <option value="hybrid">Keywords and meaning</option>
+          {semanticEnabled && <option value="hybrid">Keywords and meaning</option>}
           <option value="keyword">Keywords</option>
         </select>
       </label>

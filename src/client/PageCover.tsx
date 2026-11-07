@@ -5,10 +5,12 @@ import { uploadAttachment } from "./uploads";
 export function PageCover({
   page,
   editable,
+  enabled = false,
   onChanged,
 }: {
   page: Page;
   editable: boolean;
+  enabled?: boolean;
   onChanged: (page: Page) => void;
 }) {
   const [busy, setBusy] = useState(false),
@@ -28,6 +30,7 @@ export function PageCover({
       setBusy(false);
     }
   }
+  if (!enabled) return null;
   return (
     <div className="page-cover">
       {page.cover && (

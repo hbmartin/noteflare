@@ -4660,7 +4660,12 @@ function Workspace({
             <p>Workspace activity is not enabled.</p>
           )
         ) : view === "search" ? (
-          <SearchView spaces={spaces} tags={tags} onSelect={navigateToPage} />
+          <SearchView
+            spaces={spaces}
+            tags={tags}
+            onSelect={navigateToPage}
+            semanticEnabled={activeMember.features?.semanticSearch === true}
+          />
         ) : view === "mentions" ? (
           <MentionsView onSelect={navigateToPage} onRead={handleMentionsRead} />
         ) : view === "templates" ? (
@@ -4732,7 +4737,8 @@ function Workspace({
             <PageCover
               key={activeSelected.id}
               page={activeSelected}
-              editable={activeMember.role !== "viewer"}
+              editable={activeMember.role !== "viewer" && activeMember.features?.images === true}
+              enabled={activeMember.features?.images === true}
               onChanged={updatePage}
             />
             {activeSelected.taskList ? (

@@ -1,8 +1,6 @@
 import { Tokenizer } from "@huggingface/tokenizers";
 import vocabulary from "./tokenizers/bge-small-en-v1.5.json";
 
-export const SEMANTIC_MODEL = "@cf/baai/bge-small-en-v1.5" as const;
-export const SEMANTIC_VERSION = "bge-small-cls:wordpiece-384-48:v1";
 // Model revision 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a. The tokenizer
 // is bundled so upgrades are deliberate and never depend on a network download.
 const tokenizer = new Tokenizer(vocabulary, {

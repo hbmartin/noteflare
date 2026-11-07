@@ -1,14 +1,22 @@
+import {
+  publicationInputs,
+  publicationDependencies,
+  advancePublication,
+  type PublicationCheckpoint,
+} from "./publication-state";
+import { tableInternal, tableRegistry } from "./table-service";
+import type { TableQueryResult } from "../shared/table-protocol";
 import { putPublicationObject } from "./publication-storage";
 import { expandPublicationDocument, PublicationContentError } from "./publication-documents";
 import type { Env } from "./env";
 import { HttpError } from "./http";
-import { publicationPages, type Publication, type PublicationPage } from "./publications";
+import { type Publication, type PublicationPage } from "./publications";
 import type { PublicationConfig } from "../shared/publications";
 import { publicTablePage } from "./public-table";
 import { publishedRows, publishedCell } from "../shared/published-table";
 import { escapePublic as esc, PUBLIC_STYLE } from "./public-utils";
 import { sha256Hex } from "../shared/import-integrity";
-import { reservePlatformUsage, enqueuePlatformJob } from "./platform-jobs";
+import { reservePlatformUsage } from "./platform-jobs";
 export type PublicationManifest = {
   publicationId: string;
   generation: number;
@@ -58,24 +66,26 @@ function shell(
 }
 async function buildPublication(env: Env, payload: unknown) {
   if (env.PUBLIC_PUBLISHING_ENABLED !== "true") return;
-  const job = payload as {
-    publicationId: string;
-    generation: number;
-    offset?: number;
-    tableCursor?: string;
-    part?: number;
-    tableRevision?: number;
-    documentStateKey?: string;
-  };
-  const pub = await env.DB.prepare(
+  const wakeup = payload as { publicationId: string; generation: number };
+  let pub = await env.DB.prepare(
     "SELECT * FROM publications WHERE id=? AND generation=? AND active=1 AND needs_build=1",
   )
-    .bind(job.publicationId, job.generation)
+    .bind(wakeup.publicationId, wakeup.generation)
     .first<Publication>();
   if (!pub) return;
   if (!env.PUBLICATIONS_BUCKET) throw new Error("The publications bucket is not configured.");
-  const config = JSON.parse(pub.config_json) as PublicationConfig,
-    pages = await publicationPages(env, pub),
+  if (pub.build_content_version === null) {
+    await env.DB.prepare(`UPDATE publications SET build_content_version=content_version,build_checkpoint_json=?
+      WHERE id=? AND generation=? AND access_generation=? AND active=1 AND build_content_version IS NULL`)
+      .bind(JSON.stringify({ offset: 0 }), pub.id, pub.generation, pub.access_generation)
+      .run();
+    pub = (await env.DB.prepare("SELECT * FROM publications WHERE id=? AND generation=? AND active=1 AND needs_build=1")
+      .bind(pub.id, pub.generation)
+      .first<Publication>())!;
+    if (!pub) return;
+  }
+  const job = JSON.parse(pub.build_checkpoint_json!) as PublicationCheckpoint;
+  const { config, pages } = await publicationInputs(env, pub),
     allowed = new Map(pages.map((page) => [page.id, page])),
     base = `/sites/${pub.url_key}`,
     prefix = `publications/${pub.id}/${pub.generation}`;
@@ -87,8 +97,7 @@ async function buildPublication(env: Env, payload: unknown) {
       assets[id] = source;
     };
     let parts: string[] = [];
-    let tableNext: string | null = null,
-      tableRevision: number | undefined;
+    let tableNext: string | null = null;
     const startPart = job.part ?? 1;
     let totalParts = 1,
       diagramKey: string | null = null,
@@ -108,11 +117,20 @@ async function buildPublication(env: Env, payload: unknown) {
       Object.assign(assets, expanded.assets);
       parts = [expanded.html];
     } else if (page.kind === "table") {
-      const table = await publicTablePage(env, page.id, config.tableViews[page.id], job.tableCursor),
+      const registry = await tableRegistry(env, page.id);
+      const params = new URLSearchParams({
+        handle: await sha256Hex(`${pub.id}:${pub.generation}:${page.id}`),
+        publicationId: pub.id,
+        publicationGeneration: String(pub.generation),
+        accessGeneration: String(pub.access_generation),
+      });
+      if (config.tableViews[page.id]) params.set("viewId", config.tableViews[page.id]!);
+      if (job.tableCursor) params.set("cursor", job.tableCursor);
+      const table =
+          registry?.state === "do" || registry?.state === "repairing"
+            ? await tableInternal<TableQueryResult>(env, page.id, `/publication-snapshot?${params}`)
+            : await publicTablePage(env, page.id, config.tableViews[page.id], job.tableCursor),
         view = table.view;
-      tableRevision = table.revision;
-      if (job.tableRevision !== undefined && job.tableRevision !== table.revision)
-        throw new Error("The table changed during publication.");
       tableNext = table.nextCursor;
       const taskList = Boolean(
         (
@@ -139,16 +157,21 @@ async function buildPublication(env: Env, payload: unknown) {
         return `<table><thead><tr>${columns.map((column) => `<th>${esc(column.name)}</th>`).join("")}</tr></thead><tbody>${current.map((row) => `<tr>${columns.map((column) => `<td>${esc(publishedCell(column, row, taskList))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
       });
     } else {
-      const projection = await env.DB.prepare(
-        "SELECT thumbnail_r2_key FROM diagram_projections WHERE page_id=? AND content_epoch=?",
-      )
-        .bind(page.id, page.content_epoch)
-        .first<{ thumbnail_r2_key: string }>();
-      if (!projection) throw new Error("Diagram is awaiting compaction.");
-      const image = await env.BUCKET.get(projection.thumbnail_r2_key);
-      if (!image) throw new Error("Diagram image unavailable.");
       diagramKey = `${prefix}/${page.id}/diagram.svg`;
-      await putPublicationObject(env, pub, diagramKey, image.body, { httpMetadata: { contentType: "image/svg+xml" } });
+      if (!(await env.PUBLICATIONS_BUCKET.head(diagramKey))) {
+        const projection = await env.DB.prepare(
+          "SELECT thumbnail_r2_key FROM diagram_projections WHERE page_id=? AND content_epoch=?",
+        )
+          .bind(page.id, page.content_epoch)
+          .first<{ thumbnail_r2_key: string }>();
+        if (!projection) throw new Error("Diagram is awaiting compaction.");
+        const image = await env.BUCKET.get(projection.thumbnail_r2_key);
+        if (!image) throw new Error("Diagram image unavailable.");
+        await putPublicationObject(env, pub, diagramKey, image.body, {
+          onlyIf: { etagDoesNotMatch: "*" },
+          httpMetadata: { contentType: "image/svg+xml" },
+        });
+      }
       parts = [`<img alt="${esc(page.title)}" src="${base}/diagrams/${page.id}.svg">`];
     }
     if (startPart === 1 && env.BROWSER) {
@@ -188,6 +211,7 @@ async function buildPublication(env: Env, payload: unknown) {
         }
       }
     }
+    await publicationDependencies(env, pub, "attachment", Object.keys(assets));
     for (let part = 0; part < parts.length; part++) {
       const key = `${prefix}/${page.id}/${startPart + part}.html`;
       await putPublicationObject(
@@ -224,31 +248,12 @@ async function buildPublication(env: Env, payload: unknown) {
         .run();
     }
     if (tableNext) {
-      await enqueuePlatformJob(env, {
-        workspaceId: pub.workspace_id,
-        kind: "publication",
-        key: `${pub.id}:${offset}:${startPart + 1}`,
-        generation: String(pub.generation),
-        payload: {
-          publicationId: pub.id,
-          generation: pub.generation,
-          offset,
-          part: startPart + 1,
-          tableCursor: tableNext,
-          tableRevision,
-        },
-      });
+      await advancePublication(env, pub, { offset, part: startPart + 1, tableCursor: tableNext });
       return;
     }
   }
   if (offset + 1 < pages.length) {
-    await enqueuePlatformJob(env, {
-      workspaceId: pub.workspace_id,
-      kind: "publication",
-      key: `${pub.id}:${offset + 1}`,
-      generation: String(pub.generation),
-      payload: { publicationId: pub.id, generation: pub.generation, offset: offset + 1 },
-    });
+    await advancePublication(env, pub, { offset: offset + 1 });
     return;
   }
   const entries = (
@@ -278,6 +283,7 @@ async function buildPublication(env: Env, payload: unknown) {
       .bind(config.logoAttachmentId, pub.workspace_id)
       .first<{ page_id: string }>();
     if (!logo || !allowed.has(logo.page_id)) throw new Error("The site logo must belong to a published page.");
+    await publicationDependencies(env, pub, "attachment", [config.logoAttachmentId]);
     assets[config.logoAttachmentId] = logo.page_id;
   }
   const manifest: PublicationManifest = {
@@ -330,9 +336,18 @@ async function buildPublication(env: Env, payload: unknown) {
   const manifestKey = `${prefix}/manifest.json`;
   await putPublicationObject(env, pub, manifestKey, JSON.stringify(manifest));
   await env.DB.prepare(
-    "UPDATE publications SET manifest_key=?,active_generation=?,active_access_generation=?,needs_build=0,build_error=NULL WHERE id=? AND generation=? AND access_generation=? AND active=1",
+    "UPDATE publications SET manifest_key=?,active_generation=?,active_access_generation=?,built_content_version=build_content_version,needs_build=CASE WHEN content_version>build_content_version THEN 1 ELSE 0 END,generation=generation+CASE WHEN content_version>build_content_version THEN 1 ELSE 0 END,build_content_version=NULL,build_checkpoint_json=NULL,dependencies_ready=1,build_error=NULL WHERE id=? AND generation=? AND access_generation=? AND active=1 AND needs_build=1 AND build_content_version=? AND build_checkpoint_json IS ?",
   )
-    .bind(manifestKey, pub.generation, pub.access_generation, pub.id, pub.generation, pub.access_generation)
+    .bind(
+      manifestKey,
+      pub.generation,
+      pub.access_generation,
+      pub.id,
+      pub.generation,
+      pub.access_generation,
+      pub.build_content_version,
+      pub.build_checkpoint_json,
+    )
     .run();
 }
 

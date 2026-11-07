@@ -1,12 +1,6 @@
 import type { Env, MemberContext } from "./env";
 import { HttpError, sha256 } from "./http";
-import {
-  chunkSemanticBlocks,
-  SEMANTIC_MODEL,
-  SEMANTIC_VERSION,
-  semanticTokenCount,
-  tokenPrefix,
-} from "./semantic-chunks";
+import { SEMANTIC_MODEL, SEMANTIC_VERSION } from "./semantic-model";
 import { readSemanticSource, semanticPage } from "./semantic-source";
 import { enqueuePlatformJob, PlatformJobDeferred, type PlatformJob } from "./platform-jobs";
 import { ACCEPTED_PAGE_DELETION_SQL } from "./deletion-policy";
@@ -159,6 +153,7 @@ export async function handleSemanticJob(env: Env, job: PlatformJob) {
     return;
   }
   if (!(await currentGeneration(env, pageId, generation))) return;
+  const { chunkSemanticBlocks, semanticTokenCount } = await import("./semantic-chunks");
   const chunks = chunkSemanticBlocks(source.page.title, source.blocks);
   const contentHash = await sha256(
     JSON.stringify([
@@ -354,6 +349,7 @@ export async function semanticMatches(
     encoder.encode(JSON.stringify(filter)).length >= 2048
   )
     return { matches: [], status: "unavailable" };
+  const { tokenPrefix, semanticTokenCount } = await import("./semantic-chunks");
   const input = tokenPrefix(query, 384);
   if (!input.trim()) return { matches: [], status: "available" };
   if (!(await reserve(env, semanticTokenCount(input), true))) return { matches: [], status: "budget_exhausted" };

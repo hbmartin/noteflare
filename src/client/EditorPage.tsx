@@ -1406,7 +1406,14 @@ export function EditorPage({
             />
           )}
           {attachmentsOpen && <AttachmentsPanel page={page} editable={editable} />}
-          {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
+          {backlinksOpen && (
+            <BacklinksPanel
+              pageId={page.id}
+              revision={backlinksRevision}
+              onSelect={onSelectPage}
+              semanticEnabled={member.features?.semanticSearch === true}
+            />
+          )}
         </aside>
       </div>
       {member.features?.heatmaps && (

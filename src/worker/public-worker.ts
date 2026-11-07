@@ -1,7 +1,7 @@
 import type { Env } from "./env";
 import { classifyError, attachmentDisposition } from "./http";
 import { liveForm, formDocument, submitPublicForm, FORM_SCRIPT } from "./forms";
-import { publicHtml } from "./public-utils";
+import { publicHtml, publicReadFailure } from "./public-utils";
 import {
   authorizeShareRequest,
   getShareAccess,
@@ -85,10 +85,7 @@ async function shareResponse(
   const pageId = segments[2] === "pages" ? segments[3] : undefined;
   const page = await resolveSharedPage(env, key, pageId);
   if (!page) return missing();
-  const state = await env.DB.prepare("SELECT generation FROM public_delivery_state WHERE workspace_id=?")
-    .bind(page.workspace_id)
-    .first<{ generation: number }>();
-  const version = `share:${page.id}:${page.access_generation ?? 1}:${state?.generation ?? 0}`;
+  const version = `share:${page.id}:${page.access_generation ?? 1}:${page.content_generation ?? 1}`;
   return cached(request, version, !page.password_hash, context, async () => {
     if (segments[2] === "sitemap.xml") {
       const sitemap = await publicSitemap(env, page, key, new URL(request.url).origin);
@@ -101,9 +98,7 @@ async function shareResponse(
         .first<{ page_id: string; mime: string }>();
       const source = attachment ? await resolveSharedPage(env, key, attachment.page_id) : null;
       if (!attachment || !source) return missing();
-      return attachment.mime.startsWith("image/")
-        ? imageDerivative(env, segments[3]!, "preview-v1")
-        : ((await publicAttachment(env, source, segments[3]!)) ?? missing());
+      return (await publicAttachment(env, source, segments[3]!)) ?? missing();
     }
     if (segments[2] === "diagram-thumbnails" && segments.length === 4) {
       const sourceId = new URL(request.url).searchParams.get("source");
@@ -174,7 +169,10 @@ async function publishedResponse(
     if (!attachment) return missing();
     if (parts[2] !== "original" && !Object.hasOwn(IMAGE_PRESETS, parts[2]!)) return missing();
     return cached(request, `${pub.id}:${manifest.generation}:${pub.access_generation}`, true, context, async () => {
-      if (parts[2] !== "original" || attachment.mime.startsWith("image/")) {
+      if (
+        parts[2] !== "original" ||
+        (attachment.mime.startsWith("image/") && env.IMAGES_ENABLED === "true" && env.IMAGES)
+      ) {
         const focal = await env.DB.prepare("SELECT cover_x x,cover_y y FROM pages WHERE id=?")
           .bind(sourceId)
           .first<{ x: number; y: number }>();
@@ -258,6 +256,8 @@ export async function fetchPublic(request: Request, env: Env, context: Execution
     }
     return host ? await publishedResponse(request, env, context, host, parts) : missing();
   } catch (error) {
+    const publicFailure = publicReadFailure(error, request.url);
+    if (publicFailure) return publicFailure;
     const classified = classifyError(error);
     return Response.json(classified.body, { status: classified.status, headers: { "cache-control": "no-store" } });
   }

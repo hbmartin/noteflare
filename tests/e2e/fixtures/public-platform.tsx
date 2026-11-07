@@ -28,7 +28,7 @@ function Harness() {
   return (
     <main style={{ padding: 24, maxWidth: 900, margin: "auto" }}>
       <h1>Public platform controls</h1>
-      <PageCover page={page} editable onChanged={setPage} />
+      <PageCover page={page} enabled editable onChanged={setPage} />
       <FormsControl
         pageId="table"
         title="Contact form"
@@ -44,7 +44,7 @@ function Harness() {
                 role: "editor",
                 user: { id: "owner" },
                 workspace: { id: "workspace" },
-                features: { tableGallery: true },
+                features: { tableGallery: true, images: true },
               } as ClientMemberContext
             }
             queryBase="/api/gallery-table"

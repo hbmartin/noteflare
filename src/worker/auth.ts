@@ -388,7 +388,7 @@ export function createAuth(env: Env, allowRegistration = false) {
       before: createAuthMiddleware(async (ctx) => {
         // A form's database attribution principal must never acquire browser capabilities,
         // even if a session or credential was accidentally introduced outside these hooks.
-        if (ctx.path !== "/sign-out") {
+        if (ctx.path !== "/sign-out" && ctx.path !== "/get-session") {
           const current = await getSessionFromCtx(ctx, { disableRefresh: true });
           if (current) await requireLoginIdentity(env, current.user.id);
         }
@@ -483,6 +483,8 @@ export function createAuth(env: Env, allowRegistration = false) {
         });
       }),
       after: createAuthMiddleware(async (ctx) => {
+        if (ctx.path === "/get-session" && ctx.context.session)
+          await requireLoginIdentity(env, ctx.context.session.user.id);
         if (!isSlackCallback(ctx)) return;
         const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
         // Existing OAuth accounts use update rather than create. Complete the
@@ -620,8 +622,6 @@ async function getMember(request: Request, env: Env): Promise<MemberContext | nu
       throw error;
     });
   if (!session) return null;
-  if (await isServiceIdentity(env, session.user.id))
-    throw new HttpError(403, "login_not_allowed", "This identity cannot sign in.");
   const accessExpiresAt = await requireAccessIdentity(env, request.headers, session.user.id);
   const assuranceExpiresAt = await requireSecurity(env, session.user.id, session.session.id);
 

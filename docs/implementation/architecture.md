@@ -143,10 +143,9 @@ effect disconnection.
 
 Manual retry retains the exact request, operation ID and captured success intent.
 Each form/property caller owns its acknowledgement snapshots. Retrying a view save
-can close only its captured panel state; retrying an option save cannot erase newer
+can close only when both its submitted form and captured panel remain current; retrying an option save cannot erase newer
 input. View deletion resets selection only if the same owner still selects that
-view, regardless of search/month changes. Confirmed task writes whose presentation
-owner retired return saved/committed-retired without applying presentation actions.
+view, regardless of search/month changes. Retired task completions apply no presentation actions.
 Normalized outcomes retain classification and timeout fallback, not exception chains.
 
 Mutation rejection notices are immediate and retain review guidance without

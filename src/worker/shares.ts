@@ -37,6 +37,7 @@ export type ShareRow = {
   password_hash?: string | null;
   expires_at?: number | null;
   access_generation?: number;
+  content_generation?: number;
   id: string;
   workspace_id: string;
   root_page_id: string;
@@ -621,7 +622,7 @@ export async function publicAttachment(env: Env, share: SharedPageRow, attachmen
     .bind(attachmentId, share.page_id)
     .first<{ id: string; page_id: string; r2_key: string; name: string; mime: string }>();
   if (!attachment) return null;
-  if (attachment.mime.startsWith("image/"))
+  if (attachment.mime.startsWith("image/") && env.IMAGES_ENABLED === "true" && env.IMAGES)
     return (await import("./images")).imageDerivative(env, attachmentId, "preview-v1");
   const object = await env.BUCKET.get(attachment.r2_key);
   if (!object) return null;

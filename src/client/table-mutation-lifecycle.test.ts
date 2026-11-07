@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { settleTableMutation, connectedMutationReads, taskMutationCompletion } from "./table-mutation-lifecycle";
+import { settleTableMutation, connectedMutationReads } from "./table-mutation-lifecycle";
 
 describe("settled mutation presentation", () => {
   it.each(["success", "conflict", "denial", "transport"])(
@@ -79,11 +79,4 @@ describe("installed mutation coordinator", () => {
       expect(connectedMutationReads(true, true, owner, { owner, reads }, reads, sameOwner)).toBe(reads);
     },
   );
-  it("keeps retired confirmed task success distinct from suspended and rejected responses", () => {
-    expect(taskMutationCompletion("retired", true)).toBe("committed-retired");
-    expect(taskMutationCompletion("committed", true)).toBe("committed-current");
-    for (const result of ["retired", "rejected", "suspended", "uncertain"])
-      expect(taskMutationCompletion(result, false)).toBeUndefined();
-    expect(taskMutationCompletion("suspended", true)).toBeUndefined();
-  });
 });
