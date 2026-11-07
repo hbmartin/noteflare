@@ -36,6 +36,17 @@ async function alarmAt(phase: number, overrides: Partial<Env>) {
 }
 
 describe("audit maintenance wakeups", () => {
+  it("keeps cycling for retired snapshot batches and backoff even with optional services disabled", async () => {
+    await env.DB.prepare(
+      "INSERT INTO publication_table_snapshots VALUES('retired','object','gone-page','gone-publication',1,1,1,?)",
+    )
+      .bind(Date.now() + 60_000)
+      .run();
+    expect(await env.DB.prepare("SELECT 1 FROM platform_jobs LIMIT 1").first()).toBeNull();
+    expect((await alarmAt(10, {})).alarm).toBeGreaterThanOrEqual(Date.now());
+    await env.DB.prepare("DELETE FROM publication_table_snapshots").run();
+    expect((await alarmAt(10, {})).alarm).toBeNull();
+  });
   it.each([
     { feature: "archive", phase: 3, count: 11, flag: "AUDIT_ENABLED", column: "archive_id", completed: "verified" },
     { feature: "Basin", phase: 4, count: 21, flag: "BASIN_ENABLED", column: "basin_exported_at", completed: 1 },

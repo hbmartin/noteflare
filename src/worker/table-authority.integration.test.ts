@@ -2550,7 +2550,7 @@ describe("per-table authority", () => {
         );
         expect(meta).toMatchObject({
           projectedRevision: 1,
-          repairIntent: { phase: "headers", headerFormat: 1, headerStep: 1 },
+          repairIntent: { phase: "headers", headerFormat: 2, headerStep: 1 },
         });
         return prepared;
       } finally {
@@ -2563,6 +2563,14 @@ describe("per-table authority", () => {
     ).first<{ count: number }>();
     expect(published!.count).toBeGreaterThan(0);
     expect(published!.count).toBeLessThanOrEqual(100);
+    await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+      const meta = JSON.parse(
+        state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+      );
+      meta.repairIntent.headerFormat = 1;
+      state.storage.sql.exec("UPDATE meta SET value=? WHERE id=1", JSON.stringify(meta));
+    });
+    await evictDurableObject(env.TABLE.getByName(pageId));
     await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
   });
@@ -3539,9 +3547,71 @@ describe("per-table authority", () => {
       text_value: "Original",
     });
     await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(pageId).run();
+    await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+      state.storage.sql.exec("INSERT INTO publication_snapshots VALUES('private-copy','retired',1,1,'{}')");
+      state.storage.sql.exec("INSERT INTO publication_snapshot_rows VALUES('private-copy',0,'private content')");
+    });
     const deletion = await acceptPageDeletion(env, member.workspace.id, member.user.id, pageId);
     await processDeletionJob(env, deletion.jobId);
     await expect(tableInternal(env, pageId, "/verify")).rejects.toMatchObject({ code: "table_purged" });
+    await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+      expect(state.storage.sql.exec("SELECT 1 FROM publication_snapshots").toArray()).toEqual([]);
+      expect(state.storage.sql.exec("SELECT 1 FROM publication_snapshot_rows").toArray()).toEqual([]);
+      // Simulate an older deployment which left a copy in an already-purged object.
+      state.storage.sql.exec("INSERT INTO publication_snapshots VALUES('old-copy','retired',1,1,'{}')");
+      state.storage.sql.exec("INSERT INTO publication_snapshot_rows VALUES('old-copy',0,'old private content')");
+    });
+    await evictDurableObject(env.TABLE.getByName(pageId));
+    await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+      expect(state.storage.sql.exec("SELECT 1 FROM publication_snapshots").toArray()).toEqual([]);
+      expect(state.storage.sql.exec("SELECT 1 FROM publication_snapshot_rows").toArray()).toEqual([]);
+    });
+  });
+
+  it("repairs swapped header keys and absent cells while preserving explicit nulls", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "alpha", name: "Alpha", type: "text" });
+    await write(pageId, member, "create_column", { id: "beta", name: "Beta", type: "text" });
+    await write(pageId, member, "create_row", { id: "repair-row", values: { alpha: null } });
+    const generation = await env.DB.prepare("SELECT generation FROM table_authority WHERE page_id=?")
+      .bind(pageId)
+      .first<number>("generation");
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO table_projection_context VALUES(?,?)").bind(pageId, generation),
+      env.DB.prepare("UPDATE table_columns SET name_key=NULL WHERE page_id=?").bind(pageId),
+      env.DB.prepare("UPDATE table_columns SET name='Beta',name_key='beta' WHERE id='alpha'"),
+      env.DB.prepare("UPDATE table_columns SET name='Alpha',name_key='alpha' WHERE id='beta'"),
+      env.DB.prepare(
+        "INSERT INTO table_cells(row_id,column_id,text_value,updated_at) VALUES('repair-row','beta','Stale',1)",
+      ),
+      env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(pageId),
+    ]);
+    await repairTableProjection(env, member, pageId);
+    for (let i = 0; i < 20; i++) {
+      if (
+        (await env.DB.prepare("SELECT state FROM table_authority WHERE page_id=?").bind(pageId).first("state")) === "do"
+      )
+        break;
+      await runInDurableObject(env.TABLE.getByName(pageId), async (instance) => {
+        await (instance as unknown as { resumeRepair(): Promise<unknown> }).resumeRepair();
+      });
+    }
+    expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+    expect(
+      (
+        await env.DB.prepare("SELECT id,name,name_key FROM table_columns WHERE page_id=? ORDER BY id")
+          .bind(pageId)
+          .all()
+      ).results,
+    ).toEqual([
+      { id: "alpha", name: "Alpha", name_key: "alpha" },
+      { id: "beta", name: "Beta", name_key: "beta" },
+    ]);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM table_cells WHERE row_id='repair-row' AND column_id='beta'").first(),
+    ).toBeNull();
+    expect((await queryTable(env, member, pageId)).rows[0]!.cells.alpha).toBeNull();
   });
   it.each(["create", "rename", "archive"] as const)(
     "drains pending task %s effects before repairing and preserves failed retries",

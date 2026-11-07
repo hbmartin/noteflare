@@ -14,6 +14,11 @@ const SORT_VALUE_EXPRESSIONS: Record<string, string> = {
   select: "(SELECT o.label FROM table_select_options o WHERE o.id = sort_cell.select_value)",
 };
 
+/** Fixed SQL shared by public selection and counts; excludes hidden task details before paging. */
+export const PUBLIC_TABLE_ROW_ELIGIBILITY = ` AND (coalesce((SELECT is_task_list FROM pages WHERE id=r.page_id),0)=0 OR EXISTS(
+ SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id
+ WHERE link.row_id=r.id AND detail.archived_at IS NULL AND detail.import_job_id IS NULL))`;
+
 export type TableRowQuery = {
   sql: string;
   orderSql: string;
@@ -36,9 +41,10 @@ export function buildTableRowQuery(
   pageId: string,
   columns: { id: string; type: string }[],
   query: Record<string, string | undefined>,
+  options: { publicRows?: boolean } = {},
 ): TableRowQuery {
   const filter = normalizeSearchValue((query.q ?? "").slice(0, 200));
-  const filterSql = `AND NOT EXISTS(SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id JOIN pages list ON list.id=r.page_id WHERE link.row_id=r.id AND list.is_task_list=1 AND detail.archived_at IS NOT NULL) AND (? = '' OR EXISTS(SELECT 1 FROM table_cells fc LEFT JOIN table_select_options fo ON fo.id=fc.select_value WHERE fc.row_id=r.id AND instr(coalesce(fc.text_search_value,fo.label_search_value,lower(coalesce(fc.text_value,CAST(fc.number_value AS TEXT),CASE WHEN fc.boolean_value IS NOT NULL THEN CASE WHEN fc.boolean_value=1 THEN 'true' ELSE 'false' END END,fc.date_value,fo.label,''))),?)>0))`;
+  const filterSql = `${options.publicRows ? PUBLIC_TABLE_ROW_ELIGIBILITY : ""} AND NOT EXISTS(SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id JOIN pages list ON list.id=r.page_id WHERE link.row_id=r.id AND list.is_task_list=1 AND detail.archived_at IS NOT NULL) AND (? = '' OR EXISTS(SELECT 1 FROM table_cells fc LEFT JOIN table_select_options fo ON fo.id=fc.select_value WHERE fc.row_id=r.id AND instr(coalesce(fc.text_search_value,fo.label_search_value,lower(coalesce(fc.text_value,CAST(fc.number_value AS TEXT),CASE WHEN fc.boolean_value IS NOT NULL THEN CASE WHEN fc.boolean_value=1 THEN 'true' ELSE 'false' END END,fc.date_value,fo.label,''))),?)>0))`;
   const limit = query.limit === undefined ? TABLE_PAGE_DEFAULT : Number(query.limit);
   if (!Number.isInteger(limit) || limit < 1 || limit > TABLE_PAGE_MAX) {
     throw new HttpError(422, "invalid_table_cursor", `limit must be an integer between 1 and ${TABLE_PAGE_MAX}.`);

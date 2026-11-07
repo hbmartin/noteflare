@@ -1,5 +1,5 @@
 import type { Env } from "./env";
-import { classifyError, attachmentDisposition } from "./http";
+import { classifyError } from "./http";
 import { liveForm, formDocument, submitPublicForm, FORM_SCRIPT } from "./forms";
 import { publicHtml, publicReadFailure } from "./public-utils";
 import {
@@ -19,8 +19,8 @@ import {
 } from "./shares";
 import { publicationPageAllowed, publicationHostAllowsShare, type Publication } from "./publications";
 import type { PublicationManifest } from "./publication-builder";
-import { imageDerivative, imagePlaceholder, IMAGE_PRESETS, type ImagePreset } from "./images";
-import { isInlineMime } from "./attachments";
+import { imagePlaceholder, IMAGE_PRESETS, type ImagePreset } from "./images";
+import { deliverPublicAttachment, publicImagesEnabled } from "./public-attachment";
 const missing = () => new Response("Not found.", { status: 404, headers: { "cache-control": "no-store" } });
 const unavailable = () =>
   new Response("This site is being updated. Please try again shortly.", {
@@ -35,7 +35,7 @@ async function cached(
   context: ExecutionContext,
   render: () => Promise<Response>,
 ): Promise<Response> {
-  const cache = await caches.open("public-pages");
+  const cache = await caches.open("public-pages-v2");
   const url = new URL(request.url);
   url.searchParams.set("__public_generation", generation);
   const key = new Request(url.toString(), { method: "GET" });
@@ -85,7 +85,7 @@ async function shareResponse(
   const pageId = segments[2] === "pages" ? segments[3] : undefined;
   const page = await resolveSharedPage(env, key, pageId);
   if (!page) return missing();
-  const version = `share:${page.id}:${page.access_generation ?? 1}:${page.content_generation ?? 1}`;
+  const version = `share:${page.id}:${page.access_generation ?? 1}:${page.content_generation ?? 1}:images:${Number(publicImagesEnabled(env))}`;
   return cached(request, version, !page.password_hash, context, async () => {
     if (segments[2] === "sitemap.xml") {
       const sitemap = await publicSitemap(env, page, key, new URL(request.url).origin);
@@ -162,37 +162,33 @@ async function publishedResponse(
       sourceId = manifest.assets[attachmentId];
     if (!sourceId || !(await publicationPageAllowed(env, pub, sourceId))) return missing();
     const attachment = await env.DB.prepare(
-      "SELECT r2_key,name,mime FROM attachments WHERE id=? AND page_id=? AND workspace_id=?",
+      "SELECT id,r2_key,name,mime,size FROM attachments WHERE id=? AND page_id=? AND workspace_id=?",
     )
       .bind(attachmentId, sourceId, pub.workspace_id)
-      .first<{ r2_key: string; name: string; mime: string }>();
+      .first<{ id: string; r2_key: string; name: string; mime: string; size: number }>();
     if (!attachment) return missing();
     if (parts[2] !== "original" && !Object.hasOwn(IMAGE_PRESETS, parts[2]!)) return missing();
-    return cached(request, `${pub.id}:${manifest.generation}:${pub.access_generation}`, true, context, async () => {
-      if (
-        parts[2] !== "original" ||
-        (attachment.mime.startsWith("image/") && env.IMAGES_ENABLED === "true" && env.IMAGES)
-      ) {
-        const focal = await env.DB.prepare("SELECT cover_x x,cover_y y FROM pages WHERE id=?")
-          .bind(sourceId)
-          .first<{ x: number; y: number }>();
-        return imageDerivative(
-          env,
-          attachmentId,
-          parts[2] === "original" ? "preview-v1" : (parts[2] as ImagePreset),
-          focal ?? { x: 0.5, y: 0.5 },
+    return cached(
+      request,
+      `${pub.id}:${manifest.generation}:${pub.access_generation}:images:${Number(publicImagesEnabled(env))}`,
+      true,
+      context,
+      async () => {
+        const focal = publicImagesEnabled(env)
+          ? await env.DB.prepare("SELECT cover_x x,cover_y y FROM pages WHERE id=?")
+              .bind(sourceId)
+              .first<{ x: number; y: number }>()
+          : null;
+        return (
+          (await deliverPublicAttachment(
+            env,
+            attachment,
+            parts[2] === "original" ? undefined : (parts[2] as ImagePreset),
+            focal ?? { x: 0.5, y: 0.5 },
+          )) ?? missing()
         );
-      }
-      const file = await env.BUCKET.get(attachment.r2_key);
-      if (!file) return missing();
-      const inline = isInlineMime(attachment.mime);
-      return new Response(file.body, {
-        headers: {
-          "content-type": inline ? attachment.mime : "application/octet-stream",
-          "content-disposition": attachmentDisposition(attachment.name, inline),
-        },
-      });
-    });
+      },
+    );
   } else if (parts[0] === "diagrams" && parts.length === 2) {
     const id = parts[1]!.replace(/\.svg$/, "");
     if (!manifest.pages.some((page) => page.id === id) || !(await publicationPageAllowed(env, pub, id)))

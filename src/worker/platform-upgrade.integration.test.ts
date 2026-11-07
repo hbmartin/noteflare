@@ -1,7 +1,48 @@
-import { applyD1Migrations, env } from "cloudflare:test";
+import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { expect, it } from "vitest";
 
+it("0112 retires old continuations once and keeps active output and cleanup intent", async () => {
+  await reset();
+  await applyD1Migrations(
+    env.DB,
+    env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0112"),
+  );
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','upgrade12@test.example',1,1)",
+    ),
+    env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Upgrade',1)"),
+    env.DB.prepare(
+      "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,generation,access_generation,active_generation,active_access_generation,manifest_key,needs_build,build_content_version,content_version,build_checkpoint_json,created_by,created_at,updated_at) VALUES('site','workspace','workspace-general','legacy-key','{}',1,8,3,7,3,'active-manifest',1,2,4,'{\"offset\":2,\"tableCursor\":\"legacy\"}','owner',1,1)",
+    ),
+  ]);
+  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+  const expected = {
+    generation: 9,
+    access_generation: 3,
+    active_generation: 7,
+    manifest_key: "active-manifest",
+    needs_build: 1,
+    content_version: 4,
+    build_content_version: null,
+    build_checkpoint_json: null,
+  };
+  const current = () =>
+    env.DB.prepare(
+      "SELECT generation,access_generation,active_generation,manifest_key,needs_build,content_version,build_content_version,build_checkpoint_json FROM publications WHERE id='site'",
+    ).first();
+  expect(await current()).toEqual(expected);
+  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+  expect(await current()).toEqual(expected);
+  await env.DB.prepare(
+    "INSERT INTO publication_table_snapshots VALUES('handle','object','deleted-page','site',8,3,1,0)",
+  ).run();
+  await env.DB.prepare("DELETE FROM publications WHERE id='site'").run();
+  expect(await env.DB.prepare("SELECT handle FROM publication_table_snapshots").first("handle")).toBe("handle");
+});
+
 it("0111 preserves old publications, form intent, and artifacts while retaining conservative access fences", async () => {
+  await reset();
   await applyD1Migrations(
     env.DB,
     env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0111"),

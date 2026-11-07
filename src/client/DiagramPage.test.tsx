@@ -87,6 +87,36 @@ function show() {
   const view = render(<DiagramPage {...props} />);
   return { next, callbacks, view, props };
 }
+it("passes semantic capability to Related pages without refreshing it on workspace events", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input) =>
+      String(input).endsWith("/related")
+        ? Response.json({ related: [], retrievalStatus: "available" })
+        : String(input).endsWith("/backlinks")
+          ? Response.json({ backlinks: [] })
+          : Response.json({ page, threads: [] }),
+    ),
+  );
+  const { view, props } = show();
+  view.rerender(
+    <DiagramPage {...props} member={{ ...member, features: { expandedEmbeds: false, semanticSearch: true } }} />,
+  );
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Backlinks" })));
+  expect(screen.getByRole("button", { name: "Refresh related pages" })).toBeInTheDocument();
+  const requests = () => vi.mocked(fetch).mock.calls.filter(([input]) => String(input).endsWith("/related"));
+  expect(requests()).toHaveLength(1);
+  await act(async () =>
+    view.rerender(
+      <DiagramPage
+        {...props}
+        member={{ ...member, features: { expandedEmbeds: false, semanticSearch: true } }}
+        backlinksRevision={1}
+      />,
+    ),
+  );
+  expect(requests()).toHaveLength(1);
+});
 it("wires successful sync into retry reset and removes all listeners on cleanup", async () => {
   const { next, view } = show();
   for (let index = 0; index < 6; index++) {

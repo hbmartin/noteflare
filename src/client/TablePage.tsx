@@ -2244,7 +2244,14 @@ function LegacyTablePage({
           </div>
         )}
       </article>
-      {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
+      {backlinksOpen && (
+        <BacklinksPanel
+          pageId={page.id}
+          revision={backlinksRevision}
+          onSelect={onSelectPage}
+          semanticEnabled={member.features?.semanticSearch === true}
+        />
+      )}
     </main>
   );
 }

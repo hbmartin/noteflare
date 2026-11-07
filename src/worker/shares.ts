@@ -10,10 +10,10 @@ import {
 } from "../shared/document-projection";
 import { bytesToBase64Url } from "../shared/security";
 import type { DocumentContentEnvelope, PageKind, ProseMirrorJson } from "../shared/types";
-import { isInlineMime } from "./attachments";
+import { deliverPublicAttachment } from "./public-attachment";
 import { diagramThumbnailResponse } from "./diagram-thumbnail";
 import type { Env, MemberContext } from "./env";
-import { attachmentDisposition, HttpError } from "./http";
+import { HttpError } from "./http";
 import { correlationHeaders } from "./observability";
 
 export type ShareOptions = Partial<{
@@ -617,23 +617,11 @@ export async function renderPublicShare(
 
 export async function publicAttachment(env: Env, share: SharedPageRow, attachmentId: string) {
   const attachment = await env.DB.prepare(
-    `SELECT id, page_id, r2_key, name, mime FROM attachments WHERE id = ? AND page_id = ?`,
+    "SELECT id,page_id,r2_key,name,mime,size FROM attachments WHERE id=? AND page_id=?",
   )
     .bind(attachmentId, share.page_id)
-    .first<{ id: string; page_id: string; r2_key: string; name: string; mime: string }>();
-  if (!attachment) return null;
-  if (attachment.mime.startsWith("image/") && env.IMAGES_ENABLED === "true" && env.IMAGES)
-    return (await import("./images")).imageDerivative(env, attachmentId, "preview-v1");
-  const object = await env.BUCKET.get(attachment.r2_key);
-  if (!object) return null;
-  const inline = isInlineMime(attachment.mime);
-  const headers = new Headers({
-    "content-type": inline ? attachment.mime : "application/octet-stream",
-    "content-disposition": attachmentDisposition(attachment.name, inline),
-    "cache-control": "no-store",
-    "x-content-type-options": "nosniff",
-  });
-  return new Response(object.body, { headers });
+    .first<{ id: string; r2_key: string; name: string; mime: string; size: number }>();
+  return attachment ? deliverPublicAttachment(env, attachment) : null;
 }
 
 export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, source: SharedPageRow) {

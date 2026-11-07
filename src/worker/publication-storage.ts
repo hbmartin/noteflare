@@ -1,3 +1,4 @@
+import { cleanupPublicationSnapshots } from "./publication-snapshots";
 import { hostnameApi, lookupHostname, leaseHostname, releaseHostname } from "./hostname-provider";
 import type { Env } from "./env";
 import type { Publication } from "./publications";
@@ -18,6 +19,7 @@ export async function putPublicationObject(
   await env.PUBLICATIONS_BUCKET.put(key, value, { onlyIf: { etagDoesNotMatch: "*" }, ...options });
 }
 export async function cleanupPublicationArtifacts(env: Env) {
+  await cleanupPublicationSnapshots(env);
   if (!env.PUBLICATIONS_BUCKET) return;
   const expired = (
     await env.DB.prepare(`SELECT a.r2_key FROM publication_artifacts a LEFT JOIN publications p ON p.id=a.publication_id

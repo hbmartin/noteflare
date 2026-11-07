@@ -5,6 +5,9 @@ import { spaceForMember } from "./page-access";
 import { HttpError, assertSameOrigin } from "./http";
 import { publicationConfig, publicationHostname, type PublicationConfig } from "../shared/publications";
 import { publicJson } from "./public-utils";
+import { recordMetric } from "./observability";
+import { tableInternal, tableRegistry } from "./table-service";
+import type { TableQueryResult } from "../shared/table-protocol";
 import { enqueuePlatformJob } from "./platform-jobs";
 export type Publication = {
   id: string;
@@ -24,6 +27,7 @@ export type Publication = {
   built_content_version: number;
   build_content_version: number | null;
   build_checkpoint_json: string | null;
+  build_failure_checkpoint_json: string | null;
   dependencies_ready: number;
 };
 export type PublicationPage = {
@@ -86,6 +90,39 @@ export async function publicationHostAllowsShare(env: Env, hostname: string, sha
       .bind(hostname, shareId)
       .first(),
   );
+}
+export async function validatePublicationTableViews(
+  env: Env,
+  config: PublicationConfig,
+  eligible: (id: string) => Promise<boolean>,
+) {
+  for (const [pageId, viewId] of Object.entries(config.tableViews)) {
+    if (!(await eligible(pageId)))
+      throw new HttpError(422, "publication_view", "Choose a table within the published roots.");
+    const table = await env.DB.prepare("SELECT kind FROM pages WHERE id=?").bind(pageId).first<{ kind: string }>();
+    if (table?.kind !== "table") throw new HttpError(422, "publication_view", "Choose a table view.");
+    const registry = await tableRegistry(env, pageId);
+    if (!registry || !["do", "repairing"].includes(registry.state))
+      throw new HttpError(
+        422,
+        "table_authority_required",
+        "Migrate this table before publishing a saved view. All rows may be published as a legacy grid.",
+      );
+    let result: TableQueryResult;
+    try {
+      result = await tableInternal<TableQueryResult>(
+        env,
+        pageId,
+        `/public-query?${new URLSearchParams({ viewId, limit: "1" })}`,
+      );
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404)
+        throw new HttpError(422, "publication_view", "Choose an existing shared table view.");
+      throw error;
+    }
+    if (result.invalidView || !result.view || result.view.id !== viewId || result.view.ownerId)
+      throw new HttpError(422, "publication_view", "Choose an existing shared table view.");
+  }
 }
 export async function publicationSettingsResponse(request: Request, env: Env, spaceId: string): Promise<Response> {
   const member = await requireMember(request, env);
@@ -151,6 +188,7 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
     if (!attachment || !(await eligible(attachment.page_id)))
       throw new HttpError(422, "publication_logo", "Choose a logo attached to a published page.");
   }
+  if (input.active === true) await validatePublicationTableViews(env, config, eligible);
   const existing =
     typeof input.id === "string"
       ? await env.DB.prepare("SELECT * FROM publications WHERE id=? AND space_id=? AND workspace_id=?")
@@ -212,6 +250,17 @@ async function queuePublication(env: Env, pub: Publication) {
 }
 export async function enqueuePendingPublications(env: Env) {
   if (env.PUBLIC_PUBLISHING_ENABLED !== "true") return;
+  const restarted = await env.DB.prepare(`UPDATE publications SET generation=generation+1,build_content_version=NULL,
+    build_checkpoint_json=NULL,build_error=NULL,build_failure_checkpoint_json=NULL
+    WHERE id IN(SELECT id FROM publications WHERE active=1 AND needs_build=1 AND build_error IS NOT NULL
+      AND build_failure_checkpoint_json IS NOT NULL AND build_failure_checkpoint_json=build_checkpoint_json
+      AND content_version>build_content_version ORDER BY updated_at LIMIT 20)`).run();
+  if (restarted.meta.changes)
+    recordMetric(env, {
+      event: "publication.restart.content",
+      component: "platform",
+      attempts: restarted.meta.changes,
+    });
   const rows = await env.DB.prepare(
     "SELECT * FROM publications WHERE active=1 AND needs_build=1 ORDER BY updated_at LIMIT 20",
   ).all<Publication>();

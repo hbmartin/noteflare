@@ -245,6 +245,15 @@ async function requireLoginIdentity(env: Env, userId: string) {
     throw new APIError("FORBIDDEN", { code: "login_not_allowed", message: "This identity cannot sign in." });
 }
 
+/** Validation belongs to one endpoint invocation, never to the long-lived auth instance. */
+async function validateSessionIdentity(env: Env, ctx: GenericEndpointContext) {
+  const userId = ctx.context.session?.user.id;
+  const checked = ctx.context as typeof ctx.context & { notesValidatedIdentity?: string };
+  if (!userId || checked.notesValidatedIdentity === userId) return;
+  await requireLoginIdentity(env, userId);
+  checked.notesValidatedIdentity = userId;
+}
+
 export function createAuth(env: Env, allowRegistration = false) {
   return betterAuth({
     database: env.DB,
@@ -358,6 +367,11 @@ export function createAuth(env: Env, allowRegistration = false) {
         },
       },
       session: {
+        update: {
+          before: async (_session, ctx) => {
+            if (ctx?.path === "/get-session") await validateSessionIdentity(env, ctx);
+          },
+        },
         delete: {
           before: async (session) => {
             await trackRealtimeUser(env, session.userId);
@@ -483,8 +497,7 @@ export function createAuth(env: Env, allowRegistration = false) {
         });
       }),
       after: createAuthMiddleware(async (ctx) => {
-        if (ctx.path === "/get-session" && ctx.context.session)
-          await requireLoginIdentity(env, ctx.context.session.user.id);
+        if (ctx.path === "/get-session") await validateSessionIdentity(env, ctx);
         if (!isSlackCallback(ctx)) return;
         const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
         // Existing OAuth accounts use update rather than create. Complete the

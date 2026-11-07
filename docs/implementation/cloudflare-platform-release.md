@@ -154,6 +154,57 @@ Pricing references: [Workers](https://developers.cloudflare.com/workers/platform
 
 ## Acceptance and rollback
 
+### Publication lifecycle follow-up (migration 0112)
+
+Treat 0111 as already applied. Pause publication builds on the application Worker and drain in-flight jobs before
+applying `0112_publication_lifecycle.sql`. Deploy the coordinated application and public Workers, then restore the
+previous publishing setting. The migration retires unfinished old-format checkpoints once; active manifests and
+access generations stay intact. Healthy builds still finish captured content while later edits remain pending.
+Failed checkpoints with newer content restart automatically, and authority cutover retires incompatible legacy
+cursors. Saved views on legacy tables require explicit migration before active site settings can be saved.
+
+The public Worker uses the `public-pages-v2` Cache API namespace. Do not roll it back to the old namespace:
+historical workspace-counter keys can collide with the newer per-share counters. Public cover, gallery and logo
+URLs serve validated originals when Images or its binding is unavailable, including URLs in existing manifests.
+Configured transformation failures retain the safe placeholder. Original/processed availability is part of media
+cache identity.
+
+New table captures register durable cleanup intent before copying values. Publication maintenance processes ten
+retired handles per pass, deleting at most 500 rows per handle request. Completed, cancelled and superseded captures
+are released promptly; active captures remain protected regardless of age. Cleanup intent survives deletion of the
+publication or page. Permanent table deletion also purges local snapshots, including on upgrade of an already-purged
+object.
+
+Run this one-time inventory sweep after upgrading if the installation ran the earlier snapshot builder. D1 page
+records alone cannot discover snapshots in idle or previously deleted objects. Cloudflare's
+[namespace inventory API](https://developers.cloudflare.com/api/resources/durable_objects/subresources/namespaces/subresources/objects/methods/list/)
+provides the stored object IDs. The sweep only registers cleanup intent; normal maintenance releases retired data.
+
+1. Copy `scripts/publication-snapshot-sweep.example.jsonc` outside the checkout. Set its `main` to the absolute path
+   of `scripts/publication-snapshot-sweep-worker.mjs`, remove the relative `$schema`, and set the TABLE binding's
+   `script_name` and `environment` (if used) to the upgraded application deployment.
+2. Create a private environment file outside the checkout containing a fresh `SNAPSHOT_SWEEP_TOKEN` of at least
+   32 characters. Run `pnpm exec wrangler dev --remote --config /absolute/path/sweep.jsonc --env-file
+   /absolute/path/sweep.env --port 8789`. Use only remote development on the loopback endpoint; do not deploy this
+   temporary helper or add a public maintenance route.
+3. In another shell, export the same `SNAPSHOT_SWEEP_TOKEN` and a scoped `CLOUDFLARE_API_TOKEN` that can read the
+   TABLE namespace inventory. Run `node scripts/publication-snapshot-sweep.mjs --account-id ACCOUNT_ID
+   --namespace-id TABLE_NAMESPACE_ID --checkpoint /absolute/path/snapshot-sweep.json`. Supply identifiers only,
+   never secrets, as command arguments. The checkpoint is private, contains no tokens or row values, and resumes
+   after interruption using the same command.
+4. Confirm the checkpoint reports completion. Observe `publication.snapshots.backlog` and
+   `publication.snapshots.oldest` until retired captures drain. Live build captures are intentionally excluded.
+   Stop the temporary development worker and delete its temporary token and environment file.
+
+Monitor `publication.restart.content` and `publication.restart.authority` alongside existing job failures. Owner
+settings show the current failure and checkpoint progress. Before a code rollback, pause the builder; preserve D1
+intents, R2 inputs and frozen captures. Any rollback build must retain snapshot purge/cleanup and the v2 public cache
+namespace. Resume publishing only with checkpoint-compatible code. Do not delete durable work to recover a build.
+
+Local validation must cover fresh installation and an 0111 database with active output and unfinished builds.
+Production migration, deployment, namespace sweeping, and controlled quota/load verification are separate release
+operations; local tests do not establish their completion.
+
 Local checks cover transaction rollback, durable coalescing, delayed/duplicate jobs, expired queue delivery,
 atomic quotas, archive-before-prune, exact four/five-reader boundaries, Access identity matching, Turnstile failures,
 share lifecycle/grants, legacy ciphertext and conditional rotation. See the test files next to the feature modules.
