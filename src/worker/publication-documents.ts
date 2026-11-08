@@ -5,7 +5,8 @@ import { collectTransclusions, serializeDocument } from "../shared/document-proj
 import { putPublicationObject } from "./publication-storage";
 import { publicationInput, advancePublication } from "./publication-state";
 
-export class PublicationContentError extends Error {}
+import { HttpError } from "./http";
+import { PublicationContentError, type PublicationSourceVersion } from "./publication-failure";
 
 type Reference = { token: string; sourcePageId: string; blockId: string; ancestors: string[] };
 type Expansion = {
@@ -15,6 +16,8 @@ type Expansion = {
   nonce: string;
   count: number;
   round: number;
+  sources?: PublicationSourceVersion[];
+  legacy?: boolean;
 };
 const body = (html: string) => /<body>([\s\S]*)<\/body>/i.exec(html)?.[1] ?? html;
 const decode = (value: string) =>
@@ -29,23 +32,42 @@ async function readProjection(env: Env, page: PublicationPage) {
     .bind(page.id, page.content_epoch)
     .first<{ r2_key: string; sequence: number }>();
   if (!metadata) {
-    if (page.indexed_seq === 0) return { type: "doc", content: [] } as ProseMirrorJson;
-    throw new PublicationContentError("A document is awaiting compaction.");
+    if (page.indexed_seq === 0)
+      return {
+        version: 1 as const,
+        source: { pageId: page.id, contentEpoch: page.content_epoch, sequence: 0, key: null },
+        document: { type: "doc", content: [] } as ProseMirrorJson,
+      };
+    const epoch = await env.DB.prepare("SELECT content_epoch FROM pages WHERE id=?")
+      .bind(page.id)
+      .first<number>("content_epoch");
+    if (epoch !== page.content_epoch)
+      throw new PublicationContentError("A document capture needs a new revision.", [
+        { pageId: page.id, contentEpoch: page.content_epoch, sequence: page.indexed_seq, key: null },
+      ]);
+    throw new HttpError(503, "publication_projection_pending", "A document is awaiting compaction.");
   }
   const object = await env.BUCKET.get(metadata.r2_key);
-  if (!object) throw new PublicationContentError("A document projection is unavailable.");
+  if (!object) throw new HttpError(503, "publication_projection_pending", "A document projection is unavailable.");
   const envelope = await object.json<DocumentContentEnvelope>();
   if (
     envelope.pageId !== page.id ||
     envelope.contentEpoch !== page.content_epoch ||
     envelope.sequence !== metadata.sequence
   )
-    throw new PublicationContentError("A document projection changed.");
-  return envelope.document;
+    throw new HttpError(503, "publication_projection_pending", "A document projection changed.");
+  return {
+    version: 1 as const,
+    source: { pageId: page.id, contentEpoch: page.content_epoch, sequence: metadata.sequence, key: metadata.r2_key },
+    document: envelope.document,
+  };
 }
 function projection(env: Env, pub: Publication, page: PublicationPage) {
-  return publicationInput(env, pub, `publications/${pub.id}/${pub.generation}/${page.id}/source.json`, () =>
-    readProjection(env, page),
+  return publicationInput<Awaited<ReturnType<typeof readProjection>> | ProseMirrorJson>(
+    env,
+    pub,
+    `publications/${pub.id}/${pub.generation}/${page.id}/source.json`,
+    () => readProjection(env, page),
   );
 }
 /** Complete authorized synced content across bounded jobs before any page can enter a manifest. */
@@ -62,72 +84,106 @@ export async function expandPublicationDocument(
   },
 ): Promise<{ html: string; assets: Record<string, string> } | null> {
   const { pub, page, allowed, base, prefix, offset } = input;
-  let state: Expansion;
-  if (input.stateKey) {
-    if (!input.stateKey.startsWith(`${prefix}/${page.id}/expansion-`))
-      throw new PublicationContentError("Invalid publication continuation.");
-    const object = await env.PUBLICATIONS_BUCKET!.get(input.stateKey);
-    if (!object) throw new PublicationContentError("Publication continuation is unavailable.");
-    state = await object.json<Expansion>();
-  } else state = { html: "", assets: {}, pending: [], nonce: crypto.randomUUID(), count: 0, round: 0 };
-  const render = (document: ProseMirrorJson, sourceId: string, ancestors: string[]) => {
-    let html = body(
-      serializeDocument(document, {
-        pageHref: (id) => (allowed.has(id) ? `${base}/p/${id}` : null),
-        linkedDiagramThumbnailHref: (id) => (allowed.get(id)?.kind === "diagram" ? `${base}/diagrams/${id}.svg` : null),
-      }).html,
-    );
-    html = html.replace(
-      /((?:href|src)=")\/api\/attachments\/([A-Za-z0-9_-]+)"/g,
-      (_match, attribute: string, id: string) => {
-        state.assets[id] = sourceId;
-        return `${attribute}${base}/assets/${id}/original"`;
-      },
-    );
-    return html.replace(
-      /<div class="synced-reference" data-source-page-id="([^"]+)" data-block-id="([^"]+)">Synced content unavailable<\/div>/g,
-      (_match, source: string, block: string) => {
-        const sourcePageId = decode(source),
-          blockId = decode(block);
-        if (!allowed.has(sourcePageId)) return '<div class="synced-reference">Synced content unavailable</div>';
-        if (++state.count > 1000)
-          throw new PublicationContentError("A published page may expand at most 1,000 synced references.");
-        const token = `<!--publication:${state.nonce}:${state.count}-->`;
-        state.pending.push({ token, sourcePageId, blockId, ancestors });
-        return token;
-      },
-    );
+  let state: Expansion = {
+    html: "",
+    assets: {},
+    pending: [],
+    nonce: crypto.randomUUID(),
+    count: 0,
+    round: 0,
+    sources: [],
+    legacy: false,
   };
-  if (!input.stateKey) state.html = render(await projection(env, pub, page), page.id, []);
-  for (let processed = 0; state.pending.length && processed < 8; processed++) {
-    const ref = state.pending.shift()!,
-      identity = JSON.stringify([ref.sourcePageId, ref.blockId]);
-    if (ref.ancestors.includes(identity))
-      throw new PublicationContentError("Published synced content contains a cycle.");
-    if (ref.ancestors.length >= 20)
-      throw new PublicationContentError("Published synced content exceeds 20 nested references.");
-    const source = allowed.get(ref.sourcePageId);
-    if (!source || source.kind !== "document")
-      throw new PublicationContentError("A published synced source is unavailable.");
-    const sourceDocument = await projection(env, pub, source),
-      block = collectTransclusions(sourceDocument).sources.find((item) => item.blockId === ref.blockId);
-    if (!block) throw new PublicationContentError("A published synced source block is unavailable.");
-    const replacement = render({ type: "doc", content: [{ type: "blockGroup", content: block.content }] }, source.id, [
-      ...ref.ancestors,
-      identity,
-    ]);
-    state.html = state.html.replace(ref.token, () => replacement);
-    if (state.html.length > 5 * 1024 * 1024)
+  try {
+    if (input.stateKey) {
+      if (!input.stateKey.startsWith(`${prefix}/${page.id}/expansion-`))
+        throw new PublicationContentError("Invalid publication continuation.");
+      const object = await env.PUBLICATIONS_BUCKET!.get(input.stateKey);
+      if (!object) throw new PublicationContentError("Publication continuation is unavailable.");
+      state = await object.json<Expansion>();
+    }
+    if (!state.sources) {
+      state.sources = [];
+      state.legacy = true;
+    }
+    const documentFor = async (source: PublicationPage) => {
+      const captured = await projection(env, pub, source);
+      if ("document" in captured && "source" in captured) {
+        if (!state.sources!.some((item) => item.pageId === source.id)) state.sources!.push(captured.source);
+        return captured.document;
+      }
+      state.legacy = true;
+      return captured;
+    };
+    const render = (document: ProseMirrorJson, sourceId: string, ancestors: string[]) => {
+      let html = body(
+        serializeDocument(document, {
+          pageHref: (id) => (allowed.has(id) ? `${base}/p/${id}` : null),
+          linkedDiagramThumbnailHref: (id) =>
+            allowed.get(id)?.kind === "diagram" ? `${base}/diagrams/${id}.svg` : null,
+        }).html,
+      );
+      html = html.replace(
+        /((?:href|src)=")\/api\/attachments\/([A-Za-z0-9_-]+)"/g,
+        (_match, attribute: string, id: string) => {
+          state.assets[id] = sourceId;
+          return `${attribute}${base}/assets/${id}/original"`;
+        },
+      );
+      return html.replace(
+        /<div class="synced-reference" data-source-page-id="([^"]+)" data-block-id="([^"]+)">Synced content unavailable<\/div>/g,
+        (_match, source: string, block: string) => {
+          const sourcePageId = decode(source),
+            blockId = decode(block);
+          if (!allowed.has(sourcePageId)) return '<div class="synced-reference">Synced content unavailable</div>';
+          if (++state.count > 1000)
+            throw new PublicationContentError("A published page may expand at most 1,000 synced references.");
+          const token = `<!--publication:${state.nonce}:${state.count}-->`;
+          state.pending.push({ token, sourcePageId, blockId, ancestors });
+          return token;
+        },
+      );
+    };
+    if (!input.stateKey) state.html = render(await documentFor(page), page.id, []);
+    for (let processed = 0; state.pending.length && processed < 8; processed++) {
+      const ref = state.pending.shift()!,
+        identity = JSON.stringify([ref.sourcePageId, ref.blockId]);
+      if (ref.ancestors.includes(identity))
+        throw new PublicationContentError("Published synced content contains a cycle.");
+      if (ref.ancestors.length >= 20)
+        throw new PublicationContentError("Published synced content exceeds 20 nested references.");
+      const source = allowed.get(ref.sourcePageId);
+      if (!source || source.kind !== "document")
+        throw new PublicationContentError("A published synced source is unavailable.");
+      const sourceDocument = await documentFor(source),
+        block = collectTransclusions(sourceDocument).sources.find((item) => item.blockId === ref.blockId);
+      if (!block) throw new PublicationContentError("A published synced source block is unavailable.");
+      const replacement = render(
+        { type: "doc", content: [{ type: "blockGroup", content: block.content }] },
+        source.id,
+        [...ref.ancestors, identity],
+      );
+      state.html = state.html.replace(ref.token, () => replacement);
+      if (state.html.length > 5 * 1024 * 1024)
+        throw new PublicationContentError("Published synced content exceeds 5 MiB.");
+    }
+    const serialized = JSON.stringify(state);
+    if (new TextEncoder().encode(serialized).byteLength > 5 * 1024 * 1024)
       throw new PublicationContentError("Published synced content exceeds 5 MiB.");
+    if (state.pending.length) {
+      const stateKey = `${prefix}/${page.id}/expansion-${++state.round}.json`;
+      await putPublicationObject(env, pub, stateKey, JSON.stringify(state));
+      await advancePublication(env, pub, { offset, documentStateKey: stateKey });
+      return null;
+    }
+    return { html: state.html, assets: state.assets };
+  } catch (error) {
+    if (error instanceof PublicationContentError)
+      throw new PublicationContentError(
+        error.message,
+        [...new Map([...(state.sources ?? []), ...error.sources].map((source) => [source.pageId, source])).values()],
+        Boolean(state.legacy || error.legacy),
+      );
+    throw error;
   }
-  const serialized = JSON.stringify(state);
-  if (new TextEncoder().encode(serialized).byteLength > 5 * 1024 * 1024)
-    throw new PublicationContentError("Published synced content exceeds 5 MiB.");
-  if (state.pending.length) {
-    const stateKey = `${prefix}/${page.id}/expansion-${++state.round}.json`;
-    await putPublicationObject(env, pub, stateKey, JSON.stringify(state));
-    await advancePublication(env, pub, { offset, documentStateKey: stateKey });
-    return null;
-  }
-  return { html: state.html, assets: state.assets };
 }

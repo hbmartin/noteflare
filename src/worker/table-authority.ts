@@ -575,6 +575,7 @@ export class TableAuthority extends DurableObject<Env> {
           "/repair-status",
           "/export",
           "/public-query",
+          "/publication-view",
           "/publication-snapshot",
           "/delete-row",
         ].includes(path)
@@ -684,6 +685,44 @@ export class TableAuthority extends DurableObject<Env> {
         }
         if (path === "/verify") return Response.json(await this.verification());
         if (path === "/publication-snapshot") return Response.json(await this.publicationSnapshot(url));
+        if (path === "/publication-view") {
+          const registry = await this.env.DB.prepare("SELECT state,generation FROM table_authority WHERE page_id=?")
+            .bind(this.meta().pageId)
+            .first<{ state: string; generation: number }>();
+          this.requireActive();
+          const meta = this.meta();
+          if (
+            !registry ||
+            !["do", "repairing"].includes(registry.state) ||
+            registry.generation !== meta.generation ||
+            !meta.seeded ||
+            Number(url.searchParams.get("generation")) !== meta.generation
+          )
+            return fail("Table migration changed. Reload the settings.", 503, "table_seed_pending");
+          const { view, invalidView, columns } = this.queryInputs(url, {
+            pageId: meta.pageId,
+            workspaceId: meta.workspaceId,
+            userId: "public-publication",
+            generation: meta.generation,
+            expiresAt: Date.now() + 1000,
+          });
+          if (!view || view.ownerId || invalidView)
+            return fail("The public view is unavailable.", 404, "view_not_found");
+          const properties = new Map(columns.map((column) => [column.id, column]));
+          const group = view.columnId ? properties.get(view.columnId) : null;
+          if (
+            view.visibleColumnIds.some((propertyId) => !properties.has(propertyId)) ||
+            view.sorts.some((sort) => !properties.has(sort.columnId) || !["asc", "desc"].includes(sort.direction)) ||
+            (view.kind === "board" && (!group || !["select", "status"].includes(group.type))) ||
+            (view.kind === "calendar" && group?.type !== "date") ||
+            Object.entries(view.calculations ?? {}).some(([propertyId, kind]) => {
+              const column = properties.get(propertyId);
+              return !column || !allowedCalculationKinds(column).includes(kind);
+            })
+          )
+            return fail("The public view is unavailable.", 404, "view_not_found");
+          return Response.json({ id: view.id });
+        }
         if (path === "/public-query") {
           const meta = this.meta();
           if (!meta.seeded || meta.projectedRevision !== meta.revision || meta.repairIntent)
@@ -2457,19 +2496,20 @@ export class TableAuthority extends DurableObject<Env> {
         .bind(publicationId, generation, access, meta.pageId)
         .first();
     if (!eligible) return fail("Publication snapshot has retired.", 409, "publication_changed");
-    await registerPublicationSnapshot(this.env, {
-      handle,
-      objectId: this.ctx.id.toString(),
-      pageId: meta.pageId,
-      publicationId,
-      generation,
-      accessGeneration: access,
-      createdAt: Date.now(),
-    });
     let saved = this.rows<{ metadata: string }>("SELECT metadata FROM publication_snapshots WHERE id=?", handle)[0];
     if (!saved && url.searchParams.has("cursor"))
       return fail("The frozen table capture is unavailable. Restart this build.", 409, "publication_snapshot_missing");
     if (!saved) {
+      await registerPublicationSnapshot(this.env, {
+        handle,
+        objectId: this.ctx.id.toString(),
+        pageId: meta.pageId,
+        publicationId,
+        generation,
+        accessGeneration: access,
+        createdAt: Date.now(),
+      });
+
       const taskIds = await publicTaskRowIds(this.env, meta.pageId);
       this.ctx.storage.transactionSync(() => {
         this.requireActive();
@@ -4115,23 +4155,22 @@ export class TableAuthority extends DurableObject<Env> {
         ),
       ),
     );
+    const canonicalCells = this.rows<{ row_id: string; column_id: string; value: string; revision: number }>(
+      "SELECT row_id,column_id,value,revision FROM cells WHERE row_id IN(SELECT value FROM json_each(?))",
+      JSON.stringify(ids),
+    );
+    const byRow = new Map<string, typeof canonicalCells>();
+    for (const cell of canonicalCells) {
+      const group = byRow.get(cell.row_id) ?? [];
+      group.push(cell);
+      byRow.set(cell.row_id, group);
+    }
     const cells: ProjectionStatement[] = rows.map((row) => ({
       sql: "DELETE FROM table_cells WHERE row_id=? AND row_id IN(SELECT id FROM table_rows WHERE page_id=?) AND column_id NOT IN(SELECT value FROM json_each(?))",
-      binds: [
-        row.id,
-        meta.pageId,
-        JSON.stringify(
-          this.rows<{ column_id: string }>("SELECT column_id FROM cells WHERE row_id=?", row.id).map(
-            (cell) => cell.column_id,
-          ),
-        ),
-      ],
+      binds: [row.id, meta.pageId, JSON.stringify((byRow.get(row.id) ?? []).map((cell) => cell.column_id))],
     }));
     for (const row of rows)
-      for (const cell of this.rows<{ column_id: string; value: string; revision: number }>(
-        "SELECT * FROM cells WHERE row_id=?",
-        row.id,
-      ))
+      for (const cell of byRow.get(row.id) ?? [])
         cells.push(
           this.cellProjection(
             row.id,

@@ -24,16 +24,18 @@ export async function registerPublicationSnapshot(env: Env, input: PublicationSn
     )
     .run();
 }
+/** Shared ownership rule; retry deadlines are deliberately separate from retirement. */
+export const retiredPublicationSnapshots = `FROM publication_table_snapshots s
+  LEFT JOIN publications p ON p.id=s.publication_id AND p.generation=s.generation AND p.access_generation=s.access_generation
+  WHERE (p.id IS NULL OR p.active=0 OR p.needs_build=0)`;
 /** One bounded turn per handle; rotation prevents a large retired capture starving smaller ones. */
 export async function cleanupPublicationSnapshots(env: Env) {
   const now = Date.now();
   const rows = (
-    await env.DB.prepare(`SELECT s.handle,s.object_id FROM publication_table_snapshots s
-    LEFT JOIN publications p ON p.id=s.publication_id AND p.generation=s.generation AND p.access_generation=s.access_generation
-    WHERE s.next_attempt_at<=? AND (p.id IS NULL OR p.active=0 OR p.needs_build=0)
+    await env.DB.prepare(`SELECT s.handle,s.object_id,s.cleanup_attempts ${retiredPublicationSnapshots} AND s.next_attempt_at<=?
     ORDER BY s.next_attempt_at,s.handle LIMIT 10`)
       .bind(now)
-      .all<{ handle: string; object_id: string }>()
+      .all<{ handle: string; object_id: string; cleanup_attempts: number }>()
   ).results;
   for (const row of rows) {
     try {
@@ -41,19 +43,22 @@ export async function cleanupPublicationSnapshots(env: Env) {
       if (result.released)
         await env.DB.prepare("DELETE FROM publication_table_snapshots WHERE handle=?").bind(row.handle).run();
       else
-        await env.DB.prepare("UPDATE publication_table_snapshots SET next_attempt_at=? WHERE handle=?")
+        await env.DB.prepare(
+          "UPDATE publication_table_snapshots SET next_attempt_at=?,cleanup_attempts=0 WHERE handle=?",
+        )
           .bind(now + 5000, row.handle)
           .run();
     } catch {
-      await env.DB.prepare("UPDATE publication_table_snapshots SET next_attempt_at=? WHERE handle=?")
-        .bind(now + 60_000, row.handle)
+      await env.DB.prepare(
+        "UPDATE publication_table_snapshots SET next_attempt_at=?,cleanup_attempts=cleanup_attempts+1 WHERE handle=?",
+      )
+        .bind(now + Math.min(3_600_000, 60_000 * 2 ** Math.min(row.cleanup_attempts, 6)), row.handle)
         .run();
     }
   }
-  const backlog =
-    await env.DB.prepare(`SELECT count(*) count,min(s.created_at) oldest FROM publication_table_snapshots s
-    LEFT JOIN publications p ON p.id=s.publication_id AND p.generation=s.generation AND p.access_generation=s.access_generation
-    WHERE p.id IS NULL OR p.active=0 OR p.needs_build=0`).first<{ count: number; oldest: number | null }>();
+  const backlog = await env.DB.prepare(
+    `SELECT count(*) count,min(s.created_at) oldest ${retiredPublicationSnapshots}`,
+  ).first<{ count: number; oldest: number | null }>();
   recordMetric(env, { event: "publication.snapshots.backlog", component: "platform", backlog: backlog?.count ?? 0 });
   recordMetric(env, {
     event: "publication.snapshots.oldest",

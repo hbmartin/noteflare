@@ -246,7 +246,13 @@ describe("public publication delivery", () => {
         .first<{ id: string; payload_json: string }>();
       if (!job) break;
       const payload = JSON.parse(job.payload_json) as { documentStateKey?: string };
-      if (payload.documentStateKey) {
+      if (
+        (
+          await env.DB.prepare("SELECT build_checkpoint_json FROM publications WHERE id='site'").first<string>(
+            "build_checkpoint_json",
+          )
+        )?.includes("documentStateKey")
+      ) {
         continued++;
         generationsDuringContinuation.push(
           await env.DB.prepare("SELECT active_generation FROM publications WHERE id='site'").first("active_generation"),
@@ -304,6 +310,12 @@ describe("public publication delivery", () => {
       "cycle",
     );
     expect(await (await publicFetch("/sites/public-key")).text()).toContain("Content root");
+    const { enqueuePendingPublications } = await import("./publications");
+    await env.DB.prepare("UPDATE pages SET title='Unrelated edit' WHERE id='root'").run();
+    await enqueuePendingPublications(configured());
+    expect(await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first("generation")).toBe(
+      next.generation,
+    );
     await env.BUCKET.put(
       "projection/child",
       JSON.stringify({
@@ -316,7 +328,6 @@ describe("public publication delivery", () => {
     );
     await env.DB.prepare("UPDATE document_projections SET sequence=3 WHERE page_id='child'").run();
     await env.DB.prepare("UPDATE pages SET indexed_seq=3 WHERE id='child'").run();
-    const { enqueuePendingPublications } = await import("./publications");
     await enqueuePendingPublications(configured());
     const restarted = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
     expect(restarted.generation).toBe(next.generation + 1);
@@ -709,27 +720,57 @@ describe("platform review regressions", () => {
     const config = publicationConfig({ title: "Views", homePageId: tableId, tableViews: { [tableId]: "shared" } }, [
       tableId,
     ]);
-    await expect(validatePublicationTableViews(configured(), config, async () => true)).rejects.toMatchObject({
+    await expect(
+      validatePublicationTableViews(configured(), config, {
+        workspaceId: "workspace",
+        spaceId: "workspace-general",
+        roots: [tableId],
+      }),
+    ).rejects.toMatchObject({
       code: "table_authority_required",
     });
-    await expect(validatePublicationTableViews(configured(), config, async () => false)).rejects.toMatchObject({
+    await expect(
+      validatePublicationTableViews(configured(), config, {
+        workspaceId: "workspace",
+        spaceId: "workspace-general",
+        roots: [],
+      }),
+    ).rejects.toMatchObject({
       code: "publication_view",
     });
     await enableTableAuthority(configured(), member, tableId);
-    await expect(validatePublicationTableViews(configured(), config, async () => true)).rejects.toBeInstanceOf(Error);
+    await expect(
+      validatePublicationTableViews(configured(), config, {
+        workspaceId: "workspace",
+        spaceId: "workspace-general",
+        roots: [tableId],
+      }),
+    ).rejects.toBeInstanceOf(Error);
     await tableCommand(configured(), member, tableId, {
       operationId: crypto.randomUUID(),
       kind: "save_view",
       payload: { id: "shared", name: "Shared" },
     });
-    await expect(validatePublicationTableViews(configured(), config, async () => true)).resolves.toBeUndefined();
+    await expect(
+      validatePublicationTableViews(configured(), config, {
+        workspaceId: "workspace",
+        spaceId: "workspace-general",
+        roots: [tableId],
+      }),
+    ).resolves.toBeUndefined();
     await tableCommand(configured(), member, tableId, {
       operationId: crypto.randomUUID(),
       kind: "save_view",
       payload: { id: "personal", name: "Personal", personal: true },
     });
     config.tableViews[tableId] = "personal";
-    await expect(validatePublicationTableViews(configured(), config, async () => true)).rejects.toBeInstanceOf(Error);
+    await expect(
+      validatePublicationTableViews(configured(), config, {
+        workspaceId: "workspace",
+        spaceId: "workspace-general",
+        roots: [tableId],
+      }),
+    ).rejects.toBeInstanceOf(Error);
   });
   it("decodes JSON-valued legacy cells and their revisions within six reads", async () => {
     await insertPage(tableId, null, "table").run();
@@ -1302,4 +1343,379 @@ describe("platform review regressions", () => {
       ),
     ).toBe("a title 0");
   });
+});
+
+describe("publication recovery scheduling regressions", () => {
+  it("prunes retained obsolete views, rejects newly invalid selections, and validates canonical metadata during repair", async () => {
+    const { validatePublicationTableViews } = await import("./publications");
+    await insertPage(tableId, null, "table").run();
+    await env.DB.prepare("INSERT INTO table_state VALUES(?,1)").bind(tableId).run();
+    await enableTableAuthority(configured(), member, tableId);
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "save_view",
+      payload: { id: "shared", name: "Shared" },
+    });
+    const scope = { workspaceId: "workspace", spaceId: "workspace-general", roots: [tableId] };
+    const config = publicationConfig({ title: "Views", homePageId: tableId, tableViews: { [tableId]: "shared" } }, [
+      tableId,
+    ]);
+    await runInDurableObject(env.TABLE.getByName(tableId), (_instance, state) => {
+      const meta = JSON.parse(
+        state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+      );
+      meta.repairIntent = { generation: meta.generation, version: 2, phase: "blocked" };
+      state.storage.sql.exec("UPDATE meta SET value=? WHERE id=1", JSON.stringify(meta));
+    });
+    await expect(validatePublicationTableViews(configured(), config, scope)).resolves.toBeUndefined();
+    await runInDurableObject(env.TABLE.getByName(tableId), (_instance, state) => {
+      const view = JSON.parse(
+        state.storage.sql.exec<{ value: string }>("SELECT value FROM views WHERE id='shared'").one().value,
+      );
+      state.storage.sql.exec(
+        "UPDATE views SET value=? WHERE id='shared'",
+        JSON.stringify({ ...view, sorts: [{ columnId: "missing", direction: "asc" }] }),
+      );
+    });
+    await expect(validatePublicationTableViews(configured(), config, scope)).rejects.toMatchObject({
+      code: "publication_view",
+    });
+    await runInDurableObject(env.TABLE.getByName(tableId), (_instance, state) => {
+      const view = JSON.parse(
+        state.storage.sql.exec<{ value: string }>("SELECT value FROM views WHERE id='shared'").one().value,
+      );
+      state.storage.sql.exec("UPDATE views SET value=? WHERE id='shared'", JSON.stringify({ ...view, sorts: [] }));
+    });
+    await env.DB.prepare("UPDATE table_authority SET state='seeding' WHERE page_id=?").bind(tableId).run();
+    await expect(
+      tableInternal(configured(), tableId, "/publication-view?viewId=shared&generation=1"),
+    ).rejects.toMatchObject({ code: "table_seed_pending" });
+    await env.DB.prepare("UPDATE table_authority SET state='repairing' WHERE page_id=?").bind(tableId).run();
+    await expect(tableInternal(configured(), tableId, "/public-query?viewId=shared")).rejects.toMatchObject({
+      code: "table_projection_pending",
+    });
+    await expect(
+      tableInternal(configured(), tableId, "/publication-view?viewId=shared&generation=99"),
+    ).rejects.toMatchObject({ code: "table_seed_pending" });
+    await expect(
+      env.TABLE.getByName(tableId).fetch(
+        new Request("https://table.internal/publication-view?viewId=shared&generation=1"),
+      ),
+    ).resolves.toHaveProperty("status", 403);
+    await expect(validatePublicationTableViews(configured(), config, { ...scope, roots: [] })).rejects.toMatchObject({
+      code: "publication_view",
+    });
+    await expect(
+      validatePublicationTableViews(configured(), config, { ...scope, roots: [] }, { [tableId]: "shared" }),
+    ).resolves.toBeUndefined();
+    expect(config.tableViews).toEqual({});
+    config.tableViews[tableId] = "shared";
+    await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(tableId).run();
+    await validatePublicationTableViews(configured(), config, scope, { [tableId]: "shared" });
+    expect(config.tableViews).toEqual({});
+  });
+  it("validates 200 views using one scope read and at most four metadata requests concurrently", async () => {
+    const { validatePublicationTableViews } = await import("./publications");
+    await insertPage("scope-root").run();
+    const ids = Array.from({ length: 200 }, (_, i) => `scope-${i}`);
+    for (let i = 0; i < ids.length; i += 50)
+      await env.DB.batch(ids.slice(i, i + 50).map((id) => insertPage(id, "scope-root", "table")));
+    await env.DB.prepare(
+      "INSERT INTO table_authority(page_id,state) SELECT id,'do' FROM pages WHERE kind='table'",
+    ).run();
+    let running = 0,
+      maximum = 0,
+      calls = 0;
+    const table = {
+      getByName: () => ({
+        fetch: async (request: Request) => {
+          expect(new URL(request.url).pathname).toBe("/publication-view");
+          calls++;
+          maximum = Math.max(maximum, ++running);
+          await new Promise<void>((resolve) => setTimeout(resolve, 1));
+          running--;
+          return Response.json({ id: "shared" });
+        },
+      }),
+    } as unknown as Env["TABLE"];
+    const counter = countedD1(env.DB);
+    await validatePublicationTableViews(
+      { ...configured(), TABLE: table, DB: counter.database },
+      publicationConfig(
+        { title: "Many", homePageId: "scope-root", tableViews: Object.fromEntries(ids.map((id) => [id, "shared"])) },
+        ["scope-root"],
+      ),
+      { workspaceId: "workspace", spaceId: "workspace-general", roots: ["scope-root"] },
+    );
+    expect(calls).toBe(200);
+    expect(maximum).toBe(4);
+    expect(counter.statements).toHaveLength(1);
+  });
+  it("records initialization failures and does not restart them after unrelated content edits", async () => {
+    await fixturePublication();
+    await env.DB.prepare("UPDATE pages SET title='Rebuild' WHERE id='root'").run();
+    const current = () => env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>();
+    const pending = (await current())!;
+    const bindings = configured();
+    delete bindings.PUBLICATIONS_BUCKET;
+    await expect(
+      processPublicationBuildJob(bindings, { publicationId: "site", generation: pending.generation }),
+    ).rejects.toThrow("bucket");
+    expect((await current())!.build_error).toContain("optional bindings");
+    expect(JSON.parse((await current())!.build_failure_json!).kind).toBe("transient");
+    await env.DB.prepare("UPDATE pages SET title='More edits' WHERE id='child'").run();
+    const { enqueuePendingPublications } = await import("./publications");
+    await enqueuePendingPublications(configured());
+    expect((await current())!.generation).toBe(pending.generation);
+    await env.DB.prepare("UPDATE publications SET active=0 WHERE id='site'").run();
+    expect((await current())!.build_error).toBeNull();
+    expect((await current())!.build_failure_json).toBeNull();
+  });
+  it("commits replacement job intent with retirement and activation, preserving a predecessor lease", async () => {
+    await fixturePublication();
+    await env.DB.prepare("UPDATE pages SET title='Next' WHERE id='root'").run();
+    const pub = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    await env.DB.prepare("UPDATE platform_jobs SET lease_token='previous',lease_until=? WHERE job_key='site'")
+      .bind(Date.now() + 60000)
+      .run();
+    const { retirePublicationBuild } = await import("./publication-jobs");
+    await retirePublicationBuild(configured(), pub, "authority");
+    expect(
+      await env.DB.prepare("SELECT generation,lease_token FROM platform_jobs WHERE job_key='site'").first(),
+    ).toEqual({ generation: String(pub.generation + 1), lease_token: "previous" });
+    await env.DB.prepare("UPDATE platform_jobs SET lease_until=NULL,lease_token=NULL").run();
+    const { recoverPlatformJobs } = await import("./platform-jobs");
+    const handlers = {
+      publication: async (jobEnv: Env, job: { payload: unknown }) => processPublicationBuildJob(jobEnv, job.payload),
+    };
+    await env.DB.prepare("DELETE FROM platform_jobs WHERE kind<>'publication'").run();
+    await recoverPlatformJobs(configured(), handlers, 1);
+    await env.DB.prepare("UPDATE pages SET title='Newer during build' WHERE id='child'").run();
+    await env.DB.prepare("DELETE FROM platform_jobs WHERE kind<>'publication'").run();
+    for (let i = 0; i < 6; i++) await recoverPlatformJobs(configured(), handlers, 1);
+    const done = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(done.active_generation).toBeGreaterThanOrEqual(pub.generation + 1);
+    expect((await publicFetch("/sites/public-key")).status).toBe(200);
+  });
+  it("invalidates publication ordering without access changes or private-page writes", async () => {
+    const pub = await fixturePublication();
+    await env.DB.prepare("UPDATE pages SET position='z' WHERE id='outside'").run();
+    expect(await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first("generation")).toBe(
+      pub.generation,
+    );
+    await env.DB.prepare("UPDATE pages SET position='z' WHERE id='root'").run();
+    const next = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(next.generation).toBe(pub.generation + 1);
+    expect(next.access_generation).toBe(pub.access_generation);
+    await processPublicationBuildJob(configured(), { publicationId: "site", generation: next.generation });
+    await processPublicationBuildJob(configured(), { publicationId: "site", generation: next.generation });
+    const html = await (await publicFetch("/sites/public-key")).text();
+    expect(html.indexOf(">child</a>")).toBeLessThan(html.indexOf(">root</a>"));
+  });
+});
+
+it("records a first-update failure and malformed checkpoint without masking the original error", async () => {
+  await fixturePublication();
+  await env.DB.prepare("UPDATE pages SET title='Start again' WHERE id='root'").run();
+  const generation = (await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first<number>(
+    "generation",
+  ))!;
+  let fail = true;
+  const problem = new Error("initialization failed");
+  const database = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (sql.startsWith("UPDATE publications SET build_content_version="))
+            return new Proxy(statement, {
+              get(original, method) {
+                if (method === "bind")
+                  return (...args: unknown[]) => {
+                    const bound = original.bind(...args);
+                    return new Proxy(bound, {
+                      get(item, operation) {
+                        if (operation === "run")
+                          return async () => {
+                            if (fail) {
+                              fail = false;
+                              throw problem;
+                            }
+                            return item.run();
+                          };
+                        const value = Reflect.get(item, operation);
+                        return typeof value === "function" ? value.bind(item) : value;
+                      },
+                    });
+                  };
+                const value = Reflect.get(original, method);
+                return typeof value === "function" ? value.bind(original) : value;
+              },
+            });
+          return statement;
+        };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await expect(
+    processPublicationBuildJob({ ...configured(), DB: database }, { publicationId: "site", generation }),
+  ).rejects.toBe(problem);
+  expect(
+    await env.DB.prepare("SELECT build_error FROM publications WHERE id='site'").first("build_error"),
+  ).toBeTruthy();
+  await env.DB.prepare(
+    "UPDATE publications SET build_content_version=content_version,build_checkpoint_json='null' WHERE id='site'",
+  ).run();
+  await expect(processPublicationBuildJob(configured(), { publicationId: "site", generation })).rejects.toMatchObject({
+    code: "publication_checkpoint_invalid",
+  });
+  expect(
+    JSON.parse(
+      (await env.DB.prepare("SELECT build_failure_json FROM publications WHERE id='site'").first<string>(
+        "build_failure_json",
+      ))!,
+    ).kind,
+  ).toBe("configuration");
+});
+it("upgrades a legacy failed capture once and then waits for its relevant source to change", async () => {
+  await fixturePublication();
+  await env.DB.prepare("UPDATE pages SET title='Rebuild' WHERE id='root'").run();
+  const pub = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+  const cyclic = {
+    type: "doc",
+    content: [
+      {
+        type: "blockContainer",
+        attrs: { id: "loop" },
+        content: [
+          { type: "syncedBlockSource", attrs: { blockId: "loop" } },
+          {
+            type: "blockGroup",
+            content: [{ type: "syncedBlockReference", attrs: { sourcePageId: "root", blockId: "loop" } }],
+          },
+        ],
+      },
+    ],
+  };
+  await env.BUCKET.put(`publications/site/${pub.generation}/root/source.json`, JSON.stringify(cyclic));
+  await processPublicationBuildJob(configured(), { publicationId: "site", generation: pub.generation });
+  await expect(
+    processPublicationBuildJob(configured(), { publicationId: "site", generation: pub.generation }),
+  ).rejects.toThrow("cycle");
+  const { enqueuePendingPublications } = await import("./publications");
+  await enqueuePendingPublications(configured());
+  const next = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+  expect(next.generation).toBe(pub.generation + 1);
+  await env.BUCKET.put(
+    "projection/root",
+    JSON.stringify({ schemaVersion: 1, pageId: "root", contentEpoch: 1, sequence: 1, document: cyclic }),
+  );
+  await processPublicationBuildJob(configured(), { publicationId: "site", generation: next.generation });
+  await expect(
+    processPublicationBuildJob(configured(), { publicationId: "site", generation: next.generation }),
+  ).rejects.toThrow("cycle");
+  const failed = (await env.DB.prepare("SELECT build_failure_json FROM publications WHERE id='site'").first<string>(
+    "build_failure_json",
+  ))!;
+  expect(JSON.parse(failed)).toMatchObject({ kind: "content", legacy: false });
+  await env.DB.prepare("UPDATE pages SET title='Unrelated child' WHERE id='child'").run();
+  await enqueuePendingPublications(configured());
+  expect(await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first("generation")).toBe(
+    next.generation,
+  );
+});
+
+it("registers a table capture once and performs no registry writes on continuation reads", async () => {
+  const { stub } = await formFixture();
+  await runInDurableObject(stub, (_instance, state) => {
+    for (let i = 0; i < 201; i++)
+      state.storage.sql.exec("INSERT INTO rows VALUES(?,?,1,'owner',1,'owner',NULL)", `registry-row-${i}`, i);
+  });
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,created_by,created_at,updated_at) VALUES('registry-site','workspace','workspace-general','registry-key',?,1,'owner',1,1)",
+    ).bind(JSON.stringify(publicationConfig({ title: "Registry", homePageId: tableId }, [tableId]))),
+    env.DB.prepare("INSERT INTO publication_roots VALUES('registry-site',?)").bind(tableId),
+  ]);
+  await processPublicationBuildJob(configured(), { publicationId: "registry-site", generation: 1 });
+  await runInDurableObject(stub, async (instance) => {
+    const internal = instance as unknown as { env: Env; publicationSnapshot: (url: URL) => Promise<TableQueryResult> };
+    const original = internal.env;
+    const count = countedD1(env.DB);
+    internal.env = { ...original, DB: count.database };
+    try {
+      const checkpoint = JSON.parse(
+        (await env.DB.prepare("SELECT build_checkpoint_json FROM publications WHERE id='registry-site'").first<string>(
+          "build_checkpoint_json",
+        ))!,
+      );
+      const url = new URL("https://table.internal/publication-snapshot");
+      for (const [key, value] of Object.entries({
+        handle: checkpoint.tableSource.handle,
+        publicationId: "registry-site",
+        publicationGeneration: "1",
+        accessGeneration: "1",
+        cursor: checkpoint.tableCursor,
+      }))
+        url.searchParams.set(key, String(value));
+      const second = await internal.publicationSnapshot(url);
+      expect(second.rows).toHaveLength(100);
+      url.searchParams.set("cursor", second.nextCursor!);
+      expect((await internal.publicationSnapshot(url)).rows).toHaveLength(1);
+      expect(count.statements.some((sql) => sql.includes("INSERT OR IGNORE INTO publication_table_snapshots"))).toBe(
+        false,
+      );
+    } finally {
+      internal.env = original;
+    }
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) n FROM publication_table_snapshots WHERE publication_id='registry-site'",
+    ).first("n"),
+  ).toBe(1);
+});
+
+it("keeps table-readiness failures at their checkpoint through unrelated edits", async () => {
+  const { stub } = await formFixture();
+  await fixturePublication();
+  await env.DB.prepare("UPDATE pages SET parent_id='root',position='z' WHERE id=?").bind(tableId).run();
+  const generation = (await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first<number>(
+    "generation",
+  ))!;
+  await processPublicationBuildJob(configured(), { publicationId: "site", generation });
+  await processPublicationBuildJob(configured(), { publicationId: "site", generation });
+  await runInDurableObject(stub, (_instance, state) => {
+    const meta = JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value);
+    meta.repairIntent = { generation: meta.generation, version: 2, phase: "blocked" };
+    state.storage.sql.exec("UPDATE meta SET value=? WHERE id=1", JSON.stringify(meta));
+  });
+  const { enqueuePendingPublications } = await import("./publications");
+  const checkpoints: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    await expect(processPublicationBuildJob(configured(), { publicationId: "site", generation })).rejects.toMatchObject(
+      { code: "table_projection_pending" },
+    );
+    const failed = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(JSON.parse(failed.build_failure_json!).kind).toBe("transient");
+    checkpoints.push(failed.build_checkpoint_json!);
+    await env.DB.prepare("UPDATE pages SET title=? WHERE id='child'").bind(`New edit ${i}`).run();
+    await enqueuePendingPublications(configured());
+    expect(await env.DB.prepare("SELECT generation FROM publications WHERE id='site'").first("generation")).toBe(
+      generation,
+    );
+  }
+  expect(new Set(checkpoints).size).toBe(1);
+  expect(JSON.parse(checkpoints[0]!).offset).toBe(2);
+  await runInDurableObject(stub, async (instance, state) => {
+    const meta = JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value);
+    delete meta.repairIntent;
+    state.storage.sql.exec("UPDATE meta SET value=? WHERE id=1", JSON.stringify(meta));
+    await (instance as unknown as { project: () => Promise<unknown> }).project();
+  });
+  await processPublicationBuildJob(configured(), { publicationId: "site", generation });
+  expect(
+    await env.DB.prepare("SELECT active_generation FROM publications WHERE id='site'").first("active_generation"),
+  ).toBe(generation);
 });

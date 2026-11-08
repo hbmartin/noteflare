@@ -36,14 +36,14 @@ async function alarmAt(phase: number, overrides: Partial<Env>) {
 }
 
 describe("audit maintenance wakeups", () => {
-  it("keeps cycling for retired snapshot batches and backoff even with optional services disabled", async () => {
+  it("sleeps until retired snapshot cleanup is due even with optional services disabled", async () => {
     await env.DB.prepare(
-      "INSERT INTO publication_table_snapshots VALUES('retired','object','gone-page','gone-publication',1,1,1,?)",
+      "INSERT INTO publication_table_snapshots(handle,object_id,page_id,publication_id,generation,access_generation,created_at,next_attempt_at) VALUES('retired','object','gone-page','gone-publication',1,1,1,?)",
     )
       .bind(Date.now() + 60_000)
       .run();
     expect(await env.DB.prepare("SELECT 1 FROM platform_jobs LIMIT 1").first()).toBeNull();
-    expect((await alarmAt(10, {})).alarm).toBeGreaterThanOrEqual(Date.now());
+    expect((await alarmAt(10, {})).alarm).toBeGreaterThan(Date.now() + 55_000);
     await env.DB.prepare("DELETE FROM publication_table_snapshots").run();
     expect((await alarmAt(10, {})).alarm).toBeNull();
   });
@@ -92,4 +92,59 @@ describe("audit maintenance wakeups", () => {
     expect(put).toHaveBeenCalledOnce();
     expect(await env.DB.prepare("SELECT archive_id FROM audit_events").first("archive_id")).toBeNull();
   });
+});
+
+it("pulls a distant retry alarm forward when new work arrives", async () => {
+  const stub = env.PLATFORM!.getByName("maintenance");
+  await runInDurableObject(stub, async (instance, state) => {
+    await state.storage.setAlarm(Date.now() + 3_600_000);
+    await instance.wake();
+    expect(await state.storage.getAlarm()).toBeLessThanOrEqual(Date.now() + 1000);
+    await state.storage.deleteAlarm();
+  });
+});
+it("accounts for active job leases when choosing the next maintenance deadline", async () => {
+  const lease = Date.now() + 300_000;
+  await env.DB.prepare(
+    "INSERT INTO platform_jobs(id,workspace_id,kind,job_key,generation,payload_json,available_at,created_at,updated_at,lease_until) VALUES('leased','workspace','publication','site','1','{}',0,0,0,?)",
+  )
+    .bind(lease)
+    .run();
+  expect((await alarmAt(10, {})).alarm).toBe(lease);
+});
+it("backs off failed snapshot releases persistently without running full cycles every five seconds", async () => {
+  const { cleanupPublicationSnapshots } = await import("./publication-snapshots");
+  await env.DB.prepare(
+    "INSERT INTO publication_table_snapshots(handle,object_id,page_id,publication_id,generation,access_generation,created_at) VALUES('failed','object','gone','gone',1,1,1)",
+  ).run();
+  let calls = 0;
+  const table = {
+    idFromString: () => ({}),
+    get: () => ({
+      releasePublicationSnapshot: async () => {
+        calls++;
+        throw new Error("unavailable");
+      },
+    }),
+  } as unknown as Env["TABLE"];
+  const configured = { ...env, TABLE: table } as Env;
+  const start = Date.now();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+  try {
+    for (let i = 0; i < 8; i++) {
+      const now = Date.now();
+      await cleanupPublicationSnapshots(configured);
+      const row = (await env.DB.prepare(
+        "SELECT next_attempt_at,cleanup_attempts FROM publication_table_snapshots",
+      ).first<{ next_attempt_at: number; cleanup_attempts: number }>())!;
+      expect(row.cleanup_attempts).toBe(i + 1);
+      expect(row.next_attempt_at - now).toBe(Math.min(3_600_000, 60_000 * 2 ** i));
+      expect((await alarmAt(10, {})).alarm).toBe(row.next_attempt_at);
+      await cleanupPublicationSnapshots(configured);
+      expect(calls).toBe(i + 1);
+      clock.mockReturnValue(row.next_attempt_at);
+    }
+  } finally {
+    clock.mockRestore();
+  }
 });

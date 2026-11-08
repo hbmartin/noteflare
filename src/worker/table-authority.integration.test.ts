@@ -2521,6 +2521,11 @@ describe("per-table authority", () => {
         "WITH RECURSIVE n(value) AS (SELECT 0 UNION ALL SELECT value+1 FROM n WHERE value<249) INSERT INTO table_select_options(id,column_id,label,color,position) SELECT printf('header-option-%03d',value),'many-options',printf('Option %d',value),'gray',value FROM n",
       ),
     ]);
+    await env.DB.prepare(
+      "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('late-header',?,'Late header','text',1)",
+    )
+      .bind(pageId)
+      .run();
     await enableTableAuthority(env, member, pageId);
     await changeProjection(pageId, [
       { sql: "UPDATE table_select_options SET label='Unrepaired' WHERE column_id='many-options'", binds: [] },
@@ -2558,11 +2563,35 @@ describe("per-table authority", () => {
       }
     });
     expect(requests).toBeLessThan(30);
+    expect(
+      await env.DB.prepare("SELECT name_key FROM table_columns WHERE id='late-header'").first("name_key"),
+    ).toBeNull();
+    await expect(write(pageId, member, "save_view", { name: "Blocked during headers" })).rejects.toMatchObject({
+      code: "table_projection_repairing",
+    });
+    await expect(env.DB.prepare("UPDATE table_columns SET name='Unsafe' WHERE id='late-header'").run()).rejects.toThrow(
+      "table_authority_required",
+    );
     const published = await env.DB.prepare(
       "SELECT count(*) count FROM table_select_options WHERE column_id='many-options' AND label<>'Unrepaired'",
     ).first<{ count: number }>();
     expect(published!.count).toBeGreaterThan(0);
     expect(published!.count).toBeLessThanOrEqual(100);
+    const other = await fixture();
+    await changeProjection(pageId, [
+      { sql: "UPDATE table_columns SET page_id=? WHERE id='late-header'", binds: [other.pageId] },
+    ]);
+    await finishAlarmRepair(pageId);
+    expect((await tableRepairStatus(env, pageId)).state).toBe("blocked");
+    await expect(write(pageId, member, "save_view", { name: "Still blocked" })).rejects.toMatchObject({
+      code: "table_projection_repairing",
+    });
+    expect(
+      await env.DB.prepare("SELECT name_key FROM table_columns WHERE id='late-header'").first("name_key"),
+    ).toBeNull();
+    await changeProjection(pageId, [
+      { sql: "UPDATE table_columns SET page_id=? WHERE id='late-header'", binds: [pageId] },
+    ]);
     await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
       const meta = JSON.parse(
         state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
@@ -2571,8 +2600,17 @@ describe("per-table authority", () => {
       state.storage.sql.exec("UPDATE meta SET value=? WHERE id=1", JSON.stringify(meta));
     });
     await evictDurableObject(env.TABLE.getByName(pageId));
+    await requestRepairTableProjection(env, member, pageId);
     await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM table_columns WHERE page_id=? AND name_key IS NULL")
+        .bind(pageId)
+        .first("count"),
+    ).toBe(0);
+    expect(await env.DB.prepare("SELECT name_key FROM table_columns WHERE id='late-header'").first("name_key")).toBe(
+      "late header",
+    );
   });
   it("checkpoints discarded pure SQL only at bounded traversal boundaries", async () => {
     const { pageId, member } = await fixture();
@@ -4198,5 +4236,31 @@ it("uses the live role rather than captured owner privileges before looking up r
   await expect(tableReceiptCoverage(env, member, pageId, "receipt")).rejects.toMatchObject({
     status: 404,
     code: "page_not_found",
+  });
+});
+
+it("loads canonical repair cells once for an entire row batch", async () => {
+  const { pageId, member } = await fixture();
+  await enableTableAuthority(env, member, pageId);
+  await write(pageId, member, "create_column", { id: "title", name: "Title", type: "text" });
+  await write(pageId, member, "create_row", { id: "one", values: { title: null } });
+  await write(pageId, member, "create_row", { id: "two", values: { title: "Two" } });
+  await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+    const internal = instance as unknown as {
+      rows: (sql: string, ...binds: (string | number | null)[]) => unknown[];
+      repairRowsStatements: (rows: unknown[]) => Promise<unknown>;
+    };
+    const original = internal.rows;
+    let reads = 0;
+    internal.rows = function (sql, ...binds) {
+      if (/FROM cells\b/.test(sql)) reads++;
+      return original.call(this, sql, ...binds);
+    };
+    try {
+      await internal.repairRowsStatements(state.storage.sql.exec("SELECT * FROM rows ORDER BY id").toArray());
+      expect(reads).toBe(1);
+    } finally {
+      internal.rows = original;
+    }
   });
 });

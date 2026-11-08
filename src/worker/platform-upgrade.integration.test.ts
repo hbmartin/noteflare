@@ -35,7 +35,7 @@ it("0112 retires old continuations once and keeps active output and cleanup inte
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
   expect(await current()).toEqual(expected);
   await env.DB.prepare(
-    "INSERT INTO publication_table_snapshots VALUES('handle','object','deleted-page','site',8,3,1,0)",
+    "INSERT INTO publication_table_snapshots(handle,object_id,page_id,publication_id,generation,access_generation,created_at,next_attempt_at) VALUES('handle','object','deleted-page','site',8,3,1,0)",
   ).run();
   await env.DB.prepare("DELETE FROM publications WHERE id='site'").run();
   expect(await env.DB.prepare("SELECT handle FROM publication_table_snapshots").first("handle")).toBe("handle");
@@ -119,4 +119,45 @@ it("0111 preserves old publications, form intent, and artifacts while retaining 
   expect(
     await env.DB.prepare("SELECT access_generation FROM publications WHERE id='site'").first("access_generation"),
   ).toBe(5);
+});
+
+it("0113 preserves healthy captures and manifests while new generations atomically acquire work", async () => {
+  await reset();
+  await applyD1Migrations(
+    env.DB,
+    env.TEST_MIGRATIONS!.filter((m) => m.name < "0113"),
+  );
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','upgrade13@test.example',1,1)",
+    ),
+    env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Upgrade',1)"),
+    env.DB.prepare(
+      "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,generation,access_generation,active_generation,active_access_generation,manifest_key,needs_build,build_content_version,content_version,build_checkpoint_json,created_by,created_at,updated_at) VALUES('site','workspace','workspace-general','key','{}',1,8,3,7,3,'active',1,4,5,'{\"version\":2,\"offset\":2}', 'owner',1,1)",
+    ),
+  ]);
+  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,access_generation,active_generation,manifest_key,build_checkpoint_json FROM publications WHERE id='site'",
+    ).first(),
+  ).toEqual({
+    generation: 8,
+    access_generation: 3,
+    active_generation: 7,
+    manifest_key: "active",
+    build_checkpoint_json: '{"version":2,"offset":2}',
+  });
+  await env.DB.prepare(
+    "UPDATE publications SET build_error='old',build_failure_checkpoint_json=build_checkpoint_json,build_failure_json='{\"kind\":\"content\"}' WHERE id='site'",
+  ).run();
+  await env.DB.prepare(
+    "UPDATE publications SET generation=generation+1,build_checkpoint_json=NULL WHERE id='site'",
+  ).run();
+  expect(
+    await env.DB.prepare("SELECT generation,build_error,build_failure_json FROM publications WHERE id='site'").first(),
+  ).toEqual({ generation: 9, build_error: null, build_failure_json: null });
+  expect(
+    await env.DB.prepare("SELECT generation,payload_json FROM platform_jobs WHERE job_key='site'").first(),
+  ).toEqual({ generation: "9", payload_json: '{"publicationId":"site","generation":9}' });
 });

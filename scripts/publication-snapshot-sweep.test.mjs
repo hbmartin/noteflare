@@ -71,3 +71,48 @@ it("keeps the temporary worker authenticated and invokes only the bound reconcil
   );
   expect(await response.json()).toEqual({ next: null });
 });
+
+it("reconciles idle and orphaned objects across every inventory page before declaring completion", async () => {
+  const accountId = "a".repeat(32),
+    namespaceId = "b".repeat(32),
+    idle = "c".repeat(64),
+    orphan = "d".repeat(64);
+  const checkpoint = { version: 1, accountId, namespaceId, complete: false };
+  const pages = [],
+    objects = [],
+    saved = [];
+  const total = await sweepSnapshots({
+    accountId,
+    namespaceId,
+    endpoint: "http://127.0.0.1:8789",
+    apiToken: "private-api",
+    sweepToken: "private-sweep".repeat(4),
+    checkpoint,
+    save: async (state) => saved.push(structuredClone(state)),
+    fetcher: async (url, options) => {
+      if (String(url).startsWith("https:")) {
+        const cursor = new URL(url).searchParams.get("cursor");
+        pages.push(cursor);
+        return Response.json(
+          cursor
+            ? { success: true, result: [{ id: orphan, hasStoredData: true }], result_info: {} }
+            : {
+                success: true,
+                result: [
+                  { id: idle, hasStoredData: true },
+                  { id: "e".repeat(64), hasStoredData: false },
+                ],
+                result_info: { cursor: "second" },
+              },
+        );
+      }
+      objects.push(JSON.parse(options.body).objectId);
+      return Response.json({ next: null });
+    },
+  });
+  expect(pages).toEqual([null, "second"]);
+  expect(objects).toEqual([idle, orphan]);
+  expect(total).toBe(2);
+  expect(saved.at(-1)).toMatchObject({ complete: true, completedObjects: 2, accountId, namespaceId });
+  expect(saved.slice(0, -1).every((state) => !state.complete)).toBe(true);
+});

@@ -1,3 +1,4 @@
+import { retiredPublicationSnapshots } from "./publication-snapshots";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { recoverPlatformJobs, type PlatformHandlers } from "./platform-jobs";
@@ -45,7 +46,9 @@ export class PlatformCoordinator extends DurableObject<Env> {
     return authorizeAiGeneration(this.env, input);
   }
   async wake() {
-    if ((await this.ctx.storage.getAlarm()) === null) await this.ctx.storage.setAlarm(Date.now() + 1000);
+    const next = Date.now() + 1000,
+      current = await this.ctx.storage.getAlarm();
+    if (current === null || current > next) await this.ctx.storage.setAlarm(next);
   }
   // fallow-ignore-next-line unused-class-member -- Called by the Cloudflare Durable Object alarm runtime.
   async alarm() {
@@ -95,19 +98,28 @@ export class PlatformCoordinator extends DurableObject<Env> {
       });
     }
     await this.ctx.storage.put("phase", (phase + 1) % 11);
-    // Short cycles while work is pending; idle installs only run on cron wakeup.
-    const pending =
-      phase < 10 ||
-      (await this.env.DB.prepare(`SELECT 1 WHERE EXISTS(SELECT 1 FROM platform_jobs LIMIT 1)
-        OR EXISTS(SELECT 1 FROM publication_table_snapshots snapshot LEFT JOIN publications publication
-          ON publication.id=snapshot.publication_id AND publication.generation=snapshot.generation
-          AND publication.access_generation=snapshot.access_generation
-          WHERE publication.id IS NULL OR publication.active=0 OR publication.needs_build=0 LIMIT 1)
-        OR (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE archive_id IS NULL LIMIT 1))
-        OR (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE basin_exported_at IS NULL LIMIT 1))`)
-        .bind(this.env.AUDIT_ENABLED === "true" ? 1 : 0, this.env.BASIN_ENABLED === "true" ? 1 : 0)
-        .first());
-    if (pending) await this.ctx.storage.setAlarm(Date.now() + 5000);
+    if (phase < 10) {
+      await this.ctx.storage.setAlarm(Date.now() + 5000);
+      return;
+    }
+    const now = Date.now();
+    const next = await this.env.DB.prepare(`SELECT min(due) due FROM (
+      SELECT max(available_at,coalesce(lease_until,0)) due FROM platform_jobs
+      UNION ALL SELECT s.next_attempt_at due ${retiredPublicationSnapshots}
+      UNION ALL SELECT ? due FROM publications p WHERE ?=1 AND p.active=1 AND p.needs_build=1
+        AND NOT EXISTS(SELECT 1 FROM platform_jobs j WHERE j.kind='publication' AND j.generation=CAST(p.generation AS TEXT)
+          AND json_extract(j.payload_json,'$.publicationId')=p.id)
+      UNION ALL SELECT ? due WHERE (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE archive_id IS NULL LIMIT 1))
+        OR (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE basin_exported_at IS NULL LIMIT 1)))`)
+      .bind(
+        now,
+        this.env.PUBLIC_PUBLISHING_ENABLED === "true" ? 1 : 0,
+        now,
+        this.env.AUDIT_ENABLED === "true" ? 1 : 0,
+        this.env.BASIN_ENABLED === "true" ? 1 : 0,
+      )
+      .first<{ due: number | null }>();
+    if (next?.due !== null && next?.due !== undefined) await this.ctx.storage.setAlarm(Math.max(now + 5000, next.due));
   }
 }
 

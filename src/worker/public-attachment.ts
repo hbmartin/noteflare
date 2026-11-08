@@ -1,3 +1,4 @@
+import { rasterImageMime, IMAGE_DERIVATIVE_MAX_BYTES } from "./image-policy";
 import type { Env } from "./env";
 import { isInlineMime } from "./attachments";
 import { attachmentDisposition } from "./http";
@@ -13,7 +14,7 @@ export async function deliverPublicAttachment(
   preset?: ImagePreset,
   focal = { x: 0.5, y: 0.5 },
 ): Promise<Response | null> {
-  if (preset && (!/^image\/(png|jpeg|webp|avif|gif)$/.test(attachment.mime) || attachment.size > 20 * 1024 * 1024))
+  if (preset && (!rasterImageMime(attachment.mime) || attachment.size > IMAGE_DERIVATIVE_MAX_BYTES))
     return (await import("./images")).imagePlaceholder();
   if (publicImagesEnabled(env) && (preset || attachment.mime.startsWith("image/")))
     return (await import("./images")).imageDerivative(env, attachment.id, preset ?? "preview-v1", focal);
