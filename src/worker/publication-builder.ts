@@ -193,9 +193,24 @@ async function buildPublication(env: Env, payload: unknown) {
           )
             .bind(page.id, page.content_epoch)
             .first<{ thumbnail_r2_key: string }>();
-          if (!projection) throw new Error("Diagram is awaiting compaction.");
+          if (!projection) {
+            const epoch = await env.DB.prepare("SELECT content_epoch FROM pages WHERE id=?")
+              .bind(page.id)
+              .first<number>("content_epoch");
+            if (epoch !== page.content_epoch)
+              throw new PublicationContentError("A diagram capture needs a new revision.", [
+                {
+                  pageId: page.id,
+                  contentEpoch: page.content_epoch,
+                  sequence: page.indexed_seq,
+                  key: null,
+                  comparison: "epoch",
+                },
+              ]);
+            throw new HttpError(503, "publication_projection_pending", "A diagram is awaiting compaction.");
+          }
           const image = await env.BUCKET.get(projection.thumbnail_r2_key);
-          if (!image) throw new Error("Diagram image unavailable.");
+          if (!image) throw new HttpError(503, "publication_projection_pending", "A diagram image is unavailable.");
           await putPublicationObject(env, pub, diagramKey, image.body, {
             onlyIf: { etagDoesNotMatch: "*" },
             httpMetadata: { contentType: "image/svg+xml" },

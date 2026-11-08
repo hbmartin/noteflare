@@ -1,4 +1,5 @@
 import { retiredPublicationSnapshots } from "./publication-snapshots";
+import { restartablePublicationFailure } from "./publication-failure";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { recoverPlatformJobs, type PlatformHandlers } from "./platform-jobs";
@@ -109,9 +110,12 @@ export class PlatformCoordinator extends DurableObject<Env> {
       UNION ALL SELECT ? due FROM publications p WHERE ?=1 AND p.active=1 AND p.needs_build=1
         AND NOT EXISTS(SELECT 1 FROM platform_jobs j WHERE j.kind='publication' AND j.generation=CAST(p.generation AS TEXT)
           AND json_extract(j.payload_json,'$.publicationId')=p.id)
+      UNION ALL SELECT ? due FROM publications p WHERE ?=1 AND ${restartablePublicationFailure}
       UNION ALL SELECT ? due WHERE (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE archive_id IS NULL LIMIT 1))
         OR (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE basin_exported_at IS NULL LIMIT 1)))`)
       .bind(
+        now,
+        this.env.PUBLIC_PUBLISHING_ENABLED === "true" ? 1 : 0,
         now,
         this.env.PUBLIC_PUBLISHING_ENABLED === "true" ? 1 : 0,
         now,

@@ -154,6 +154,19 @@ Pricing references: [Workers](https://developers.cloudflare.com/workers/platform
 
 ## Acceptance and rollback
 
+### Diagram recovery and settings saves
+
+The recovery patch needs no migration beyond 0113 and does not reset existing checkpoints. Deploy the application
+Worker with its bundled client. Publication settings saves now return normalized configuration and stored roots
+alongside the existing response fields; the client updates its site cache without a follow-up GET. Site and space
+selection stays locked during the save, while the remaining fields stay editable.
+
+An uncaptured diagram whose frozen epoch no longer exists becomes a captured-content failure and acquires a fresh
+generation through the existing guarded recovery path. Already captured images remain immutable. Current-epoch
+projection/image readiness failures retain their checkpoint and backoff; older transient failures are reclassified
+on their next scheduled retry. Restartable content failures keep maintenance runnable even when their old job has
+a future retry deadline. Active manifests, access generations, leases and snapshot cleanup deadlines remain intact.
+
 ### Publication recovery follow-up (migration 0113)
 
 Treat 0112 as applied. Pause builders and drain in-flight work, apply `0113_publication_recovery.sql`, deploy the

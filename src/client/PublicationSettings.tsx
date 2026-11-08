@@ -36,6 +36,7 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
     [hostname, setHostname] = useState(""),
     [url, setUrl] = useState(""),
     [busy, setBusy] = useState(false),
+    [saving, setSaving] = useState(false),
     [error, setError] = useState(""),
     [loaded, setLoaded] = useState(false),
     [views, setViews] = useState<Record<string, TableView[]>>({});
@@ -100,6 +101,7 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
       submittedSpace = spaceId,
       submittedSite = siteId;
     setBusy(true);
+    setSaving(true);
     setError("");
     try {
       const result = await api<{ publication: Site; url: string }>(`/api/spaces/${spaceId}/publications`, {
@@ -107,28 +109,27 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
         body: json({ id: siteId || undefined, generation, roots, config, active }),
       });
       if (selection.current.spaceId !== submittedSpace || selection.current.siteId !== submittedSite) return;
+      const stored = result.publication;
+      setSites((current) =>
+        current.some((site) => site.id === stored.id)
+          ? current.map((site) => (site.id === stored.id ? stored : site))
+          : [...current, stored],
+      );
       setSiteId(result.publication.id);
       setGeneration(result.publication.generation);
       setUrl(result.url);
-      const updated = await api<{ publications: Site[] }>(`/api/spaces/${spaceId}/publications`);
-      if (
-        selection.current.spaceId !== submittedSpace ||
-        ![submittedSite, result.publication.id].includes(selection.current.siteId)
-      )
-        return;
-      setSites(updated.publications);
-      const stored = updated.publications.find((site) => site.id === result.publication.id);
-      if (stored)
-        setConfig((current) => {
-          if (current === submitted) return stored.config;
-          const tableViews = { ...current.tableViews };
-          for (const [id, view] of Object.entries(submitted.tableViews))
-            if (tableViews[id] === view && !(id in stored.config.tableViews)) delete tableViews[id];
-          return { ...current, tableViews };
-        });
+      setConfig((current) => {
+        if (current === submitted) return stored.config;
+        const tableViews = { ...current.tableViews };
+        for (const [id, view] of Object.entries(submitted.tableViews))
+          if (tableViews[id] === view && !(id in stored.config.tableViews)) delete tableViews[id];
+        return { ...current, tableViews };
+      });
     } catch (cause) {
-      setError(apiErrorMessage(cause, "The site could not be saved."));
+      if (selection.current.spaceId === submittedSpace && selection.current.siteId === submittedSite)
+        setError(apiErrorMessage(cause, "The site could not be saved."));
     } finally {
+      setSaving(false);
       setBusy(false);
     }
   }
@@ -157,6 +158,7 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
         Space
         <select
           value={spaceId}
+          disabled={saving}
           onChange={(event) => {
             setSpaceId(event.target.value);
             setLoaded(false);
@@ -178,7 +180,11 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
         <>
           <label>
             Site
-            <select value={siteId} onChange={(event) => choose(sites.find((site) => site.id === event.target.value))}>
+            <select
+              disabled={saving}
+              value={siteId}
+              onChange={(event) => choose(sites.find((site) => site.id === event.target.value))}
+            >
               <option value="">New site</option>
               {sites.map((site) => (
                 <option key={site.id} value={site.id}>

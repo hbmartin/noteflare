@@ -6,7 +6,7 @@ import { HttpError, assertSameOrigin } from "./http";
 import { publicationConfig, publicationHostname, type PublicationConfig } from "../shared/publications";
 import { publicJson } from "./public-utils";
 import { tableInternal } from "./table-service";
-import { changedPublicationSources } from "./publication-failure";
+import { restartablePublicationFailure } from "./publication-failure";
 import { retirePublicationBuild } from "./publication-jobs";
 import { enqueuePlatformJob } from "./platform-jobs";
 export type Publication = {
@@ -268,11 +268,21 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
     env.DB.prepare(
       "INSERT OR IGNORE INTO publication_roots(publication_id,page_id) SELECT p.id,root.value FROM publications p CROSS JOIN json_each(?) root WHERE p.id=? AND p.generation=? AND p.updated_at=?",
     ).bind(JSON.stringify(roots), id, next, now),
+    env.DB.prepare("SELECT * FROM publications WHERE id=?").bind(id),
+    env.DB.prepare("SELECT page_id FROM publication_roots WHERE publication_id=? ORDER BY page_id").bind(id),
   ]);
   if (!results[0]!.meta.changes) throw new HttpError(409, "publication_changed", "Reload the site settings.");
-  const pub = (await env.DB.prepare("SELECT * FROM publications WHERE id=?").bind(id).first<Publication>())!;
+  const pub = results[3]!.results[0] as Publication;
+  const storedRoots = results[4]!.results as Array<{ page_id: string }>;
   await queuePublication(env, pub);
-  return Response.json({ publication: pub, url: `${env.PUBLIC_BASE_URL ?? new URL(request.url).origin}/sites/${key}` });
+  return Response.json({
+    publication: {
+      ...pub,
+      config: JSON.parse(pub.config_json),
+      roots: storedRoots.map((row) => row.page_id),
+    },
+    url: `${env.PUBLIC_BASE_URL ?? new URL(request.url).origin}/sites/${key}`,
+  });
 }
 async function queuePublication(env: Env, pub: Publication) {
   if (pub.active)
@@ -289,10 +299,7 @@ async function queuePublication(env: Env, pub: Publication) {
 }
 export async function enqueuePendingPublications(env: Env) {
   if (env.PUBLIC_PUBLISHING_ENABLED !== "true") return;
-  const failures = await env.DB.prepare(`SELECT * FROM publications p WHERE p.active=1 AND p.needs_build=1
-    AND json_extract(p.build_failure_json,'$.kind')='content'
-    AND p.build_failure_checkpoint_json IS p.build_checkpoint_json
-    AND (json_extract(p.build_failure_json,'$.legacy')=1 OR ${changedPublicationSources})
+  const failures = await env.DB.prepare(`SELECT * FROM publications p WHERE ${restartablePublicationFailure}
     ORDER BY p.updated_at LIMIT 20`).all<Publication>();
   for (const pub of failures.results) await retirePublicationBuild(env, pub, "content");
   const rows = await env.DB.prepare(
