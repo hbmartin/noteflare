@@ -154,6 +154,40 @@ Pricing references: [Workers](https://developers.cloudflare.com/workers/platform
 
 ## Acceptance and rollback
 
+### Publication recovery follow-up (migration 0113)
+
+Treat 0112 as applied. Pause builders and drain in-flight work, apply `0113_publication_recovery.sql`, deploy the
+compatible application and public Workers, then resume. This migration preserves healthy checkpoints, captures,
+active manifests and access generations. New generations acquire durable job intent in the same D1 transaction,
+including generations created by invalidation triggers; Queue messages remain optional wakeups.
+
+Settings prune unchanged saved table-view selections only after those tables leave the selected scope. New invalid
+selections and invalid in-scope views remain errors. Validation reads canonical view metadata with at most four
+concurrent authority requests; projection lag and repair do not block these metadata reads.
+
+Build failures retain their generation/access/checkpoint identity and a safe owner message. Temporary readiness
+or infrastructure failures retry the existing checkpoint with job backoff. Configuration failures remain actionable
+until settings or migration resolves them. Captured-content failures restart only after a consumed source's epoch,
+projection sequence or key changes. Consulted-source metadata is private and persists across synced continuations.
+Healthy older captures still finish. A content failure without provenance receives one replacement generation;
+its new captures include provenance and cannot keep restarting for unrelated edits.
+
+Cleanup retains ten-handle/500-row bounds. Incomplete releases rotate after five seconds; failures back off from
+one minute to one hour. The coordinator sleeps until the earliest eligible job, lease or cleanup deadline, and
+new work pulls a distant alarm forward. Monitor existing job failures, `publication.restart.content`,
+`publication.restart.authority`, `publication.snapshots.backlog` and `publication.snapshots.oldest`.
+
+The pre-registry namespace sweep below remains **required** for installations that ran the earlier builder.
+A zero registered backlog alone does not establish completion. Retain its completed checkpoint with matching
+account/namespace IDs and completed-object count, confirm every inventory page was reconciled, then verify retired
+cleanup backlog drains. Active captures remain protected regardless of age. There is no new discovery on object
+wake and no public maintenance endpoint.
+
+Rollback pauses builders and preserves D1 failure/job state and private captures. Keep patched cleanup, deadline
+scheduling and the v2 public cache namespace. Older builders must not consume the new private source envelopes or
+continuations; resume with compatible forward code. Production migration, deployment and sweeping are separate
+operator actions.
+
 ### Publication lifecycle follow-up (migration 0112)
 
 Treat 0111 as already applied. Pause publication builds on the application Worker and drain in-flight jobs before

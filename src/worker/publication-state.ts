@@ -2,7 +2,6 @@ import type { Env } from "./env";
 import { publicationPages, type Publication, type PublicationPage } from "./publications";
 import type { PublicationConfig } from "../shared/publications";
 import { putPublicationObject } from "./publication-storage";
-import { recordMetric } from "./observability";
 import { enqueuePlatformJob } from "./platform-jobs";
 
 export type PublicationCheckpoint = {
@@ -13,17 +12,6 @@ export type PublicationCheckpoint = {
   documentStateKey?: string;
   tableSource?: { kind: "legacy" } | { kind: "snapshot"; handle: string };
 };
-export async function retirePublicationBuild(env: Env, pub: Publication, reason: "content" | "authority") {
-  const changed = await env.DB.prepare(`UPDATE publications SET generation=generation+1,needs_build=1,
-    build_content_version=NULL,build_checkpoint_json=NULL,build_error=NULL,build_failure_checkpoint_json=NULL
-    WHERE id=? AND generation=? AND access_generation=? AND active=1 AND needs_build=1
-    AND build_checkpoint_json IS ?`)
-    .bind(pub.id, pub.generation, pub.access_generation, pub.build_checkpoint_json)
-    .run();
-  if (changed.meta.changes)
-    recordMetric(env, { event: `publication.restart.${reason}`, component: "platform", attempts: 1 });
-}
-
 export async function publicationDependencies(
   env: Env,
   pub: Publication,
@@ -91,7 +79,7 @@ export async function advancePublication(
   enqueue = true,
 ) {
   const changed =
-    await env.DB.prepare(`UPDATE publications SET build_checkpoint_json=?,build_error=NULL,build_failure_checkpoint_json=NULL WHERE id=? AND generation=?
+    await env.DB.prepare(`UPDATE publications SET build_checkpoint_json=?,build_error=NULL,build_failure_checkpoint_json=NULL,build_failure_json=NULL WHERE id=? AND generation=?
     AND access_generation=? AND active=1 AND build_checkpoint_json IS ?`)
       .bind(
         JSON.stringify({ ...next, version: 2 }),
@@ -107,7 +95,7 @@ export async function advancePublication(
       kind: "publication",
       key: `${pub.id}:${next.offset}:${next.part ?? 1}:${next.documentStateKey ?? ""}`,
       generation: String(pub.generation),
-      payload: { publicationId: pub.id, generation: pub.generation, ...next },
+      payload: { publicationId: pub.id, generation: pub.generation },
     });
   return Boolean(changed.meta.changes);
 }

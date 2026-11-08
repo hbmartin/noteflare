@@ -5,9 +5,9 @@ import { spaceForMember } from "./page-access";
 import { HttpError, assertSameOrigin } from "./http";
 import { publicationConfig, publicationHostname, type PublicationConfig } from "../shared/publications";
 import { publicJson } from "./public-utils";
-import { recordMetric } from "./observability";
-import { tableInternal, tableRegistry } from "./table-service";
-import type { TableQueryResult } from "../shared/table-protocol";
+import { tableInternal } from "./table-service";
+import { changedPublicationSources } from "./publication-failure";
+import { retirePublicationBuild } from "./publication-jobs";
 import { enqueuePlatformJob } from "./platform-jobs";
 export type Publication = {
   id: string;
@@ -28,6 +28,7 @@ export type Publication = {
   build_content_version: number | null;
   build_checkpoint_json: string | null;
   build_failure_checkpoint_json: string | null;
+  build_failure_json: string | null;
   dependencies_ready: number;
 };
 export type PublicationPage = {
@@ -94,35 +95,68 @@ export async function publicationHostAllowsShare(env: Env, hostname: string, sha
 export async function validatePublicationTableViews(
   env: Env,
   config: PublicationConfig,
-  eligible: (id: string) => Promise<boolean>,
+  scope: { workspaceId: string; spaceId: string; roots: string[] },
+  previous: Record<string, string> = {},
 ) {
-  for (const [pageId, viewId] of Object.entries(config.tableViews)) {
-    if (!(await eligible(pageId)))
+  const entries = Object.entries(config.tableViews);
+  if (!entries.length) return;
+  const rows = await env.DB.prepare(`WITH RECURSIVE ancestry(root,id,parent_id,allowed,depth) AS (
+    SELECT p.id,p.id,p.parent_id,p.workspace_id=? AND p.space_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0,0
+    FROM pages p WHERE p.id IN(SELECT value FROM json_each(?))
+    UNION ALL SELECT a.root,p.id,p.parent_id,a.allowed AND p.workspace_id=? AND p.space_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0,a.depth+1
+    FROM pages p JOIN ancestry a ON a.parent_id=p.id WHERE a.depth<50)
+    SELECT p.id,p.kind,t.state,t.generation,EXISTS(SELECT 1 FROM ancestry a WHERE a.root=p.id AND a.allowed=1
+      AND a.id IN(SELECT value FROM json_each(?))) eligible
+    FROM pages p LEFT JOIN table_authority t ON t.page_id=p.id WHERE p.id IN(SELECT value FROM json_each(?))`)
+    .bind(
+      scope.workspaceId,
+      scope.spaceId,
+      JSON.stringify(entries.map(([id]) => id)),
+      scope.workspaceId,
+      scope.spaceId,
+      JSON.stringify(scope.roots),
+      JSON.stringify(entries.map(([id]) => id)),
+    )
+    .all<{ id: string; kind: string; state: string | null; generation: number | null; eligible: number }>();
+  const tables = new Map(rows.results.map((row) => [row.id, row]));
+  const selected: Array<{ pageId: string; viewId: string; generation: number }> = [];
+  for (const [pageId, viewId] of entries) {
+    const table = tables.get(pageId);
+    if (!table?.eligible) {
+      if (previous[pageId] === viewId) {
+        delete config.tableViews[pageId];
+        continue;
+      }
       throw new HttpError(422, "publication_view", "Choose a table within the published roots.");
-    const table = await env.DB.prepare("SELECT kind FROM pages WHERE id=?").bind(pageId).first<{ kind: string }>();
-    if (table?.kind !== "table") throw new HttpError(422, "publication_view", "Choose a table view.");
-    const registry = await tableRegistry(env, pageId);
-    if (!registry || !["do", "repairing"].includes(registry.state))
+    }
+    if (table.kind !== "table") throw new HttpError(422, "publication_view", "Choose a table view.");
+    if (!table.state || !["do", "repairing"].includes(table.state))
       throw new HttpError(
         422,
         "table_authority_required",
         "Migrate this table before publishing a saved view. All rows may be published as a legacy grid.",
       );
-    let result: TableQueryResult;
-    try {
-      result = await tableInternal<TableQueryResult>(
-        env,
-        pageId,
-        `/public-query?${new URLSearchParams({ viewId, limit: "1" })}`,
-      );
-    } catch (error) {
-      if (error instanceof HttpError && error.status === 404)
-        throw new HttpError(422, "publication_view", "Choose an existing shared table view.");
-      throw error;
-    }
-    if (result.invalidView || !result.view || result.view.id !== viewId || result.view.ownerId)
-      throw new HttpError(422, "publication_view", "Choose an existing shared table view.");
+    selected.push({ pageId, viewId, generation: table.generation! });
   }
+  let cursor = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(4, selected.length) }, async () => {
+      while (cursor < selected.length) {
+        const { pageId, viewId, generation } = selected[cursor++]!;
+        try {
+          await tableInternal(
+            env,
+            pageId,
+            `/publication-view?${new URLSearchParams({ viewId, generation: String(generation) })}`,
+          );
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404)
+            throw new HttpError(422, "publication_view", "Choose an existing shared table view.");
+          throw error;
+        }
+      }
+    }),
+  );
 }
 export async function publicationSettingsResponse(request: Request, env: Env, spaceId: string): Promise<Response> {
   const member = await requireMember(request, env);
@@ -154,6 +188,15 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
   }
   assertSameOrigin(request, env.BETTER_AUTH_URL);
   const input = await publicJson(request);
+  const existing =
+    typeof input.id === "string"
+      ? await env.DB.prepare("SELECT * FROM publications WHERE id=? AND space_id=? AND workspace_id=?")
+          .bind(input.id, spaceId, member.workspace.id)
+          .first<Publication>()
+      : null;
+  if (input.id && !existing) throw new HttpError(404, "publication_not_found", "Site not found.");
+  if (existing && input.generation !== existing.generation)
+    throw new HttpError(409, "publication_changed", "Reload the site settings.");
   const roots = [...new Set(Array.isArray(input.roots) ? input.roots : [])];
   if ((input.active === true && !roots.length) || roots.length > 100 || roots.some((id) => typeof id !== "string"))
     throw new HttpError(422, "publication_roots", "Choose between 1 and 100 page roots.");
@@ -188,22 +231,19 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
     if (!attachment || !(await eligible(attachment.page_id)))
       throw new HttpError(422, "publication_logo", "Choose a logo attached to a published page.");
   }
-  if (input.active === true) await validatePublicationTableViews(env, config, eligible);
-  const existing =
-    typeof input.id === "string"
-      ? await env.DB.prepare("SELECT * FROM publications WHERE id=? AND space_id=? AND workspace_id=?")
-          .bind(input.id, spaceId, member.workspace.id)
-          .first<Publication>()
-      : null;
-  if (input.id && !existing) throw new HttpError(404, "publication_not_found", "Site not found.");
-  if (existing && input.generation !== existing.generation)
-    throw new HttpError(409, "publication_changed", "Reload the site settings.");
+  if (input.active === true)
+    await validatePublicationTableViews(
+      env,
+      config,
+      { workspaceId: member.workspace.id, spaceId, roots: roots as string[] },
+      existing ? (JSON.parse(existing.config_json) as PublicationConfig).tableViews : {},
+    );
   const id = existing?.id ?? crypto.randomUUID(),
     key = existing?.url_key ?? crypto.randomUUID(),
     now = Date.now();
   const mutation = existing
     ? env.DB.prepare(
-        "UPDATE publications SET config_json=?,active=?,generation=generation+1,access_generation=access_generation+1,content_version=content_version+1,build_checkpoint_json=NULL,build_content_version=NULL,needs_build=1,updated_at=? WHERE id=? AND generation=?",
+        "UPDATE publications SET config_json=?,active=?,generation=generation+1,access_generation=access_generation+1,content_version=content_version+1,build_checkpoint_json=NULL,build_content_version=NULL,build_error=NULL,build_failure_checkpoint_json=NULL,build_failure_json=NULL,needs_build=1,updated_at=? WHERE id=? AND generation=?",
       ).bind(JSON.stringify(config), Number(input.active === true), now, id, existing.generation)
     : env.DB.prepare(
         "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -244,25 +284,21 @@ async function queuePublication(env: Env, pub: Publication) {
       payload: {
         publicationId: pub.id,
         generation: pub.generation,
-        ...(pub.build_checkpoint_json ? JSON.parse(pub.build_checkpoint_json) : {}),
       },
     });
 }
 export async function enqueuePendingPublications(env: Env) {
   if (env.PUBLIC_PUBLISHING_ENABLED !== "true") return;
-  const restarted = await env.DB.prepare(`UPDATE publications SET generation=generation+1,build_content_version=NULL,
-    build_checkpoint_json=NULL,build_error=NULL,build_failure_checkpoint_json=NULL
-    WHERE id IN(SELECT id FROM publications WHERE active=1 AND needs_build=1 AND build_error IS NOT NULL
-      AND build_failure_checkpoint_json IS NOT NULL AND build_failure_checkpoint_json=build_checkpoint_json
-      AND content_version>build_content_version ORDER BY updated_at LIMIT 20)`).run();
-  if (restarted.meta.changes)
-    recordMetric(env, {
-      event: "publication.restart.content",
-      component: "platform",
-      attempts: restarted.meta.changes,
-    });
+  const failures = await env.DB.prepare(`SELECT * FROM publications p WHERE p.active=1 AND p.needs_build=1
+    AND json_extract(p.build_failure_json,'$.kind')='content'
+    AND p.build_failure_checkpoint_json IS p.build_checkpoint_json
+    AND (json_extract(p.build_failure_json,'$.legacy')=1 OR ${changedPublicationSources})
+    ORDER BY p.updated_at LIMIT 20`).all<Publication>();
+  for (const pub of failures.results) await retirePublicationBuild(env, pub, "content");
   const rows = await env.DB.prepare(
-    "SELECT * FROM publications WHERE active=1 AND needs_build=1 ORDER BY updated_at LIMIT 20",
+    `SELECT * FROM publications p WHERE active=1 AND needs_build=1 AND NOT EXISTS(
+      SELECT 1 FROM platform_jobs j WHERE j.kind='publication' AND j.generation=CAST(p.generation AS TEXT)
+      AND json_extract(j.payload_json,'$.publicationId')=p.id) ORDER BY updated_at LIMIT 20`,
   ).all<Publication>();
   for (const pub of rows.results) await queuePublication(env, pub);
 }

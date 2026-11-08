@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { Page, Space } from "../shared/types";
 import type { TableView } from "../shared/table-protocol";
 import { publicationConfig, type PublicationConfig } from "../shared/publications";
@@ -39,6 +39,28 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
     [error, setError] = useState(""),
     [loaded, setLoaded] = useState(false),
     [views, setViews] = useState<Record<string, TableView[]>>({});
+  const selection = useRef({ spaceId, siteId });
+  useLayoutEffect(() => {
+    selection.current = { spaceId, siteId };
+  });
+  const selectedSite = sites.find((site) => site.id === siteId);
+  let completedPages: number | null = null;
+  try {
+    const checkpoint: unknown = selectedSite?.build_checkpoint_json
+      ? JSON.parse(selectedSite.build_checkpoint_json)
+      : null;
+    if (
+      checkpoint &&
+      typeof checkpoint === "object" &&
+      "offset" in checkpoint &&
+      typeof checkpoint.offset === "number" &&
+      Number.isSafeInteger(checkpoint.offset) &&
+      checkpoint.offset >= 0
+    )
+      completedPages = checkpoint.offset;
+  } catch {
+    /* An invalid checkpoint is reported by the worker; settings remain editable. */
+  }
   const available = pages.filter((page) => page.spaceId === spaceId && !page.archivedAt && !page.isTemplate);
   const change = (patch: Partial<PublicationConfig>) => setConfig({ ...config, ...patch });
   function choose(site?: Site) {
@@ -74,6 +96,9 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
     }
   }
   async function save() {
+    const submitted = config,
+      submittedSpace = spaceId,
+      submittedSite = siteId;
     setBusy(true);
     setError("");
     try {
@@ -81,11 +106,26 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
         method: "PUT",
         body: json({ id: siteId || undefined, generation, roots, config, active }),
       });
+      if (selection.current.spaceId !== submittedSpace || selection.current.siteId !== submittedSite) return;
       setSiteId(result.publication.id);
       setGeneration(result.publication.generation);
       setUrl(result.url);
       const updated = await api<{ publications: Site[] }>(`/api/spaces/${spaceId}/publications`);
+      if (
+        selection.current.spaceId !== submittedSpace ||
+        ![submittedSite, result.publication.id].includes(selection.current.siteId)
+      )
+        return;
       setSites(updated.publications);
+      const stored = updated.publications.find((site) => site.id === result.publication.id);
+      if (stored)
+        setConfig((current) => {
+          if (current === submitted) return stored.config;
+          const tableViews = { ...current.tableViews };
+          for (const [id, view] of Object.entries(submitted.tableViews))
+            if (tableViews[id] === view && !(id in stored.config.tableViews)) delete tableViews[id];
+          return { ...current, tableViews };
+        });
     } catch (cause) {
       setError(apiErrorMessage(cause, "The site could not be saved."));
     } finally {
@@ -147,25 +187,18 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
               ))}
             </select>
           </label>
-          {sites.find((site) => site.id === siteId)?.needs_build ? (
+          {selectedSite?.active && selectedSite.needs_build ? (
             <output>
               Building the latest version. Older content stays available until the new version is ready; changed access
               closes the site while it rebuilds.
-              {sites.find((site) => site.id === siteId)?.build_checkpoint_json && (
-                <>
-                  {" "}
-                  Pages completed:{" "}
-                  {JSON.parse(sites.find((site) => site.id === siteId)!.build_checkpoint_json!).offset ?? 0}.
-                </>
-              )}
-              {(sites.find((site) => site.id === siteId)?.content_version ?? 0) >
-                (sites.find((site) => site.id === siteId)?.build_content_version ?? Infinity) && (
+              {completedPages !== null && <> Pages completed: {completedPages}.</>}
+              {(selectedSite?.content_version ?? 0) > (selectedSite?.build_content_version ?? Infinity) && (
                 <> Newer edits are queued for the next version.</>
               )}
             </output>
           ) : null}
-          {sites.find((site) => site.id === siteId)?.build_error && (
-            <p role="alert">{sites.find((site) => site.id === siteId)!.build_error}</p>
+          {selectedSite?.active && selectedSite.needs_build && selectedSite.build_error && (
+            <p role="alert">{selectedSite!.build_error}</p>
           )}
           <fieldset>
             <legend>Pages to publish</legend>

@@ -64,6 +64,9 @@ export async function enqueuePlatformJob(env: Env, intent: PlatformJobIntent, be
   const statement = platformIntentStatement(env.DB, intent);
   if (before.length) await env.DB.batch([...before, statement]);
   else await statement.run();
+  await notifyPlatformJob(env, intent);
+}
+export async function notifyPlatformJob(env: Env, intent: Pick<PlatformJobIntent, "workspaceId" | "kind" | "key">) {
   // Recovery re-enqueues from D1 if this best-effort wakeup fails or expires.
   if (env.PLATFORM_QUEUE) {
     try {

@@ -1,3 +1,4 @@
+import { rasterImageMime, IMAGE_DERIVATIVE_MAX_BYTES } from "./image-policy";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import type { Env } from "./env";
 import { requireMember } from "./auth";
@@ -34,7 +35,7 @@ export async function imageDerivative(
   const attachment = await env.DB.prepare("SELECT r2_key,mime,size FROM attachments WHERE id=?")
     .bind(attachmentId)
     .first<{ r2_key: string; mime: string; size: number }>();
-  if (!attachment || !/^image\/(png|jpeg|webp|avif|gif)$/.test(attachment.mime) || attachment.size > 20 * 1024 * 1024)
+  if (!attachment || !rasterImageMime(attachment.mime) || attachment.size > IMAGE_DERIVATIVE_MAX_BYTES)
     return imagePlaceholder();
   const object = await env.BUCKET.get(attachment.r2_key);
   if (!object) return imagePlaceholder();
@@ -114,7 +115,7 @@ export async function coverResponse(request: Request, env: Env, pageId: string):
     const found = await env.DB.prepare("SELECT mime,size FROM attachments WHERE id=? AND page_id=? AND workspace_id=?")
       .bind(attachmentId, pageId, member.workspace.id)
       .first<{ mime: string; size: number }>();
-    if (!found || !/^image\/(png|jpeg|webp|avif|gif)$/.test(found.mime) || found.size > 10 * 1024 * 1024)
+    if (!found || !rasterImageMime(found.mime) || found.size > 10 * 1024 * 1024)
       throw new HttpError(422, "invalid_cover", "Choose a page image of at most 10 MiB.");
   }
   const x = input.x === undefined ? 0.5 : Number(input.x),
