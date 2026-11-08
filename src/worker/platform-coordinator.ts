@@ -1,5 +1,5 @@
 import { retiredPublicationSnapshots } from "./publication-snapshots";
-import { restartablePublicationFailure } from "./publication-failure";
+import { restartablePublicationFailure, publicationNeedsJob } from "./publication-failure";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { recoverPlatformJobs, type PlatformHandlers } from "./platform-jobs";
@@ -21,6 +21,16 @@ import {
   type AiGenerationAccessRequest,
   type AiGenerationAccessResult,
 } from "./ai-generation-access";
+
+export { wakePlatform } from "./platform-wakeup";
+
+type MaintenanceSchedule = {
+  active: boolean;
+  running: boolean;
+  scanning: boolean;
+  notBefore: number;
+  wakeAt: number | null;
+};
 
 export const platformHandlers: PlatformHandlers = {
   semantic: handleSemanticJob,
@@ -46,14 +56,47 @@ export class PlatformCoordinator extends DurableObject<Env> {
       return { allowed: false, status: 403, code: "conversation_locked" };
     return authorizeAiGeneration(this.env, input);
   }
-  async wake() {
-    const next = Date.now() + 1000,
-      current = await this.ctx.storage.getAlarm();
-    if (current === null || current > next) await this.ctx.storage.setAlarm(next);
+  private async scheduleState(): Promise<MaintenanceSchedule> {
+    return (
+      (await this.ctx.storage.get<MaintenanceSchedule>("schedule")) ?? {
+        active: false,
+        running: false,
+        scanning: false,
+        notBefore: 0,
+        wakeAt: null,
+      }
+    );
+  }
+  async wake(at = Date.now() + 1000) {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const state = await this.scheduleState();
+      const next = Math.max(
+        Date.now() + 1000,
+        Number.isFinite(at) ? at : 0,
+        state.running ? Date.now() + 5000 : state.notBefore,
+      );
+      // Existing phases already cover requests arriving before the final scan.
+      if ((!state.active || state.scanning) && (state.wakeAt === null || next < state.wakeAt)) {
+        state.wakeAt = next;
+        await this.ctx.storage.put("schedule", state);
+      }
+      const current = await this.ctx.storage.getAlarm();
+      if (current === null || current > next) await this.ctx.storage.setAlarm(next);
+    });
   }
   // fallow-ignore-next-line unused-class-member -- Called by the Cloudflare Durable Object alarm runtime.
   async alarm() {
     const phase = (await this.ctx.storage.get<number>("phase")) ?? 0;
+    const ready = await this.ctx.blockConcurrencyWhile(async () => {
+      const state = await this.scheduleState();
+      if (state.notBefore > Date.now()) {
+        await this.ctx.storage.setAlarm(state.notBefore);
+        return false;
+      }
+      await this.ctx.storage.put("schedule", { ...state, active: true, running: true, scanning: false });
+      return true;
+    });
+    if (!ready) return;
     try {
       await withAuditRequest(this.env, `platform-alarm:${phase}:${crypto.randomUUID()}`, async (alarmEnv) => {
         switch (phase) {
@@ -98,18 +141,25 @@ export class PlatformCoordinator extends DurableObject<Env> {
         phase,
       });
     }
-    await this.ctx.storage.put("phase", (phase + 1) % 11);
     if (phase < 10) {
-      await this.ctx.storage.setAlarm(Date.now() + 5000);
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const state = await this.scheduleState(),
+          next = Date.now() + 5000;
+        await this.ctx.storage.put({ phase: phase + 1, schedule: { ...state, running: false, notBefore: next } });
+        await this.ctx.storage.setAlarm(next);
+      });
       return;
     }
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const state = await this.scheduleState();
+      // The scan covers earlier requests; new requests remain durable until a later scan.
+      await this.ctx.storage.put("schedule", { ...state, scanning: true, wakeAt: null });
+    });
     const now = Date.now();
     const next = await this.env.DB.prepare(`SELECT min(due) due FROM (
       SELECT max(available_at,coalesce(lease_until,0)) due FROM platform_jobs
       UNION ALL SELECT s.next_attempt_at due ${retiredPublicationSnapshots}
-      UNION ALL SELECT ? due FROM publications p WHERE ?=1 AND p.active=1 AND p.needs_build=1
-        AND NOT EXISTS(SELECT 1 FROM platform_jobs j WHERE j.kind='publication' AND j.generation=CAST(p.generation AS TEXT)
-          AND json_extract(j.payload_json,'$.publicationId')=p.id)
+      UNION ALL SELECT ? due FROM publications p WHERE ?=1 AND ${publicationNeedsJob}
       UNION ALL SELECT ? due FROM publications p WHERE ?=1 AND ${restartablePublicationFailure}
       UNION ALL SELECT ? due WHERE (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE archive_id IS NULL LIMIT 1))
         OR (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE basin_exported_at IS NULL LIMIT 1)))`)
@@ -123,17 +173,16 @@ export class PlatformCoordinator extends DurableObject<Env> {
         this.env.BASIN_ENABLED === "true" ? 1 : 0,
       )
       .first<{ due: number | null }>();
-    if (next?.due !== null && next?.due !== undefined) await this.ctx.storage.setAlarm(Math.max(now + 5000, next.due));
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const state = await this.scheduleState(),
+        notBefore = Date.now() + 5000;
+      const due = Math.min(next?.due ?? Infinity, state.wakeAt ?? Infinity);
+      await this.ctx.storage.put({
+        phase: 0,
+        schedule: { ...state, active: false, running: false, scanning: false, notBefore },
+      });
+      if (Number.isFinite(due)) await this.ctx.storage.setAlarm(Math.max(notBefore, due));
+      else await this.ctx.storage.deleteAlarm();
+    });
   }
-}
-
-export async function wakePlatform(env: Env) {
-  if (env.PLATFORM) await env.PLATFORM.get(env.PLATFORM.idFromName("maintenance")).wake();
-  else if (
-    env.SEMANTIC_SEARCH_ENABLED === "true" ||
-    env.PUBLIC_PUBLISHING_ENABLED === "true" ||
-    env.AUDIT_ENABLED === "true" ||
-    env.HEATMAPS_ENABLED === "true"
-  )
-    throw new Error("PLATFORM coordinator binding is required for enabled platform services");
 }

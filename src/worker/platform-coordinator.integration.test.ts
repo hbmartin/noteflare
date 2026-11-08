@@ -27,6 +27,7 @@ async function alarmAt(phase: number, overrides: Partial<Env>) {
     try {
       await state.storage.deleteAlarm();
       await state.storage.put("phase", phase);
+      await state.storage.delete("schedule");
       await instance.alarm();
       return { alarm: await state.storage.getAlarm(), phase: await state.storage.get<number>("phase") };
     } finally {
@@ -230,6 +231,16 @@ describe("publication recovery deadlines", () => {
       }
     },
   );
+
+  it("sleeps instead of recreating work for an exhausted state failure", async () => {
+    const checkpoint = await pendingPublication(Date.now());
+    await fail(checkpoint, "state");
+    await env.DB.prepare("UPDATE publications SET build_state_recovery_count=1 WHERE id='site'").run();
+    await env.DB.prepare("DELETE FROM platform_jobs").run();
+    await enqueuePendingPublications({ ...env, PUBLIC_PUBLISHING_ENABLED: "true" } as Env);
+    expect(await env.DB.prepare("SELECT 1 FROM platform_jobs").first()).toBeNull();
+    expect((await alarmAt(10, { PUBLIC_PUBLISHING_ENABLED: "true" })).alarm).toBeNull();
+  });
 
   it("does not retire an advanced checkpoint or an activated build from delayed failure metadata", async () => {
     const now = Date.now(),

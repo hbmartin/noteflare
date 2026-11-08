@@ -154,6 +154,41 @@ Pricing references: [Workers](https://developers.cloudflare.com/workers/platform
 
 ## Acceptance and rollback
 
+### Publication privacy, recovery and scheduling (migration 0114)
+
+Pause builders and drain in-flight work, apply `0114_publication_state_recovery.sql`, deploy the application Worker
+with its bundled client, then resume. Treat 0113 as applied. This migration preserves healthy checkpoints, captures,
+active manifests, access generations and cleanup intent. Public URLs, the v2 cache namespace and feature defaults
+remain unchanged.
+
+Saved table-view selections remain dormant outside the selected roots or while their tables are archived or moved.
+When a table returns, its exact retained shared view must validate; no missing or private view falls back to all rows.
+**Audit installations that ran the pruning code before returning affected tables to scope.** Current settings cannot
+identify or reconstruct erased selections reliably. Use retained generation inputs where available, compare the
+intended restrictions, and explicitly restore the correct view. Do not infer that an absent selection authorizes a
+previously filtered table. This audit is an operator action, separate from this code change and deployment.
+
+Owner settings responses expose an explicit allowlist. Failure provenance, R2 keys, snapshot handles and recovery
+bookkeeping remain private. The legacy `build_checkpoint_json` response contains only a validated offset or null.
+Settings stay editable during saves except for site/space selection; newer drafts and dormant views are retained.
+
+Damaged checkpoints or continuations receive one automatic replacement generation. The durable recovery budget
+survives checkpoint advancement and content/authority replacements; settings saves, deactivation, activation and
+new access generations reset it. Repeated damage is terminal until reset, with a safe owner message and no missing-job
+recreation. Infrastructure failures retain exponential backoff. Existing stranded errors are reclassified when their
+jobs next retry; healthy old captures and source-provenance restart rules remain supported.
+
+Maintenance persists cadence and wake requests, retaining five-second phase spacing through routine document
+wakeups and process restarts. A concurrent wake cannot be overwritten by an older deadline query. Job settlement
+releases its owned lease before notifying replacement work; Queue retries use delayed delivery, with durable
+coordinator recovery when delivery fails. Final activation notifies only pending builds or retired snapshot cleanup.
+Monitor `publication.restart.state`, `publication.state.exhausted`, platform job failures and existing snapshot backlog
+metrics. The namespace sweep below remains mandatory for pre-registry captures.
+
+Rollback pauses builders and retains the additive migration and durable inputs. Any rollback build must preserve
+dormant-view retention, safe settings responses and scheduling guards; resume builders only with compatible code.
+Production migration, deployment, sweeping and the historical-settings audit remain separate operator actions.
+
 ### Diagram recovery and settings saves
 
 The recovery patch needs no migration beyond 0113 and does not reset existing checkpoints. Deploy the application
@@ -174,8 +209,8 @@ compatible application and public Workers, then resume. This migration preserves
 active manifests and access generations. New generations acquire durable job intent in the same D1 transaction,
 including generations created by invalidation triggers; Queue messages remain optional wakeups.
 
-Settings prune unchanged saved table-view selections only after those tables leave the selected scope. New invalid
-selections and invalid in-scope views remain errors. Validation reads canonical view metadata with at most four
+Migration 0114 supersedes the original pruning behavior: unchanged saved selections remain dormant outside scope.
+New invalid selections and invalid in-scope views remain errors. Validation reads canonical view metadata with at most four
 concurrent authority requests; projection lag and repair do not block these metadata reads.
 
 Build failures retain their generation/access/checkpoint identity and a safe owner message. Temporary readiness

@@ -54,8 +54,8 @@ afterEach(() => {
   cleanup();
   vi.resetAllMocks();
 });
-async function load(spaces = [space]) {
-  render(<PublicationSettings spaces={spaces} pages={[page]} />);
+async function load(spaces = [space], pages = [page]) {
+  render(<PublicationSettings spaces={spaces} pages={pages} />);
   fireEvent.click(screen.getByRole("button", { name: "Load publishing settings" }));
   await screen.findByLabelText("Site title");
 }
@@ -88,7 +88,7 @@ it.each([false, true])("applies normalized settings while preserving newer edits
     if (options?.method === "PUT") {
       submitted.push(JSON.parse(options.body as string));
       if (submitted.length === 1) await gate;
-      current = { ...site, generation: 2, config: { ...site.config, tableViews: {} } };
+      current = { ...site, generation: 2, config: { ...site.config, title: "Normalized" } };
       return { publication: current, url: "https://public.test/sites/key" } as never;
     }
     return { publications: [current] } as never;
@@ -102,8 +102,8 @@ it.each([false, true])("applies normalized settings while preserving newer edits
   fireEvent.click(screen.getByRole("button", { name: "Save site" }));
   await waitFor(() => expect(submitted).toHaveLength(2));
   const config = submitted[1]!.config as { title: string; tableViews: Record<string, string> };
-  expect(config.title).toBe(newer ? "Newer title" : "Site");
-  expect(config.tableViews).toEqual({});
+  expect(config.title).toBe(newer ? "Newer title" : "Normalized");
+  expect(config.tableViews).toEqual(site.config.tableViews);
 });
 
 it("locks selection during save, keeps edits available, and refreshes the site before reselection", async () => {
@@ -206,4 +206,38 @@ it("inserts a newly saved site into the selectable cache without another GET", a
   await waitFor(() => expect(submitted).toHaveLength(2));
   expect(submitted[1]).toMatchObject({ id: "created", generation: 1 });
   expect(reads).toBe(1);
+});
+
+it.each([
+  { active: 0, needs_build: 1 },
+  { active: 1, needs_build: 0 },
+])("does not render numeric false conditions: %o", async (flags) => {
+  vi.mocked(api).mockImplementation(async (url) =>
+    url.includes("hostnames") ? ({ hostnames: [] } as never) : ({ publications: [{ ...site, ...flags }] } as never),
+  );
+  await load();
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) expect(walker.currentNode.textContent).not.toBe("0");
+});
+it("displays a retained view until its metadata loads instead of showing all rows", async () => {
+  const table = { ...page, id: "table", kind: "table" as const, title: "Records" };
+  const saved = { ...site, config: { ...site.config, tableViews: { table: "filtered" } } };
+  let finish!: (value: unknown) => void;
+  const pending = new Promise((resolve) => {
+    finish = resolve;
+  });
+  vi.mocked(api).mockImplementation(async (url) => {
+    if (url.includes("hostnames")) return { hostnames: [] } as never;
+    if (url.includes("/tables/")) return (await pending) as never;
+    return { publications: [saved] } as never;
+  });
+  await load([space], [page, table]);
+  const selector = screen.getByRole("combobox", { name: "Records" });
+  expect(selector).toHaveValue("filtered");
+  expect(screen.getByRole("option", { name: "Saved view (metadata unavailable)" })).toBeInTheDocument();
+  fireEvent.focus(selector);
+  finish({ views: [{ id: "filtered", name: "Filtered", kind: "grid", ownerId: null }] });
+  await screen.findByRole("option", { name: "Filtered (grid)" });
+  expect(selector).toHaveValue("filtered");
+  expect(screen.queryByRole("option", { name: "Saved view (metadata unavailable)" })).not.toBeInTheDocument();
 });

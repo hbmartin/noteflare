@@ -118,13 +118,7 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
       setSiteId(result.publication.id);
       setGeneration(result.publication.generation);
       setUrl(result.url);
-      setConfig((current) => {
-        if (current === submitted) return stored.config;
-        const tableViews = { ...current.tableViews };
-        for (const [id, view] of Object.entries(submitted.tableViews))
-          if (tableViews[id] === view && !(id in stored.config.tableViews)) delete tableViews[id];
-        return { ...current, tableViews };
-      });
+      setConfig((current) => (current === submitted ? stored.config : current));
     } catch (cause) {
       if (selection.current.spaceId === submittedSpace && selection.current.siteId === submittedSite)
         setError(apiErrorMessage(cause, "The site could not be saved."));
@@ -203,7 +197,7 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
               )}
             </output>
           ) : null}
-          {selectedSite?.active && selectedSite.needs_build && selectedSite.build_error && (
+          {Boolean(selectedSite?.active && selectedSite.needs_build && selectedSite.build_error) && (
             <p role="alert">{selectedSite!.build_error}</p>
           )}
           <fieldset>
@@ -387,6 +381,10 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
                     }}
                   >
                     <option value="">All rows as a table</option>
+                    {config.tableViews[page.id] &&
+                      !views[page.id]?.some((view) => view.id === config.tableViews[page.id]) && (
+                        <option value={config.tableViews[page.id]}>Saved view (metadata unavailable)</option>
+                      )}
                     {(views[page.id] ?? []).map((view) => (
                       <option key={view.id} value={view.id}>
                         {view.name} ({view.kind})

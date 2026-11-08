@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { publicationConfig } from "../../src/shared/publications";
 test.use({ serviceWorkers: "block" });
 test.skip(Boolean(process.env.NOTES_E2E_BASE_URL), "Requires the local Vite control harness.");
 async function openHarness(page: Page, gallery = false) {
@@ -41,11 +42,25 @@ async function openHarness(page: Page, gallery = false) {
   });
   await page.route("**/api/spaces/space/publications", async (route) => {
     if (route.request().method() === "GET") return route.fulfill({ json: { publications: [] } });
-    sites.push(route.request().postDataJSON());
+    const submitted = route.request().postDataJSON();
+    sites.push(submitted);
     await route.fulfill({
-      json: { publication: { id: "site", generation: 1 }, url: "https://public.example.test/sites/key" },
+      json: {
+        publication: {
+          id: "site",
+          url_key: "key",
+          generation: sites.length,
+          active: Number(submitted.active),
+          needs_build: 1,
+          build_error: null,
+          config: submitted.config,
+          roots: submitted.roots,
+        },
+        url: "https://public.example.test/sites/key",
+      },
     });
   });
+  await page.route("**/api/publications/*/hostnames", (route) => route.fulfill({ json: { hostnames: [] } }));
   await page.route("**/__e2e__/public-platform*", (route) =>
     route.fulfill({
       contentType: "text/html",
@@ -174,4 +189,68 @@ test("gallery cells use the existing mutation lifecycle and an unlinked card ope
   await gallery.getByRole("button", { name: "Gallery card", exact: true }).click();
   await expect(gallery.getByLabel("Selected gallery page")).toHaveText("new-detail");
   expect(details).toBe(1);
+});
+
+test("publishing saves lock selection, preserve newer edits and reuse the confirmed generation", async ({ page }) => {
+  await openHarness(page);
+  const config = publicationConfig({ title: "First site", homePageId: "page", tableViews: { dormant: "filtered" } }, [
+    "page",
+  ]);
+  const first = {
+    id: "first",
+    url_key: "first",
+    generation: 1,
+    active: 0,
+    needs_build: 0,
+    build_error: null,
+    config,
+    roots: ["page"],
+  };
+  const second = { ...first, id: "second", config: { ...config, title: "Second site" } };
+  const submissions: Array<{ generation: number; config: typeof config }> = [];
+  let finish!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  await page.unroute("**/api/spaces/space/publications");
+  await page.route("**/api/spaces/space/publications", async (route) => {
+    if (route.request().method() === "GET") return route.fulfill({ json: { publications: [first, second] } });
+    submissions.push(route.request().postDataJSON());
+    if (submissions.length === 1) await gate;
+    await route.fulfill({
+      json: {
+        publication: { ...first, generation: submissions.length + 1, config: { ...config, title: "Saved site" } },
+        url: "https://public.example.test/sites/first",
+      },
+    });
+  });
+  await page.getByRole("button", { name: "Load publishing settings" }).click();
+  const site = page.getByRole("combobox", { name: "Site", exact: true }),
+    space = page.getByRole("combobox", { name: "Space", exact: true });
+  await expect(site).toHaveValue("first");
+  expect(
+    await page
+      .locator(".settings-section")
+      .filter({ has: page.getByRole("heading", { name: "Published spaces" }) })
+      .evaluate((section) => {
+        const walker = document.createTreeWalker(section, NodeFilter.SHOW_TEXT);
+        let zeros = 0;
+        while (walker.nextNode()) if (walker.currentNode.textContent === "0") zeros++;
+        return zeros;
+      }),
+  ).toBe(0);
+  await page.getByRole("button", { name: "Save site", exact: true }).click();
+  await expect(site).toBeDisabled();
+  await expect(space).toBeDisabled();
+  await page.getByLabel("Site title", { exact: true }).fill("Newer draft");
+  finish();
+  await expect(site).toBeEnabled();
+  await expect(space).toBeEnabled();
+  await expect(page.getByLabel("Site title", { exact: true })).toHaveValue("Newer draft");
+  await site.selectOption("second");
+  await site.selectOption("first");
+  await expect(page.getByLabel("Site title", { exact: true })).toHaveValue("Saved site");
+  await page.getByRole("button", { name: "Save site", exact: true }).click();
+  await expect.poll(() => submissions.length).toBe(2);
+  expect(submissions[1]).toMatchObject({ generation: 2, config: { tableViews: { dormant: "filtered" } } });
 });
