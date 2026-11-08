@@ -3,6 +3,7 @@ import { publicationPages, type Publication, type PublicationPage } from "./publ
 import type { PublicationConfig } from "../shared/publications";
 import { putPublicationObject } from "./publication-storage";
 import { enqueuePlatformJob } from "./platform-jobs";
+import { PublicationStateError } from "./publication-failure";
 
 export type PublicationCheckpoint = {
   version: 2;
@@ -12,6 +13,35 @@ export type PublicationCheckpoint = {
   documentStateKey?: string;
   tableSource?: { kind: "legacy" } | { kind: "snapshot"; handle: string };
 };
+const validInteger = (n: unknown, minimum: number) => typeof n === "number" && Number.isSafeInteger(n) && n >= minimum;
+export function publicationCheckpoint(value: string | null): PublicationCheckpoint {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value ?? "null");
+  } catch {
+    throw new PublicationStateError("publication_checkpoint_invalid");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    throw new PublicationStateError("publication_checkpoint_invalid");
+  const checkpoint = parsed as Partial<PublicationCheckpoint>;
+  const source = checkpoint.tableSource;
+  if (
+    checkpoint.version !== 2 ||
+    !validInteger(checkpoint.offset, 0) ||
+    (checkpoint.part !== undefined && !validInteger(checkpoint.part, 1)) ||
+    (checkpoint.documentStateKey !== undefined &&
+      (typeof checkpoint.documentStateKey !== "string" || !checkpoint.documentStateKey)) ||
+    (checkpoint.tableCursor !== undefined &&
+      (typeof checkpoint.tableCursor !== "string" || !checkpoint.tableCursor || !source)) ||
+    (source !== undefined &&
+      (!source ||
+        typeof source !== "object" ||
+        (source.kind !== "legacy" &&
+          (source.kind !== "snapshot" || typeof source.handle !== "string" || !/^[a-f0-9]{64}$/.test(source.handle)))))
+  )
+    throw new PublicationStateError("publication_checkpoint_invalid");
+  return checkpoint as PublicationCheckpoint;
+}
 export async function publicationDependencies(
   env: Env,
   pub: Publication,

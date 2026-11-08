@@ -257,6 +257,8 @@ describe("password cryptography RPC", () => {
 
   it("rejects throttled requests before any hashing RPC", async () => {
     await bootstrap();
+    // Keep requests in one rate-limit window even when hashing crosses a wall-clock boundary.
+    vi.spyOn(Date, "now").mockReturnValue(Math.floor(Date.now() / 10_000) * 10_000 + 1000);
     const { calls, request } = instrument();
     const body = { email: "missing@example.test", password: "password123" };
     let response = await request("/api/auth/sign-in/email", body);

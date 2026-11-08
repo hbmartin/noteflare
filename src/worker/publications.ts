@@ -6,7 +6,7 @@ import { HttpError, assertSameOrigin } from "./http";
 import { publicationConfig, publicationHostname, type PublicationConfig } from "../shared/publications";
 import { publicJson } from "./public-utils";
 import { tableInternal } from "./table-service";
-import { changedPublicationSources } from "./publication-failure";
+import { restartablePublicationFailure, publicationNeedsJob } from "./publication-failure";
 import { retirePublicationBuild } from "./publication-jobs";
 import { enqueuePlatformJob } from "./platform-jobs";
 export type Publication = {
@@ -30,6 +30,10 @@ export type Publication = {
   build_failure_checkpoint_json: string | null;
   build_failure_json: string | null;
   dependencies_ready: number;
+  build_state_recovery_count: number;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
 };
 export type PublicationPage = {
   id: string;
@@ -47,16 +51,65 @@ export type PublicationPage = {
   cover_x: number;
   cover_y: number;
 };
+/** Only trusted SQL aliases are supplied by the publication queries below. */
+function ordinaryPublicationPage(alias = "") {
+  const p = alias ? `${alias}.` : "";
+  return `${p}archived_at IS NULL AND ${p}import_job_id IS NULL AND ${p}is_template=0`;
+}
+/** Explicit owner-facing contract: private captures and provenance never cross this boundary. */
+function settingsSite(pub: Publication, roots: string[]) {
+  let progress: string | null = null;
+  try {
+    const checkpoint: unknown = JSON.parse(pub.build_checkpoint_json ?? "null");
+    if (
+      checkpoint &&
+      typeof checkpoint === "object" &&
+      "offset" in checkpoint &&
+      typeof checkpoint.offset === "number" &&
+      Number.isSafeInteger(checkpoint.offset) &&
+      checkpoint.offset >= 0
+    )
+      progress = JSON.stringify({ offset: checkpoint.offset });
+  } catch {
+    /* Invalid state is recovered by the builder, not exposed to clients. */
+  }
+  return {
+    id: pub.id,
+    workspace_id: pub.workspace_id,
+    space_id: pub.space_id,
+    url_key: pub.url_key,
+    generation: pub.generation,
+    access_generation: pub.access_generation,
+    active_generation: pub.active_generation,
+    active_access_generation: pub.active_access_generation,
+    active: pub.active,
+    needs_build: pub.needs_build,
+    build_error:
+      pub.active && pub.needs_build && pub.build_failure_checkpoint_json === pub.build_checkpoint_json
+        ? pub.build_error
+        : null,
+    content_version: pub.content_version,
+    built_content_version: pub.built_content_version,
+    build_content_version: pub.build_content_version,
+    build_checkpoint_json: progress,
+    dependencies_ready: pub.dependencies_ready,
+    created_by: pub.created_by,
+    created_at: pub.created_at,
+    updated_at: pub.updated_at,
+    config: JSON.parse(pub.config_json) as PublicationConfig,
+    roots,
+  };
+}
 export async function publicationPages(env: Env, pub: Publication): Promise<PublicationPage[]> {
   const result = await env.DB.prepare(
     `WITH RECURSIVE ancestors(root_id,id,parent_id,allowed,depth) AS (
- SELECT r.page_id,p.id,p.parent_id,p.space_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0,0
+ SELECT r.page_id,p.id,p.parent_id,p.space_id=? AND ${ordinaryPublicationPage("p")},0
  FROM publication_roots r JOIN pages p ON p.id=r.page_id WHERE r.publication_id=? AND p.workspace_id=?
- UNION ALL SELECT a.root_id,p.id,p.parent_id,p.space_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0,a.depth+1
+ UNION ALL SELECT a.root_id,p.id,p.parent_id,p.space_id=? AND ${ordinaryPublicationPage("p")},a.depth+1
  FROM pages p JOIN ancestors a ON a.parent_id=p.id WHERE p.workspace_id=? AND a.depth<50),
  eligible(id,depth) AS (SELECT root_id,max(depth) FROM ancestors GROUP BY root_id HAVING min(allowed)=1 AND max(parent_id IS NULL)=1),
  tree(id,depth) AS (SELECT id,depth FROM eligible UNION SELECT p.id,t.depth+1 FROM pages p JOIN tree t ON p.parent_id=t.id
- WHERE p.space_id=? AND p.workspace_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0 AND t.depth<51)
+ WHERE p.space_id=? AND p.workspace_id=? AND ${ordinaryPublicationPage("p")} AND t.depth<51)
  SELECT DISTINCT p.id,p.workspace_id,p.space_id,p.parent_id,p.kind,p.title,p.icon,substr(p.plain_text,1,280) plain_text,
  p.content_epoch,p.indexed_seq,p.updated_at,p.cover_attachment_id,p.cover_x,p.cover_y,t.depth publication_depth
  FROM tree t JOIN pages p ON p.id=t.id ORDER BY p.position,p.id LIMIT 5001`,
@@ -73,8 +126,8 @@ export async function publicationPageAllowed(env: Env, pub: Publication, pageId:
   return Boolean(
     await env.DB.prepare(
       `WITH RECURSIVE ancestors(id,parent_id,allowed,depth) AS (
- SELECT id,parent_id,space_id=? AND archived_at IS NULL AND import_job_id IS NULL AND is_template=0,0 FROM pages WHERE id=? AND workspace_id=?
- UNION ALL SELECT p.id,p.parent_id,p.space_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0,a.depth+1
+ SELECT id,parent_id,space_id=? AND ${ordinaryPublicationPage()},0 FROM pages WHERE id=? AND workspace_id=?
+ UNION ALL SELECT p.id,p.parent_id,p.space_id=? AND ${ordinaryPublicationPage("p")},a.depth+1
  FROM pages p JOIN ancestors a ON a.parent_id=p.id WHERE p.workspace_id=? AND a.depth<50)
  SELECT 1 FROM ancestors a JOIN publication_roots r ON r.page_id=a.id WHERE r.publication_id=?
  AND NOT EXISTS(SELECT 1 FROM ancestors WHERE allowed=0) AND EXISTS(SELECT 1 FROM ancestors WHERE parent_id IS NULL) LIMIT 1`,
@@ -101,9 +154,9 @@ export async function validatePublicationTableViews(
   const entries = Object.entries(config.tableViews);
   if (!entries.length) return;
   const rows = await env.DB.prepare(`WITH RECURSIVE ancestry(root,id,parent_id,allowed,depth) AS (
-    SELECT p.id,p.id,p.parent_id,p.workspace_id=? AND p.space_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0,0
+    SELECT p.id,p.id,p.parent_id,p.workspace_id=? AND p.space_id=? AND ${ordinaryPublicationPage("p")},0
     FROM pages p WHERE p.id IN(SELECT value FROM json_each(?))
-    UNION ALL SELECT a.root,p.id,p.parent_id,a.allowed AND p.workspace_id=? AND p.space_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0,a.depth+1
+    UNION ALL SELECT a.root,p.id,p.parent_id,a.allowed AND p.workspace_id=? AND p.space_id=? AND ${ordinaryPublicationPage("p")},a.depth+1
     FROM pages p JOIN ancestry a ON a.parent_id=p.id WHERE a.depth<50)
     SELECT p.id,p.kind,t.state,t.generation,EXISTS(SELECT 1 FROM ancestry a WHERE a.root=p.id AND a.allowed=1
       AND a.id IN(SELECT value FROM json_each(?))) eligible
@@ -123,10 +176,7 @@ export async function validatePublicationTableViews(
   for (const [pageId, viewId] of entries) {
     const table = tables.get(pageId);
     if (!table?.eligible) {
-      if (previous[pageId] === viewId) {
-        delete config.tableViews[pageId];
-        continue;
-      }
+      if (previous[pageId] === viewId) continue;
       throw new HttpError(422, "publication_view", "Choose a table within the published roots.");
     }
     if (table.kind !== "table") throw new HttpError(422, "publication_view", "Choose a table view.");
@@ -178,12 +228,12 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
         .all<{ publication_id: string; page_id: string }>()
     ).results;
     return Response.json({
-      publications: sites.map((p) => ({
-        ...p,
-        config: JSON.parse(p.config_json),
-        config_json: undefined,
-        roots: allRoots.filter((row) => row.publication_id === p.id).map((row) => row.page_id),
-      })),
+      publications: sites.map((p) =>
+        settingsSite(
+          p,
+          allRoots.filter((row) => row.publication_id === p.id).map((row) => row.page_id),
+        ),
+      ),
     });
   }
   assertSameOrigin(request, env.BETTER_AUTH_URL);
@@ -201,7 +251,7 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
   if ((input.active === true && !roots.length) || roots.length > 100 || roots.some((id) => typeof id !== "string"))
     throw new HttpError(422, "publication_roots", "Choose between 1 and 100 page roots.");
   const eligibleRoots = await env.DB.prepare(
-    "SELECT count(*) count FROM pages WHERE id IN (SELECT value FROM json_each(?)) AND workspace_id=? AND space_id=? AND archived_at IS NULL AND import_job_id IS NULL AND is_template=0",
+    `SELECT count(*) count FROM pages WHERE id IN (SELECT value FROM json_each(?)) AND workspace_id=? AND space_id=? AND ${ordinaryPublicationPage()}`,
   )
     .bind(JSON.stringify(roots), member.workspace.id, spaceId)
     .first<number>("count");
@@ -216,8 +266,8 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
   const eligible = async (pageId: string) =>
     Boolean(
       await env.DB.prepare(`WITH RECURSIVE ancestors(id,parent_id,depth) AS (
- SELECT id,parent_id,0 FROM pages WHERE id=? AND space_id=? AND archived_at IS NULL AND import_job_id IS NULL AND is_template=0
- UNION ALL SELECT p.id,p.parent_id,a.depth+1 FROM pages p JOIN ancestors a ON a.parent_id=p.id WHERE p.space_id=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0 AND a.depth<50)
+ SELECT id,parent_id,0 FROM pages WHERE id=? AND space_id=? AND ${ordinaryPublicationPage()}
+ UNION ALL SELECT p.id,p.parent_id,a.depth+1 FROM pages p JOIN ancestors a ON a.parent_id=p.id WHERE p.space_id=? AND ${ordinaryPublicationPage("p")} AND a.depth<50)
  SELECT 1 FROM ancestors WHERE id IN (SELECT value FROM json_each(?)) LIMIT 1`)
         .bind(pageId, spaceId, spaceId, JSON.stringify(roots))
         .first(),
@@ -243,7 +293,7 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
     now = Date.now();
   const mutation = existing
     ? env.DB.prepare(
-        "UPDATE publications SET config_json=?,active=?,generation=generation+1,access_generation=access_generation+1,content_version=content_version+1,build_checkpoint_json=NULL,build_content_version=NULL,build_error=NULL,build_failure_checkpoint_json=NULL,build_failure_json=NULL,needs_build=1,updated_at=? WHERE id=? AND generation=?",
+        "UPDATE publications SET config_json=?,active=?,build_state_recovery_count=0,generation=generation+1,access_generation=access_generation+1,content_version=content_version+1,build_checkpoint_json=NULL,build_content_version=NULL,build_error=NULL,build_failure_checkpoint_json=NULL,build_failure_json=NULL,needs_build=1,updated_at=? WHERE id=? AND generation=?",
       ).bind(JSON.stringify(config), Number(input.active === true), now, id, existing.generation)
     : env.DB.prepare(
         "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -268,11 +318,20 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
     env.DB.prepare(
       "INSERT OR IGNORE INTO publication_roots(publication_id,page_id) SELECT p.id,root.value FROM publications p CROSS JOIN json_each(?) root WHERE p.id=? AND p.generation=? AND p.updated_at=?",
     ).bind(JSON.stringify(roots), id, next, now),
+    env.DB.prepare("SELECT * FROM publications WHERE id=?").bind(id),
+    env.DB.prepare("SELECT page_id FROM publication_roots WHERE publication_id=? ORDER BY page_id").bind(id),
   ]);
   if (!results[0]!.meta.changes) throw new HttpError(409, "publication_changed", "Reload the site settings.");
-  const pub = (await env.DB.prepare("SELECT * FROM publications WHERE id=?").bind(id).first<Publication>())!;
+  const pub = results[3]!.results[0] as Publication;
+  const storedRoots = results[4]!.results as Array<{ page_id: string }>;
   await queuePublication(env, pub);
-  return Response.json({ publication: pub, url: `${env.PUBLIC_BASE_URL ?? new URL(request.url).origin}/sites/${key}` });
+  return Response.json({
+    publication: settingsSite(
+      pub,
+      storedRoots.map((row) => row.page_id),
+    ),
+    url: `${env.PUBLIC_BASE_URL ?? new URL(request.url).origin}/sites/${key}`,
+  });
 }
 async function queuePublication(env: Env, pub: Publication) {
   if (pub.active)
@@ -289,16 +348,12 @@ async function queuePublication(env: Env, pub: Publication) {
 }
 export async function enqueuePendingPublications(env: Env) {
   if (env.PUBLIC_PUBLISHING_ENABLED !== "true") return;
-  const failures = await env.DB.prepare(`SELECT * FROM publications p WHERE p.active=1 AND p.needs_build=1
-    AND json_extract(p.build_failure_json,'$.kind')='content'
-    AND p.build_failure_checkpoint_json IS p.build_checkpoint_json
-    AND (json_extract(p.build_failure_json,'$.legacy')=1 OR ${changedPublicationSources})
+  const failures = await env.DB.prepare(`SELECT * FROM publications p WHERE ${restartablePublicationFailure}
     ORDER BY p.updated_at LIMIT 20`).all<Publication>();
-  for (const pub of failures.results) await retirePublicationBuild(env, pub, "content");
+  for (const pub of failures.results)
+    await retirePublicationBuild(env, pub, JSON.parse(pub.build_failure_json!).kind === "state" ? "state" : "content");
   const rows = await env.DB.prepare(
-    `SELECT * FROM publications p WHERE active=1 AND needs_build=1 AND NOT EXISTS(
-      SELECT 1 FROM platform_jobs j WHERE j.kind='publication' AND j.generation=CAST(p.generation AS TEXT)
-      AND json_extract(j.payload_json,'$.publicationId')=p.id) ORDER BY updated_at LIMIT 20`,
+    `SELECT * FROM publications p WHERE ${publicationNeedsJob} ORDER BY updated_at LIMIT 20`,
   ).all<Publication>();
   for (const pub of rows.results) await queuePublication(env, pub);
 }

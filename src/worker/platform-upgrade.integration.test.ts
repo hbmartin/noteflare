@@ -161,3 +161,58 @@ it("0113 preserves healthy captures and manifests while new generations atomical
     await env.DB.prepare("SELECT generation,payload_json FROM platform_jobs WHERE job_key='site'").first(),
   ).toEqual({ generation: "9", payload_json: '{"publicationId":"site","generation":9}' });
 });
+
+it("0114 preserves healthy captures, manifests, leases and cleanup intent while budgeting state recovery", async () => {
+  await reset();
+  await applyD1Migrations(
+    env.DB,
+    env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0114"),
+  );
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner114','Owner','upgrade114@test.example',1,1)",
+    ),
+    env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace114','Upgrade',1)"),
+    env.DB.prepare(
+      "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,generation,access_generation,active_generation,active_access_generation,manifest_key,needs_build,build_content_version,content_version,build_checkpoint_json,created_by,created_at,updated_at) VALUES('site114','workspace114','workspace114-general','key114','{}',1,8,3,7,3,'private/active',1,4,5,'{\"version\":2,\"offset\":2}','owner114',1,1)",
+    ),
+    env.DB.prepare(
+      "INSERT INTO publication_table_snapshots(handle,object_id,page_id,publication_id,generation,access_generation,created_at,next_attempt_at) VALUES('handle114','object','page','site114',8,3,1,60000)",
+    ),
+    env.DB.prepare("UPDATE platform_jobs SET lease_token='held',lease_until=9999999999999 WHERE job_key='site114'"),
+  ]);
+  const before = await env.DB.prepare("SELECT * FROM publications WHERE id='site114'").first();
+  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+  expect(await env.DB.prepare("SELECT * FROM publications WHERE id='site114'").first()).toEqual({
+    ...before,
+    build_state_recovery_count: 0,
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT generation,lease_token,lease_until FROM platform_jobs WHERE job_key='site114'",
+    ).first(),
+  ).toEqual({ generation: "8", lease_token: "held", lease_until: 9999999999999 });
+  expect(
+    await env.DB.prepare("SELECT next_attempt_at FROM publication_table_snapshots WHERE handle='handle114'").first(
+      "next_attempt_at",
+    ),
+  ).toBe(60000);
+  await env.DB.prepare("UPDATE publications SET build_state_recovery_count=1 WHERE id='site114'").run();
+  await expect(
+    env.DB.prepare("UPDATE publications SET build_state_recovery_count=2 WHERE id='site114'").run(),
+  ).rejects.toThrow("CHECK constraint");
+  await env.DB.prepare(
+    "UPDATE publications SET build_checkpoint_json='{\"version\":2,\"offset\":3}',generation=generation+1 WHERE id='site114'",
+  ).run();
+  expect(
+    await env.DB.prepare("SELECT build_state_recovery_count FROM publications WHERE id='site114'").first(
+      "build_state_recovery_count",
+    ),
+  ).toBe(1);
+  await env.DB.prepare("UPDATE publications SET access_generation=access_generation+1 WHERE id='site114'").run();
+  expect(
+    await env.DB.prepare("SELECT build_state_recovery_count FROM publications WHERE id='site114'").first(
+      "build_state_recovery_count",
+    ),
+  ).toBe(0);
+});

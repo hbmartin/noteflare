@@ -1,6 +1,7 @@
 import { applyD1Migrations, env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "./env";
+import { enqueuePendingPublications, type Publication } from "./publications";
 
 beforeEach(async () => {
   await reset();
@@ -26,6 +27,7 @@ async function alarmAt(phase: number, overrides: Partial<Env>) {
     try {
       await state.storage.deleteAlarm();
       await state.storage.put("phase", phase);
+      await state.storage.delete("schedule");
       await instance.alarm();
       return { alarm: await state.storage.getAlarm(), phase: await state.storage.get<number>("phase") };
     } finally {
@@ -112,6 +114,150 @@ it("accounts for active job leases when choosing the next maintenance deadline",
     .run();
   expect((await alarmAt(10, {})).alarm).toBe(lease);
 });
+
+describe("publication recovery deadlines", () => {
+  async function pendingPublication(now: number) {
+    const checkpoint = JSON.stringify({ version: 2, offset: 3 });
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@deadlines.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Workspace',1)"),
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,content_epoch,indexed_seq) VALUES('root','workspace','workspace-general','document','a','Root','owner',1,1,1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO document_projections(page_id,content_epoch,sequence,schema_version,r2_key,content_hash,byte_size,updated_at) VALUES('root',1,1,1,'projection','hash',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO publications(id,workspace_id,space_id,url_key,config_json,active,generation,access_generation,active_generation,active_access_generation,manifest_key,needs_build,build_content_version,content_version,build_checkpoint_json,created_by,created_at,updated_at) VALUES('site','workspace','workspace-general','key','{}',1,8,3,7,3,'previous',1,1,1,?,'owner',1,1)",
+      ).bind(checkpoint),
+      env.DB.prepare("INSERT INTO publication_roots VALUES('site','root')"),
+    ]);
+    await env.DB.prepare("UPDATE platform_jobs SET available_at=? WHERE job_key='site'")
+      .bind(now + 3_600_000)
+      .run();
+    return checkpoint;
+  }
+  async function fail(checkpoint: string, kind = "content", legacy = false, epochOnly = false) {
+    await env.DB.prepare("UPDATE publications SET build_failure_checkpoint_json=?,build_failure_json=? WHERE id='site'")
+      .bind(
+        checkpoint,
+        JSON.stringify({
+          version: 1,
+          kind,
+          code: "captured_content",
+          legacy,
+          sources: legacy
+            ? []
+            : [
+                {
+                  pageId: "root",
+                  contentEpoch: 1,
+                  sequence: 1,
+                  key: "projection",
+                  ...(epochOnly ? { comparison: "epoch" } : {}),
+                },
+              ],
+        }),
+      )
+      .run();
+  }
+  const current = () => env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>();
+
+  it.each([false, true])(
+    "starts a prompt next cycle for a failure discovered after phase 1: legacy=%s",
+    async (legacy) => {
+      const now = Date.now(),
+        clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      try {
+        const checkpoint = await pendingPublication(now);
+        const bindings = { PUBLIC_PUBLISHING_ENABLED: "true" } as Partial<Env>;
+        await alarmAt(1, bindings);
+        await fail(checkpoint, "content", legacy);
+        if (!legacy) await env.DB.prepare("UPDATE document_projections SET sequence=2 WHERE page_id='root'").run();
+        const lease = now + 60_000;
+        await env.DB.prepare("UPDATE platform_jobs SET lease_token='held',lease_until=? WHERE job_key='site'")
+          .bind(lease)
+          .run();
+        expect(await alarmAt(10, bindings)).toEqual({ phase: 0, alarm: now + 5000 });
+        clock.mockReturnValue(now + 5000);
+        await alarmAt(1, bindings);
+        const replacement = (await current())!;
+        expect(replacement.generation).toBe(9);
+        expect(replacement.active_generation).toBe(7);
+        expect(replacement.access_generation).toBe(3);
+        expect(replacement.manifest_key).toBe("previous");
+        expect(replacement.build_checkpoint_json).toBeNull();
+        expect(replacement.build_failure_json).toBeNull();
+        expect(
+          await env.DB.prepare(
+            "SELECT generation,lease_token,lease_until FROM platform_jobs WHERE job_key='site'",
+          ).first(),
+        ).toEqual({ generation: "9", lease_token: "held", lease_until: lease });
+        await alarmAt(1, bindings);
+        expect((await current())!.generation).toBe(9);
+        expect((await alarmAt(10, bindings)).alarm).toBe(lease);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it.each(["unchanged", "transient", "configuration", "checkpoint", "disabled", "epoch-only"])(
+    "retains the existing retry deadline for %s failures",
+    async (scenario) => {
+      const now = Date.now(),
+        clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      try {
+        const checkpoint = await pendingPublication(now);
+        await fail(
+          scenario === "checkpoint" ? JSON.stringify({ version: 2, offset: 2 }) : checkpoint,
+          ["transient", "configuration"].includes(scenario) ? scenario : "content",
+          false,
+          scenario === "epoch-only",
+        );
+        if (scenario !== "unchanged")
+          await env.DB.prepare(
+            "UPDATE document_projections SET sequence=2,r2_key='new-projection' WHERE page_id='root'",
+          ).run();
+        const bindings = { PUBLIC_PUBLISHING_ENABLED: scenario === "disabled" ? "false" : "true" } as Partial<Env>;
+        expect((await alarmAt(10, bindings)).alarm).toBe(now + 3_600_000);
+        await alarmAt(1, bindings);
+        expect((await current())!.generation).toBe(8);
+        expect((await current())!.build_checkpoint_json).toBe(checkpoint);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it("sleeps instead of recreating work for an exhausted state failure", async () => {
+    const checkpoint = await pendingPublication(Date.now());
+    await fail(checkpoint, "state");
+    await env.DB.prepare("UPDATE publications SET build_state_recovery_count=1 WHERE id='site'").run();
+    await env.DB.prepare("DELETE FROM platform_jobs").run();
+    await enqueuePendingPublications({ ...env, PUBLIC_PUBLISHING_ENABLED: "true" } as Env);
+    expect(await env.DB.prepare("SELECT 1 FROM platform_jobs").first()).toBeNull();
+    expect((await alarmAt(10, { PUBLIC_PUBLISHING_ENABLED: "true" })).alarm).toBeNull();
+  });
+
+  it("does not retire an advanced checkpoint or an activated build from delayed failure metadata", async () => {
+    const now = Date.now(),
+      checkpoint = await pendingPublication(now);
+    await fail(checkpoint, "content", true);
+    const advanced = JSON.stringify({ version: 2, offset: 4 });
+    await env.DB.prepare("UPDATE publications SET build_checkpoint_json=? WHERE id='site'").bind(advanced).run();
+    await enqueuePendingPublications({ ...env, PUBLIC_PUBLISHING_ENABLED: "true" } as Env);
+    expect((await current())!.build_checkpoint_json).toBe(advanced);
+    expect((await current())!.generation).toBe(8);
+    await env.DB.prepare("UPDATE publications SET needs_build=0 WHERE id='site'").run();
+    await fail(advanced, "content", true);
+    await enqueuePendingPublications({ ...env, PUBLIC_PUBLISHING_ENABLED: "true" } as Env);
+    expect((await current())!.generation).toBe(8);
+  });
+});
+
 it("backs off failed snapshot releases persistently without running full cycles every five seconds", async () => {
   const { cleanupPublicationSnapshots } = await import("./publication-snapshots");
   await env.DB.prepare(
