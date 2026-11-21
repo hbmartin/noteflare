@@ -1,3 +1,5 @@
+export const MAX_PUBLICATION_TABLE_VIEWS = 200;
+
 export type PublicationConfig = {
   title: string;
   description: string;
@@ -47,7 +49,7 @@ export function publicationConfig(input: unknown, rootIds: string[]): Publicatio
       ? (v.tableViews as Record<string, string>)
       : {};
   if (
-    Object.keys(tableViews).length > 200 ||
+    Object.keys(tableViews).length > MAX_PUBLICATION_TABLE_VIEWS ||
     Object.values(tableViews).some((id) => typeof id !== "string" || id.length > 100)
   )
     throw new Error("Invalid published table views.");

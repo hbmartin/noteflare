@@ -82,10 +82,12 @@ export async function notifyPlatformJob(
         { platformJobId: platformJobId(intent) },
         { delaySeconds: Math.max(0, Math.ceil((at - Date.now()) / 1000)) },
       );
+      return true;
     } catch {
       recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
     }
   }
+  return false;
 }
 
 export async function runPlatformJob(env: Env, id: string, handlers: PlatformHandlers) {
@@ -167,13 +169,14 @@ export async function runPlatformJob(env: Env, id: string, handlers: PlatformHan
       | undefined;
     if (remaining) {
       const due = Math.max(remaining.available_at, remaining.lease_until ?? 0);
-      if (!remaining.lease_until || remaining.lease_until <= Date.now())
-        await notifyPlatformJob(
+      const queued =
+        (!remaining.lease_until || remaining.lease_until <= Date.now()) &&
+        (await notifyPlatformJob(
           env,
           { workspaceId: remaining.workspace_id, kind: remaining.kind, key: remaining.job_key },
           due,
-        );
-      await wakePlatformBestEffort(env, due);
+        ));
+      if (!queued) await wakePlatformBestEffort(env, due);
     }
   }
 }

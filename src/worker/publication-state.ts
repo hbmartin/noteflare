@@ -55,10 +55,18 @@ export async function publicationDependencies(
     .bind(kind, JSON.stringify([...new Set(ids)]), pub.id, pub.generation, pub.access_generation)
     .run();
 }
+async function captureJson<T>(object: R2ObjectBody): Promise<T> {
+  try {
+    return await object.json<T>();
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new PublicationStateError("publication_capture_invalid");
+    throw error;
+  }
+}
 /** Conditional object creation makes duplicate job deliveries consume identical inputs. */
 export async function publicationInput<T>(env: Env, pub: Publication, key: string, read: () => Promise<T>): Promise<T> {
   const saved = await env.PUBLICATIONS_BUCKET!.get(key);
-  if (saved) return saved.json<T>();
+  if (saved) return captureJson<T>(saved);
   const value = await read();
   await putPublicationObject(env, pub, key, JSON.stringify(value), {
     onlyIf: { etagDoesNotMatch: "*" },
@@ -66,7 +74,7 @@ export async function publicationInput<T>(env: Env, pub: Publication, key: strin
   });
   const object = await env.PUBLICATIONS_BUCKET!.get(key);
   if (!object) throw new Error("Publication input is unavailable.");
-  return object.json<T>();
+  return captureJson<T>(object);
 }
 export async function publicationInputs(env: Env, pub: Publication) {
   return publicationInput(env, pub, `publications/${pub.id}/${pub.generation}/inputs.json`, async () => {

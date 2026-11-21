@@ -115,7 +115,7 @@ async function fixturePublication(override: Partial<Env> = {}) {
 }
 
 it("returns normalized persisted settings and roots from publication creates and updates", async () => {
-  await insertPage("home").run();
+  await env.DB.batch([insertPage("z-root"), insertPage("home"), insertPage("a-root")]);
   const signup = await createAuth(configured(), true).handler(
     new Request("http://example.test/api/auth/sign-up/email", {
       method: "POST",
@@ -146,29 +146,40 @@ it("returns normalized persisted settings and roots from publication creates and
     );
   const config = publicationConfig({ title: "Initial site", homePageId: "home" }, ["home"]);
   const created = await (
-    await save({ roots: ["home", "home"], config, active: false })
+    await save({ roots: ["z-root", "home", "a-root", "home"], config, active: false })
   ).json<{
     publication: Publication & { roots: string[]; config: typeof config };
     url: string;
   }>();
-  expect(created.publication.roots).toEqual(["home"]);
+  expect(created.publication.roots).toEqual(["a-root", "home", "z-root"]);
   expect(created.publication.config).toEqual(config);
   expect(created.publication).not.toHaveProperty("config_json");
   expect(created.url).toContain(`/sites/${created.publication.url_key}`);
+  const dormantViews = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`gone-${i}`, "shared"]));
   await env.DB.prepare("UPDATE publications SET config_json=? WHERE id=?")
-    .bind(JSON.stringify({ ...config, tableViews: { gone: "shared" } }), created.publication.id)
+    .bind(JSON.stringify({ ...config, tableViews: dormantViews }), created.publication.id)
     .run();
   const updated = await (
     await save({
       id: created.publication.id,
       generation: created.publication.generation,
-      roots: ["home"],
-      config: { ...config, title: "Updated site", tableViews: { gone: "shared" } },
+      roots: ["home", "z-root", "a-root"],
+      config: { ...config, title: "Updated site", tableViews: dormantViews },
       active: true,
     })
   ).json<typeof created>();
   expect(updated.publication.generation).toBe(created.publication.generation + 1);
-  expect(updated.publication.config).toMatchObject({ title: "Updated site", tableViews: { gone: "shared" } });
+  expect(updated.publication.config).toMatchObject({ title: "Updated site", tableViews: dormantViews });
+  expect(updated.publication.roots).toEqual(created.publication.roots);
+  await expect(
+    save({
+      id: created.publication.id,
+      generation: updated.publication.generation,
+      roots: ["home"],
+      config: { ...updated.publication.config, tableViews: { ...dormantViews, another: "shared" } },
+      active: true,
+    }),
+  ).rejects.toMatchObject({ status: 422, code: "publication_config" });
   expect(updated.publication).not.toHaveProperty("config_json");
   const privateCheckpoint = JSON.stringify({
     version: 2,
@@ -194,6 +205,7 @@ it("returns normalized persisted settings and roots from publication creates and
     )
   ).json<{ publications: Array<Record<string, unknown>> }>();
   const visible = listed.publications[0]!;
+  expect(visible.roots).toEqual(updated.publication.roots);
   expect(visible.build_checkpoint_json).toBe('{"offset":3}');
   expect(visible.build_error).toBe("Safe error");
   expect(Object.keys(visible).sort()).toEqual(Object.keys(updated.publication).sort());
@@ -209,7 +221,7 @@ it("returns normalized persisted settings and roots from publication creates and
     await save({
       id: created.publication.id,
       generation: updated.publication.generation,
-      roots: ["home"],
+      roots: ["a-root", "z-root", "home"],
       config: updated.publication.config,
       active: false,
     })

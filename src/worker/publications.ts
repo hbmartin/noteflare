@@ -97,7 +97,7 @@ function settingsSite(pub: Publication, roots: string[]) {
     created_at: pub.created_at,
     updated_at: pub.updated_at,
     config: JSON.parse(pub.config_json) as PublicationConfig,
-    roots,
+    roots: [...roots].sort(),
   };
 }
 export async function publicationPages(env: Env, pub: Publication): Promise<PublicationPage[]> {
