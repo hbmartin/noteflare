@@ -1,6 +1,7 @@
 import { setAuditActor, withAuditRequest } from "./audit";
 import type { Env } from "./env";
 import { logger, recordMetric } from "./observability";
+import { wakePlatformBestEffort } from "./platform-wakeup";
 
 export type PlatformJobIntent = {
   workspaceId: string;
@@ -15,6 +16,9 @@ export class PlatformJobDeferred extends Error {
     super("platform_job_deferred");
   }
 }
+
+/** A durable owner-visible failure that requires a build reset, rather than retries. */
+export class PlatformJobTerminal extends Error {}
 
 export type PlatformJobHandler = (env: Env, job: PlatformJob) => Promise<void>;
 export type PlatformHandlers = Readonly<Record<string, PlatformJobHandler>>;
@@ -66,11 +70,18 @@ export async function enqueuePlatformJob(env: Env, intent: PlatformJobIntent, be
   else await statement.run();
   await notifyPlatformJob(env, intent);
 }
-export async function notifyPlatformJob(env: Env, intent: Pick<PlatformJobIntent, "workspaceId" | "kind" | "key">) {
+export async function notifyPlatformJob(
+  env: Env,
+  intent: Pick<PlatformJobIntent, "workspaceId" | "kind" | "key">,
+  at = Date.now(),
+) {
   // Recovery re-enqueues from D1 if this best-effort wakeup fails or expires.
   if (env.PLATFORM_QUEUE) {
     try {
-      await env.PLATFORM_QUEUE.send({ platformJobId: platformJobId(intent) });
+      await env.PLATFORM_QUEUE.send(
+        { platformJobId: platformJobId(intent) },
+        { delaySeconds: Math.max(0, Math.ceil((at - Date.now()) / 1000)) },
+      );
     } catch {
       recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
     }
@@ -114,6 +125,13 @@ export async function runPlatformJob(env: Env, id: string, handlers: PlatformHan
       attempts: job.attempts,
     });
   } catch (error) {
+    if (error instanceof PlatformJobTerminal) {
+      await env.DB.prepare("DELETE FROM platform_jobs WHERE id=? AND generation=? AND lease_token=?")
+        .bind(id, job.generation, token)
+        .run();
+      recordMetric(env, { event: "platform.job", component: "platform", operation: job.kind, outcome: "blocked" });
+      return;
+    }
     if (error instanceof PlatformJobDeferred) {
       await env.DB.prepare(
         "UPDATE platform_jobs SET lease_token=NULL,lease_until=NULL,available_at=?,attempts=max(0,attempts-1),updated_at=? WHERE id=? AND generation=? AND lease_token=?",
@@ -135,9 +153,28 @@ export async function runPlatformJob(env: Env, id: string, handlers: PlatformHan
   } finally {
     // A newer generation retains this lease while its predecessor is in flight.
     // Release only our token, never delete or mutate that newer generation.
-    await env.DB.prepare("UPDATE platform_jobs SET lease_token=NULL,lease_until=NULL WHERE id=? AND lease_token=?")
-      .bind(id, token)
-      .run();
+    const settled = await env.DB.batch([
+      env.DB.prepare("UPDATE platform_jobs SET lease_token=NULL,lease_until=NULL WHERE id=? AND lease_token=?").bind(
+        id,
+        token,
+      ),
+      env.DB.prepare("SELECT workspace_id,kind,job_key,available_at,lease_until FROM platform_jobs WHERE id=?").bind(
+        id,
+      ),
+    ]);
+    const remaining = settled[1]!.results[0] as
+      | { workspace_id: string; kind: string; job_key: string; available_at: number; lease_until: number | null }
+      | undefined;
+    if (remaining) {
+      const due = Math.max(remaining.available_at, remaining.lease_until ?? 0);
+      if (!remaining.lease_until || remaining.lease_until <= Date.now())
+        await notifyPlatformJob(
+          env,
+          { workspaceId: remaining.workspace_id, kind: remaining.kind, key: remaining.job_key },
+          due,
+        );
+      await wakePlatformBestEffort(env, due);
+    }
   }
 }
 

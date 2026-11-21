@@ -23,6 +23,8 @@ import { formFields } from "../shared/public-forms";
 import type { TableQueryResult } from "../shared/table-protocol";
 import { publicTablePage } from "./public-table";
 import { countedD1 } from "../../tests/helpers/count-d1";
+import { createAuth } from "./auth";
+import { enrollAccount } from "../../tests/helpers/security";
 let tableId = "";
 beforeEach(async () => {
   tableId = crypto.randomUUID();
@@ -111,6 +113,223 @@ async function fixturePublication(override: Partial<Env> = {}) {
   );
   return (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
 }
+
+it("returns normalized persisted settings and roots from publication creates and updates", async () => {
+  await insertPage("home").run();
+  const signup = await createAuth(configured(), true).handler(
+    new Request("http://example.test/api/auth/sign-up/email", {
+      method: "POST",
+      headers: { origin: "http://example.test", "content-type": "application/json" },
+      body: JSON.stringify({ email: "publisher@public.test", name: "Publisher", password: "password123" }),
+    }),
+  );
+  expect(signup.status).toBe(200);
+  const cookie = await enrollAccount(signup);
+  const user = (await env.DB.prepare("SELECT id FROM user WHERE email='publisher@public.test'").first<{
+    id: string;
+  }>())!;
+  await env.DB.prepare(
+    "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
+  )
+    .bind(user.id)
+    .run();
+  const { publicationSettingsResponse } = await import("./publications");
+  const save = (body: unknown) =>
+    publicationSettingsResponse(
+      new Request("http://example.test/api/spaces/workspace-general/publications", {
+        method: "PUT",
+        headers: { cookie, origin: "http://example.test", "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+      configured(),
+      "workspace-general",
+    );
+  const config = publicationConfig({ title: "Initial site", homePageId: "home" }, ["home"]);
+  const created = await (
+    await save({ roots: ["home", "home"], config, active: false })
+  ).json<{
+    publication: Publication & { roots: string[]; config: typeof config };
+    url: string;
+  }>();
+  expect(created.publication.roots).toEqual(["home"]);
+  expect(created.publication.config).toEqual(config);
+  expect(created.publication).not.toHaveProperty("config_json");
+  expect(created.url).toContain(`/sites/${created.publication.url_key}`);
+  await env.DB.prepare("UPDATE publications SET config_json=? WHERE id=?")
+    .bind(JSON.stringify({ ...config, tableViews: { gone: "shared" } }), created.publication.id)
+    .run();
+  const updated = await (
+    await save({
+      id: created.publication.id,
+      generation: created.publication.generation,
+      roots: ["home"],
+      config: { ...config, title: "Updated site", tableViews: { gone: "shared" } },
+      active: true,
+    })
+  ).json<typeof created>();
+  expect(updated.publication.generation).toBe(created.publication.generation + 1);
+  expect(updated.publication.config).toMatchObject({ title: "Updated site", tableViews: { gone: "shared" } });
+  expect(updated.publication).not.toHaveProperty("config_json");
+  const privateCheckpoint = JSON.stringify({
+    version: 2,
+    offset: 3,
+    documentStateKey: "private/r2-key",
+    tableSource: { kind: "snapshot", handle: "private-handle" },
+  });
+  await env.DB.prepare(
+    "UPDATE publications SET build_checkpoint_json=?,build_failure_checkpoint_json=?,build_failure_json=?,build_error='Safe error',manifest_key='private/manifest',build_state_recovery_count=1 WHERE id=?",
+  )
+    .bind(
+      privateCheckpoint,
+      privateCheckpoint,
+      JSON.stringify({ kind: "transient", sources: [{ pageId: "private-page", key: "private-source" }] }),
+      created.publication.id,
+    )
+    .run();
+  const listed = await (
+    await publicationSettingsResponse(
+      new Request("http://example.test/api/spaces/workspace-general/publications", { headers: { cookie } }),
+      configured(),
+      "workspace-general",
+    )
+  ).json<{ publications: Array<Record<string, unknown>> }>();
+  const visible = listed.publications[0]!;
+  expect(visible.build_checkpoint_json).toBe('{"offset":3}');
+  expect(visible.build_error).toBe("Safe error");
+  expect(Object.keys(visible).sort()).toEqual(Object.keys(updated.publication).sort());
+  for (const hidden of [
+    "build_failure_json",
+    "build_failure_checkpoint_json",
+    "manifest_key",
+    "build_state_recovery_count",
+  ])
+    expect(visible).not.toHaveProperty(hidden);
+  expect(JSON.stringify(visible)).not.toMatch(/private\/|private-page|private-source|private-handle/);
+  const resetSite = await (
+    await save({
+      id: created.publication.id,
+      generation: updated.publication.generation,
+      roots: ["home"],
+      config: updated.publication.config,
+      active: false,
+    })
+  ).json<typeof created>();
+  expect(resetSite.publication.build_error).toBeNull();
+  expect(
+    await env.DB.prepare("SELECT build_state_recovery_count FROM publications WHERE id=?")
+      .bind(created.publication.id)
+      .first("build_state_recovery_count"),
+  ).toBe(0);
+  expect(updated.publication.roots).toEqual(
+    (
+      await env.DB.prepare("SELECT page_id FROM publication_roots WHERE publication_id=?")
+        .bind(created.publication.id)
+        .all<{ page_id: string }>()
+    ).results.map((row) => row.page_id),
+  );
+});
+
+describe("diagram publication capture recovery", () => {
+  async function pendingDiagram() {
+    await fixturePublication();
+    await env.DB.batch([
+      insertPage("diagram", "root", "diagram"),
+      env.DB.prepare("UPDATE pages SET position='z' WHERE id='diagram'"),
+      env.DB.prepare(
+        "INSERT INTO diagram_projections VALUES('diagram',1,1,1,'diagram-source','hash',1,'diagram-live','hash',1,1)",
+      ),
+    ]);
+    await env.BUCKET.put("diagram-live", "<svg>Original</svg>");
+    const pub = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    for (let i = 0; i < 2; i++)
+      await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation });
+    return pub;
+  }
+
+  it("replaces an unreachable frozen epoch and activates while the previous manifest remains available", async () => {
+    const pub = await pendingDiagram();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE pages SET content_epoch=2,indexed_seq=0 WHERE id='diagram'"),
+      env.DB.prepare(
+        "UPDATE diagram_projections SET content_epoch=2,sequence=2,thumbnail_r2_key='diagram-new' WHERE page_id='diagram'",
+      ),
+      env.DB.prepare("UPDATE pages SET indexed_seq=2 WHERE id='diagram'"),
+    ]);
+    await env.BUCKET.put("diagram-new", "<svg>Restored</svg>");
+    await expect(
+      processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation }),
+    ).rejects.toThrow("A diagram capture needs a new revision.");
+    const failed = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(JSON.parse(failed.build_failure_json!)).toMatchObject({
+      kind: "content",
+      legacy: false,
+      sources: [{ pageId: "diagram", contentEpoch: 1, comparison: "epoch" }],
+    });
+    expect(failed.manifest_key).toBe(pub.manifest_key);
+    expect((await publicFetch("/sites/public-key")).status).toBe(200);
+    const { enqueuePendingPublications } = await import("./publications");
+    await enqueuePendingPublications(configured());
+    await enqueuePendingPublications(configured());
+    const replacement = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(replacement.generation).toBe(pub.generation + 1);
+    expect(replacement.access_generation).toBe(pub.access_generation);
+    expect(replacement.active_generation).toBe(pub.active_generation);
+    await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation });
+    for (let i = 0; i < 3; i++)
+      await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: replacement.generation });
+    const completed = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(completed.active_generation).toBe(replacement.generation);
+    expect(completed.needs_build).toBe(0);
+    expect(completed.build_failure_json).toBeNull();
+    expect(
+      await (await env.BUCKET.get(`publications/site/${replacement.generation}/diagram/diagram.svg`))!.text(),
+    ).toBe("<svg>Restored</svg>");
+  });
+
+  it.each(["projection", "image"])("retries a missing current-epoch %s at the existing checkpoint", async (missing) => {
+    const pub = await pendingDiagram();
+    if (missing === "projection") await env.DB.prepare("DELETE FROM diagram_projections WHERE page_id='diagram'").run();
+    else await env.BUCKET.delete("diagram-live");
+    const before = await env.DB.prepare("SELECT build_checkpoint_json FROM publications WHERE id='site'").first(
+      "build_checkpoint_json",
+    );
+    await expect(
+      processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation }),
+    ).rejects.toMatchObject({ status: 503, code: "publication_projection_pending" });
+    const { enqueuePendingPublications } = await import("./publications");
+    await enqueuePendingPublications(configured());
+    const current = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(current.generation).toBe(pub.generation);
+    expect(current.build_checkpoint_json).toBe(before);
+    expect(JSON.parse(current.build_failure_json!).kind).toBe("transient");
+    if (missing === "projection")
+      await env.DB.prepare(
+        "INSERT INTO diagram_projections VALUES('diagram',1,1,1,'diagram-source','hash',1,'diagram-live','hash',1,1)",
+      ).run();
+    else await env.BUCKET.put("diagram-live", "<svg>Original</svg>");
+    await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation });
+    expect(
+      await env.DB.prepare("SELECT active_generation FROM publications WHERE id='site'").first("active_generation"),
+    ).toBe(pub.generation);
+  });
+
+  it("reuses an existing immutable diagram capture after the source epoch changes", async () => {
+    const pub = await pendingDiagram();
+    const key = `publications/site/${pub.generation}/diagram/diagram.svg`;
+    await putPublicationObject(configured(), pub, key, "<svg>Already captured</svg>");
+    await env.DB.batch([
+      env.DB.prepare("UPDATE pages SET content_epoch=2,indexed_seq=2 WHERE id='diagram'"),
+      env.DB.prepare("DELETE FROM diagram_projections WHERE page_id='diagram'"),
+    ]);
+    await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation });
+    await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation });
+    const current = (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
+    expect(current.active_generation).toBe(pub.generation);
+    expect(current.build_failure_json).toBeNull();
+    expect(current.needs_build).toBe(1);
+    expect(await (await env.BUCKET.get(key))!.text()).toBe("<svg>Already captured</svg>");
+  });
+});
 describe("public publication delivery", () => {
   it("keeps ordered build metadata bounded instead of copying full document text", async () => {
     const pub = await fixturePublication();
@@ -164,7 +383,10 @@ describe("public publication delivery", () => {
     await putPublicationObject(configured(), pub, "active-artifact", "active");
     await env.DB.prepare("UPDATE publications SET generation=2 WHERE id='site'").run();
     await putPublicationObject(configured(), { ...pub, generation: 2 }, "building-artifact", "building");
-    await env.DB.prepare("UPDATE publication_artifacts SET created_at=1").run();
+    // Cleanup is bounded; only age the artifacts owned by this test.
+    await env.DB.prepare(
+      "UPDATE publication_artifacts SET created_at=1 WHERE r2_key IN('old-artifact','active-artifact','building-artifact')",
+    ).run();
     await cleanupPublicationArtifacts(configured());
     expect(await env.BUCKET.head("old-artifact")).toBeNull();
     expect(await env.BUCKET.head("active-artifact")).not.toBeNull();
@@ -1346,7 +1568,7 @@ describe("platform review regressions", () => {
 });
 
 describe("publication recovery scheduling regressions", () => {
-  it("prunes retained obsolete views, rejects newly invalid selections, and validates canonical metadata during repair", async () => {
+  it("retains dormant views, rejects newly invalid selections, and validates canonical metadata during repair", async () => {
     const { validatePublicationTableViews } = await import("./publications");
     await insertPage(tableId, null, "table").run();
     await env.DB.prepare("INSERT INTO table_state VALUES(?,1)").bind(tableId).run();
@@ -1408,11 +1630,11 @@ describe("publication recovery scheduling regressions", () => {
     await expect(
       validatePublicationTableViews(configured(), config, { ...scope, roots: [] }, { [tableId]: "shared" }),
     ).resolves.toBeUndefined();
-    expect(config.tableViews).toEqual({});
+    expect(config.tableViews).toEqual({ [tableId]: "shared" });
     config.tableViews[tableId] = "shared";
     await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(tableId).run();
     await validatePublicationTableViews(configured(), config, scope, { [tableId]: "shared" });
-    expect(config.tableViews).toEqual({});
+    expect(config.tableViews).toEqual({ [tableId]: "shared" });
   });
   it("validates 200 views using one scope read and at most four metadata requests concurrently", async () => {
     const { validatePublicationTableViews } = await import("./publications");
@@ -1576,7 +1798,7 @@ it("records a first-update failure and malformed checkpoint without masking the 
         "build_failure_json",
       ))!,
     ).kind,
-  ).toBe("configuration");
+  ).toBe("state");
 });
 it("upgrades a legacy failed capture once and then waits for its relevant source to change", async () => {
   await fixturePublication();
@@ -1719,3 +1941,136 @@ it("keeps table-readiness failures at their checkpoint through unrelated edits",
     await env.DB.prepare("SELECT active_generation FROM publications WHERE id='site'").first("active_generation"),
   ).toBe(generation);
 });
+
+it.each(["archive", "move", "roots"])(
+  "keeps filtered rows and hidden columns private after %s leaves and returns to scope",
+  async (scenario) => {
+    const { stub } = await formFixture();
+    await env.DB.batch([
+      insertPage("scope-root"),
+      insertPage("home-root"),
+      insertPage("private-root"),
+      env.DB.prepare("UPDATE pages SET indexed_seq=0 WHERE id IN ('scope-root','home-root','private-root')"),
+      env.DB.prepare("UPDATE pages SET parent_id='scope-root' WHERE id=?").bind(tableId),
+    ]);
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "create_column",
+      payload: { id: "secret", name: "Secret", type: "text" },
+    });
+    for (const title of ["Keep", "Exclude"])
+      await tableCommand(configured(), member, tableId, {
+        operationId: crypto.randomUUID(),
+        kind: "create_row",
+        payload: { values: { title, secret: "Private cell" } },
+      });
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "save_view",
+      payload: {
+        id: "filtered",
+        name: "Filtered",
+        visibleColumnIds: ["title"],
+        filters: { kind: "condition", columnId: "title", operator: "eq", value: "Keep" },
+      },
+    });
+    await runInDurableObject(stub, async (instance) => {
+      await (instance as unknown as { project(): Promise<unknown> }).project();
+    });
+    const signup = await createAuth(configured(), true).handler(
+      new Request("http://example.test/api/auth/sign-up/email", {
+        method: "POST",
+        headers: {
+          origin: "http://example.test",
+          "content-type": "application/json",
+          "cf-connecting-ip": `192.0.2.${["archive", "move", "roots"].indexOf(scenario) + 20}`,
+        },
+        body: JSON.stringify({ email: "scope-publisher@public.test", name: "Publisher", password: "password123" }),
+      }),
+    );
+    expect(signup.status).toBe(200);
+    const cookie = await enrollAccount(signup);
+    const owner = await env.DB.prepare("SELECT id FROM user WHERE email='scope-publisher@public.test'").first<string>(
+      "id",
+    );
+    await env.DB.prepare(
+      "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
+    )
+      .bind(owner)
+      .run();
+    const { publicationSettingsResponse } = await import("./publications");
+    let id: string | undefined;
+    let config = publicationConfig(
+      { title: "Restricted", homePageId: "home-root", tableViews: { [tableId]: "filtered" } },
+      ["scope-root", "home-root"],
+    );
+    const save = async (roots: string[]) => {
+      const previous = id
+        ? await env.DB.prepare("SELECT generation FROM publications WHERE id=?").bind(id).first<number>("generation")
+        : undefined;
+      const response = await publicationSettingsResponse(
+        new Request("http://example.test/api/spaces/workspace-general/publications", {
+          method: "PUT",
+          headers: { cookie, origin: "http://example.test", "content-type": "application/json" },
+          body: JSON.stringify({ id, generation: previous, roots, config, active: true }),
+        }),
+        configured(),
+        "workspace-general",
+      );
+      const result = await response.json<{ publication: { id: string; config: typeof config } }>();
+      id = result.publication.id;
+      config = result.publication.config;
+      expect(config.tableViews).toEqual({ [tableId]: "filtered" });
+    };
+    const finish = async () => {
+      for (let i = 0; i < 8; i++) {
+        const pub = (await env.DB.prepare("SELECT * FROM publications WHERE id=?").bind(id).first<Publication>())!;
+        if (!pub.needs_build) return pub;
+        await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation });
+      }
+      throw new Error("Publication did not activate");
+    };
+    const assertRestricted = async () => {
+      const pub = await finish();
+      const response = await publicFetch(`/sites/${pub.url_key}/p/${tableId}`);
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      expect(html).toContain("Keep");
+      expect(html).not.toContain("Exclude");
+      expect(html).not.toContain("Private cell");
+      expect(html).not.toContain("Secret</th>");
+    };
+    await save(["scope-root", "home-root"]);
+    await assertRestricted();
+    if (scenario === "archive") await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(tableId).run();
+    if (scenario === "move")
+      await env.DB.prepare("UPDATE pages SET parent_id='private-root' WHERE id=?").bind(tableId).run();
+    config = { ...config, title: "Renamed while absent" };
+    await save(scenario === "roots" ? ["home-root"] : ["scope-root", "home-root"]);
+    const absent = await finish();
+    expect((await publicFetch(`/sites/${absent.url_key}/p/${tableId}`)).status).toBe(404);
+    if (scenario === "archive")
+      await env.DB.prepare("UPDATE pages SET archived_at=NULL WHERE id=?").bind(tableId).run();
+    if (scenario === "move")
+      await env.DB.prepare("UPDATE pages SET parent_id='scope-root' WHERE id=?").bind(tableId).run();
+    await save(["scope-root", "home-root"]);
+    await assertRestricted();
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "save_view",
+      payload: {
+        id: "filtered",
+        name: "Private",
+        personal: true,
+        revision: (await queryTable(configured(), member, tableId, "viewId=filtered")).view!.revision,
+      },
+    });
+    await expect(save(["scope-root", "home-root"])).rejects.toMatchObject({ code: "publication_view" });
+    await tableCommand(configured(), member, tableId, {
+      operationId: crypto.randomUUID(),
+      kind: "delete_view",
+      payload: { viewId: "filtered" },
+    });
+    await expect(save(["scope-root", "home-root"])).rejects.toMatchObject({ code: "publication_view" });
+  },
+);

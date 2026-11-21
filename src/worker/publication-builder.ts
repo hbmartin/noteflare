@@ -1,16 +1,24 @@
 import { retirePublicationBuild, wakePublicationBuild } from "./publication-jobs";
 import {
   publicationInputs,
+  publicationCheckpoint,
+  type PublicationCheckpoint,
   publicationDependencies,
   advancePublication,
-  type PublicationCheckpoint,
 } from "./publication-state";
 import { tableInternal, tableRegistry } from "./table-service";
 import type { TableQueryResult } from "../shared/table-protocol";
 import { putPublicationObject } from "./publication-storage";
 import { expandPublicationDocument } from "./publication-documents";
-import { PublicationContentError, publicationFailure } from "./publication-failure";
+import {
+  PublicationContentError,
+  PublicationStateError,
+  publicationFailure,
+  blockedPublicationBuild,
+} from "./publication-failure";
 import type { Env } from "./env";
+import { recordMetric } from "./observability";
+import { wakePlatformBestEffort } from "./platform-wakeup";
 import { HttpError } from "./http";
 import { type Publication, type PublicationPage } from "./publications";
 import type { PublicationConfig } from "../shared/publications";
@@ -18,7 +26,7 @@ import { publicTablePage } from "./public-table";
 import { publishedRows, publishedCell } from "../shared/published-table";
 import { escapePublic as esc, PUBLIC_STYLE } from "./public-utils";
 import { sha256Hex } from "../shared/import-integrity";
-import { reservePlatformUsage } from "./platform-jobs";
+import { reservePlatformUsage, PlatformJobTerminal } from "./platform-jobs";
 export type PublicationManifest = {
   publicationId: string;
   generation: number;
@@ -70,7 +78,7 @@ async function buildPublication(env: Env, payload: unknown) {
   if (env.PUBLIC_PUBLISHING_ENABLED !== "true") return;
   const wakeup = payload as { publicationId: string; generation: number };
   let pub = await env.DB.prepare(
-    "SELECT * FROM publications WHERE id=? AND generation=? AND active=1 AND needs_build=1",
+    `SELECT * FROM publications p WHERE id=? AND generation=? AND active=1 AND needs_build=1 AND NOT (${blockedPublicationBuild})`,
   )
     .bind(wakeup.publicationId, wakeup.generation)
     .first<Publication>();
@@ -89,21 +97,15 @@ async function buildPublication(env: Env, payload: unknown) {
         .first<Publication>())!;
       if (!pub) return;
     }
-    let job = JSON.parse(pub.build_checkpoint_json!) as PublicationCheckpoint;
-    if (!job || job.version !== 2 || !Number.isSafeInteger(job.offset) || job.offset < 0) {
-      throw new HttpError(
-        422,
-        "publication_checkpoint_invalid",
-        "The build checkpoint is invalid. Save the site settings to start a new build.",
-      );
-    }
+    let job = publicationCheckpoint(pub.build_checkpoint_json);
     const { config, pages } = await publicationInputs(env, pub),
       allowed = new Map(pages.map((page) => [page.id, page])),
       base = `/sites/${pub.url_key}`,
       prefix = `publications/${pub.id}/${pub.generation}`;
     if (!allowed.has(config.homePageId))
       throw new HttpError(422, "publication_home", "The published home page is unavailable.");
-    const offset = job.offset ?? 0;
+    if (job.offset >= pages.length) throw new PublicationStateError("publication_checkpoint_invalid");
+    const offset = job.offset;
     for (const page of pages.slice(offset, offset + 1)) {
       const assets: Record<string, string> = {};
       const record = (id: string, source: string) => {
@@ -193,9 +195,24 @@ async function buildPublication(env: Env, payload: unknown) {
           )
             .bind(page.id, page.content_epoch)
             .first<{ thumbnail_r2_key: string }>();
-          if (!projection) throw new Error("Diagram is awaiting compaction.");
+          if (!projection) {
+            const epoch = await env.DB.prepare("SELECT content_epoch FROM pages WHERE id=?")
+              .bind(page.id)
+              .first<number>("content_epoch");
+            if (epoch !== page.content_epoch)
+              throw new PublicationContentError("A diagram capture needs a new revision.", [
+                {
+                  pageId: page.id,
+                  contentEpoch: page.content_epoch,
+                  sequence: page.indexed_seq,
+                  key: null,
+                  comparison: "epoch",
+                },
+              ]);
+            throw new HttpError(503, "publication_projection_pending", "A diagram is awaiting compaction.");
+          }
           const image = await env.BUCKET.get(projection.thumbnail_r2_key);
-          if (!image) throw new Error("Diagram image unavailable.");
+          if (!image) throw new HttpError(503, "publication_projection_pending", "A diagram image is unavailable.");
           await putPublicationObject(env, pub, diagramKey, image.body, {
             onlyIf: { etagDoesNotMatch: "*" },
             httpMetadata: { contentType: "image/svg+xml" },
@@ -381,7 +398,7 @@ async function buildPublication(env: Env, payload: unknown) {
     const manifestKey = `${prefix}/manifest.json`;
     await putPublicationObject(env, pub, manifestKey, JSON.stringify(manifest));
     const activated = await env.DB.prepare(
-      "UPDATE publications SET manifest_key=?,active_generation=?,active_access_generation=?,built_content_version=build_content_version,needs_build=CASE WHEN content_version>build_content_version THEN 1 ELSE 0 END,generation=generation+CASE WHEN content_version>build_content_version THEN 1 ELSE 0 END,build_content_version=NULL,build_checkpoint_json=NULL,dependencies_ready=1,build_error=NULL,build_failure_checkpoint_json=NULL,build_failure_json=NULL WHERE id=? AND generation=? AND access_generation=? AND active=1 AND needs_build=1 AND build_content_version=? AND build_checkpoint_json IS ?",
+      "UPDATE publications SET manifest_key=?,active_generation=?,active_access_generation=?,built_content_version=build_content_version,needs_build=CASE WHEN content_version>build_content_version THEN 1 ELSE 0 END,generation=generation+CASE WHEN content_version>build_content_version THEN 1 ELSE 0 END,build_content_version=NULL,build_checkpoint_json=NULL,build_state_recovery_count=0,dependencies_ready=1,build_error=NULL,build_failure_checkpoint_json=NULL,build_failure_json=NULL WHERE id=? AND generation=? AND access_generation=? AND active=1 AND needs_build=1 AND build_content_version=? AND build_checkpoint_json IS ?",
     )
       .bind(
         manifestKey,
@@ -394,7 +411,20 @@ async function buildPublication(env: Env, payload: unknown) {
         pub.build_checkpoint_json,
       )
       .run();
-    if (activated.meta.changes) await wakePublicationBuild(env, pub);
+    if (activated.meta.changes) {
+      const pending = await env.DB.prepare("SELECT 1 FROM publications WHERE id=? AND active=1 AND needs_build=1")
+        .bind(pub.id)
+        .first();
+      if (pending) await wakePublicationBuild(env, pub);
+      else {
+        const retired = await env.DB.prepare(
+          "SELECT 1 FROM publication_table_snapshots WHERE publication_id=? AND generation=? LIMIT 1",
+        )
+          .bind(pub.id, pub.generation)
+          .first();
+        if (retired) await wakePlatformBestEffort(env);
+      }
+    }
   } catch (error) {
     if (
       error instanceof HttpError &&
@@ -403,23 +433,34 @@ async function buildPublication(env: Env, payload: unknown) {
       await retirePublicationBuild(env, pub, "authority");
       return;
     }
+    let recorded = false;
     try {
-      await env.DB.prepare(`UPDATE publications SET build_error=?,build_failure_checkpoint_json=?,build_failure_json=?
+      const diagnostic =
+        await env.DB.prepare(`UPDATE publications SET build_error=?,build_failure_checkpoint_json=?,build_failure_json=?
       WHERE id=? AND generation=? AND access_generation=? AND active=1 AND needs_build=1 AND build_checkpoint_json IS ?`)
-        .bind(
-          error instanceof PublicationContentError || error instanceof HttpError
-            ? error.message
-            : "Publication build could not complete. Check the selected home, table views, logo and optional bindings.",
-          pub.build_checkpoint_json,
-          JSON.stringify(publicationFailure(error)),
-          pub.id,
-          pub.generation,
-          pub.access_generation,
-          pub.build_checkpoint_json,
-        )
-        .run();
+          .bind(
+            error instanceof PublicationStateError
+              ? pub.build_state_recovery_count === 1
+                ? "Publication state could not be recovered. Save the site settings to try a new build."
+                : "Publication build state needs automatic recovery."
+              : error instanceof PublicationContentError || error instanceof HttpError
+                ? error.message
+                : "Publication build could not complete. Check the selected home, table views, logo and optional bindings.",
+            pub.build_checkpoint_json,
+            JSON.stringify(publicationFailure(error)),
+            pub.id,
+            pub.generation,
+            pub.access_generation,
+            pub.build_checkpoint_json,
+          )
+          .run();
+      recorded = Boolean(diagnostic.meta.changes);
     } catch {
       /* Keep the original failure when diagnostics are unavailable. */
+    }
+    if (recorded && error instanceof PublicationStateError && pub.build_state_recovery_count === 1) {
+      recordMetric(env, { event: "publication.state.exhausted", component: "platform", attempts: 1 });
+      throw new PlatformJobTerminal();
     }
     throw error;
   }
