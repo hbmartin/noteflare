@@ -3,7 +3,7 @@ import { restartablePublicationFailure, publicationNeedsJob } from "./publicatio
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { recoverPlatformJobs, type PlatformHandlers } from "./platform-jobs";
-import { handleSemanticJob, sweepSemanticJobs } from "./semantic";
+import { handleSemanticJob, sweepSemanticJobs, semanticEnabled, unclaimedSemanticWork } from "./semantic";
 import { processPublicationBuildJob } from "./publication-builder";
 import { enqueuePendingPublications, processHostnameSyncJob } from "./publications";
 import { processImageDerivativeJob, cleanupImageDerivatives } from "./images";
@@ -30,6 +30,8 @@ type MaintenanceSchedule = {
   scanning: boolean;
   notBefore: number;
   wakeAt: number | null;
+  wakeKind?: "immediate" | "deadline";
+  retries?: Record<string, { attempts: number; at: number }>;
 };
 
 export const platformHandlers: PlatformHandlers = {
@@ -67,24 +69,58 @@ export class PlatformCoordinator extends DurableObject<Env> {
       }
     );
   }
-  async wake(at = Date.now() + 1000) {
+  async wake(at?: number) {
     await this.ctx.blockConcurrencyWhile(async () => {
       const state = await this.scheduleState();
       const next = Math.max(
         Date.now() + 1000,
-        Number.isFinite(at) ? at : 0,
+        at !== undefined && Number.isFinite(at) ? at : 0,
         state.running ? Date.now() + 5000 : state.notBefore,
       );
       // A request may belong to a phase that has already finished this cycle.
-      if (state.wakeAt === null || next < state.wakeAt) {
+      const immediate = at === undefined || !Number.isFinite(at) || at <= Date.now();
+      if (
+        state.wakeAt === null ||
+        next < state.wakeAt ||
+        (next === state.wakeAt && immediate && state.wakeKind !== "immediate")
+      ) {
         state.wakeAt = next;
+        state.wakeKind = immediate ? "immediate" : "deadline";
         await this.ctx.storage.put("schedule", state);
       }
       const current = await this.ctx.storage.getAlarm();
       if (current === null || current > next) await this.ctx.storage.setAlarm(next);
     });
   }
-  // fallow-ignore-next-line unused-class-member -- Called by the Cloudflare Durable Object alarm runtime.
+  private async maintenance(operation: number | "scan", run: () => Promise<void>) {
+    const retry = (await this.scheduleState()).retries?.[operation];
+    if (retry && retry.at > Date.now()) return;
+    try {
+      await run();
+    } catch {
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const state = await this.scheduleState();
+        const attempts = Math.min((state.retries?.[operation]?.attempts ?? 0) + 1, 7);
+        const at = Date.now() + Math.min(3600000, 60000 * 2 ** (attempts - 1));
+        await this.ctx.storage.put("schedule", {
+          ...state,
+          retries: { ...state.retries, [operation]: { attempts, at } },
+        });
+      });
+      logger.warn("platform.maintenance.failed", "platform", "Platform maintenance retains a delayed retry", {
+        phase: operation,
+      });
+      return;
+    }
+    if (retry)
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const state = await this.scheduleState();
+        const retries = { ...state.retries };
+        delete retries[operation];
+        await this.ctx.storage.put("schedule", { ...state, retries });
+      });
+  }
+  // Called by the Cloudflare Durable Object alarm runtime.
   async alarm() {
     const phase = (await this.ctx.storage.get<number>("phase")) ?? 0;
     const ready = await this.ctx.blockConcurrencyWhile(async () => {
@@ -93,15 +129,19 @@ export class PlatformCoordinator extends DurableObject<Env> {
         await this.ctx.storage.setAlarm(state.notBefore);
         return false;
       }
-      // Consume only due requests covered by this new cycle. Requests received
-      // after it starts, or with future deadlines, survive through the final scan.
+      // The one-second delivery delay does not make a generic request future work.
+      // Requests received after cycle entry survive the final scan.
       const wakeAt =
-        phase === 0 && !state.active && state.wakeAt !== null && state.wakeAt <= Date.now() ? null : state.wakeAt;
+        phase === 0 &&
+        !state.active &&
+        (state.wakeKind === "immediate" || (state.wakeAt !== null && state.wakeAt <= Date.now()))
+          ? null
+          : state.wakeAt;
       await this.ctx.storage.put("schedule", { ...state, active: true, running: true, scanning: false, wakeAt });
       return true;
     });
     if (!ready) return;
-    try {
+    await this.maintenance(phase, async () => {
       await withAuditRequest(this.env, `platform-alarm:${phase}:${crypto.randomUUID()}`, async (alarmEnv) => {
         switch (phase) {
           case 0:
@@ -140,11 +180,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
             break;
         }
       });
-    } catch {
-      logger.warn("platform.maintenance.failed", "platform", "Platform maintenance will retry on the next cycle", {
-        phase,
-      });
-    }
+    });
     if (phase < 10) {
       await this.ctx.blockConcurrencyWhile(async () => {
         const state = await this.scheduleState(),
@@ -158,28 +194,40 @@ export class PlatformCoordinator extends DurableObject<Env> {
       const state = await this.scheduleState();
       await this.ctx.storage.put("schedule", { ...state, scanning: true });
     });
-    const now = Date.now();
-    const next = await this.env.DB.prepare(`SELECT min(due) due FROM (
-      SELECT max(available_at,coalesce(lease_until,0)) due FROM platform_jobs
-      UNION ALL SELECT s.next_attempt_at due ${retiredPublicationSnapshots}
-      UNION ALL SELECT ? due FROM publications p WHERE ?=1 AND ${publicationNeedsJob}
-      UNION ALL SELECT ? due FROM publications p WHERE ?=1 AND ${restartablePublicationFailure}
-      UNION ALL SELECT ? due WHERE (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE archive_id IS NULL LIMIT 1))
-        OR (?=1 AND EXISTS(SELECT 1 FROM audit_events WHERE basin_exported_at IS NULL LIMIT 1)))`)
-      .bind(
-        now,
-        this.env.PUBLIC_PUBLISHING_ENABLED === "true" ? 1 : 0,
-        now,
-        this.env.PUBLIC_PUBLISHING_ENABLED === "true" ? 1 : 0,
-        now,
-        this.env.AUDIT_ENABLED === "true" ? 1 : 0,
-        this.env.BASIN_ENABLED === "true" ? 1 : 0,
-      )
-      .first<{ due: number | null }>();
+    let scannedDue = Infinity;
+    await this.maintenance("scan", async () => {
+      const now = Date.now(),
+        retries = (await this.scheduleState()).retries;
+      const phaseDue = (operation: number) => Math.max(now, retries?.[operation]?.at ?? 0);
+      // D1 permits at most five compound SELECT terms. Combine each phase's work.
+      const next = await this.env.DB.prepare(`SELECT min(due) due FROM (
+      SELECT max(available_at,coalesce(lease_until,0),?) due FROM platform_jobs
+      UNION ALL SELECT max(s.next_attempt_at,?) due ${retiredPublicationSnapshots}
+      UNION ALL SELECT ? due FROM publications p WHERE ?=1 AND ((${publicationNeedsJob}) OR (${restartablePublicationFailure}))
+      UNION ALL SELECT ? due WHERE ?=1 AND EXISTS(SELECT 1 FROM semantic_dirty d WHERE ${unclaimedSemanticWork} LIMIT 1)
+      UNION ALL SELECT coalesce(min(archive_due,basin_due),archive_due,basin_due) due FROM (
+        SELECT (SELECT ? FROM audit_events WHERE ?=1 AND archive_id IS NULL LIMIT 1) archive_due,
+          (SELECT ? FROM audit_events WHERE ?=1 AND basin_exported_at IS NULL LIMIT 1) basin_due))`)
+        .bind(
+          phaseDue(2),
+          phaseDue(8),
+          phaseDue(1),
+          this.env.PUBLIC_PUBLISHING_ENABLED === "true" ? 1 : 0,
+          phaseDue(0),
+          semanticEnabled(this.env) ? 1 : 0,
+          phaseDue(3),
+          this.env.AUDIT_ENABLED === "true" ? 1 : 0,
+          phaseDue(4),
+          this.env.BASIN_ENABLED === "true" ? 1 : 0,
+        )
+        .first<{ due: number | null }>();
+      scannedDue = next?.due ?? Infinity;
+    });
     await this.ctx.blockConcurrencyWhile(async () => {
       const state = await this.scheduleState(),
         notBefore = Date.now() + 5000;
-      const due = Math.min(next?.due ?? Infinity, state.wakeAt ?? Infinity);
+      const retryDue = Math.min(...Object.values(state.retries ?? {}).map((retry) => retry.at));
+      const due = Math.min(scannedDue, state.wakeAt ?? Infinity, retryDue);
       await this.ctx.storage.put({
         phase: 0,
         schedule: { ...state, active: false, running: false, scanning: false, notBefore },

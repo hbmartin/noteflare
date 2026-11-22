@@ -1,7 +1,12 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Page, Space } from "../shared/types";
 import type { TableView } from "../shared/table-protocol";
-import { MAX_PUBLICATION_TABLE_VIEWS, publicationConfig, type PublicationConfig } from "../shared/publications";
+import {
+  MAX_PUBLICATION_TABLE_VIEWS,
+  publicationConfig,
+  type PublicationConfig,
+  type PublicationTableOptions,
+} from "../shared/publications";
 import { api, json, apiErrorMessage } from "./api";
 import { uploadAttachment } from "./uploads";
 type Site = {
@@ -24,7 +29,7 @@ type Hostname = {
   verification_json: string;
   last_error: string | null;
 };
-type ViewMetadata = { status: "loading" | "loaded" | "error"; items: TableView[] };
+type ViewMetadata = { status: "loading" | "loaded" | "error"; items: TableView[]; error?: string };
 function savedViewLabel(status?: ViewMetadata["status"]) {
   switch (status) {
     case "loaded":
@@ -51,8 +56,41 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
     [busy, setBusy] = useState(false),
     [saving, setSaving] = useState(false),
     [error, setError] = useState(""),
+    [selectionError, setSelectionError] = useState(""),
     [loaded, setLoaded] = useState(false),
+    [tableOptions, setTableOptions] = useState<{
+      key: string;
+      status: "loaded" | "error";
+      tables: PublicationTableOptions["tables"];
+      error?: string;
+    }>(),
+    [scopeRetry, setScopeRetry] = useState(0),
     [views, setViews] = useState<Record<string, ViewMetadata>>({});
+  const scopeKey = JSON.stringify([spaceId, roots, scopeRetry]);
+  useEffect(() => {
+    if (!loaded) return undefined;
+    const controller = new AbortController();
+    const [draftSpace, draftRoots] = JSON.parse(scopeKey) as [string, string[]];
+    void api<PublicationTableOptions>(`/api/spaces/${draftSpace}/publications/table-options`, {
+      method: "POST",
+      readOnly: true,
+      body: json({ roots: draftRoots }),
+      signal: controller.signal,
+    })
+      .then((result) => {
+        if (!controller.signal.aborted) setTableOptions({ key: scopeKey, status: "loaded", tables: result.tables });
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted)
+          setTableOptions({
+            key: scopeKey,
+            status: "error",
+            tables: [],
+            error: apiErrorMessage(cause, "Published tables could not be checked."),
+          });
+      });
+    return () => controller.abort();
+  }, [loaded, scopeKey]);
   const selection = useRef({ spaceId, siteId });
   useLayoutEffect(() => {
     selection.current = { spaceId, siteId };
@@ -76,19 +114,22 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
     /* An invalid checkpoint is reported by the worker; settings remain editable. */
   }
   const available = pages.filter((page) => page.spaceId === spaceId && !page.archivedAt && !page.isTemplate);
-  const availableTables = available.filter((page) => page.kind === "table");
-  const unavailableSelections = Object.entries(config.tableViews).filter(
-    ([id]) => !availableTables.some((page) => page.id === id),
-  );
+  const scopeConfirmed = tableOptions?.key === scopeKey && tableOptions.status === "loaded";
+  const availableTables = scopeConfirmed ? tableOptions.tables : [];
+  const unavailableSelections = scopeConfirmed
+    ? Object.entries(config.tableViews).filter(([id]) => !availableTables.some((page) => page.id === id))
+    : [];
   const selectionCount = Object.keys(config.tableViews).length;
   const change = (patch: Partial<PublicationConfig>) => setConfig({ ...config, ...patch });
   function removeView(pageId: string) {
     const tableViews = { ...config.tableViews };
     delete tableViews[pageId];
     change({ tableViews });
-    setError("");
+    setSelectionError("");
   }
   function choose(site?: Site) {
+    setScopeRetry((value) => value + 1);
+    setSelectionError("");
     setSiteId(site?.id ?? "");
     setGeneration(site?.generation);
     setRoots(site?.roots ?? []);
@@ -231,9 +272,10 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
                 <input
                   type="checkbox"
                   checked={roots.includes(page.id)}
-                  onChange={(event) =>
-                    setRoots(event.target.checked ? [...roots, page.id] : roots.filter((id) => id !== page.id))
-                  }
+                  onChange={(event) => {
+                    setRoots(event.target.checked ? [...roots, page.id] : roots.filter((id) => id !== page.id));
+                    setScopeRetry((value) => value + 1);
+                  }}
                 />
                 {page.title}
               </label>
@@ -382,59 +424,86 @@ export function PublicationSettings({ spaces, pages }: { spaces: Space[]; pages:
             <p>
               {selectionCount} of {MAX_PUBLICATION_TABLE_VIEWS} saved view selections used.
             </p>
+            {selectionError && <p role="alert">{selectionError}</p>}
+            {!scopeConfirmed &&
+              (tableOptions?.key === scopeKey && tableOptions.status === "error" ? (
+                <div>
+                  <p role="alert">
+                    {tableOptions.error} Saved restrictions remain unchanged; table availability is unknown.
+                  </p>
+                  <button type="button" onClick={() => setScopeRetry((value) => value + 1)}>
+                    Retry table availability
+                  </button>
+                </div>
+              ) : (
+                <output>Checking published tables. Saved restrictions remain unchanged.</output>
+              ))}
             {availableTables.map((page) => (
-              <label key={page.id}>
-                {page.title}
-                <select
-                  value={config.tableViews[page.id] ?? ""}
-                  onFocus={() => {
-                    if (views[page.id] && views[page.id]!.status !== "error") return;
-                    setViews((previous) => ({ ...previous, [page.id]: { status: "loading", items: [] } }));
-                    void api<{ views: TableView[] }>(`/api/tables/${page.id}/query?limit=1`)
-                      .then((result) =>
-                        setViews((previous) => ({
-                          ...previous,
-                          [page.id]: { status: "loaded", items: result.views.filter((view) => view.ownerId === null) },
-                        })),
-                      )
-                      .catch((cause) => {
-                        setViews((previous) => ({ ...previous, [page.id]: { status: "error", items: [] } }));
-                        setError(apiErrorMessage(cause, "Views could not be loaded."));
-                      });
-                  }}
-                  onChange={(e) => {
-                    const tableViews = { ...config.tableViews };
-                    if (e.target.value && !tableViews[page.id] && selectionCount >= MAX_PUBLICATION_TABLE_VIEWS) {
-                      setError(
-                        `Remove a saved view restriction before adding another. Sites support at most ${MAX_PUBLICATION_TABLE_VIEWS} selections.`,
-                      );
-                      return;
-                    }
-                    if (e.target.value) tableViews[page.id] = e.target.value;
-                    else delete tableViews[page.id];
-                    change({ tableViews });
-                    setError("");
-                  }}
-                >
-                  <option value="">All rows as a table</option>
-                  {config.tableViews[page.id] &&
-                    !views[page.id]?.items.some((view) => view.id === config.tableViews[page.id]) && (
-                      <option value={config.tableViews[page.id]}>{savedViewLabel(views[page.id]?.status)}</option>
-                    )}
-                  {(views[page.id]?.items ?? []).map((view) => (
-                    <option key={view.id} value={view.id}>
-                      {view.name} ({view.kind})
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <div key={page.id}>
+                <label key={page.id}>
+                  {page.title}
+                  <select
+                    value={config.tableViews[page.id] ?? ""}
+                    onFocus={() => {
+                      if (views[page.id] && views[page.id]!.status !== "error") return;
+                      setViews((previous) => ({ ...previous, [page.id]: { status: "loading", items: [] } }));
+                      void api<{ views: TableView[] }>(`/api/tables/${page.id}/query?limit=1`)
+                        .then((result) =>
+                          setViews((previous) => ({
+                            ...previous,
+                            [page.id]: {
+                              status: "loaded",
+                              items: result.views.filter((view) => view.ownerId === null),
+                            },
+                          })),
+                        )
+                        .catch((cause) => {
+                          setViews((previous) => ({
+                            ...previous,
+                            [page.id]: {
+                              status: "error",
+                              items: [],
+                              error: apiErrorMessage(cause, "Views could not be loaded."),
+                            },
+                          }));
+                        });
+                    }}
+                    onChange={(e) => {
+                      const tableViews = { ...config.tableViews };
+                      if (e.target.value && !tableViews[page.id] && selectionCount >= MAX_PUBLICATION_TABLE_VIEWS) {
+                        setSelectionError(
+                          `Remove a saved view restriction before adding another. Sites support at most ${MAX_PUBLICATION_TABLE_VIEWS} selections.`,
+                        );
+                        return;
+                      }
+                      if (e.target.value) tableViews[page.id] = e.target.value;
+                      else delete tableViews[page.id];
+                      change({ tableViews });
+                      setSelectionError("");
+                    }}
+                  >
+                    <option value="">All rows as a table</option>
+                    {config.tableViews[page.id] &&
+                      !views[page.id]?.items.some((view) => view.id === config.tableViews[page.id]) && (
+                        <option value={config.tableViews[page.id]}>{savedViewLabel(views[page.id]?.status)}</option>
+                      )}
+                    {(views[page.id]?.items ?? []).map((view) => (
+                      <option key={view.id} value={view.id}>
+                        {view.name} ({view.kind})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {views[page.id]?.error && <p role="alert">{views[page.id]!.error}</p>}
+              </div>
             ))}
             {unavailableSelections.length > 0 && (
               <fieldset>
                 <legend>Unavailable table selections</legend>
                 <p>
-                  These restrictions are retained while their tables are unavailable. Removing a restriction means a
-                  returning table will publish all rows and columns. Changes take effect when you save the site.
+                  These restrictions are retained outside the current publication scope. Removing a restriction means
+                  the table will publish all rows and columns whenever it is included. Changes take effect when you save
+                  the site.
                 </p>
                 {unavailableSelections.map(([pageId, viewId]) => (
                   <div key={pageId}>

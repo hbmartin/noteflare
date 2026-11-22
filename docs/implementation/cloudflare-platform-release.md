@@ -158,15 +158,23 @@ Pricing references: [Workers](https://developers.cloudflare.com/workers/platform
 
 This follow-up needs no migration beyond 0114 or checkpoint reset. Deploy the application Worker and bundled client
 together. Existing maintenance storage remains readable. Wakes received after a maintenance cycle starts survive
-until another cycle consumes them; future requests retain their deadlines and phases remain five seconds apart.
-Successful Queue delivery avoids an additional job-settlement coordinator RPC. Database recovery scans still run
-independently, and missing or failed Queue delivery retains coordinator recovery at the actual deadline.
+until another cycle consumes them; generic requests already present at cycle entry are covered by that cycle.
+Wake hints coalesce to the earliest request; D1 job records own independent future deadlines. Phases remain five
+seconds apart. Failed phases and deadline scans retain private retries from one minute up to one hour, without
+blocking healthy phases. Enabled semantic backlog without a matching current-generation job schedules another
+bounded sweep; existing job leases and backoff still apply.
+Successful Queue delivery avoids an additional job-settlement coordinator RPC except when a recorded publication
+failure requires coordinator retirement. That notification follows owned-lease release. Missing or failed Queue
+delivery retains coordinator recovery at the actual deadline.
 
 Owners can remove unavailable table-view selections explicitly to regain capacity within the 200-selection limit.
-The UI explains that returning tables then publish all rows and columns; removal remains a draft until Save. No
-restriction is discarded automatically. Settings responses return roots in the same sorted order for GET and PUT.
+An owner-only read-only draft-scope query supplies all included table controls, including tables hidden from the
+sidebar. Unknown or failed scope reads never classify restrictions as unavailable. The UI explains that removing
+a restriction permits all rows and columns whenever its table is included; removal remains a draft until Save.
+No restriction is discarded automatically. Settings responses return roots in the same sorted order for GET and PUT.
 Malformed private `inputs.json` and `source.json` captures use the existing one-time state recovery budget, including
-failures previously classified as transient when retried. Storage outages retain backoff. Keep the historical-settings
+syntax and structural failures previously classified as transient when retried. Validators preserve older document
+captures and do not normalize frozen inputs. Storage outages retain backoff. Keep the historical-settings
 audit and namespace sweep below; production deployment and those operator actions remain separate.
 
 ### Publication privacy, recovery and scheduling (migration 0114)

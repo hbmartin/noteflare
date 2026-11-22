@@ -133,7 +133,52 @@ it("returns normalized persisted settings and roots from publication creates and
   )
     .bind(user.id)
     .run();
-  const { publicationSettingsResponse } = await import("./publications");
+  const { publicationSettingsResponse, publicationTableOptionsResponse } = await import("./publications");
+  await env.DB.batch([
+    insertPage("detail", "home"),
+    insertPage("hidden-table", "detail", "table"),
+    insertPage("excluded-table", null, "table"),
+    env.DB.prepare(
+      "INSERT INTO page_import_sources(page_id,source_path,source_role,created_at) VALUES('detail','detail','table_row_detail',1)",
+    ),
+  ]);
+  const options = (roots: unknown) =>
+    publicationTableOptionsResponse(
+      new Request("http://example.test/api/spaces/workspace-general/publications/table-options", {
+        method: "POST",
+        headers: { cookie, origin: "http://example.test", "content-type": "application/json" },
+        body: JSON.stringify({ roots }),
+      }),
+      configured(),
+      "workspace-general",
+    );
+  expect(await (await options(["home"])).json()).toEqual({ tables: [{ id: "hidden-table", title: "hidden-table" }] });
+  expect(await (await options([])).json()).toEqual({ tables: [] });
+  await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id='detail'").run();
+  expect(await (await options(["home"])).json()).toEqual({ tables: [] });
+  await env.DB.prepare("UPDATE pages SET archived_at=NULL WHERE id='detail'").run();
+  expect(await (await options(["home", "excluded-table"])).json()).toMatchObject({
+    tables: expect.arrayContaining([
+      { id: "hidden-table", title: "hidden-table" },
+      { id: "excluded-table", title: "excluded-table" },
+    ]),
+  });
+  await expect(options(Array(101).fill("home"))).rejects.toMatchObject({ status: 422 });
+  await expect(options([1])).rejects.toMatchObject({ status: 422 });
+  await expect(
+    publicationTableOptionsResponse(
+      new Request("http://example.test/api/spaces/workspace-general/publications/table-options", {
+        method: "POST",
+        headers: { cookie, origin: "https://another.test", "content-type": "application/json" },
+        body: '{"roots":["home"]}',
+      }),
+      configured(),
+      "workspace-general",
+    ),
+  ).rejects.toMatchObject({ status: 403 });
+  await env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE user_id=?").bind(user.id).run();
+  await expect(options(["home"])).rejects.toMatchObject({ status: 403 });
+  await env.DB.prepare("UPDATE workspace_members SET role='owner' WHERE user_id=?").bind(user.id).run();
   const save = (body: unknown) =>
     publicationSettingsResponse(
       new Request("http://example.test/api/spaces/workspace-general/publications", {
@@ -1802,7 +1847,7 @@ it("records a first-update failure and malformed checkpoint without masking the 
     "UPDATE publications SET build_content_version=content_version,build_checkpoint_json='null' WHERE id='site'",
   ).run();
   await expect(processPublicationBuildJob(configured(), { publicationId: "site", generation })).rejects.toMatchObject({
-    code: "publication_checkpoint_invalid",
+    cause: { code: "publication_checkpoint_invalid" },
   });
   expect(
     JSON.parse(

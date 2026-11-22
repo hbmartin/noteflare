@@ -272,7 +272,7 @@ import { withAuditRequest } from "./audit";
 import { consumePlatformQueue } from "./platform-jobs";
 import { platformHandlers, wakePlatform } from "./platform-coordinator";
 import { formsSettingsResponse } from "./forms";
-import { publicationSettingsResponse, hostnameSettingsResponse } from "./publications";
+import { publicationSettingsResponse, publicationTableOptionsResponse, hostnameSettingsResponse } from "./publications";
 import { mediaResponse, coverResponse } from "./images";
 import { rowPageResponse } from "./row-pages";
 import { turnstileConfiguration, verifyPublicChallenge } from "./turnstile";
@@ -7169,6 +7169,9 @@ app.get("/api/pages/:pageId/forms", (c) => formsSettingsResponse(c.req.raw, c.en
 app.put("/api/pages/:pageId/forms", (c) => formsSettingsResponse(c.req.raw, c.env, c.req.param("pageId")));
 app.get("/api/spaces/:spaceId/publications", (c) =>
   publicationSettingsResponse(c.req.raw, c.env, c.req.param("spaceId")),
+);
+app.post("/api/spaces/:spaceId/publications/table-options", (c) =>
+  publicationTableOptionsResponse(c.req.raw, c.env, c.req.param("spaceId")),
 );
 app.put("/api/spaces/:spaceId/publications", (c) =>
   publicationSettingsResponse(c.req.raw, c.env, c.req.param("spaceId")),

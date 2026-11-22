@@ -3,7 +3,12 @@ import type { Env } from "./env";
 import { requireMember, requireOwner } from "./auth";
 import { spaceForMember } from "./page-access";
 import { HttpError, assertSameOrigin } from "./http";
-import { publicationConfig, publicationHostname, type PublicationConfig } from "../shared/publications";
+import {
+  publicationConfig,
+  publicationHostname,
+  type PublicationConfig,
+  type PublicationTableOptions,
+} from "../shared/publications";
 import { publicJson } from "./public-utils";
 import { tableInternal } from "./table-service";
 import { restartablePublicationFailure, publicationNeedsJob } from "./publication-failure";
@@ -100,11 +105,17 @@ function settingsSite(pub: Publication, roots: string[]) {
     roots: [...roots].sort(),
   };
 }
-export async function publicationPages(env: Env, pub: Publication): Promise<PublicationPage[]> {
+async function publicationScopePages(
+  env: Env,
+  scope: { workspaceId: string; spaceId: string },
+  roots: { publicationId: string } | { pageIds: string[] },
+): Promise<PublicationPage[]> {
   const result = await env.DB.prepare(
-    `WITH RECURSIVE ancestors(root_id,id,parent_id,allowed,depth) AS (
+    `WITH RECURSIVE roots(page_id) AS (
+ SELECT page_id FROM publication_roots WHERE publication_id=? UNION SELECT value FROM json_each(?)),
+ ancestors(root_id,id,parent_id,allowed,depth) AS (
  SELECT r.page_id,p.id,p.parent_id,p.space_id=? AND ${ordinaryPublicationPage("p")},0
- FROM publication_roots r JOIN pages p ON p.id=r.page_id WHERE r.publication_id=? AND p.workspace_id=?
+ FROM roots r JOIN pages p ON p.id=r.page_id WHERE p.workspace_id=?
  UNION ALL SELECT a.root_id,p.id,p.parent_id,p.space_id=? AND ${ordinaryPublicationPage("p")},a.depth+1
  FROM pages p JOIN ancestors a ON a.parent_id=p.id WHERE p.workspace_id=? AND a.depth<50),
  eligible(id,depth) AS (SELECT root_id,max(depth) FROM ancestors GROUP BY root_id HAVING min(allowed)=1 AND max(parent_id IS NULL)=1),
@@ -114,13 +125,50 @@ export async function publicationPages(env: Env, pub: Publication): Promise<Publ
  p.content_epoch,p.indexed_seq,p.updated_at,p.cover_attachment_id,p.cover_x,p.cover_y,t.depth publication_depth
  FROM tree t JOIN pages p ON p.id=t.id ORDER BY p.position,p.id LIMIT 5001`,
   )
-    .bind(pub.space_id, pub.id, pub.workspace_id, pub.space_id, pub.workspace_id, pub.space_id, pub.workspace_id)
+    .bind(
+      "publicationId" in roots ? roots.publicationId : null,
+      JSON.stringify("pageIds" in roots ? roots.pageIds : []),
+      scope.spaceId,
+      scope.workspaceId,
+      scope.spaceId,
+      scope.workspaceId,
+      scope.spaceId,
+      scope.workspaceId,
+    )
     .all<PublicationPage & { publication_depth: number }>();
   if (result.results.length > 5000)
     throw new HttpError(422, "publication_limit", "Publish at most 5,000 pages per site.");
   if (result.results.some((page) => page.publication_depth > 50))
     throw new HttpError(422, "publication_depth_limit", "Published pages may be nested at most 50 levels.");
   return result.results;
+}
+export async function publicationPages(env: Env, pub: Publication): Promise<PublicationPage[]> {
+  return publicationScopePages(
+    env,
+    { workspaceId: pub.workspace_id, spaceId: pub.space_id },
+    { publicationId: pub.id },
+  );
+}
+/** Owner preview of draft scope; sidebar hiding is deliberately not publication eligibility. */
+export async function publicationTableOptionsResponse(request: Request, env: Env, spaceId: string): Promise<Response> {
+  const member = await requireMember(request, env);
+  requireOwner(member);
+  await spaceForMember(env, member, spaceId);
+  if (env.PUBLIC_PUBLISHING_ENABLED !== "true")
+    throw new HttpError(404, "publishing_disabled", "Site publishing is unavailable.");
+  assertSameOrigin(request, env.BETTER_AUTH_URL);
+  const input = await publicJson(request);
+  if (!Array.isArray(input.roots) || input.roots.length > 100 || input.roots.some((id) => typeof id !== "string"))
+    throw new HttpError(422, "publication_roots", "Choose at most 100 page roots.");
+  const pages = await publicationScopePages(
+    env,
+    { workspaceId: member.workspace.id, spaceId },
+    { pageIds: [...new Set(input.roots)] },
+  );
+  const result: PublicationTableOptions = {
+    tables: pages.filter((page) => page.kind === "table").map(({ id, title }) => ({ id, title })),
+  };
+  return Response.json(result);
 }
 export async function publicationPageAllowed(env: Env, pub: Publication, pageId: string): Promise<boolean> {
   return Boolean(
