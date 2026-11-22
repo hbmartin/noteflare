@@ -76,9 +76,17 @@ it("limits the legacy storage override to default development", async () => {
   vi.stubEnv("CLOUDFLARE_ENV", "production");
   const production = await development();
   expect(production.config.vars.OFFLINE_EDITING_ENABLED).toBe("false");
-  expect(production.config.r2_buckets).toMatchObject([
-    { bucket_name: "cloudflare-realtime-notes", preview_bucket_name: "cloudflare-realtime-notes-preview" },
-  ]);
+  expect(production.config.r2_buckets).toEqual(
+    expect.arrayContaining([
+      {
+        binding: "BUCKET",
+        bucket_name: "cloudflare-realtime-notes",
+        preview_bucket_name: "cloudflare-realtime-notes-preview",
+      },
+      { binding: "PUBLICATIONS_BUCKET", bucket_name: "cloudflare-realtime-notes-publications" },
+      { binding: "AUDIT_BUCKET", bucket_name: "cloudflare-realtime-notes-audit" },
+    ]),
+  );
   vi.stubEnv("CLOUDFLARE_ENV", "");
   vi.stubEnv(
     "NOTES_DEPLOY_OVERRIDES",

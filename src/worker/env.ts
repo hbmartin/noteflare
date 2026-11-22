@@ -62,6 +62,9 @@ export interface AppBindings {
   SLACK_RICH_DIGESTS_ENABLED?: "true" | "false";
   SLACK_DIGEST_DEFAULT_TIMEZONE?: string;
   OBSERVABILITY_PROBE_TOKEN?: string;
+  COST_REPORTING_ENABLED?: "true" | "false";
+  OBSERVABILITY_DATASET?: string;
+  CF_ANALYTICS_API_TOKEN?: string;
   // Optional platform capabilities. Portable installations do not provision paid services.
   PLATFORM_QUEUE?: Queue;
   PLATFORM?: DurableObjectNamespace<PlatformCoordinator>;
@@ -136,6 +139,12 @@ declare global {
       | "SEMANTIC_SEARCH_ENABLED"
       | "SEMANTIC_MAX_STORED_CHUNKS"
       | "SEMANTIC_DAILY_TOKEN_LIMIT"
+      | "SEMANTIC_DAILY_QUERY_LIMIT"
+      | "COST_REPORTING_ENABLED"
+      | "PUBLIC_BASE_URL"
+      | "CF_ACCOUNT_ID"
+      | "CF_ZONE_ID"
+      | "OBSERVABILITY_DATASET"
       | "D1_READ_REPLICATION_ENABLED"
       | "D1_READ_REPLICATION_ROUTES"
       | "PUBLIC_PUBLISHING_ENABLED"

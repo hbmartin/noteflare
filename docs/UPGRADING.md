@@ -2,6 +2,8 @@
 
 Upgrade an existing installation through its normal deployment command after checking the pending migration ranges below. Fresh installations follow [Deployment](DEPLOYMENT.md). Applied SQL migrations and Durable Object migration tags are forward-only: never edit, reorder, or mark an applied migration by hand.
 
+The named production installation with `wrangler.public.jsonc` uses the coordinated [Cloudflare production enablement](implementation/cloudflare-production-enablement.md) workflow. Its single-Worker deploy command refuses live uploads so it cannot bypass resource, owner-recovery and public-delivery gates. Portable installations keep their existing deployment flow.
+
 ## Upgrade procedure
 
 Stop any running Notion import before starting the upgrade. Keep imports stopped until migrations and the Worker rollout finish.

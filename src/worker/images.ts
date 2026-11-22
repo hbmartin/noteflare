@@ -1,4 +1,5 @@
-import { rasterImageMime, IMAGE_DERIVATIVE_MAX_BYTES } from "./image-policy";
+import { rasterImageMime, IMAGE_DERIVATIVE_MAX_BYTES, IMAGE_PRIVACY_VERSION } from "./image-policy";
+import { privateImageBytes } from "./webp-privacy";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import type { Env } from "./env";
 import { requireMember } from "./auth";
@@ -39,7 +40,9 @@ export async function imageDerivative(
     return imagePlaceholder();
   const object = await env.BUCKET.get(attachment.r2_key);
   if (!object) return imagePlaceholder();
-  const id = await sha256Hex(`${attachment.r2_key}:${object.etag}:${preset}:${focal.x}:${focal.y}`),
+  const id = await sha256Hex(
+      `${IMAGE_PRIVACY_VERSION}:${attachment.r2_key}:${object.etag}:${preset}:${focal.x}:${focal.y}`,
+    ),
     key = `image-derivatives/${id}.webp`;
   const saved = await env.BUCKET.get(key);
   if (saved)
@@ -53,7 +56,7 @@ export async function imageDerivative(
       .output({ format: "image/webp", quality: 80, anim: false });
     const response = output.response();
     if (!response.ok || !response.body) return imagePlaceholder();
-    await env.BUCKET.put(key, response.body, {
+    await env.BUCKET.put(key, await privateImageBytes(response.body), {
       httpMetadata: { contentType: "image/webp" },
       customMetadata: { attachmentId, preset },
     });

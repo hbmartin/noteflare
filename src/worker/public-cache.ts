@@ -50,7 +50,7 @@ export async function cleanupPublicCache(env: Env) {
       headers: { authorization: `Bearer ${env.CF_CACHE_PURGE_API_TOKEN}`, "content-type": "application/json" },
       body: JSON.stringify({ hosts: hosts.map((row) => row.hostname) }),
       signal: AbortSignal.timeout(8000),
-      redirect: "error",
+      redirect: "manual",
     },
   );
   if (!response.ok || (await response.json<{ success?: boolean }>()).success !== true)

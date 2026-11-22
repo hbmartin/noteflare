@@ -1,3 +1,4 @@
+import { setUsageIdentity } from "./usage";
 import { setAuditActor } from "./audit";
 import { sha256Hex } from "../shared/import-integrity";
 import { bytesToBase64Url } from "../shared/security";
@@ -298,6 +299,7 @@ export async function authenticateIntegration(request: Request, env: Env): Promi
     .first<IntegrationRow & { workspace_name: string; bot_name: string }>();
   if (!row) throw new IntegrationAuthError();
   setAuditActor({ type: "integration", id: row.id, workspaceId: row.workspace_id });
+  setUsageIdentity(row.workspace_id);
   const timestamp = Date.now();
   if (!row.last_used_at || timestamp - row.last_used_at >= 5 * 60_000) {
     await env.DB.prepare(
@@ -359,7 +361,7 @@ export async function pageForIntegration(
 ) {
   const resolved = await internalPageId(env, principal.workspaceId, pageId);
   if (!resolved) return null;
-  return env.DB.prepare(
+  const page = await env.DB.prepare(
     `WITH RECURSIVE ancestors(id, parent_id) AS (
        SELECT id, parent_id FROM pages WHERE id = ? AND workspace_id = ?
        UNION ALL
@@ -384,6 +386,8 @@ export async function pageForIntegration(
       principal.integrationId,
     )
     .first<IntegrationPage>();
+  if (page) setUsageIdentity(principal.workspaceId, page.id);
+  return page;
 }
 
 export async function pageForIntegrationBot(env: Env, workspaceId: string, botUserId: string, pageId: string) {

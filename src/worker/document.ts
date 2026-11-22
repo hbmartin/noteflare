@@ -1,3 +1,4 @@
+import { withUsage, usageBindings } from "./usage";
 import { checkpointStatements } from "./document-changes";
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { SLACK_PRODUCT_SESSION_ACCESS_SQL } from "./slack-identity";
@@ -684,7 +685,7 @@ export class Document extends YServer {
   constructor(state: DurableObjectState, env: Env) {
     super(state, env as Cloudflare.Env);
     this.state = state;
-    this.bindings = env;
+    this.bindings = usageBindings(env);
   }
 
   private get ids() {
@@ -2017,31 +2018,42 @@ export class Document extends YServer {
     }
     const { pageId } = this.ids;
     const startedAt = performance.now();
-    const compacting = traced(
-      tracing,
-      "notes.document.compact",
-      { "notes.page_id": pageId, "notes.content_kind": this.metadata.content_kind },
-      async () => {
-        try {
-          await this.compactOnce(forceVersion, suppressExternalEffects);
-          recordMetric(this.bindings, {
-            event: "document.compaction",
-            component: "document",
-            operation: this.metadata.content_kind,
-            outcome: "success",
-            durationMs: performance.now() - startedAt,
-          });
-        } catch (error) {
-          recordMetric(this.bindings, {
-            event: "document.compaction",
-            component: "document",
-            operation: this.metadata.content_kind,
-            outcome: "failure",
-            durationMs: performance.now() - startedAt,
-          });
-          logger.error("document.compaction.failed", "document", "Document compaction failed.", { pageId }, error);
-          throw error;
-        }
+    const compacting = withUsage(
+      this.bindings,
+      "document.compaction",
+      () =>
+        traced(
+          tracing,
+          "notes.document.compact",
+          { "notes.page_id": pageId, "notes.content_kind": this.metadata.content_kind },
+          async () => {
+            try {
+              await this.compactOnce(forceVersion, suppressExternalEffects);
+              recordMetric(this.bindings, {
+                event: "document.compaction",
+                component: "document",
+                operation: this.metadata.content_kind,
+                outcome: "success",
+                durationMs: performance.now() - startedAt,
+              });
+            } catch (error) {
+              recordMetric(this.bindings, {
+                event: "document.compaction",
+                component: "document",
+                operation: this.metadata.content_kind,
+                outcome: "failure",
+                durationMs: performance.now() - startedAt,
+              });
+              logger.error("document.compaction.failed", "document", "Document compaction failed.", { pageId }, error);
+              throw error;
+            }
+          },
+        ),
+      {
+        pageId,
+        workspaceId: this.state.storage.sql
+          .exec<{ workspace_id: string }>("SELECT workspace_id FROM audit_identity WHERE id=1")
+          .toArray()[0]?.workspace_id,
       },
     );
     const tracked = compacting.finally(() => {

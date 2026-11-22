@@ -1,3 +1,4 @@
+import { addUsage } from "./usage";
 import type { Env, MemberContext } from "./env";
 import { HttpError, sha256 } from "./http";
 import { SEMANTIC_MODEL, SEMANTIC_VERSION } from "./semantic-model";
@@ -247,6 +248,7 @@ export async function handleSemanticJob(env: Env, job: PlatformJob) {
     if (claimed?.count !== batch.length) throw new Error("Semantic stored-chunk reserve exhausted.");
     const tokens = batch.reduce((sum, chunk) => sum + semanticTokenCount(chunk.input), 0);
     if (!(await reserve(env, tokens, false))) throw new Error("Semantic daily token reserve exhausted.");
+    addUsage({ embeddingTokens: tokens });
     const embeddings = await env.AI!.run(
       SEMANTIC_MODEL,
       { text: batch.map((chunk) => chunk.input), pooling: "cls" },
@@ -260,6 +262,7 @@ export async function handleSemanticJob(env: Env, job: PlatformJob) {
     )
       throw new Error("Invalid embedding response.");
     if (!(await currentGeneration(env, pageId, generation))) return;
+    addUsage({ vectorWriteDimensions: batch.length * 384 });
     await env.SEMANTIC_INDEX!.upsert(
       embeddings.data.map((values, index) => ({
         id: ids[index]!,
@@ -358,6 +361,7 @@ export async function semanticMatches(
   if (!(await reserve(env, semanticTokenCount(input), true))) return { matches: [], status: "budget_exhausted" };
   let candidates: VectorizeMatches;
   try {
+    addUsage({ embeddingTokens: semanticTokenCount(input) });
     const embedded = await env.AI!.run(
       SEMANTIC_MODEL,
       { text: [input], pooling: "cls" },
@@ -369,6 +373,7 @@ export async function semanticMatches(
       embedded.data[0].some((value) => !Number.isFinite(value))
     )
       throw new Error("Embedding unavailable.");
+    addUsage({ vectorQueryDimensions: 384 });
     candidates = await env.SEMANTIC_INDEX!.query(embedded.data[0], {
       topK: 100,
       namespace: member.workspace.id,

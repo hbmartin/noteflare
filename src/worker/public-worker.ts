@@ -1,3 +1,4 @@
+import { withUsage, setUsageIdentity, addUsage } from "./usage";
 import type { Env } from "./env";
 import { classifyError } from "./http";
 import { liveForm, formDocument, submitPublicForm, FORM_SCRIPT } from "./forms";
@@ -21,6 +22,7 @@ import { publicationPageAllowed, publicationHostAllowsShare, type Publication } 
 import type { PublicationManifest } from "./publication-builder";
 import { imagePlaceholder, IMAGE_PRESETS, type ImagePreset } from "./images";
 import { deliverPublicAttachment, publicImagesEnabled } from "./public-attachment";
+import { IMAGE_PRIVACY_VERSION } from "./image-policy";
 const missing = () => new Response("Not found.", { status: 404, headers: { "cache-control": "no-store" } });
 const unavailable = () =>
   new Response("This site is being updated. Please try again shortly.", {
@@ -37,7 +39,7 @@ async function cached(
 ): Promise<Response> {
   const cache = await caches.open("public-pages-v2");
   const url = new URL(request.url);
-  url.searchParams.set("__public_generation", generation);
+  url.searchParams.set("__public_generation", `${generation}:${IMAGE_PRIVACY_VERSION}`);
   const key = new Request(url.toString(), { method: "GET" });
   let response: Response | undefined;
   if (enabled && !url.hostname.endsWith(".workers.dev")) {
@@ -85,6 +87,7 @@ async function shareResponse(
   const pageId = segments[2] === "pages" ? segments[3] : undefined;
   const page = await resolveSharedPage(env, key, pageId);
   if (!page) return missing();
+  setUsageIdentity(page.workspace_id, page.id);
   const version = `share:${page.id}:${page.access_generation ?? 1}:${page.content_generation ?? 1}:images:${Number(publicImagesEnabled(env))}`;
   return cached(request, version, !page.password_hash, context, async () => {
     if (segments[2] === "sitemap.xml") {
@@ -129,6 +132,7 @@ async function publishedResponse(
   parts: string[],
 ): Promise<Response> {
   if (!pub.active || !env.PUBLICATIONS_BUCKET) return missing();
+  setUsageIdentity(pub.workspace_id);
   if (!pub.manifest_key || pub.active_access_generation !== pub.access_generation) return unavailable();
   const object = await env.PUBLICATIONS_BUCKET.get(pub.manifest_key);
   if (!object) return unavailable();
@@ -147,6 +151,7 @@ async function publishedResponse(
     if (!Number.isSafeInteger(part) || part < 1) return missing();
     const page = manifest.pages.find((p) => p.id === pageId);
     if (!page || !(await publicationPageAllowed(env, pub, pageId))) return missing();
+    setUsageIdentity(pub.workspace_id, pageId);
     key = page.parts[part - 1];
   } else if (parts.length === 1 && parts[0] === "site.css") {
     key = manifest.styleKey;
@@ -161,6 +166,7 @@ async function publishedResponse(
     const attachmentId = parts[1]!,
       sourceId = manifest.assets[attachmentId];
     if (!sourceId || !(await publicationPageAllowed(env, pub, sourceId))) return missing();
+    setUsageIdentity(pub.workspace_id, sourceId);
     const attachment = await env.DB.prepare(
       "SELECT id,r2_key,name,mime,size FROM attachments WHERE id=? AND page_id=? AND workspace_id=?",
     )
@@ -258,4 +264,13 @@ export async function fetchPublic(request: Request, env: Env, context: Execution
     return Response.json(classified.body, { status: classified.status, headers: { "cache-control": "no-store" } });
   }
 }
-export default { fetch: fetchPublic };
+export default {
+  fetch: (request: Request, env: Env, context: ExecutionContext) =>
+    withUsage(env, "http.public", async (bindings) => {
+      addUsage({ requests: 1 });
+      const response = await fetchPublic(request, bindings, context);
+      const length = response.headers.get("content-length");
+      if (length && /^\d+$/.test(length)) addUsage({ bytes: Number(length) });
+      return response;
+    }),
+};

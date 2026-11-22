@@ -21,9 +21,9 @@ import { deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { tableTemplateSnapshot } from "./table-service";
 import { computeRowFormulas } from "../shared/table-computed";
+import { copyDownloadArtifact } from "./job-artifacts";
 import { isErrorCell, prepareFormulaEvaluation } from "../shared/formula";
 
-const EXPORT_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const EXPORT_MAX_BYTES = 64 * 1024 * 1024;
 const LINKED_DIAGRAM_ASSET_LIMIT = 64;
 // Browser Rendering loads the HTML from about:blank, so session-gated attachment URLs never resolve there.
@@ -398,6 +398,7 @@ function replaceAttachmentReference(content: string, attachmentId: string, repla
 export async function cleanupExport(env: Env, job: Pick<JobRow, "id" | "attempt">, stillOwned: () => Promise<boolean>) {
   if (!(await stillOwned())) return;
   await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${job.id}`, job.attempt, "output/");
+  if (await stillOwned()) await deleteR2AttemptArtifacts(env.BUCKET, `job-artifacts/${job.id}`, job.attempt);
 }
 
 async function portableExport(
@@ -700,22 +701,36 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
     return { outputKey, filename, byteLength: bytes.byteLength, warnings };
   });
   await step.do("publish export", async () => {
+    // A previous ambiguous D1 response may already have committed this attempt.
+    if (
+      await env.DB.prepare(
+        "SELECT 1 FROM jobs WHERE id=? AND attempt=? AND status='succeeded' AND output_key IS NOT NULL",
+      )
+        .bind(job.id, job.attempt)
+        .first()
+    )
+      return;
     await assertExportActive(env, job);
-    const timestamp = Date.now();
-    await env.DB.prepare(
+    const download = await copyDownloadArtifact(env.BUCKET, job, artifact.outputKey);
+    await assertExportActive(env, job);
+    const result = await env.DB.prepare(
       `UPDATE jobs SET status = 'succeeded', output_key = ?, progress_current = 2, progress_total = 2,
          progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
          updated_at = ? WHERE id = ? AND attempt = ? AND status = 'running'`,
     )
       .bind(
-        artifact.outputKey,
+        download.key,
         JSON.stringify({ warnings: artifact.warnings, filename: artifact.filename, byteLength: artifact.byteLength }),
-        timestamp + EXPORT_ARTIFACT_TTL_MS,
-        timestamp,
+        download.expiresAt,
+        download.publishedAt,
         job.id,
         job.attempt,
       )
       .run();
+    if (!result.meta.changes) {
+      await env.BUCKET.delete(download.key);
+      throw new Error("job_artifact_publication_fenced");
+    }
     await broadcastWorkspaceEvent(env, job.workspace_id, { type: "jobs-invalidated" });
   });
 }

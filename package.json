@@ -40,12 +40,12 @@
     "analyze:audit": "fallow audit --type-aware --brief --format compact",
     "load:realtime": "node scripts/realtime-load.mjs",
     "import:notion": "node scripts/notion-import.mjs",
-    "cf-typegen": "wrangler types --env-interface CloudflareBindings --include-runtime false --env-file worker-typegen.env",
+    "cf-typegen": "node scripts/generate-worker-types.mjs",
     "cf-typegen:check": "node scripts/check-worker-types.mjs",
     "db:local": "node scripts/migrate-d1.mjs --local",
     "db:remote": "node scripts/migrate-d1.mjs --env production --remote",
     "db:export": "node scripts/d1-export.mjs",
-    "check": "pnpm format:check && pnpm check:docs && pnpm lint && pnpm check:middleware && pnpm check:deploy && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker",
+    "check": "pnpm format:check && pnpm api:schema:check && pnpm check:docs && pnpm lint && pnpm check:middleware && pnpm check:deploy && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker && pnpm build:public",
     "deploy": "node scripts/deploy.mjs deploy",
     "security:reset": "node scripts/security-reset.mjs",
     "observability:report": "node scripts/observability.mjs report",
@@ -56,7 +56,12 @@
     "build:app": "pnpm build:plugin-ui && pnpm typecheck && vite build && node scripts/build-offline-worker.mjs",
     "deploy:one-click": "node scripts/deploy.mjs deploy --one-click",
     "deploy:production": "node scripts/deploy.mjs deploy --production",
-    "check:docs": "node scripts/check-docs.mjs"
+    "check:docs": "node scripts/check-docs.mjs",
+    "api:schema": "node scripts/generate-openapi.mjs",
+    "api:schema:check": "node scripts/generate-openapi.mjs --check",
+    "platform:provision": "node scripts/cloudflare-platform.mjs",
+    "deploy:platform": "node scripts/deploy-platform.mjs",
+    "build:public": "wrangler deploy --config wrangler.public.jsonc --dry-run --outdir .wrangler/public-dry-run"
   },
   "dependencies": {
     "@better-auth/core": "1.7.7",
@@ -138,7 +143,7 @@
         "description": "Your private **setup key**. Generate at least 32 random characters with a password manager. Enter the same key on the first-run screen to create the owner. Keep it private; you can delete this secret after setup."
       },
       "BETTER_AUTH_URL": {
-        "description": "Leave **auto** to use the installation’s workers.dev URL. Set an exact HTTPS origin only when using your own domain."
+        "description": "Leave **auto** to use the installation\u2019s workers.dev URL. Set an exact HTTPS origin only when using your own domain."
       }
     }
   }
