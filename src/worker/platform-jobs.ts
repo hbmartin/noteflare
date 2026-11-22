@@ -19,6 +19,12 @@ export class PlatformJobDeferred extends Error {
 
 /** A durable owner-visible failure that requires a build reset, rather than retries. */
 export class PlatformJobTerminal extends Error {}
+/** A persisted failure needs a coordinator phase in addition to its Queue retry. */
+export class PlatformJobMaintenanceRequired extends Error {
+  constructor(cause: Error) {
+    super(cause.message, { cause });
+  }
+}
 
 export type PlatformJobHandler = (env: Env, job: PlatformJob) => Promise<void>;
 export type PlatformHandlers = Readonly<Record<string, PlatformJobHandler>>;
@@ -108,6 +114,7 @@ export async function runPlatformJob(env: Env, id: string, handlers: PlatformHan
     attempts: row.attempts,
   };
   const started = performance.now();
+  let maintenanceRequired = false;
   try {
     const handler = handlers[job.kind];
     if (!handler) throw new Error("platform_handler_unavailable");
@@ -127,6 +134,7 @@ export async function runPlatformJob(env: Env, id: string, handlers: PlatformHan
       attempts: job.attempts,
     });
   } catch (error) {
+    maintenanceRequired = error instanceof PlatformJobMaintenanceRequired;
     if (error instanceof PlatformJobTerminal) {
       await env.DB.prepare("DELETE FROM platform_jobs WHERE id=? AND generation=? AND lease_token=?")
         .bind(id, job.generation, token)
@@ -176,7 +184,9 @@ export async function runPlatformJob(env: Env, id: string, handlers: PlatformHan
           { workspaceId: remaining.workspace_id, kind: remaining.kind, key: remaining.job_key },
           due,
         ));
-      if (!queued) await wakePlatformBestEffort(env, due);
+      if (!queued || maintenanceRequired) await wakePlatformBestEffort(env, due);
+    } else if (maintenanceRequired) {
+      await wakePlatformBestEffort(env);
     }
   }
 }

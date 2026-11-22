@@ -5,6 +5,7 @@ import {
   abortAllDurableObjects,
   createExecutionContext,
   waitOnExecutionContext,
+  runInDurableObject,
 } from "cloudflare:test";
 import { beforeEach, afterEach, expect, it, vi } from "vitest";
 import type { Env } from "./env";
@@ -12,7 +13,14 @@ import { publicationConfig } from "../shared/publications";
 import { processPublicationBuildJob } from "./publication-builder";
 import { enqueuePendingPublications, type Publication } from "./publications";
 import { retirePublicationBuild } from "./publication-jobs";
-import { runPlatformJob, recoverPlatformJobs, platformJobId } from "./platform-jobs";
+import {
+  runPlatformJob,
+  recoverPlatformJobs,
+  platformJobId,
+  enqueuePlatformJob,
+  PlatformJobTerminal,
+} from "./platform-jobs";
+import type { PlatformCoordinator } from "./platform-coordinator";
 import { fetchPublic } from "./public-worker";
 import { publicationInput } from "./publication-state";
 
@@ -102,7 +110,9 @@ it.each(["checkpoint", "shape", "missing", "prefix", "json", "structure", "input
     const damaged = await damage(kind);
     await expect(
       processPublicationBuildJob(configured(), { publicationId: damaged.id, generation: damaged.generation }),
-    ).rejects.toMatchObject({ code: expect.stringMatching(/^publication_(checkpoint|continuation|capture)_/) });
+    ).rejects.toMatchObject({
+      cause: { code: expect.stringMatching(/^publication_(checkpoint|continuation|capture)_/) },
+    });
     expect(JSON.parse((await current())!.build_failure_json!).kind).toBe("state");
     const context = createExecutionContext();
     const response = await fetchPublic(new Request("https://public.test/sites/state-key"), configured(), context);
@@ -212,24 +222,218 @@ it.each(["expansion-damaged.json", "inputs.json", "source.json"])(
   },
 );
 
-it("classifies malformed captures read after a competing conditional creation", async () => {
+it.each(["{", "null"])(
+  "classifies invalid %s captures read after a competing conditional creation",
+  async (damaged) => {
+    await fixture();
+    const pub = (await current())!;
+    const key = `publications/${pub.id}/${pub.generation}/inputs.json`;
+    await env.BUCKET.put(key, damaged);
+    let reads = 0;
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, method) {
+        if (method === "get")
+          return (name: string) => (name === key && reads++ === 0 ? Promise.resolve(null) : target.get(name));
+        const value = Reflect.get(target, method);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(
+      publicationInput(
+        { ...configured(), PUBLICATIONS_BUCKET: bucket },
+        pub,
+        key,
+        async () => ({ valid: true }),
+        (value): value is { valid: boolean } =>
+          !!value && typeof value === "object" && "valid" in value && typeof value.valid === "boolean",
+      ),
+    ).rejects.toMatchObject({ code: "publication_capture_invalid" });
+    expect(await (await env.BUCKET.get(key))!.text()).toBe(damaged);
+  },
+);
+
+it("accepts healthy legacy document nodes and additive capture metadata", async () => {
   await fixture();
-  const pub = (await current())!;
-  const key = `publications/${pub.id}/${pub.generation}/inputs.json`;
-  await env.BUCKET.put(key, "{");
-  let reads = 0;
+  const pub = await freeze();
+  const key = `publications/${pub.id}/${pub.generation}/child/source.json`;
+  const document = {
+    type: "doc",
+    extension: "older capture",
+    version: 1,
+    source: "legacy extension",
+    document: "legacy extension",
+    content: [
+      {
+        type: "futureBlock",
+        attrs: { extension: { retained: true } },
+        content: [{ type: "text", text: "Compatible text" }],
+      },
+    ],
+  };
+  await env.BUCKET.put(key, JSON.stringify(document));
+  await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation });
+  expect(await current()).toMatchObject({
+    active_generation: pub.generation,
+    needs_build: 0,
+    build_state_recovery_count: 0,
+  });
+  expect(await (await env.BUCKET.get(key))!.json()).toEqual(document);
+});
+
+it.each([
+  "inputs-null",
+  "inputs-array",
+  "inputs-config",
+  "inputs-duplicate",
+  "inputs-scope",
+  "inputs-metadata",
+  "source-null",
+  "source-scalar",
+  "source-version",
+  "source-identity",
+  "source-document",
+])("rebuilds structurally invalid %s captures without overwriting them", async (kind) => {
+  const previous = await fixture();
+  const pub = await freeze();
+  const inputsKey = `publications/${pub.id}/${pub.generation}/inputs.json`;
+  const sourceKey = `publications/${pub.id}/${pub.generation}/child/source.json`;
+  const inputs = await (await env.BUCKET.get(inputsKey))!.json<{
+    config: Record<string, unknown>;
+    pages: Array<Record<string, unknown>>;
+  }>();
+  let value: unknown = inputs;
+  if (kind === "inputs-null" || kind === "source-null") value = null;
+  if (kind === "inputs-array") value = [];
+  if (kind === "inputs-config") delete inputs.config.tableViews;
+  if (kind === "inputs-duplicate") inputs.pages.push(inputs.pages[0]!);
+  if (kind === "inputs-scope") inputs.pages[0]!.workspace_id = "another-workspace";
+  if (kind === "inputs-metadata") inputs.pages[0]!.content_epoch = "1";
+  if (kind === "source-scalar") value = 1;
+  if (["source-version", "source-identity", "source-document"].includes(kind))
+    value = {
+      version: kind === "source-version" ? 2 : 1,
+      source: { pageId: kind === "source-identity" ? "root" : "child", contentEpoch: 1, sequence: 0, key: null },
+      document: { type: "doc", content: kind === "source-document" ? {} : [] },
+    };
+  const key = kind.startsWith("inputs") ? inputsKey : sourceKey;
+  const damaged = JSON.stringify(value);
+  await env.BUCKET.put(key, damaged);
+  await expect(
+    processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation }),
+  ).rejects.toMatchObject({ cause: { code: "publication_capture_invalid" } });
+  expect(await (await env.BUCKET.get(key))!.text()).toBe(damaged);
+  await enqueuePendingPublications(configured());
+  const replacement = (await current())!;
+  expect(replacement).toMatchObject({
+    generation: pub.generation + 1,
+    build_state_recovery_count: 1,
+    manifest_key: previous.manifest_key,
+    access_generation: previous.access_generation,
+  });
+  for (let i = 0; i < 2; i++)
+    await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: replacement.generation });
+  expect(await current()).toMatchObject({
+    active_generation: replacement.generation,
+    needs_build: 0,
+    build_state_recovery_count: 0,
+  });
+});
+
+it("blocks repeated shape damage after the one automatic replacement", async () => {
+  await fixture();
+  const pub = await freeze();
+  await env.BUCKET.put(`publications/${pub.id}/${pub.generation}/inputs.json`, "null");
+  await expect(
+    processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation }),
+  ).rejects.toThrow("Private publication build state is unavailable or invalid.");
+  await enqueuePendingPublications(configured());
+  const replacement = (await current())!;
+  await env.BUCKET.put(`publications/${pub.id}/${replacement.generation}/inputs.json`, "[]");
+  await expect(
+    processPublicationBuildJob(configured(), { publicationId: pub.id, generation: replacement.generation }),
+  ).rejects.toBeInstanceOf(PlatformJobTerminal);
+  await enqueuePendingPublications(configured());
+  expect(await current()).toMatchObject({ generation: replacement.generation, build_state_recovery_count: 1 });
+});
+
+it("pulls a leased deadline forward for restartable publication failures despite successful Queue delivery", async () => {
+  const previous = await fixture();
+  const pub = await damage("inputs");
+  await env.DB.prepare("DELETE FROM platform_jobs").run();
+  const intent = {
+    workspaceId: pub.workspace_id,
+    kind: "publication",
+    key: pub.id,
+    generation: String(pub.generation),
+    payload: { publicationId: pub.id, generation: pub.generation },
+  };
+  await enqueuePlatformJob(configured(), intent);
+  let now = Date.now(),
+    entered!: () => void,
+    release!: () => void;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const held = new Promise<void>((resolve) => {
+      entered = resolve;
+    }),
+    gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
   const bucket = new Proxy(env.BUCKET, {
     get(target, method) {
       if (method === "get")
-        return (name: string) => (name === key && reads++ === 0 ? Promise.resolve(null) : target.get(name));
+        return async (key: string) => {
+          if (key.endsWith("inputs.json")) {
+            entered();
+            await gate;
+          }
+          return target.get(key);
+        };
       const value = Reflect.get(target, method);
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
-  await expect(
-    publicationInput({ ...configured(), PUBLICATIONS_BUCKET: bucket }, pub, key, async () => ({ valid: true })),
-  ).rejects.toMatchObject({ code: "publication_capture_invalid" });
-  expect(await (await env.BUCKET.get(key))!.text()).toBe("{");
+  const send = vi.fn(async () => {});
+  const bindings: Env = {
+    ...configured(),
+    AUDIT_ENABLED: "false",
+    BASIN_ENABLED: "false",
+    PUBLICATIONS_BUCKET: bucket,
+    PLATFORM: env.PLATFORM!,
+    PLATFORM_QUEUE: { send } as unknown as Queue,
+  };
+  const processing = runPlatformJob(bindings, platformJobId(intent), {
+    publication: (jobEnv, job) => processPublicationBuildJob(jobEnv, job.payload),
+  });
+  await held;
+  await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance: PlatformCoordinator, state) => {
+    const mutable = instance as unknown as { env: Env },
+      original = mutable.env;
+    mutable.env = bindings;
+    try {
+      await state.storage.deleteAll();
+      await state.storage.put("phase", 10);
+      await instance.alarm();
+      expect(await state.storage.getAlarm()).toBe(now + 300000);
+      release();
+      await processing;
+      expect(send).toHaveBeenCalledWith({ platformJobId: platformJobId(intent) }, { delaySeconds: 2 });
+      expect(await state.storage.getAlarm()).toBe(now + 5000);
+      now += 5000;
+      await instance.alarm();
+      now += 5000;
+      await instance.alarm();
+      expect(await current()).toMatchObject({
+        generation: pub.generation + 1,
+        build_state_recovery_count: 1,
+        manifest_key: previous.manifest_key,
+        access_generation: previous.access_generation,
+      });
+    } finally {
+      release();
+      mutable.env = original;
+      await state.storage.deleteAlarm();
+    }
+  });
 });
 
 it("keeps non-parsing capture body errors transient and reads healthy legacy sources", async () => {

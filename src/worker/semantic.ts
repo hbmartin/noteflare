@@ -20,9 +20,12 @@ export type SemanticMatch = {
   table_generation: number;
   score: number;
 };
-function semanticEnabled(env: Env) {
+export function semanticEnabled(env: Env) {
   return env.SEMANTIC_SEARCH_ENABLED === "true" && !!env.AI && !!env.SEMANTIC_INDEX;
 }
+/** d is a dirty record; existing intents own their leases and backoff deadlines. */
+export const unclaimedSemanticWork = `d.pending=1 AND NOT EXISTS(SELECT 1 FROM platform_jobs j
+  WHERE j.workspace_id=d.workspace_id AND j.kind='semantic' AND j.job_key=d.page_id AND j.generation=CAST(d.generation AS TEXT))`;
 function limit(value: string | undefined, fallback: number) {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -55,7 +58,7 @@ export async function sweepSemanticJobs(env: Env, count = 25) {
   if (!semanticEnabled(env)) return;
   const rows = await env.DB.prepare(
     `SELECT d.page_id,d.workspace_id,d.generation FROM semantic_dirty d LEFT JOIN pages p ON p.id=d.page_id
-       WHERE d.pending=1 AND NOT EXISTS(SELECT 1 FROM platform_jobs j WHERE j.workspace_id=d.workspace_id AND j.kind='semantic' AND j.job_key=d.page_id AND j.generation=CAST(d.generation AS TEXT))
+       WHERE ${unclaimedSemanticWork}
        ORDER BY CASE WHEN p.id IS NULL OR p.archived_at IS NOT NULL OR p.import_job_id IS NOT NULL THEN 0 ELSE 1 END,d.updated_at,d.page_id LIMIT ?`,
   )
     .bind(count)

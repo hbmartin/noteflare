@@ -4,6 +4,7 @@ import type { DocumentContentEnvelope, ProseMirrorJson } from "../shared/types";
 import { collectTransclusions, serializeDocument } from "../shared/document-projection";
 import { putPublicationObject } from "./publication-storage";
 import { publicationInput, advancePublication } from "./publication-state";
+import { validPublicationDocument, type CapturedPublicationDocument } from "./publication-captures";
 
 import { HttpError } from "./http";
 import { PublicationContentError, PublicationStateError, type PublicationSourceVersion } from "./publication-failure";
@@ -104,11 +105,12 @@ async function readProjection(env: Env, page: PublicationPage) {
   };
 }
 function projection(env: Env, pub: Publication, page: PublicationPage) {
-  return publicationInput<Awaited<ReturnType<typeof readProjection>> | ProseMirrorJson>(
+  return publicationInput<CapturedPublicationDocument>(
     env,
     pub,
     `publications/${pub.id}/${pub.generation}/${page.id}/source.json`,
     () => readProjection(env, page),
+    (value): value is CapturedPublicationDocument => validPublicationDocument(value, page),
   );
 }
 /** Complete authorized synced content across bounded jobs before any page can enter a manifest. */
@@ -158,12 +160,15 @@ export async function expandPublicationDocument(
     }
     const documentFor = async (source: PublicationPage) => {
       const captured = await projection(env, pub, source);
+      if ("type" in captured && captured.type === "doc") {
+        state.legacy = true;
+        return captured;
+      }
       if ("document" in captured && "source" in captured) {
         if (!state.sources!.some((item) => item.pageId === source.id)) state.sources!.push(captured.source);
         return captured.document;
       }
-      state.legacy = true;
-      return captured;
+      throw new PublicationStateError("publication_capture_invalid");
     };
     const render = (document: ProseMirrorJson, sourceId: string, ancestors: string[]) => {
       let html = body(

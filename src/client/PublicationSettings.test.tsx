@@ -4,7 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import userEvent from "@testing-library/user-event";
 import type { Page, Space } from "../shared/types";
 import { publicationConfig } from "../shared/publications";
-import { api } from "./api";
+import { api, ApiClientError } from "./api";
 import { PublicationSettings } from "./PublicationSettings";
 vi.mock("./api", async (importOriginal) => ({ ...(await importOriginal<typeof import("./api")>()), api: vi.fn() }));
 
@@ -54,14 +54,29 @@ afterEach(() => {
   cleanup();
   vi.resetAllMocks();
 });
+let tables: Array<{ id: string; title: string }> = [];
+function mockApi(
+  implementation: (url: string, options?: Parameters<typeof api>[1]) => Promise<unknown>,
+  preview: (options?: Parameters<typeof api>[1]) => Promise<unknown> = async () => ({ tables }),
+) {
+  vi.mocked(api).mockImplementation(
+    (url, options) => (url.endsWith("/table-options") ? preview(options) : implementation(url, options)) as never,
+  );
+}
 async function load(spaces = [space], pages = [page]) {
+  tables = pages
+    .filter(
+      (value) => value.kind === "table" && value.spaceId === spaces[0]?.id && !value.archivedAt && !value.isTemplate,
+    )
+    .map(({ id, title }) => ({ id, title }));
   render(<PublicationSettings spaces={spaces} pages={pages} />);
   fireEvent.click(screen.getByRole("button", { name: "Load publishing settings" }));
   await screen.findByLabelText("Site title");
+  await waitFor(() => expect(screen.queryByText(/Checking published tables/)).not.toBeInTheDocument());
 }
 it("keeps malformed progress editable and hides failure status after deactivation", async () => {
   let current = { ...site, build_checkpoint_json: "invalid" };
-  vi.mocked(api).mockImplementation(async (url, options) => {
+  mockApi(async (url, options) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (options?.method === "PUT") {
       current = { ...current, active: 0 };
@@ -83,7 +98,7 @@ it.each([false, true])("applies normalized settings while preserving newer edits
     finish = resolve;
   });
   const submitted: Array<Record<string, unknown>> = [];
-  vi.mocked(api).mockImplementation(async (url, options) => {
+  mockApi(async (url, options) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (options?.method === "PUT") {
       submitted.push(JSON.parse(options.body as string));
@@ -116,7 +131,7 @@ it("locks selection during save, keeps edits available, and refreshes the site b
     finish = resolve;
   });
   let reads = 0;
-  vi.mocked(api).mockImplementation(async (url, options) => {
+  mockApi(async (url, options) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (options?.method === "PUT") {
       submitted.push(JSON.parse(options.body as string));
@@ -158,7 +173,7 @@ it("releases the selection lock after rejection without losing edits or changing
     reject = fail;
   });
   const submitted: Array<{ generation: number }> = [];
-  vi.mocked(api).mockImplementation(async (url, options) => {
+  mockApi(async (url, options) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (options?.method === "PUT") {
       submitted.push(JSON.parse(options.body as string));
@@ -184,7 +199,7 @@ it("inserts a newly saved site into the selectable cache without another GET", a
   const created = { ...site, id: "created", config: { ...site.config, title: "Created site", tableViews: {} } };
   const submitted: Array<{ id?: string; generation?: number }> = [];
   let reads = 0;
-  vi.mocked(api).mockImplementation(async (url, options) => {
+  mockApi(async (url, options) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (options?.method === "PUT") {
       submitted.push(JSON.parse(options.body as string));
@@ -212,7 +227,7 @@ it.each([
   { active: 0, needs_build: 1 },
   { active: 1, needs_build: 0 },
 ])("does not render numeric false conditions: %o", async (flags) => {
-  vi.mocked(api).mockImplementation(async (url) =>
+  mockApi(async (url) =>
     url.includes("hostnames") ? ({ hostnames: [] } as never) : ({ publications: [{ ...site, ...flags }] } as never),
   );
   await load();
@@ -226,7 +241,7 @@ it("displays a retained view until its metadata loads instead of showing all row
   const pending = new Promise((resolve) => {
     finish = resolve;
   });
-  vi.mocked(api).mockImplementation(async (url) => {
+  mockApi(async (url) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (url.includes("/tables/")) return (await pending) as never;
     return { publications: [saved] } as never;
@@ -245,7 +260,7 @@ it("displays a retained view until its metadata loads instead of showing all row
 
 it.each([false, true])("identifies a loaded saved view that is missing or personal: personal=%s", async (personal) => {
   const table = { ...page, id: "table", kind: "table" as const, title: "Records" };
-  vi.mocked(api).mockImplementation(async (url) => {
+  mockApi(async (url) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (url.includes("/tables/")) return { views: personal ? [{ id: "filtered", ownerId: "owner" }] : [] } as never;
     return { publications: [{ ...site, config: { ...site.config, tableViews: { table: "filtered" } } }] } as never;
@@ -260,7 +275,7 @@ it.each([false, true])("identifies a loaded saved view that is missing or person
 it("labels failed metadata separately and retries without losing the retained selection", async () => {
   const table = { ...page, id: "table", kind: "table" as const, title: "Records" };
   let reads = 0;
-  vi.mocked(api).mockImplementation(async (url) => {
+  mockApi(async (url) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (url.includes("/tables/")) {
       if (++reads === 1) throw new Error("offline");
@@ -278,6 +293,7 @@ it("labels failed metadata separately and retries without losing the retained se
   await screen.findByRole("option", { name: "Filtered (grid)" });
   expect(selector).toHaveValue("filtered");
   expect(reads).toBe(2);
+  expect(screen.queryByText("Views could not be loaded.")).not.toBeInTheDocument();
 });
 
 it("lets owners remove unavailable restrictions and regain capacity without querying those tables", async () => {
@@ -289,7 +305,7 @@ it("lets owners remove unavailable restrictions and regain capacity without quer
   );
   const current = { ...site, config: { ...site.config, tableViews } };
   const submitted: Array<{ config: typeof current.config }> = [];
-  vi.mocked(api).mockImplementation(async (url, options) => {
+  mockApi(async (url, options) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (url.includes("/tables/"))
       return {
@@ -313,7 +329,9 @@ it("lets owners remove unavailable restrictions and regain capacity without quer
   expect(within(unavailable).getByText("Archived records — saved view filtered")).toBeInTheDocument();
   expect(within(unavailable).getByText("Moved records — saved view filtered")).toBeInTheDocument();
   expect(within(unavailable).getByText("gone-0 — saved view filtered")).toBeInTheDocument();
-  expect(within(unavailable).getByText(/returning table will publish all rows and columns/)).toBeInTheDocument();
+  expect(
+    within(unavailable).getByText(/table will publish all rows and columns whenever it is included/),
+  ).toBeInTheDocument();
   expect(screen.getByText("200 of 200 saved view selections used.")).toBeInTheDocument();
   expect(vi.mocked(api).mock.calls.some(([url]) => url.includes("/tables/"))).toBe(false);
   fireEvent.click(screen.getByRole("button", { name: "Save site" }));
@@ -345,7 +363,7 @@ it("preserves a restriction removal made while a settings save is pending", asyn
     finish = resolve;
   });
   const submitted: Array<{ config: typeof site.config }> = [];
-  vi.mocked(api).mockImplementation(async (url, options) => {
+  mockApi(async (url, options) => {
     if (url.includes("hostnames")) return { hostnames: [] } as never;
     if (options?.method === "PUT") {
       submitted.push(JSON.parse(options.body as string));
@@ -367,3 +385,118 @@ it("preserves a restriction removal made while a settings save is pending", asyn
   await waitFor(() => expect(submitted).toHaveLength(2));
   expect(submitted[1]!.config.tableViews).toEqual({});
 });
+
+it("shows server-confirmed hidden tables even when the sidebar has not loaded", async () => {
+  const hidden = { id: "hidden", title: "Nested private records" };
+  const saved = { ...site, config: { ...site.config, tableViews: { hidden: "filtered" } } };
+  let submitted: unknown;
+  mockApi(
+    async (url, options) => {
+      if (url.includes("hostnames")) return { hostnames: [] };
+      if (options?.method === "PUT") {
+        submitted = JSON.parse(options.body as string);
+        return { publication: saved, url: "https://public.test/sites/key" };
+      }
+      return { publications: [saved] };
+    },
+    async () => ({ tables: [hidden] }),
+  );
+  await load([space], []);
+  expect(screen.getByRole("combobox", { name: hidden.title })).toHaveValue("filtered");
+  expect(screen.queryByRole("button", { name: "Remove saved view restriction" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Save site" }));
+  await waitFor(() => expect(submitted).toMatchObject({ config: { tableViews: { hidden: "filtered" } } }));
+});
+
+it("ignores an aborted draft-scope response and never calls pending scope unavailable", async () => {
+  const saved = { ...site, config: { ...site.config, tableViews: { hidden: "filtered" } } };
+  let finish!: (value: unknown) => void;
+  const pending = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const signals: AbortSignal[] = [];
+  let requests = 0;
+  mockApi(
+    async (url) => (url.includes("hostnames") ? { hostnames: [] } : { publications: [saved] }),
+    async (options) => {
+      signals.push(options!.signal!);
+      if (++requests === 1) return pending;
+      expect(JSON.parse(options!.body as string).roots).toEqual([]);
+      return { tables: [] };
+    },
+  );
+  render(<PublicationSettings spaces={[space]} pages={[page]} />);
+  fireEvent.click(screen.getByRole("button", { name: "Load publishing settings" }));
+  await screen.findByText(/Checking published tables/);
+  expect(screen.queryByRole("group", { name: "Unavailable table selections" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByLabelText(page.title));
+  await screen.findByRole("group", { name: "Unavailable table selections" });
+  expect(signals[0]!.aborted).toBe(true);
+  finish({ tables: [{ id: "hidden", title: "Obsolete response" }] });
+  await waitFor(() => expect(screen.queryByRole("combobox", { name: "Obsolete response" })).not.toBeInTheDocument());
+  expect(screen.getByText("hidden — saved view filtered")).toBeInTheDocument();
+});
+
+it("keeps restrictions unknown after a scope failure and allows an explicit retry", async () => {
+  let requests = 0;
+  mockApi(
+    async (url) => (url.includes("hostnames") ? { hostnames: [] } : { publications: [site] }),
+    async () => {
+      if (++requests === 1) throw new Error("Scope offline");
+      return { tables: [] };
+    },
+  );
+  await load();
+  expect(screen.getByText(/table availability is unknown/)).toHaveAttribute("role", "alert");
+  expect(screen.queryByRole("button", { name: "Remove saved view restriction" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Retry table availability" }));
+  await screen.findByRole("button", { name: "Remove saved view restriction" });
+  expect(requests).toBe(2);
+});
+
+it.each(["save", "domain", "upload"])(
+  "retains %s errors through view edits and successful metadata retries",
+  async (operation) => {
+    const table = { ...page, id: "table", kind: "table" as const, title: "Records" };
+    const saved = { ...site, config: { ...site.config, tableViews: { table: "filtered", obsolete: "view" } } };
+    let reads = 0,
+      finish!: (value: unknown) => void;
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    mockApi(async (url, options) => {
+      if (options?.method === "PUT" || (url.includes("hostnames") && options?.method === "POST"))
+        throw new ApiClientError(409, "publication_changed", "Reload settings before retrying");
+      if (url.includes("hostnames")) return { hostnames: [] };
+      if (url.includes("/tables/")) {
+        if (++reads === 1) throw new ApiClientError(503, "offline", "Metadata offline");
+        return pending;
+      }
+      return { publications: [saved] };
+    });
+    await load([space], [page, table]);
+    const selector = screen.getByRole("combobox", { name: "Records" });
+    fireEvent.focus(selector);
+    await screen.findByText("Metadata offline");
+    fireEvent.blur(selector);
+    fireEvent.focus(selector);
+    if (operation === "save") fireEvent.click(screen.getByRole("button", { name: "Save site" }));
+    else if (operation === "domain") {
+      fireEvent.change(screen.getByLabelText("Hostname"), { target: { value: "docs.test" } });
+      fireEvent.click(screen.getByRole("button", { name: "Connect domain" }));
+    }
+    if (operation === "upload")
+      fireEvent.change(screen.getByLabelText("Logo"), {
+        target: { files: [new File([new Uint8Array(10 * 1024 * 1024 + 1)], "large.png", { type: "image/png" })] },
+      });
+    const message = operation === "upload" ? "Choose an image of at most 10 MiB." : "Reload settings before retrying";
+    await screen.findByText(message);
+    finish({ views: [{ id: "filtered", name: "Filtered", kind: "grid", ownerId: null }] });
+    await screen.findByRole("option", { name: "Filtered (grid)" });
+    expect(screen.queryByText("Metadata offline")).not.toBeInTheDocument();
+    expect(selector).toHaveValue("filtered");
+    fireEvent.change(selector, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Remove saved view restriction" }));
+    expect(screen.getByText(message)).toBeInTheDocument();
+  },
+);

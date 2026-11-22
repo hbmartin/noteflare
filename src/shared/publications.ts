@@ -1,4 +1,5 @@
 export const MAX_PUBLICATION_TABLE_VIEWS = 200;
+export type PublicationTableOptions = { tables: Array<{ id: string; title: string }> };
 
 export type PublicationConfig = {
   title: string;

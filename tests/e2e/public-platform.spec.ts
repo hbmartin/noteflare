@@ -61,6 +61,9 @@ async function openHarness(page: Page, gallery = false) {
     });
   });
   await page.route("**/api/publications/*/hostnames", (route) => route.fulfill({ json: { hostnames: [] } }));
+  await page.route("**/api/spaces/space/publications/table-options", (route) =>
+    route.fulfill({ json: { tables: [] } }),
+  );
   await page.route("**/__e2e__/public-platform*", (route) =>
     route.fulfill({
       contentType: "text/html",
@@ -260,7 +263,7 @@ test("publishing saves lock selection, preserve newer edits and reuse the confir
   await page.getByText("Published table views", { exact: true }).click();
   const unavailable = page.getByRole("group", { name: "Unavailable table selections" });
   await expect(unavailable).toContainText("dormant — saved view filtered");
-  await expect(unavailable).toContainText("returning table will publish all rows and columns");
+  await expect(unavailable).toContainText("table will publish all rows and columns whenever it is included");
   await unavailable.getByRole("button", { name: "Remove saved view restriction" }).click();
   expect(submissions).toHaveLength(2);
   await expect(page.getByText("0 of 200 saved view selections used.")).toBeVisible();
@@ -268,4 +271,57 @@ test("publishing saves lock selection, preserve newer edits and reuse the confir
   await expect.poll(() => submissions.length).toBe(3);
   expect(submissions[2]).toMatchObject({ generation: 3, config: { tableViews: {} } });
   await expect(unavailable).toHaveCount(0);
+});
+
+test("publishing preserves a hidden live table restriction while checking authoritative scope", async ({ page }) => {
+  await openHarness(page);
+  const config = publicationConfig(
+    { title: "Hidden table site", homePageId: "page", tableViews: { hidden: "filtered" } },
+    ["page"],
+  );
+  const site = {
+    id: "site",
+    url_key: "key",
+    generation: 1,
+    active: 1,
+    needs_build: 0,
+    build_error: null,
+    config,
+    roots: ["page"],
+  };
+  const submissions: Array<{ config: typeof config }> = [];
+  await page.route("**/api/spaces/space/publications", async (route) => {
+    if (route.request().method() === "GET") return route.fulfill({ json: { publications: [site] } });
+    const body = route.request().postDataJSON();
+    submissions.push(body);
+    return route.fulfill({
+      json: { publication: { ...site, generation: 2, config: body.config }, url: "https://public.test/sites/key" },
+    });
+  });
+  let finish!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  await page.route("**/api/spaces/space/publications/table-options", async (route) => {
+    expect(route.request().postDataJSON()).toEqual({ roots: ["page"] });
+    await gate;
+    await route.fulfill({ json: { tables: [{ id: "hidden", title: "Hidden records" }] } });
+  });
+  await page.route("**/api/tables/hidden/query?limit=1", (route) =>
+    route.fulfill({ json: { views: [{ id: "filtered", name: "Filtered", kind: "grid", ownerId: null }] } }),
+  );
+  await page.getByRole("button", { name: "Load publishing settings" }).click();
+  await page.getByText("Published table views", { exact: true }).click();
+  await expect(page.getByText(/Checking published tables/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Remove saved view restriction" })).toHaveCount(0);
+  finish();
+  const selector = page.getByRole("combobox", { name: "Hidden records", exact: true });
+  await expect(selector).toHaveValue("filtered");
+  await selector.focus();
+  await expect(selector.getByRole("option", { name: "Filtered (grid)" })).toHaveCount(1);
+  await page.getByLabel("Site title", { exact: true }).fill("Unrelated title update");
+  await page.getByRole("button", { name: "Save site", exact: true }).click();
+  await expect.poll(() => submissions.length).toBe(1);
+  expect(submissions[0]!.config.tableViews).toEqual({ hidden: "filtered" });
+  await expect(page.getByRole("group", { name: "Unavailable table selections" })).toHaveCount(0);
 });

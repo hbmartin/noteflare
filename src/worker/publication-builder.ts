@@ -15,6 +15,7 @@ import {
   PublicationStateError,
   publicationFailure,
   blockedPublicationBuild,
+  restartablePublicationFailure,
 } from "./publication-failure";
 import type { Env } from "./env";
 import { recordMetric } from "./observability";
@@ -26,7 +27,7 @@ import { publicTablePage } from "./public-table";
 import { publishedRows, publishedCell } from "../shared/published-table";
 import { escapePublic as esc, PUBLIC_STYLE } from "./public-utils";
 import { sha256Hex } from "../shared/import-integrity";
-import { reservePlatformUsage, PlatformJobTerminal } from "./platform-jobs";
+import { reservePlatformUsage, PlatformJobTerminal, PlatformJobMaintenanceRequired } from "./platform-jobs";
 export type PublicationManifest = {
   publicationId: string;
   generation: number;
@@ -461,6 +462,20 @@ async function buildPublication(env: Env, payload: unknown) {
     if (recorded && error instanceof PublicationStateError && pub.build_state_recovery_count === 1) {
       recordMetric(env, { event: "publication.state.exhausted", component: "platform", attempts: 1 });
       throw new PlatformJobTerminal();
+    }
+    if (recorded && (error instanceof PublicationStateError || error instanceof PublicationContentError)) {
+      let restartable = false;
+      try {
+        restartable = Boolean(
+          await env.DB.prepare(`SELECT 1 FROM publications p WHERE p.id=? AND p.generation=?
+          AND p.access_generation=? AND p.build_checkpoint_json IS ? AND ${restartablePublicationFailure}`)
+            .bind(pub.id, pub.generation, pub.access_generation, pub.build_checkpoint_json)
+            .first(),
+        );
+      } catch {
+        /* Preserve the original failure when diagnostics are unavailable. */
+      }
+      if (restartable) throw new PlatformJobMaintenanceRequired(error);
     }
     throw error;
   }
