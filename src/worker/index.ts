@@ -7698,6 +7698,11 @@ export default {
         if (
           response.status < 400 &&
           ["POST", "PATCH", "PUT", "DELETE"].includes(request.method) &&
+          // Draft scope previews are read-only despite accepting a POST body.
+          !(
+            request.method === "POST" &&
+            /^\/api\/spaces\/[^/]+\/publications\/table-options$/.test(new URL(request.url).pathname)
+          ) &&
           env.PLATFORM &&
           (env.SEMANTIC_SEARCH_ENABLED === "true" ||
             env.PUBLIC_PUBLISHING_ENABLED === "true" ||

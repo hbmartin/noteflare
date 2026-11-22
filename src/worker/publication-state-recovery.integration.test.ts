@@ -356,85 +356,93 @@ it("blocks repeated shape damage after the one automatic replacement", async () 
   expect(await current()).toMatchObject({ generation: replacement.generation, build_state_recovery_count: 1 });
 });
 
-it("pulls a leased deadline forward for restartable publication failures despite successful Queue delivery", async () => {
-  const previous = await fixture();
-  const pub = await damage("inputs");
-  await env.DB.prepare("DELETE FROM platform_jobs").run();
-  const intent = {
-    workspaceId: pub.workspace_id,
-    kind: "publication",
-    key: pub.id,
-    generation: String(pub.generation),
-    payload: { publicationId: pub.id, generation: pub.generation },
-  };
-  await enqueuePlatformJob(configured(), intent);
-  let now = Date.now(),
-    entered!: () => void,
-    release!: () => void;
-  vi.spyOn(Date, "now").mockImplementation(() => now);
-  const held = new Promise<void>((resolve) => {
-      entered = resolve;
-    }),
-    gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-  const bucket = new Proxy(env.BUCKET, {
-    get(target, method) {
-      if (method === "get")
-        return async (key: string) => {
-          if (key.endsWith("inputs.json")) {
-            entered();
-            await gate;
-          }
-          return target.get(key);
-        };
-      const value = Reflect.get(target, method);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-  const send = vi.fn(async () => {});
-  const bindings: Env = {
-    ...configured(),
-    AUDIT_ENABLED: "false",
-    BASIN_ENABLED: "false",
-    PUBLICATIONS_BUCKET: bucket,
-    PLATFORM: env.PLATFORM!,
-    PLATFORM_QUEUE: { send } as unknown as Queue,
-  };
-  const processing = runPlatformJob(bindings, platformJobId(intent), {
-    publication: (jobEnv, job) => processPublicationBuildJob(jobEnv, job.payload),
-  });
-  await held;
-  await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance: PlatformCoordinator, state) => {
-    const mutable = instance as unknown as { env: Env },
-      original = mutable.env;
-    mutable.env = bindings;
-    try {
-      await state.storage.deleteAll();
-      await state.storage.put("phase", 10);
-      await instance.alarm();
-      expect(await state.storage.getAlarm()).toBe(now + 300000);
-      release();
-      await processing;
-      expect(send).toHaveBeenCalledWith({ platformJobId: platformJobId(intent) }, { delaySeconds: 2 });
-      expect(await state.storage.getAlarm()).toBe(now + 5000);
-      now += 5000;
-      await instance.alarm();
-      now += 5000;
-      await instance.alarm();
-      expect(await current()).toMatchObject({
-        generation: pub.generation + 1,
-        build_state_recovery_count: 1,
-        manifest_key: previous.manifest_key,
-        access_generation: previous.access_generation,
+it.each([
+  { attempts: 0, delaySeconds: 2 },
+  { attempts: 9, delaySeconds: 1024 },
+  { attempts: 11, delaySeconds: 3600 },
+])(
+  "promptly restarts publication failures after $attempts previous attempts despite successful Queue delivery",
+  async ({ attempts, delaySeconds }) => {
+    const previous = await fixture();
+    const pub = await damage("inputs");
+    await env.DB.prepare("DELETE FROM platform_jobs").run();
+    const intent = {
+      workspaceId: pub.workspace_id,
+      kind: "publication",
+      key: pub.id,
+      generation: String(pub.generation),
+      payload: { publicationId: pub.id, generation: pub.generation },
+    };
+    await enqueuePlatformJob(configured(), intent);
+    await env.DB.prepare("UPDATE platform_jobs SET attempts=? WHERE id=?").bind(attempts, platformJobId(intent)).run();
+    let now = Date.now(),
+      entered!: () => void,
+      release!: () => void;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const held = new Promise<void>((resolve) => {
+        entered = resolve;
+      }),
+      gate = new Promise<void>((resolve) => {
+        release = resolve;
       });
-    } finally {
-      release();
-      mutable.env = original;
-      await state.storage.deleteAlarm();
-    }
-  });
-});
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, method) {
+        if (method === "get")
+          return async (key: string) => {
+            if (key.endsWith("inputs.json")) {
+              entered();
+              await gate;
+            }
+            return target.get(key);
+          };
+        const value = Reflect.get(target, method);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const send = vi.fn(async () => {});
+    const bindings: Env = {
+      ...configured(),
+      AUDIT_ENABLED: "false",
+      BASIN_ENABLED: "false",
+      PUBLICATIONS_BUCKET: bucket,
+      PLATFORM: env.PLATFORM!,
+      PLATFORM_QUEUE: { send } as unknown as Queue,
+    };
+    const processing = runPlatformJob(bindings, platformJobId(intent), {
+      publication: (jobEnv, job) => processPublicationBuildJob(jobEnv, job.payload),
+    });
+    await held;
+    await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance: PlatformCoordinator, state) => {
+      const mutable = instance as unknown as { env: Env },
+        original = mutable.env;
+      mutable.env = bindings;
+      try {
+        await state.storage.deleteAll();
+        await state.storage.put("phase", 10);
+        await instance.alarm();
+        expect(await state.storage.getAlarm()).toBe(now + 300000);
+        release();
+        await processing;
+        expect(send).toHaveBeenCalledWith({ platformJobId: platformJobId(intent) }, { delaySeconds });
+        expect(await state.storage.getAlarm()).toBe(now + 5000);
+        now += 5000;
+        await instance.alarm();
+        now += 5000;
+        await instance.alarm();
+        expect(await current()).toMatchObject({
+          generation: pub.generation + 1,
+          build_state_recovery_count: 1,
+          manifest_key: previous.manifest_key,
+          access_generation: previous.access_generation,
+        });
+      } finally {
+        release();
+        mutable.env = original;
+        await state.storage.deleteAlarm();
+      }
+    });
+  },
+);
 
 it("keeps non-parsing capture body errors transient and reads healthy legacy sources", async () => {
   await fixture();
