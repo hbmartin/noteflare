@@ -1,4 +1,5 @@
 import { setAuditActor } from "./audit";
+import { setUsageIdentity } from "./usage";
 import { accessPlugin } from "./access";
 import { requireAccessIdentity, verifyAccessAssertion } from "./access-identity";
 import { trackRealtimeUser, deleteRejectedSession } from "./realtime-access";
@@ -680,6 +681,7 @@ export async function requireMember(request: Request, env: Env) {
   const member = await getMember(request, env);
   if (!member) throw new HttpError(401, "unauthorized", "Sign in to continue.");
   setAuditActor({ type: "user", id: member.user.id, workspaceId: member.workspace.id });
+  setUsageIdentity(member.workspace.id);
   return member;
 }
 

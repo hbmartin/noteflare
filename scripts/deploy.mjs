@@ -831,6 +831,10 @@ export async function main(argv) {
     if (result.error || result.status !== 0) throw new Error("Worker dry run failed.");
     return;
   }
+  if (context.target === "production" && existsSync(resolve("wrangler.public.jsonc")))
+    throw new Error(
+      "This production checkout requires a coordinated application/public release. Use the gated Deploy workflow described in docs/implementation/cloudflare-production-enablement.md; the single-Worker deploy command cannot apply this release.",
+    );
   const connection = await cloudflare(config.account_id ?? manifest.account ?? undefined);
   const integrityDB = integrityDatabaseID(config, connection.account, manifest.account);
   await deployPrepared(manifest, {

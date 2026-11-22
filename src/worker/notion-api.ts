@@ -69,6 +69,7 @@ import { dateMentionFromProps } from "../shared/date-mentions";
 import { withinMissingGrace } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
+import { notionBodyIssue, notionQueryIssue } from "../shared/notion-request-schemas";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import { webhookEventStatements, type WebhookEventType } from "./webhooks";
 import { broadcastWorkspaceEvent } from "./workspace-events";
@@ -203,6 +204,8 @@ registerMetricMiddleware(notionApi, "*", async (c, next) => {
   const principal = await authenticateIntegration(c.req.raw, c.env);
   c.set("principal", principal);
   await enforceApiRateLimits(c.env.API_BURST_LIMIT, c.env.API_MINUTE_LIMIT, principal.integrationId);
+  const issue = notionQueryIssue(c.req.method, new URL(c.req.url));
+  if (issue) throw new NotionError(400, "validation_error", issue);
   await next();
 });
 
@@ -284,6 +287,8 @@ async function body(request: Request, allowEmpty = false) {
     if (allowEmpty && !source.trim()) return {};
     const value: unknown = JSON.parse(source);
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+    const issue = notionBodyIssue(request.method, new URL(request.url).pathname, value);
+    if (issue) throw new NotionError(400, "validation_error", issue);
     return value as Record<string, unknown>;
   } catch (error) {
     if (error instanceof NotionError) throw error;

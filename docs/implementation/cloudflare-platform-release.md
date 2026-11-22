@@ -79,10 +79,11 @@ audience, algorithm, human subject and expiry, and binds it to an explicitly lin
 does not link accounts. Local MFA and recovery remain required. Private browser/API/WS requests must use the
 canonical application host. Machine authentication remains required on narrowly excluded integration endpoints.
 
-Before changing the application origin: enroll a backup local factor, test recovery, register new passkeys for the
-new relying party, update provider callbacks and integration configuration, then enable Access enforcement. Keep
-the previous origin's authenticated application disabled after cutover. Access policy configuration, IdP choice
-and device posture remain operator responsibilities. Test both IdP/JWKS outage and direct-host bypass.
+Before changing the application origin, verify owner password and backup MFA/recovery access and update provider
+callbacks and integration configuration. After cutover, enroll and test passkeys for the new relying party. Access
+enforcement stays disabled until the operator explicitly enables it. Keep the previous origin's authenticated
+application disabled after cutover. Access policy configuration, IdP choice and device posture remain operator
+responsibilities. Test both IdP/JWKS outage and direct-host bypass when Access is enabled.
 
 Turnstile is verified once at external initiation boundaries; internal auth dispatches reuse the already-verified
 request. Password unlock grants are opaque, hashed in D1, host-only, and bounded by 24 hours and share expiry.
@@ -378,3 +379,7 @@ Before enabling optional services broadly, measure optimized Worker startup, tot
 amplification on a controlled account. Verify the minimal configuration, ongoing edits without Queue, image
 rollback, warm-cache access revocation, custom-domain password unlock in Chromium, and recovery after lost queue
 messages. Local tests and dry builds do not certify production product quotas or paid-service costs.
+
+## Coordinated production enablement
+
+The [production enablement runbook](cloudflare-production-enablement.md) defines the canonical origins, provisioning, schema-only migration rehearsal and coordinated application/public deployment. Checked-in production feature flags remain disabled until the generated release profile passes resource and secret preflight. Access remains an explicit operator setting. The cost API and request-schema catalog are additive; all existing migration and publication compatibility gates still apply.

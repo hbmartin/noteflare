@@ -10,6 +10,7 @@ import {
   reservePlatformUsage,
 } from "./platform-jobs";
 import { finalizeHeatmaps, heatmapWeek, readHeatmap } from "./heatmaps";
+import { withUsage } from "./usage";
 
 beforeEach(async () => {
   await reset();
@@ -32,6 +33,24 @@ const pageInsert = (database: D1Database, id: string) =>
     )
     .bind(id);
 describe("durable platform release", () => {
+  it("retains audit transaction semantics when resource instrumentation is enabled", async () => {
+    const writeDataPoint = vi.fn();
+    await withUsage(
+      { ...bindings(), COST_REPORTING_ENABLED: "true", AUDIT_ENABLED: "true", OBSERVABILITY: { writeDataPoint } },
+      "test",
+      async (configured) => {
+        await withAuditRequest(configured, "instrumented", async (audited) => {
+          setAuditActor({ type: "user", id: "owner", workspaceId: "workspace" });
+          await pageInsert(audited.DB, "instrumented-page").run();
+        });
+      },
+      { workspaceId: "workspace", pageId: "instrumented-page" },
+    );
+    expect(
+      await env.DB.prepare("SELECT actor_id FROM audit_events WHERE target_id='instrumented-page'").first("actor_id"),
+    ).toBe("owner");
+    expect(writeDataPoint).toHaveBeenCalledTimes(1);
+  });
   it("commits audit evidence with mutations and rolls both back together", async () => {
     await withAuditRequest({ ...bindings(), AUDIT_ENABLED: "true" }, "request", async (configured) => {
       setAuditActor({ type: "user", id: "owner", workspaceId: "workspace" });
@@ -143,6 +162,63 @@ describe("durable platform release", () => {
     const content = await (await env.BUCKET.get(archive!.object_key))!.text();
     expect(content).toContain('"id":"event"');
     expect(content).not.toContain("must not escape");
+  });
+  it("retains delayed archives for a full lock period after both object uploads", async () => {
+    const started = Date.now();
+    await auditStatement(env.DB, {
+      id: "delayed",
+      workspaceId: "workspace",
+      actorType: "system",
+      actorId: null,
+      action: "page.update",
+      targetType: "page",
+      targetId: null,
+      outcome: "success",
+      committedAt: started - 400 * 86400_000,
+    }).run();
+    await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true" });
+    const archive = await env.DB.prepare("SELECT object_key,expires_at FROM audit_archives").first<{
+      object_key: string;
+      expires_at: number;
+    }>();
+    expect(archive!.expires_at).toBeGreaterThanOrEqual(started + 365 * 86400_000);
+    expect(await env.BUCKET.head(archive!.object_key)).not.toBeNull();
+  });
+  it("keeps archive journal records after a partial or silently rejected delete", async () => {
+    const key = "audit/locked.ndjson";
+    await env.BUCKET.put(key, "retained");
+    await env.BUCKET.put(`${key}.manifest.json`, "{}");
+    await env.DB.prepare(
+      "INSERT INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at) VALUES('locked','workspace',?,'digest',1,1,1,1,1)",
+    )
+      .bind(key)
+      .run();
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "delete") return async () => {};
+        if (property === "head") return async () => ({ uploaded: new Date(1) });
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket });
+    expect(await env.DB.prepare("SELECT id FROM audit_archives WHERE id='locked'").first()).not.toBeNull();
+  });
+  it("reconciles a legacy expiry from the newer manifest upload before deleting either object", async () => {
+    await env.DB.prepare(
+      "INSERT INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at) VALUES('legacy','workspace','audit/legacy','digest',1,1,1,1,1)",
+    ).run();
+    const uploaded = Date.now() - 86400_000;
+    const remove = vi.fn();
+    const bucket = {
+      head: vi.fn(async (key: string) => ({ uploaded: new Date(key.endsWith(".json") ? uploaded : 1) })),
+      delete: remove,
+    } as unknown as R2Bucket;
+    await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket });
+    expect(remove).not.toHaveBeenCalled();
+    expect(await env.DB.prepare("SELECT expires_at FROM audit_archives WHERE id='legacy'").first("expires_at")).toBe(
+      uploaded + 365 * 86400_000,
+    );
   });
   it("publishes only finalized exact five-reader groups and never exports reader keys", async () => {
     const week = heatmapWeek(Date.now()) - 7 * 86400_000;

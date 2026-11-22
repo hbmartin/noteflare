@@ -205,6 +205,28 @@ function retention(value: string | undefined, fallback: number, max: number) {
   const parsed = Number(value ?? fallback);
   return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= max ? parsed : fallback;
 }
+/** Reconcile ambiguous PUTs and bucket-lock races without overwriting verified bytes. */
+export async function immutableAuditObject(
+  bucket: R2Bucket,
+  key: string,
+  body: string,
+  options: R2PutOptions,
+  failure: string,
+) {
+  let object = await bucket.get(key);
+  if (!object) {
+    try {
+      await bucket.put(key, body, { ...options, onlyIf: { etagDoesNotMatch: "*" } });
+    } catch {
+      // R2 checks bucket locks before conditions; a racing writer can yield 409.
+      // Only the following exact byte verification can establish success.
+    }
+    object = await bucket.get(key);
+  }
+  if (!object || (await object.text()) !== body) throw new Error(failure);
+  return object;
+}
+
 export async function archiveAudit(env: Env) {
   if (env.AUDIT_ENABLED !== "true") return;
   const bucket = env.AUDIT_BUCKET ?? env.BUCKET;
@@ -218,17 +240,21 @@ export async function archiveAudit(env: Env) {
     const digest = await sha256Hex(body),
       id = `audit:${digest}`,
       key = `audit/${encodeURIComponent(workspaceId)}/${digest}.ndjson`;
-    await bucket.put(key, body, {
-      httpMetadata: { contentType: "application/x-ndjson" },
-      customMetadata: { sha256: digest, count: String(events.length) },
-    });
-    const verified = await bucket.get(key);
-    if (!verified || (await sha256Hex(await verified.text())) !== digest)
-      throw new Error("audit_archive_verification_failed");
+    const verified = await immutableAuditObject(
+      bucket,
+      key,
+      body,
+      {
+        httpMetadata: { contentType: "application/x-ndjson" },
+        customMetadata: { sha256: digest, count: String(events.length) },
+      },
+      "audit_archive_verification_failed",
+    );
     const firstAt = events[0]!.committed_at,
       lastAt = events.at(-1)!.committed_at;
     const expiresAt = lastAt + retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650) * 86400_000;
-    await bucket.put(
+    const manifest = await immutableAuditObject(
+      bucket,
       `${key}.manifest.json`,
       JSON.stringify({
         schemaVersion: 1,
@@ -241,14 +267,20 @@ export async function archiveAudit(env: Env) {
         lastAt,
         expiresAt,
       }),
+      { httpMetadata: { contentType: "application/json" } },
+      "audit_manifest_verification_failed",
     );
-    const manifest = await bucket.get(`${key}.manifest.json`);
-    if (!manifest || (await manifest.json<{ digest: string }>()).digest !== digest)
-      throw new Error("audit_manifest_verification_failed");
+    // Locks measure age from upload, including a manifest written on a later retry.
+    const deletableAt = Math.max(
+      expiresAt,
+      verified.uploaded.getTime() + retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650) * 86400_000,
+      manifest.uploaded.getTime() + retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650) * 86400_000,
+    );
     await env.DB.batch([
       env.DB.prepare(
-        `INSERT OR IGNORE INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)`,
-      ).bind(id, workspaceId, key, digest, events.length, firstAt, lastAt, Date.now(), expiresAt),
+        `INSERT INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET expires_at=max(expires_at,excluded.expires_at)`,
+      ).bind(id, workspaceId, key, digest, events.length, firstAt, lastAt, Date.now(), deletableAt),
       ...events.map((event) =>
         env.DB.prepare("UPDATE audit_events SET archive_id=? WHERE id=? AND archive_id IS NULL").bind(id, event.id),
       ),
@@ -258,11 +290,29 @@ export async function archiveAudit(env: Env) {
     ${env.BASIN_ENABLED === "true" ? "AND basin_exported_at IS NOT NULL" : ""}`)
     .bind(Date.now() - retention(env.AUDIT_HOT_DAYS, 30, 365) * 86400_000)
     .run();
-  const expired = await env.DB.prepare("SELECT id,object_key FROM audit_archives WHERE expires_at<? LIMIT 10")
+  const expired = await env.DB.prepare(
+    "SELECT id,object_key,expires_at FROM audit_archives WHERE expires_at<? LIMIT 10",
+  )
     .bind(Date.now())
-    .all<{ id: string; object_key: string }>();
+    .all<{ id: string; object_key: string; expires_at: number }>();
   for (const row of expired.results) {
+    const objects = await Promise.all([bucket.head(row.object_key), bucket.head(`${row.object_key}.manifest.json`)]);
+    const eligibleAt = Math.max(
+      row.expires_at,
+      ...objects
+        .filter((object) => object !== null)
+        .map((object) => object.uploaded.getTime() + retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650) * 86400_000),
+    );
+    if (eligibleAt > Date.now()) {
+      // Reconcile legacy expiry records and retention changes before attempting any delete.
+      await env.DB.prepare("UPDATE audit_archives SET expires_at=max(expires_at,?) WHERE id=?")
+        .bind(eligibleAt, row.id)
+        .run();
+      continue;
+    }
     await bucket.delete([row.object_key, `${row.object_key}.manifest.json`]);
+    // Do not erase the journal's archive pointer after a partial/locked deletion.
+    if ((await bucket.head(row.object_key)) || (await bucket.head(`${row.object_key}.manifest.json`))) continue;
     await env.DB.prepare("DELETE FROM audit_archives WHERE id=? AND expires_at<?").bind(row.id, Date.now()).run();
   }
 }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, apiErrorMessage, json } from "./api";
+import { PlatformCosts } from "./PlatformCosts";
 type Status = {
   capabilities: Record<string, { enabled: boolean; ready: boolean; missing: string[] }>;
   jobs: { kind: string; pending: number; oldestAt: number; failures: number }[];
@@ -85,6 +86,7 @@ export function PlatformSettings() {
   return (
     <section id="settings-platform">
       <h2>Cloudflare platform</h2>
+      <PlatformCosts />
       <p>
         Optional services use your Cloudflare account’s allowances. Budgets below are application limits; other
         applications may consume the same account quotas.

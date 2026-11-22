@@ -11,6 +11,37 @@ export function validatePlatformConfiguration(config, { secretNames, publicWorke
     if (secretNames) need(names.has(name), `set the ${name} Worker secret before enabling this capability`);
   };
   if (publicWorker) secret("BETTER_AUTH_SECRET");
+  if (publicWorker) {
+    for (const name of names)
+      need(
+        ["BETTER_AUTH_SECRET", "TURNSTILE_SECRET_KEY"].includes(name),
+        `${name} must not be configured on the public Worker`,
+      );
+    for (const name of [
+      "BOOTSTRAP_TOKEN",
+      "CF_ANALYTICS_API_TOKEN",
+      "CF_CACHE_PURGE_API_TOKEN",
+      "CF_SAAS_API_TOKEN",
+      "CF_EDGE_API_TOKEN",
+      "OPENAI_API_KEY",
+      "SLACK_CLIENT_SECRET",
+      "SLACK_TOKEN_ENCRYPTION_KEY",
+      "WEBHOOK_ENCRYPTION_KEY",
+      "AI_TOKEN_ENCRYPTION_KEY",
+    ]) {
+      need(!names.has(name) && !Object.hasOwn(vars, name), `${name} must not be configured on the public Worker`);
+    }
+    need(!config.ai && !config.vectorize?.length, "AI and Vectorize belong on the application Worker");
+    need(!has("r2_buckets", "AUDIT_BUCKET"), "audit archives belong on the application Worker");
+  }
+  if (!publicWorker && enabled("COST_REPORTING_ENABLED")) {
+    need(/^[a-f0-9]{32}$/.test(vars.CF_ACCOUNT_ID ?? ""), "cost reporting requires CF_ACCOUNT_ID");
+    need(
+      /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(vars.OBSERVABILITY_DATASET ?? ""),
+      "cost reporting requires OBSERVABILITY_DATASET",
+    );
+    secret("CF_ANALYTICS_API_TOKEN");
+  }
   if (enabled("SEMANTIC_SEARCH_ENABLED")) {
     need(config.ai?.binding === "AI", "AI binding is required");
     need(has("vectorize", "SEMANTIC_INDEX"), "SEMANTIC_INDEX binding is required");
@@ -121,6 +152,7 @@ export function validatePlatformConfiguration(config, { secretNames, publicWorke
   for (const [name, fallback, maximum] of [
     ["SEMANTIC_MAX_STORED_CHUNKS", 10000, 1000000],
     ["SEMANTIC_DAILY_TOKEN_LIMIT", 100000, 100000000],
+    ["SEMANTIC_DAILY_QUERY_LIMIT", 2000, 1000000],
     ["FORMS_DAILY_LIMIT", 100, 100000],
     ["AUDIT_HOT_DAYS", 30, 365],
     ["AUDIT_ARCHIVE_DAYS", 365, 3650],

@@ -1,3 +1,4 @@
+import { setUsageIdentity } from "./usage";
 import type { Role } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import type { PageJsonRow } from "./page-row";
@@ -91,6 +92,7 @@ export async function pageForMember(
     .bind(member.user.id, pageId, member.workspace.id, ...(live ? [] : [member.role]))
     .first<PageRow & { workspace_role?: Role }>();
   if (!row) throw new HttpError(404, "page_not_found", "Page not found.");
+  setUsageIdentity(member.workspace.id, row.id);
   return {
     ...row,
     effective_role: effectiveSpaceRole(

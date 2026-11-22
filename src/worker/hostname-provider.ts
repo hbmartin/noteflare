@@ -14,7 +14,7 @@ export async function hostnameApi(env: Env, path: string, init: RequestInit = {}
     {
       ...init,
       headers: { authorization: `Bearer ${env.CF_SAAS_API_TOKEN}`, "content-type": "application/json" },
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(8000),
     },
   );

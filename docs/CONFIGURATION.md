@@ -498,3 +498,13 @@ See [the coordinated release runbook](implementation/cloudflare-platform-release
 | `AUDIT_PIPELINE`             | Optional Basin audit stream binding. A send acknowledgement is not archive proof.                                                                                               |
 | `HEATMAP_PIPELINE`           | Optional Basin aggregate-only analytics stream binding.                                                                                                                         |
 | `HEATMAP_HMAC_KEY`           | Separate secret of at least 32 characters for page/week reader pseudonyms; never exported.                                                                                      |
+
+## Page usage reporting
+
+| Name                     | Default              | Notes                                                                                                                                                     |
+| ------------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `COST_REPORTING_ENABLED` | `false`              | Enables request-scoped page usage events and the owner cost API. The coordinated platform release profile enables it after resource and secret preflight. |
+| `OBSERVABILITY_DATASET`  | unset                | Existing Analytics Engine dataset identifier. Production uses `cloudflare_realtime_notes_production`; staging has a separate dataset.                     |
+| `CF_ANALYTICS_API_TOKEN` | unset; Worker secret | Account-scoped **Account Analytics Read** token for the application Worker only. Never bind it to public delivery.                                        |
+
+The owner API accepts bounded 24-hour, seven-day and 30-day windows. Reports include sampling-adjusted resource counts and gross variable equivalents using the dated rate card in `src/shared/platform-costs.ts`. They exclude fixed subscriptions, CPU, live storage byte-days and D1 row counts unavailable from `first`/`raw` results. Counts cannot reconstruct page attribution before collection began. See the [production enablement runbook](implementation/cloudflare-production-enablement.md).

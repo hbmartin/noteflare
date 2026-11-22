@@ -1,5 +1,6 @@
 import type { Env } from "./env";
 import { HttpError } from "./http";
+import { logger } from "./observability";
 
 export function turnstileConfiguration(env: Env) {
   const enabled = env.TURNSTILE_ENABLED === "true";
@@ -15,11 +16,16 @@ export async function verifyTurnstile(
   expectedHostname = new URL(request.url).hostname,
 ) {
   if (env.TURNSTILE_ENABLED !== "true") return;
-  if (!env.TURNSTILE_SITE_KEY || !env.TURNSTILE_SECRET_KEY)
+  if (!env.TURNSTILE_SITE_KEY || !env.TURNSTILE_SECRET_KEY) {
+    logger.warn("security.turnstile.unavailable", "security", "Turnstile configuration is unavailable.", {
+      code: "configuration",
+    });
     throw new HttpError(503, "challenge_unavailable", "Human verification is unavailable. Try again shortly.");
+  }
   if (typeof token !== "string" || !token || token.length > 2048)
     throw new HttpError(403, "challenge_required", "Complete human verification and try again.");
   let result: { success?: boolean; hostname?: string; action?: string };
+  let providerStatus: number | undefined;
   try {
     const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
       method: "POST",
@@ -31,11 +37,19 @@ export async function verifyTurnstile(
         idempotency_key: crypto.randomUUID(),
       }),
       signal: AbortSignal.timeout(8000),
-      redirect: "error",
+      redirect: "manual",
     });
+    providerStatus = response.status;
     if (!response.ok) throw new Error("Verification unavailable");
     result = await response.json();
-  } catch {
+  } catch (error) {
+    const kind =
+      error instanceof Error && ["TypeError", "SyntaxError", "TimeoutError", "AbortError"].includes(error.name)
+        ? error.name
+        : "failure";
+    logger.warn("security.turnstile.unavailable", "security", "Turnstile provider verification is unavailable.", {
+      code: providerStatus ? `provider_${providerStatus}` : `transport_${kind}`,
+    });
     throw new HttpError(503, "challenge_unavailable", "Human verification is unavailable. Try again shortly.");
   }
   if (result.success !== true || result.hostname !== expectedHostname || result.action !== action)

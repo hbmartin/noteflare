@@ -1,3 +1,4 @@
+import { setUsageIdentity } from "./usage";
 import type { Env } from "./env";
 import { requireMember, requireOwner } from "./auth";
 import { pageForMember } from "./page-access";
@@ -28,10 +29,13 @@ function requireFormChallenge(env: Env) {
 export async function liveForm(env: Env, key: string): Promise<PublicForm | null> {
   if (env.FORMS_ENABLED !== "true") return null;
   requireFormChallenge(env);
-  return env.DB.prepare(`SELECT f.* FROM public_forms f JOIN pages p ON p.id=f.page_id JOIN table_authority a ON a.page_id=p.id
+  const form =
+    await env.DB.prepare(`SELECT f.* FROM public_forms f JOIN pages p ON p.id=f.page_id JOIN table_authority a ON a.page_id=p.id
     WHERE f.url_key=? AND f.active=1 AND (f.expires_at IS NULL OR f.expires_at>?) AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_task_list=0 AND a.state='do'`)
-    .bind(key, Date.now())
-    .first<PublicForm>();
+      .bind(key, Date.now())
+      .first<PublicForm>();
+  if (form) setUsageIdentity(form.workspace_id, form.page_id);
+  return form;
 }
 export async function formsSettingsResponse(request: Request, env: Env, pageId: string): Promise<Response> {
   const member = await requireMember(request, env);

@@ -1,3 +1,4 @@
+import { withUsage, addUsage } from "./usage";
 import { publicReadFailure } from "./public-utils";
 import {
   prepareCommentSubmission,
@@ -7630,113 +7631,119 @@ export default {
   async fetch(request: Request, env: Env, context: ExecutionContext) {
     const requestId = crypto.randomUUID();
     const rayId = request.headers.get("cf-ray") ?? undefined;
-    return withObservabilityContext(
-      env,
-      {
-        trigger: "fetch",
-        requestId,
-        correlationId: requestId,
-        ...(rayId ? { rayId } : {}),
-      },
-      async () => {
-        const startedAt = performance.now();
-        let response: Response;
-        try {
-          const handle = async () =>
-            withAuditRequest(env, requestId, async (requestEnv) => {
-              try {
-                await enforceAccessBoundary(request, requestEnv);
-                await verifyPublicChallenge(request, requestEnv);
-              } catch (error) {
-                if (error instanceof HttpError)
-                  return Response.json(
-                    { error: { code: error.code, message: error.message, details: error.details } },
-                    { status: error.status, headers: { "cache-control": "no-store" } },
-                  );
-                throw error;
-              }
-              const party = await handlePartyRequest(request, requestEnv);
-              if (party) return party;
-              return withRealtimeAccessTracking(
-                requestEnv,
-                () => app.fetch(request, requestEnv, context),
-                async (workspaceId) => {
-                  const member = await requireMember(request, requestEnv);
-                  return member.role === "owner" && member.workspace.id === workspaceId;
-                },
-              );
-            });
-          response = context.tracing
-            ? await context.tracing.enterSpan("notes.route_request", async (span) => {
-                span.setAttribute("notes.request_id", requestId);
+    return withUsage(env, "http.application", async (usageEnv) =>
+      withObservabilityContext(
+        usageEnv,
+        {
+          trigger: "fetch",
+          requestId,
+          correlationId: requestId,
+          ...(rayId ? { rayId } : {}),
+        },
+        async () => {
+          const startedAt = performance.now();
+          addUsage({ requests: 1 });
+          let response: Response;
+          try {
+            const handle = async () =>
+              withAuditRequest(usageEnv, requestId, async (requestEnv) => {
                 try {
-                  return await handle();
-                } finally {
-                  span.setAttribute("http.route", metricRouteTemplate());
+                  await enforceAccessBoundary(request, requestEnv);
+                  await verifyPublicChallenge(request, requestEnv);
+                } catch (error) {
+                  if (error instanceof HttpError)
+                    return Response.json(
+                      { error: { code: error.code, message: error.message, details: error.details } },
+                      { status: error.status, headers: { "cache-control": "no-store" } },
+                    );
+                  throw error;
                 }
-              })
-            : await handle();
-        } catch (error) {
-          logger.error(
-            "http.request.failed",
-            "http",
-            "Request handling failed outside the application router",
-            { route: metricRouteTemplate() },
-            error,
-          );
-          recordMetric(env, {
+                const party = await handlePartyRequest(request, requestEnv);
+                if (party) return party;
+                return withRealtimeAccessTracking(
+                  requestEnv,
+                  () => app.fetch(request, requestEnv, context),
+                  async (workspaceId) => {
+                    const member = await requireMember(request, requestEnv);
+                    return member.role === "owner" && member.workspace.id === workspaceId;
+                  },
+                );
+              });
+            response = context.tracing
+              ? await context.tracing.enterSpan("notes.route_request", async (span) => {
+                  span.setAttribute("notes.request_id", requestId);
+                  try {
+                    return await handle();
+                  } finally {
+                    span.setAttribute("http.route", metricRouteTemplate());
+                  }
+                })
+              : await handle();
+          } catch (error) {
+            logger.error(
+              "http.request.failed",
+              "http",
+              "Request handling failed outside the application router",
+              { route: metricRouteTemplate() },
+              error,
+            );
+            recordMetric(usageEnv, {
+              event: "http.request",
+              component: "http",
+              operation: metricRouteTemplate(),
+              outcome: "exception",
+              code: "500",
+              durationMs: performance.now() - startedAt,
+            });
+            throw error;
+          }
+          const headers = new Headers(response.headers);
+          if (
+            response.status < 400 &&
+            ["POST", "PATCH", "PUT", "DELETE"].includes(request.method) &&
+            // Draft scope previews are read-only despite accepting a POST body.
+            !(
+              request.method === "POST" &&
+              /^\/api\/spaces\/[^/]+\/publications\/table-options$/.test(new URL(request.url).pathname)
+            ) &&
+            usageEnv.PLATFORM &&
+            (usageEnv.SEMANTIC_SEARCH_ENABLED === "true" ||
+              usageEnv.PUBLIC_PUBLISHING_ENABLED === "true" ||
+              usageEnv.AUDIT_ENABLED === "true" ||
+              usageEnv.HEATMAPS_ENABLED === "true" ||
+              new URL(request.url).pathname.startsWith("/api/platform/keys"))
+          )
+            context.waitUntil(
+              wakePlatform(usageEnv).catch(() =>
+                logger.warn("platform.wake.failed", "platform", "Scheduled recovery will retry platform work"),
+              ),
+            );
+          if (!new URL(request.url).pathname.startsWith("/share/")) headers.set("X-Robots-Tag", "noindex, nofollow");
+          headers.set("x-request-id", requestId);
+          headers.set("x-worker-version", usageEnv.CF_VERSION_METADATA?.id ?? "local");
+          const contentLengthHeader = headers.get("content-length");
+          const contentLength =
+            contentLengthHeader !== null && /^\d+$/.test(contentLengthHeader.trim())
+              ? Number(contentLengthHeader)
+              : null;
+          if (contentLength !== null) addUsage({ bytes: contentLength });
+          recordMetric(usageEnv, {
             event: "http.request",
             component: "http",
             operation: metricRouteTemplate(),
-            outcome: "exception",
-            code: "500",
+            outcome: response.status >= 500 ? "server_error" : response.status >= 400 ? "client_error" : "success",
+            code: String(response.status),
             durationMs: performance.now() - startedAt,
+            ...(contentLength !== null && Number.isFinite(contentLength) ? { bytes: contentLength } : {}),
           });
-          throw error;
-        }
-        const headers = new Headers(response.headers);
-        if (
-          response.status < 400 &&
-          ["POST", "PATCH", "PUT", "DELETE"].includes(request.method) &&
-          // Draft scope previews are read-only despite accepting a POST body.
-          !(
-            request.method === "POST" &&
-            /^\/api\/spaces\/[^/]+\/publications\/table-options$/.test(new URL(request.url).pathname)
-          ) &&
-          env.PLATFORM &&
-          (env.SEMANTIC_SEARCH_ENABLED === "true" ||
-            env.PUBLIC_PUBLISHING_ENABLED === "true" ||
-            env.AUDIT_ENABLED === "true" ||
-            env.HEATMAPS_ENABLED === "true" ||
-            new URL(request.url).pathname.startsWith("/api/platform/keys"))
-        )
-          context.waitUntil(
-            wakePlatform(env).catch(() =>
-              logger.warn("platform.wake.failed", "platform", "Scheduled recovery will retry platform work"),
-            ),
-          );
-        if (!new URL(request.url).pathname.startsWith("/share/")) headers.set("X-Robots-Tag", "noindex, nofollow");
-        headers.set("x-request-id", requestId);
-        headers.set("x-worker-version", env.CF_VERSION_METADATA?.id ?? "local");
-        const contentLengthHeader = headers.get("content-length");
-        const contentLength =
-          contentLengthHeader !== null && /^\d+$/.test(contentLengthHeader.trim()) ? Number(contentLengthHeader) : null;
-        recordMetric(env, {
-          event: "http.request",
-          component: "http",
-          operation: metricRouteTemplate(),
-          outcome: response.status >= 500 ? "server_error" : response.status >= 400 ? "client_error" : "success",
-          code: String(response.status),
-          durationMs: performance.now() - startedAt,
-          ...(contentLength !== null && Number.isFinite(contentLength) ? { bytes: contentLength } : {}),
-        });
-        return new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers,
-          webSocket: response.webSocket,
-        });
-      },
+          return new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers,
+            webSocket: response.webSocket,
+          });
+        },
+      ),
     );
   },
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext) {

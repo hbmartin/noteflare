@@ -1,0 +1,67 @@
+.platform-costs {
+  min-inline-size: 0;
+}
+.platform-cost-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-block: 1rem;
+}
+.platform-cost-table {
+  overflow: auto;
+  max-inline-size: 100%;
+  max-block-size: 32rem;
+  container-type: inline-size;
+}
+.platform-cost-table table {
+  border-collapse: separate;
+  border-spacing: 0;
+  inline-size: 100%;
+}
+.platform-cost-table caption {
+  text-align: start;
+  padding-block: 0.75rem;
+}
+.platform-cost-table th,
+.platform-cost-table td {
+  padding: 0.6rem;
+  text-align: start;
+}
+.platform-cost-table thead {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 2;
+  background: var(--bg, Canvas);
+}
+.platform-cost-table tbody th {
+  position: sticky;
+  inset-inline-start: 0;
+  background: var(--bg, Canvas);
+  overflow-wrap: anywhere;
+  min-inline-size: 10rem;
+}
+@container (width < 42rem) {
+  .platform-cost-table table,
+  .platform-cost-table tbody,
+  .platform-cost-table tr,
+  .platform-cost-table th,
+  .platform-cost-table td {
+    display: block;
+  }
+  .platform-cost-table thead {
+    display: none;
+  }
+  .platform-cost-table tr {
+    margin-block-end: 1rem;
+    border: 1px solid var(--border, GrayText);
+  }
+  .platform-cost-table tbody th {
+    inset-block-start: 0;
+    z-index: 1;
+  }
+  .platform-cost-table td::before {
+    content: attr(data-label) ": ";
+    font-weight: 600;
+  }
+}

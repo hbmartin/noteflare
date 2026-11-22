@@ -1,3 +1,4 @@
+import { withUsage, setUsageIdentity } from "./usage";
 import { setAuditActor, withAuditRequest } from "./audit";
 import type { Env } from "./env";
 import { logger, recordMetric } from "./observability";
@@ -96,7 +97,10 @@ export async function notifyPlatformJob(
   return false;
 }
 
-export async function runPlatformJob(env: Env, id: string, handlers: PlatformHandlers) {
+export function runPlatformJob(env: Env, id: string, handlers: PlatformHandlers) {
+  return withUsage(env, "platform.job", (bindings) => runPlatformJobObserved(bindings, id, handlers));
+}
+async function runPlatformJobObserved(env: Env, id: string, handlers: PlatformHandlers) {
   const token = crypto.randomUUID();
   const now = Date.now();
   const row = await env.DB.prepare(`UPDATE platform_jobs SET lease_token=?,lease_until=?,attempts=attempts+1
@@ -113,6 +117,7 @@ export async function runPlatformJob(env: Env, id: string, handlers: PlatformHan
     payload: JSON.parse(row.payload_json),
     attempts: row.attempts,
   };
+  setUsageIdentity(job.workspaceId, job.kind === "semantic" ? job.key : undefined);
   const started = performance.now();
   let maintenanceRequired = false;
   try {

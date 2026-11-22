@@ -7,6 +7,7 @@ import { freshSecurityAuthorization } from "./security";
 import { beginKeyRotation, encryptionKeyStatus } from "./secrets";
 import { auditStatement, listAudit } from "./audit";
 import { heatmapContext, readHeatmap, recordHeatmap } from "./heatmaps";
+import { costOptions, platformCosts } from "./platform-costs";
 
 const capability = (enabled: boolean, dependencies: Record<string, boolean>) => ({
   enabled,
@@ -22,6 +23,11 @@ function platformCapabilities(env: Env) {
     semantic: capability(env.SEMANTIC_SEARCH_ENABLED === "true", {
       AI: !!env.AI,
       SEMANTIC_INDEX: !!env.SEMANTIC_INDEX,
+    }),
+    costs: capability(env.COST_REPORTING_ENABLED === "true", {
+      CF_ANALYTICS_API_TOKEN: !!env.CF_ANALYTICS_API_TOKEN,
+      CF_ACCOUNT_ID: !!env.CF_ACCOUNT_ID,
+      OBSERVABILITY_DATASET: !!env.OBSERVABILITY_DATASET,
     }),
     images: capability(env.IMAGES_ENABLED === "true", { IMAGES: !!env.IMAGES }),
     publications: capability(env.PUBLIC_PUBLISHING_ENABLED === "true", {
@@ -60,6 +66,12 @@ function platformCapabilities(env: Env) {
 
 // nosemgrep: worker-hono-construction -- Reviewed platform subapp covered by the middleware registration policy.
 export const platformApi = new Hono<{ Bindings: Env }>();
+platformApi.get("/platform/costs", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  c.header("cache-control", "private, no-store");
+  return c.json(await platformCosts(c.env, member.workspace.id, costOptions(new URL(c.req.url).searchParams)));
+});
 platformApi.get("/platform", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);

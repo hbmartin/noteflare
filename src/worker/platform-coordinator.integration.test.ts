@@ -83,7 +83,10 @@ describe("audit maintenance wakeups", () => {
     const put = vi.fn(async () => {
       throw new Error("archive unavailable");
     });
-    const configured = { AUDIT_ENABLED: "true", AUDIT_BUCKET: { put } } as unknown as Partial<Env>;
+    const configured = {
+      AUDIT_ENABLED: "true",
+      AUDIT_BUCKET: { put, get: vi.fn(async () => null) },
+    } as unknown as Partial<Env>;
     const before = Date.now();
     const failed = await alarmAt(3, configured);
     expect(failed.phase).toBe(4);

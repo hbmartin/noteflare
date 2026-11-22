@@ -10,6 +10,11 @@ on:
       - main
   workflow_dispatch:
     inputs:
+      confirm_platform_cutover_ready:
+        description: Staging acceptance and owner password/MFA recovery are verified for the canonical-domain cutover
+        required: false
+        default: false
+        type: boolean
       confirm_page_move_receipt_migration_safe:
         description: Page moves are quiesced, or the live Worker already reads versioned receipts
         required: false
@@ -116,6 +121,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       PAGE_MOVE_RECEIPT_MIGRATION_SAFE: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_page_move_receipt_migration_safe && 'true' || 'false' }}
       SLACK_REVIEW_MIGRATION_SAFE: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_slack_review_migration_safe && 'true' || 'false' }}
+      PLATFORM_CUTOVER_READY: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_platform_cutover_ready && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -152,14 +158,20 @@ jobs:
       - name: Worker dry run
         run: pnpm build:worker
 
+      - name: Validate provisioned platform and prepare coordinated configs
+        run: pnpm platform:provision prepare production
+
+      - name: Build both prepared Workers before migrations
+        run: pnpm deploy:platform production --dry-run
+
       # Migrations must complete before the Worker is deployed. The Worker
       # queries the search, reference, mention, deletion-job, archive-disconnect,
       # and table-state tables on ordinary request paths.
       - name: Apply D1 migrations
         run: pnpm db:remote
 
-      - name: Deploy Worker
-        run: pnpm wrangler deploy --env production
+      - name: Deploy application and public Workers
+        run: pnpm deploy:platform production
 
       - name: Health check
         env:

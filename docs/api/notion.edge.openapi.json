@@ -1,0 +1,366 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "NoteFlare integration API", "version": "2026-03-11" },
+  "servers": [{ "url": "https://notes.sparkedinnovations.training" }],
+  "paths": {
+    "/v1/pages/{pageId}": {
+      "get": {
+        "operationId": "noteflare_1",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      },
+      "patch": {
+        "operationId": "noteflare_8",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/pages/{pageId}/markdown": {
+      "get": {
+        "operationId": "noteflare_2",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      },
+      "patch": {
+        "operationId": "noteflare_3",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/async_tasks/{taskId}": {
+      "get": {
+        "operationId": "noteflare_4",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "taskId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/pages/{pageId}/properties/{propertyId}": {
+      "get": {
+        "operationId": "noteflare_5",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+          { "name": "propertyId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+          { "name": "page_size", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "start_cursor", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/pages/{pageId}/cover": {
+      "get": {
+        "operationId": "noteflare_6",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/pages": {
+      "post": {
+        "operationId": "noteflare_7",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/pages/{pageId}/move": {
+      "post": {
+        "operationId": "noteflare_9",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/pages/{pageId}/trash": {
+      "post": {
+        "operationId": "noteflare_10",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/blocks/{blockId}": {
+      "get": {
+        "operationId": "noteflare_11",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "blockId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      },
+      "patch": {
+        "operationId": "noteflare_14",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "blockId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      },
+      "delete": {
+        "operationId": "noteflare_15",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "blockId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/blocks/{blockId}/children": {
+      "get": {
+        "operationId": "noteflare_12",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "blockId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },
+          { "name": "page_size", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "start_cursor", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      },
+      "patch": {
+        "operationId": "noteflare_13",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "blockId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/search": {
+      "post": {
+        "operationId": "noteflare_16",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/users/me": {
+      "get": {
+        "operationId": "noteflare_17",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/users": {
+      "get": {
+        "operationId": "noteflare_18",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "page_size", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "start_cursor", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/users/{userId}": {
+      "get": {
+        "operationId": "noteflare_19",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "userId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/comments": {
+      "get": {
+        "operationId": "noteflare_20",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "page_size", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "start_cursor", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "block_id", "in": "query", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      },
+      "post": {
+        "operationId": "noteflare_21",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    },
+    "/v1/comments/{commentId}": {
+      "patch": {
+        "operationId": "noteflare_22",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "commentId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      },
+      "delete": {
+        "operationId": "noteflare_23",
+        "parameters": [
+          {
+            "name": "Notion-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["2026-03-11"] }
+          },
+          { "name": "commentId", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "security": [{ "bearer": [] }],
+        "responses": { "200": { "description": "Operation completed; see the API compatibility contract." } }
+      }
+    }
+  },
+  "components": { "securitySchemes": { "bearer": { "type": "http", "scheme": "bearer" } } }
+}

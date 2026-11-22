@@ -3,7 +3,8 @@ import { countedD1 } from "../../tests/helpers/count-d1";
 import { enrollAccount, responseCookies } from "../../tests/helpers/security";
 import { sha256Hex } from "../shared/import-integrity";
 import { requireSecurity } from "./security";
-import { applyD1Migrations, env, reset } from "cloudflare:test";
+import { applyD1Migrations, env, reset, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import worker from "./index";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import type { Env, MemberContext } from "./env";
@@ -199,6 +200,26 @@ describe("public share access", () => {
 });
 
 describe("Turnstile", () => {
+  it("uses a Workers-supported redirect mode and rejects provider redirects without forwarding secrets", async () => {
+    const configured = {
+      ...testEnv,
+      TURNSTILE_ENABLED: "true" as const,
+      TURNSTILE_SITE_KEY: "site-key",
+      TURNSTILE_SECRET_KEY: "private-secret",
+    };
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      // Construct the actual Workers Request, rather than hiding runtime option
+      // errors behind a successful fetch stub. Workers rejects redirect:error.
+      const outbound = new Request(input, init);
+      expect(outbound.redirect).toBe("manual");
+      return new Response(null, { status: 302, headers: { location: "https://untrusted.example" } });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    await expect(
+      verifyTurnstile(post("https://app.example/bootstrap", {}), configured, "bootstrap", "token"),
+    ).rejects.toMatchObject({ status: 503, code: "challenge_unavailable" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
   it("binds Siteverify to exact hostname and action and fails closed during outage", async () => {
     const configured = {
       ...testEnv,
@@ -611,4 +632,48 @@ describe("Secrets Store encryption", () => {
       )?.completed,
     ).toBe(1);
   });
+});
+
+it("authorizes the cost API freshly before serving a cached workspace report", async () => {
+  await seed();
+  const signup = await createAuth(testEnv, true).handler(
+    post("http://example.test/api/auth/sign-up/email", {
+      email: "cost-owner@example.test",
+      name: "Cost owner",
+      password: "password123",
+    }),
+  );
+  const cookie = await enrollAccount(signup);
+  const user = await env.DB.prepare("SELECT id FROM user WHERE email='cost-owner@example.test'").first<{
+    id: string;
+  }>();
+  await env.DB.prepare(
+    "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
+  )
+    .bind(user!.id)
+    .run();
+  const fetcher = vi.fn(async () => Response.json({ data: [] }));
+  vi.stubGlobal("fetch", fetcher);
+  const configured: Env = {
+    ...testEnv,
+    COST_REPORTING_ENABLED: "true",
+    CF_ACCOUNT_ID: "a".repeat(32),
+    OBSERVABILITY_DATASET: "cost_test",
+    CF_ANALYTICS_API_TOKEN: "private",
+  };
+  async function request() {
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      new Request("http://example.test/api/platform/costs", { headers: { cookie } }),
+      configured,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    return response;
+  }
+  expect((await request()).status).toBe(200);
+  expect(fetcher).toHaveBeenCalledTimes(3);
+  await env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE user_id=?").bind(user!.id).run();
+  expect((await request()).status).toBe(403);
+  expect(fetcher).toHaveBeenCalledTimes(3);
 });
