@@ -219,7 +219,11 @@ test("publishing saves lock selection, preserve newer edits and reuse the confir
     if (submissions.length === 1) await gate;
     await route.fulfill({
       json: {
-        publication: { ...first, generation: submissions.length + 1, config: { ...config, title: "Saved site" } },
+        publication: {
+          ...first,
+          generation: submissions.length + 1,
+          config: { ...submissions.at(-1)!.config, title: "Saved site" },
+        },
         url: "https://public.example.test/sites/first",
       },
     });
@@ -253,4 +257,15 @@ test("publishing saves lock selection, preserve newer edits and reuse the confir
   await page.getByRole("button", { name: "Save site", exact: true }).click();
   await expect.poll(() => submissions.length).toBe(2);
   expect(submissions[1]).toMatchObject({ generation: 2, config: { tableViews: { dormant: "filtered" } } });
+  await page.getByText("Published table views", { exact: true }).click();
+  const unavailable = page.getByRole("group", { name: "Unavailable table selections" });
+  await expect(unavailable).toContainText("dormant — saved view filtered");
+  await expect(unavailable).toContainText("returning table will publish all rows and columns");
+  await unavailable.getByRole("button", { name: "Remove saved view restriction" }).click();
+  expect(submissions).toHaveLength(2);
+  await expect(page.getByText("0 of 200 saved view selections used.")).toBeVisible();
+  await page.getByRole("button", { name: "Save site", exact: true }).click();
+  await expect.poll(() => submissions.length).toBe(3);
+  expect(submissions[2]).toMatchObject({ generation: 3, config: { tableViews: {} } });
+  await expect(unavailable).toHaveCount(0);
 });

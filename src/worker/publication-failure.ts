@@ -27,6 +27,7 @@ export class PublicationStateError extends Error {
   constructor(
     readonly code:
       | "publication_checkpoint_invalid"
+      | "publication_capture_invalid"
       | "publication_continuation_invalid"
       | "publication_continuation_missing",
   ) {

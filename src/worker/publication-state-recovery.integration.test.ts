@@ -14,6 +14,7 @@ import { enqueuePendingPublications, type Publication } from "./publications";
 import { retirePublicationBuild } from "./publication-jobs";
 import { runPlatformJob, recoverPlatformJobs, platformJobId } from "./platform-jobs";
 import { fetchPublic } from "./public-worker";
+import { publicationInput } from "./publication-state";
 
 beforeEach(async () => {
   await reset();
@@ -77,7 +78,12 @@ async function damage(kind: string) {
   let checkpoint: unknown = { version: 2, offset: 1 };
   if (kind === "checkpoint") checkpoint = { version: 1, offset: 1 };
   else if (kind === "shape") checkpoint = { version: 2, offset: -1 };
-  else {
+  else if (kind === "inputs" || kind === "source") {
+    await env.BUCKET.put(
+      `publications/${pub.id}/${pub.generation}/${kind === "inputs" ? "inputs.json" : "child/source.json"}`,
+      "{",
+    );
+  } else {
     const key = `publications/${pub.id}/${pub.generation}/child/expansion-damaged.json`;
     checkpoint = { version: 2, offset: 1, documentStateKey: kind === "prefix" ? "private/wrong-prefix" : key };
     if (kind === "json") await env.BUCKET.put(key, "{");
@@ -89,14 +95,14 @@ async function damage(kind: string) {
     .run();
   return (await current())!;
 }
-it.each(["checkpoint", "shape", "missing", "prefix", "json", "structure"])(
+it.each(["checkpoint", "shape", "missing", "prefix", "json", "structure", "inputs", "source"])(
   "replaces %s state once and activates without fencing previous output",
   async (kind) => {
     const previous = await fixture();
     const damaged = await damage(kind);
     await expect(
       processPublicationBuildJob(configured(), { publicationId: damaged.id, generation: damaged.generation }),
-    ).rejects.toMatchObject({ code: expect.stringMatching(/^publication_(checkpoint|continuation)_/) });
+    ).rejects.toMatchObject({ code: expect.stringMatching(/^publication_(checkpoint|continuation|capture)_/) });
     expect(JSON.parse((await current())!.build_failure_json!).kind).toBe("state");
     const context = createExecutionContext();
     const response = await fetchPublic(new Request("https://public.test/sites/state-key"), configured(), context);
@@ -123,34 +129,38 @@ it.each(["checkpoint", "shape", "missing", "prefix", "json", "structure"])(
     });
   },
 );
-it("makes repeated state damage terminal without recreating jobs, then permits reset", async () => {
-  await fixture();
-  const first = await damage("missing");
-  await expect(
-    processPublicationBuildJob(configured(), { publicationId: first.id, generation: first.generation }),
-  ).rejects.toBeInstanceOf(Error);
-  await enqueuePendingPublications(configured());
-  const second = await damage("structure");
-  const jobId = platformJobId({ workspaceId: "workspace", kind: "publication", key: second.id });
-  const handlers = {
-    publication: async (bindings: Env, job: { payload: unknown }) => processPublicationBuildJob(bindings, job.payload),
-  };
-  await runPlatformJob(configured(), jobId, handlers);
-  // A duplicate delivery observes the terminal state without retrying its damaged capture.
-  await processPublicationBuildJob(configured(), { publicationId: second.id, generation: second.generation });
-  await recoverPlatformJobs(configured(), handlers);
-  await enqueuePendingPublications(configured());
-  expect(await env.DB.prepare("SELECT 1 FROM platform_jobs").first()).toBeNull();
-  expect(await current()).toMatchObject({ generation: second.generation, build_state_recovery_count: 1 });
-  expect((await current())!.build_error).toContain("Save the site settings");
-  await env.DB.prepare("UPDATE pages SET title='Unrelated edit' WHERE id='child'").run();
-  await enqueuePendingPublications(configured());
-  expect((await current())!.generation).toBe(second.generation);
-  await env.DB.prepare(
-    "UPDATE publications SET access_generation=access_generation+1,build_checkpoint_json=NULL,build_content_version=NULL,generation=generation+1 WHERE id='state-site'",
-  ).run();
-  expect((await current())!.build_state_recovery_count).toBe(0);
-});
+it.each(["structure", "inputs", "source"])(
+  "makes repeated %s damage terminal without recreating jobs, then permits reset",
+  async (kind) => {
+    await fixture();
+    const first = await damage("missing");
+    await expect(
+      processPublicationBuildJob(configured(), { publicationId: first.id, generation: first.generation }),
+    ).rejects.toBeInstanceOf(Error);
+    await enqueuePendingPublications(configured());
+    const second = await damage(kind);
+    const jobId = platformJobId({ workspaceId: "workspace", kind: "publication", key: second.id });
+    const handlers = {
+      publication: async (bindings: Env, job: { payload: unknown }) =>
+        processPublicationBuildJob(bindings, job.payload),
+    };
+    await runPlatformJob(configured(), jobId, handlers);
+    // A duplicate delivery observes the terminal state without retrying its damaged capture.
+    await processPublicationBuildJob(configured(), { publicationId: second.id, generation: second.generation });
+    await recoverPlatformJobs(configured(), handlers);
+    await enqueuePendingPublications(configured());
+    expect(await env.DB.prepare("SELECT 1 FROM platform_jobs").first()).toBeNull();
+    expect(await current()).toMatchObject({ generation: second.generation, build_state_recovery_count: 1 });
+    expect((await current())!.build_error).toContain("Save the site settings");
+    await env.DB.prepare("UPDATE pages SET title='Unrelated edit' WHERE id='child'").run();
+    await enqueuePendingPublications(configured());
+    expect((await current())!.generation).toBe(second.generation);
+    await env.DB.prepare(
+      "UPDATE publications SET access_generation=access_generation+1,build_checkpoint_json=NULL,build_content_version=NULL,generation=generation+1 WHERE id='state-site'",
+    ).run();
+    expect((await current())!.build_state_recovery_count).toBe(0);
+  },
+);
 it("preserves the budget through checkpoint, content, and authority transitions and fences stale retirement", async () => {
   await fixture();
   const first = await damage("checkpoint");
@@ -169,17 +179,82 @@ it("preserves the budget through checkpoint, content, and authority transitions 
   await env.DB.prepare("UPDATE publications SET active=0 WHERE id='state-site'").run();
   expect((await current())!.build_state_recovery_count).toBe(0);
 });
-it("keeps R2 infrastructure failures transient and retains the checkpoint", async () => {
+it.each(["expansion-damaged.json", "inputs.json", "source.json"])(
+  "keeps R2 %s infrastructure failures transient and retains the checkpoint",
+  async (file) => {
+    await fixture();
+    const pub = await damage(file === "source.json" ? "source" : "missing");
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, key) {
+        if (key === "get")
+          return async (name: string) => {
+            if (name.endsWith(file)) throw new Error("provider detail");
+            return target.get(name);
+          };
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(
+      processPublicationBuildJob(
+        { ...configured(), PUBLICATIONS_BUCKET: bucket },
+        { publicationId: pub.id, generation: pub.generation },
+      ),
+    ).rejects.toThrow("provider detail");
+    await enqueuePendingPublications(configured());
+    expect(await current()).toMatchObject({
+      generation: pub.generation,
+      build_state_recovery_count: 0,
+      build_checkpoint_json: pub.build_checkpoint_json,
+    });
+    expect(JSON.parse((await current())!.build_failure_json!).kind).toBe("transient");
+    expect((await current())!.build_error).not.toContain("provider detail");
+  },
+);
+
+it("classifies malformed captures read after a competing conditional creation", async () => {
   await fixture();
-  const pub = await damage("missing");
+  const pub = (await current())!;
+  const key = `publications/${pub.id}/${pub.generation}/inputs.json`;
+  await env.BUCKET.put(key, "{");
+  let reads = 0;
   const bucket = new Proxy(env.BUCKET, {
-    get(target, key) {
-      if (key === "get")
+    get(target, method) {
+      if (method === "get")
+        return (name: string) => (name === key && reads++ === 0 ? Promise.resolve(null) : target.get(name));
+      const value = Reflect.get(target, method);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await expect(
+    publicationInput({ ...configured(), PUBLICATIONS_BUCKET: bucket }, pub, key, async () => ({ valid: true })),
+  ).rejects.toMatchObject({ code: "publication_capture_invalid" });
+  expect(await (await env.BUCKET.get(key))!.text()).toBe("{");
+});
+
+it("keeps non-parsing capture body errors transient and reads healthy legacy sources", async () => {
+  await fixture();
+  const pub = await freeze();
+  const key = `publications/${pub.id}/${pub.generation}/child/source.json`;
+  await env.BUCKET.put(key, JSON.stringify({ type: "doc", content: [] }));
+  const bucket = new Proxy(env.BUCKET, {
+    get(target, method) {
+      if (method === "get")
         return async (name: string) => {
-          if (name.includes("expansion-damaged")) throw new Error("provider detail");
-          return target.get(name);
+          const object = await target.get(name);
+          if (!object || name !== key) return object;
+          return new Proxy(object, {
+            get(body, property) {
+              if (property === "json")
+                return async () => {
+                  throw new Error("body read unavailable");
+                };
+              const value = Reflect.get(body, property);
+              return typeof value === "function" ? value.bind(body) : value;
+            },
+          });
         };
-      const value = Reflect.get(target, key);
+      const value = Reflect.get(target, method);
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
@@ -188,15 +263,14 @@ it("keeps R2 infrastructure failures transient and retains the checkpoint", asyn
       { ...configured(), PUBLICATIONS_BUCKET: bucket },
       { publicationId: pub.id, generation: pub.generation },
     ),
-  ).rejects.toThrow("provider detail");
-  await enqueuePendingPublications(configured());
-  expect(await current()).toMatchObject({
-    generation: pub.generation,
-    build_state_recovery_count: 0,
-    build_checkpoint_json: pub.build_checkpoint_json,
-  });
+  ).rejects.toThrow("body read unavailable");
   expect(JSON.parse((await current())!.build_failure_json!).kind).toBe("transient");
-  expect((await current())!.build_error).not.toContain("provider detail");
+  await processPublicationBuildJob(configured(), { publicationId: pub.id, generation: pub.generation });
+  expect(await current()).toMatchObject({
+    active_generation: pub.generation,
+    build_state_recovery_count: 0,
+    needs_build: 0,
+  });
 });
 
 it("does not wake completed document builds without follow-up or snapshot cleanup", async () => {

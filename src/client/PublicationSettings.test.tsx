@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import userEvent from "@testing-library/user-event";
 import type { Page, Space } from "../shared/types";
@@ -236,8 +236,134 @@ it("displays a retained view until its metadata loads instead of showing all row
   expect(selector).toHaveValue("filtered");
   expect(screen.getByRole("option", { name: "Saved view (metadata unavailable)" })).toBeInTheDocument();
   fireEvent.focus(selector);
+  expect(screen.getByRole("option", { name: "Loading saved view…" })).toBeInTheDocument();
   finish({ views: [{ id: "filtered", name: "Filtered", kind: "grid", ownerId: null }] });
   await screen.findByRole("option", { name: "Filtered (grid)" });
   expect(selector).toHaveValue("filtered");
   expect(screen.queryByRole("option", { name: "Saved view (metadata unavailable)" })).not.toBeInTheDocument();
+});
+
+it.each([false, true])("identifies a loaded saved view that is missing or personal: personal=%s", async (personal) => {
+  const table = { ...page, id: "table", kind: "table" as const, title: "Records" };
+  vi.mocked(api).mockImplementation(async (url) => {
+    if (url.includes("hostnames")) return { hostnames: [] } as never;
+    if (url.includes("/tables/")) return { views: personal ? [{ id: "filtered", ownerId: "owner" }] : [] } as never;
+    return { publications: [{ ...site, config: { ...site.config, tableViews: { table: "filtered" } } }] } as never;
+  });
+  await load([space], [page, table]);
+  const selector = screen.getByRole("combobox", { name: "Records" });
+  fireEvent.focus(selector);
+  await screen.findByRole("option", { name: "Saved view unavailable or no longer shared" });
+  expect(selector).toHaveValue("filtered");
+});
+
+it("labels failed metadata separately and retries without losing the retained selection", async () => {
+  const table = { ...page, id: "table", kind: "table" as const, title: "Records" };
+  let reads = 0;
+  vi.mocked(api).mockImplementation(async (url) => {
+    if (url.includes("hostnames")) return { hostnames: [] } as never;
+    if (url.includes("/tables/")) {
+      if (++reads === 1) throw new Error("offline");
+      return { views: [{ id: "filtered", ownerId: null, name: "Filtered", kind: "grid" }] } as never;
+    }
+    return { publications: [{ ...site, config: { ...site.config, tableViews: { table: "filtered" } } }] } as never;
+  });
+  await load([space], [page, table]);
+  const selector = screen.getByRole("combobox", { name: "Records" });
+  fireEvent.focus(selector);
+  await screen.findByRole("option", { name: "Saved view (metadata could not be loaded)" });
+  expect(selector).toHaveValue("filtered");
+  fireEvent.blur(selector);
+  fireEvent.focus(selector);
+  await screen.findByRole("option", { name: "Filtered (grid)" });
+  expect(selector).toHaveValue("filtered");
+  expect(reads).toBe(2);
+});
+
+it("lets owners remove unavailable restrictions and regain capacity without querying those tables", async () => {
+  const table = { ...page, id: "table", kind: "table" as const, title: "Records" };
+  const archived = { ...table, id: "archived", title: "Archived records", archivedAt: 1 };
+  const moved = { ...table, id: "moved", title: "Moved records", spaceId: "other-space" };
+  const tableViews = Object.fromEntries(
+    ["archived", "moved", ...Array.from({ length: 198 }, (_, i) => `gone-${i}`)].map((id) => [id, "filtered"]),
+  );
+  const current = { ...site, config: { ...site.config, tableViews } };
+  const submitted: Array<{ config: typeof current.config }> = [];
+  vi.mocked(api).mockImplementation(async (url, options) => {
+    if (url.includes("hostnames")) return { hostnames: [] } as never;
+    if (url.includes("/tables/"))
+      return {
+        views: [
+          { id: "first", name: "First", kind: "grid", ownerId: null },
+          { id: "second", name: "Second", kind: "grid", ownerId: null },
+        ],
+      } as never;
+    if (options?.method === "PUT") {
+      const body = JSON.parse(options.body as string);
+      submitted.push(body);
+      return {
+        publication: { ...current, generation: submitted.length + 1, config: body.config },
+        url: "https://public.test/sites/key",
+      } as never;
+    }
+    return { publications: [current] } as never;
+  });
+  await load([space], [page, table, archived, moved]);
+  const unavailable = screen.getByRole("group", { name: "Unavailable table selections" });
+  expect(within(unavailable).getByText("Archived records — saved view filtered")).toBeInTheDocument();
+  expect(within(unavailable).getByText("Moved records — saved view filtered")).toBeInTheDocument();
+  expect(within(unavailable).getByText("gone-0 — saved view filtered")).toBeInTheDocument();
+  expect(within(unavailable).getByText(/returning table will publish all rows and columns/)).toBeInTheDocument();
+  expect(screen.getByText("200 of 200 saved view selections used.")).toBeInTheDocument();
+  expect(vi.mocked(api).mock.calls.some(([url]) => url.includes("/tables/"))).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Save site" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Save site" })).toBeEnabled());
+  expect(submitted[0]!.config.tableViews).toEqual(tableViews);
+  const selector = screen.getByRole("combobox", { name: "Records" });
+  fireEvent.focus(selector);
+  await screen.findByRole("option", { name: "First (grid)" });
+  fireEvent.change(selector, { target: { value: "first" } });
+  expect(screen.getByText(/Remove a saved view restriction before adding another/)).toHaveAttribute("role", "alert");
+  expect(selector).toHaveValue("");
+  fireEvent.click(within(unavailable).getAllByRole("button", { name: "Remove saved view restriction" })[0]!);
+  expect(submitted).toHaveLength(1);
+  expect(screen.getByText("199 of 200 saved view selections used.")).toBeInTheDocument();
+  fireEvent.change(selector, { target: { value: "first" } });
+  fireEvent.change(selector, { target: { value: "second" } });
+  expect(screen.getByText("200 of 200 saved view selections used.")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Save site" }));
+  await waitFor(() => expect(submitted).toHaveLength(2));
+  expect(submitted[1]!.config.tableViews).toEqual({
+    ...Object.fromEntries(Object.entries(tableViews).filter(([id]) => id !== "archived")),
+    table: "second",
+  });
+});
+
+it("preserves a restriction removal made while a settings save is pending", async () => {
+  let finish!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const submitted: Array<{ config: typeof site.config }> = [];
+  vi.mocked(api).mockImplementation(async (url, options) => {
+    if (url.includes("hostnames")) return { hostnames: [] } as never;
+    if (options?.method === "PUT") {
+      submitted.push(JSON.parse(options.body as string));
+      if (submitted.length === 1) await pending;
+      return {
+        publication: { ...site, generation: 2, config: submitted.at(-1)!.config },
+        url: "https://public.test/sites/key",
+      } as never;
+    }
+    return { publications: [site] } as never;
+  });
+  await load();
+  fireEvent.click(screen.getByRole("button", { name: "Save site" }));
+  fireEvent.click(screen.getByRole("button", { name: "Remove saved view restriction" }));
+  finish();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Save site" })).toBeEnabled());
+  expect(screen.queryByRole("group", { name: "Unavailable table selections" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Save site" }));
+  await waitFor(() => expect(submitted).toHaveLength(2));
+  expect(submitted[1]!.config.tableViews).toEqual({});
 });

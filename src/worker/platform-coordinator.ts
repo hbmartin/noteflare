@@ -75,8 +75,8 @@ export class PlatformCoordinator extends DurableObject<Env> {
         Number.isFinite(at) ? at : 0,
         state.running ? Date.now() + 5000 : state.notBefore,
       );
-      // Existing phases already cover requests arriving before the final scan.
-      if ((!state.active || state.scanning) && (state.wakeAt === null || next < state.wakeAt)) {
+      // A request may belong to a phase that has already finished this cycle.
+      if (state.wakeAt === null || next < state.wakeAt) {
         state.wakeAt = next;
         await this.ctx.storage.put("schedule", state);
       }
@@ -93,7 +93,11 @@ export class PlatformCoordinator extends DurableObject<Env> {
         await this.ctx.storage.setAlarm(state.notBefore);
         return false;
       }
-      await this.ctx.storage.put("schedule", { ...state, active: true, running: true, scanning: false });
+      // Consume only due requests covered by this new cycle. Requests received
+      // after it starts, or with future deadlines, survive through the final scan.
+      const wakeAt =
+        phase === 0 && !state.active && state.wakeAt !== null && state.wakeAt <= Date.now() ? null : state.wakeAt;
+      await this.ctx.storage.put("schedule", { ...state, active: true, running: true, scanning: false, wakeAt });
       return true;
     });
     if (!ready) return;
@@ -152,8 +156,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
     }
     await this.ctx.blockConcurrencyWhile(async () => {
       const state = await this.scheduleState();
-      // The scan covers earlier requests; new requests remain durable until a later scan.
-      await this.ctx.storage.put("schedule", { ...state, scanning: true, wakeAt: null });
+      await this.ctx.storage.put("schedule", { ...state, scanning: true });
     });
     const now = Date.now();
     const next = await this.env.DB.prepare(`SELECT min(due) due FROM (

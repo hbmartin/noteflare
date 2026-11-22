@@ -154,6 +154,21 @@ Pricing references: [Workers](https://developers.cloudflare.com/workers/platform
 
 ## Acceptance and rollback
 
+### Maintenance wake retention and settings recovery
+
+This follow-up needs no migration beyond 0114 or checkpoint reset. Deploy the application Worker and bundled client
+together. Existing maintenance storage remains readable. Wakes received after a maintenance cycle starts survive
+until another cycle consumes them; future requests retain their deadlines and phases remain five seconds apart.
+Successful Queue delivery avoids an additional job-settlement coordinator RPC. Database recovery scans still run
+independently, and missing or failed Queue delivery retains coordinator recovery at the actual deadline.
+
+Owners can remove unavailable table-view selections explicitly to regain capacity within the 200-selection limit.
+The UI explains that returning tables then publish all rows and columns; removal remains a draft until Save. No
+restriction is discarded automatically. Settings responses return roots in the same sorted order for GET and PUT.
+Malformed private `inputs.json` and `source.json` captures use the existing one-time state recovery budget, including
+failures previously classified as transient when retried. Storage outages retain backoff. Keep the historical-settings
+audit and namespace sweep below; production deployment and those operator actions remain separate.
+
 ### Publication privacy, recovery and scheduling (migration 0114)
 
 Pause builders and drain in-flight work, apply `0114_publication_state_recovery.sql`, deploy the application Worker
