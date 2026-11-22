@@ -8,6 +8,7 @@ import {
   consumePlatformQueue,
   platformJobId,
   PlatformJobDeferred,
+  PlatformJobMaintenanceRequired,
 } from "./platform-jobs";
 
 beforeEach(async () => {
@@ -369,34 +370,38 @@ it.each([0, 1000, 2000])("does not wake maintenance after successful Queue deliv
   expect(wake).not.toHaveBeenCalled();
   expect(await env.DB.prepare("SELECT lease_token FROM platform_jobs").first("lease_token")).toBeNull();
 });
-it("preserves a foreign lease and schedules its expiry without a premature Queue delivery", async () => {
-  const now = Date.now();
-  vi.spyOn(Date, "now").mockReturnValue(now);
-  await enqueuePlatformJob(configured(), intent);
-  const send = vi.fn(async () => {}),
-    wake = vi.fn(async () => {});
-  await runPlatformJob(
-    {
-      ...configured(),
-      PLATFORM_QUEUE: { send } as unknown as Queue,
-      PLATFORM: { idFromName: () => ({}), get: () => ({ wake }) } as unknown as NonNullable<Env["PLATFORM"]>,
-    },
-    platformJobId(intent),
-    {
-      fixture: async () => {
-        await env.DB.prepare("UPDATE platform_jobs SET generation='2',lease_token='foreign',lease_until=?")
-          .bind(now + 60000)
-          .run();
+it.each([false, true])(
+  "preserves a foreign lease without premature Queue delivery: maintenance required=%s",
+  async (maintenanceRequired) => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await enqueuePlatformJob(configured(), intent);
+    const send = vi.fn(async () => {}),
+      wake = vi.fn(async () => {});
+    await runPlatformJob(
+      {
+        ...configured(),
+        PLATFORM_QUEUE: { send } as unknown as Queue,
+        PLATFORM: { idFromName: () => ({}), get: () => ({ wake }) } as unknown as NonNullable<Env["PLATFORM"]>,
       },
-    },
-  );
-  expect(send).not.toHaveBeenCalled();
-  expect(wake).toHaveBeenCalledExactlyOnceWith(now + 60000);
-  expect(await env.DB.prepare("SELECT generation,lease_token FROM platform_jobs").first()).toEqual({
-    generation: "2",
-    lease_token: "foreign",
-  });
-});
+      platformJobId(intent),
+      {
+        fixture: async () => {
+          await env.DB.prepare("UPDATE platform_jobs SET generation='2',lease_token='foreign',lease_until=?")
+            .bind(now + 60000)
+            .run();
+          if (maintenanceRequired) throw new PlatformJobMaintenanceRequired(new Error("restart required"));
+        },
+      },
+    );
+    expect(send).not.toHaveBeenCalled();
+    expect(wake).toHaveBeenCalledExactlyOnceWith(maintenanceRequired ? undefined : now + 60000);
+    expect(await env.DB.prepare("SELECT generation,lease_token FROM platform_jobs").first()).toEqual({
+      generation: "2",
+      lease_token: "foreign",
+    });
+  },
+);
 it("does not notify Queue or maintenance when completed work leaves no replacement", async () => {
   await enqueuePlatformJob(configured(), intent);
   const send = vi.fn(async () => {}),

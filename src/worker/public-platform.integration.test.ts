@@ -114,6 +114,64 @@ async function fixturePublication(override: Partial<Env> = {}) {
   return (await env.DB.prepare("SELECT * FROM publications WHERE id='site'").first<Publication>())!;
 }
 
+it("avoids maintenance wakes for table previews while preserving settings-write wakes", async () => {
+  await env.DB.batch([insertPage("home"), insertPage("table", "home", "table")]);
+  const signup = await createAuth(configured(), true).handler(
+    new Request("http://example.test/api/auth/sign-up/email", {
+      method: "POST",
+      headers: { origin: "http://example.test", "content-type": "application/json" },
+      body: JSON.stringify({ email: "preview@public.test", name: "Publisher", password: "password123" }),
+    }),
+  );
+  expect(signup.status).toBe(200);
+  const cookie = await enrollAccount(signup);
+  const userId = await env.DB.prepare("SELECT id FROM user WHERE email='preview@public.test'").first<string>("id");
+  await env.DB.prepare(
+    "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
+  )
+    .bind(userId)
+    .run();
+  const wake = vi.fn(async () => {});
+  const bindings: Env = {
+    ...configured(),
+    PLATFORM: { idFromName: () => ({}), get: () => ({ wake }) } as unknown as NonNullable<Env["PLATFORM"]>,
+  };
+  const worker = (await import("./index")).default;
+  const fetchSettings = async (path: string, body: unknown, method: "POST" | "PUT" = "POST") => {
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      new Request(`http://example.test/api/spaces/workspace-general/publications${path}`, {
+        method,
+        headers: { cookie, origin: "http://example.test", "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+      bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    return response;
+  };
+  for (const roots of [["home"], []]) {
+    const response = await fetchSettings("/table-options", { roots });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ tables: roots.length ? [{ id: "table", title: "table" }] : [] });
+    expect(wake).not.toHaveBeenCalled();
+  }
+  const saved = await fetchSettings(
+    "",
+    {
+      roots: ["home"],
+      config: publicationConfig({ title: "Preview site", homePageId: "home" }, ["home"]),
+      active: false,
+    },
+    "PUT",
+  );
+  expect(saved.status).toBe(200);
+  expect(wake).toHaveBeenCalledExactlyOnceWith(undefined);
+  expect((await fetchSettings("/table-options", { roots: ["home"] })).status).toBe(200);
+  expect(wake).toHaveBeenCalledTimes(1);
+});
+
 it("returns normalized persisted settings and roots from publication creates and updates", async () => {
   await env.DB.batch([insertPage("z-root"), insertPage("home"), insertPage("a-root")]);
   const signup = await createAuth(configured(), true).handler(

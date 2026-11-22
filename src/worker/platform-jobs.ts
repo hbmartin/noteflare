@@ -184,7 +184,8 @@ export async function runPlatformJob(env: Env, id: string, handlers: PlatformHan
           { workspaceId: remaining.workspace_id, kind: remaining.kind, key: remaining.job_key },
           due,
         ));
-      if (!queued || maintenanceRequired) await wakePlatformBestEffort(env, due);
+      if (maintenanceRequired) await wakePlatformBestEffort(env);
+      else if (!queued) await wakePlatformBestEffort(env, due);
     } else if (maintenanceRequired) {
       await wakePlatformBestEffort(env);
     }
