@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { unstable_readConfig } from "wrangler";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   platformProfile,
   retentionRules,
@@ -210,14 +213,22 @@ describe("Cloudflare platform provisioning", () => {
     expect(configs.publicWorker.durable_objects.bindings.every((item) => item.script_name === base.name)).toBe(true);
     expect(configs.application).not.toHaveProperty("configPath");
     const stage = deploymentConfigs(platformProfile("staging"), "database", "sitekey", base, publicBase, {
-      applicationVars: { AUTH_MODE: "access_required", IMAGES_ENABLED: "false", AUDIT_ARCHIVE_DAYS: "730" },
+      applicationVars: {
+        AUTH_MODE: "access_required",
+        IMAGES_ENABLED: "false",
+        AUDIT_ARCHIVE_DAYS: "730",
+        AUDIT_ARCHIVE_LOCK_DAYS: "1",
+        BETTER_AUTH_URL: "https://old.example.com",
+      },
       publicVars: { PUBLIC_PUBLISHING_ENABLED: "false", FORMS_DAILY_LIMIT: "22" },
-      enable: parseActivation("--enable=semantic,costs"),
+      enable: parseActivation("--enable= semantic, ,costs, semantic "),
     });
     expect(stage.application.vars).toMatchObject({
       AUTH_MODE: "access_required",
       IMAGES_ENABLED: "false",
       AUDIT_ARCHIVE_DAYS: "730",
+      AUDIT_ARCHIVE_LOCK_DAYS: "365",
+      BETTER_AUTH_URL: platformProfile("staging").appOrigin,
       SEMANTIC_SEARCH_ENABLED: "true",
       COST_REPORTING_ENABLED: "true",
       FORMS_ENABLED: "false",
@@ -231,7 +242,8 @@ describe("Cloudflare platform provisioning", () => {
       const productionIds = new Set(configs[worker].ratelimits.map((binding) => binding.namespace_id));
       expect(stage[worker].ratelimits.every((binding) => !productionIds.has(binding.namespace_id))).toBe(true);
     }
-    expect(() => parseActivation("--enable=access")).toThrow("Choose features");
+    expect(parseActivation("--enable= , ")).toEqual([]);
+    expect(() => parseActivation("--enable=semantic, access")).toThrow("Choose features");
   });
   it("checks existing private buckets and reads back merged policy updates idempotently", async () => {
     const profile = platformProfile(),
@@ -311,6 +323,55 @@ describe("Cloudflare platform provisioning", () => {
       "/workers/scripts/cloudflare-realtime-notes-platform-staging/settings",
       "/workers/scripts/cloudflare-realtime-notes-platform-staging-public/settings",
     ]);
+  });
+  it("uses staging-only credentials and refreshes Turnstile without replacing identity secrets", async () => {
+    const profile = platformProfile("staging");
+    const directory = mkdtempSync(join(tmpdir(), "noteflare-bootstrap-"));
+    let configured = false;
+    const api = vi.fn(async (path, options) => {
+      if (path.endsWith("/settings")) {
+        if (!configured) return null;
+        return {
+          bindings: [
+            { type: "plain_text", name: "BETTER_AUTH_URL", text: profile.appOrigin },
+            ...["BETTER_AUTH_SECRET", "TURNSTILE_SECRET_KEY", "BOOTSTRAP_TOKEN"].map((name) => ({
+              type: "secret_text",
+              name,
+            })),
+          ],
+        };
+      }
+      if (path.startsWith("/challenges/widgets?"))
+        return { result: [{ name: `${profile.name}-platform`, sitekey: "staging-widget" }] };
+      if (path === "/challenges/widgets/staging-widget")
+        return { secret: configured ? "rotated-test-secret" : "initial-test-secret" };
+      if (path.endsWith("/secrets") && options.method === "PUT") return {};
+      throw new Error(`Unexpected fixture request: ${path}`);
+    });
+    const productionOnly = { BETTER_AUTH_SECRET: "prod-test-secret-".repeat(3), BOOTSTRAP_TOKEN: "prod-test-token" };
+    const execute = vi.fn(() => ({ status: 0 }));
+    try {
+      await bootstrap(profile, api, directory, productionOnly, execute);
+      const persisted = readFileSync(join(directory, "bootstrap.env"), "utf8");
+      expect(persisted).toMatch(/^BETTER_AUTH_SECRET=[\w-]{64}\nBOOTSTRAP_TOKEN=[\w-]{64}\n$/);
+      expect(persisted).not.toContain(productionOnly.BETTER_AUTH_SECRET);
+      expect(JSON.stringify(api.mock.calls)).not.toContain(productionOnly.BOOTSTRAP_TOKEN);
+      expect(execute).toHaveBeenCalledTimes(2);
+      configured = true;
+      api.mockClear();
+      execute.mockClear();
+      await bootstrap(profile, api, directory, productionOnly, execute);
+      expect(execute).not.toHaveBeenCalled();
+      expect(api.mock.calls.filter(([, options]) => options?.method === "PUT")).toEqual(
+        [profile.name, profile.publicName].map((name) => [
+          `/workers/scripts/${name}/secrets`,
+          { method: "PUT", body: { name: "TURNSTILE_SECRET_KEY", text: "rotated-test-secret", type: "secret_text" } },
+        ]),
+      );
+      expect(readFileSync(join(directory, "bootstrap.env"), "utf8")).toBe(persisted);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
   it("rejects public Worker secrets beyond its two required purposes", () => {
     const config = deploymentConfigs(

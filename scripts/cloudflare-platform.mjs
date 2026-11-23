@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { createHash, randomBytes } from "node:crypto";
@@ -13,6 +13,7 @@ import { notionOpenApi } from "../src/shared/notion-request-schemas.ts";
 const ACCOUNT = "940db9a80e285cf3f700d5d903d8e182";
 const ZONE = "986af780c629979d91800d7e569f4b9c";
 const DAY = 86400;
+const AUDIT_LOCK_DAYS = 365;
 export function platformProfile(environment = "production") {
   if (!["production", "staging"].includes(environment)) throw new Error("Choose production or staging.");
   const name =
@@ -41,7 +42,7 @@ export function retentionRules() {
       id: "noteflare-audit-365d",
       enabled: true,
       prefix: "audit/",
-      condition: { type: "Age", maxAgeSeconds: 365 * DAY },
+      condition: { type: "Age", maxAgeSeconds: AUDIT_LOCK_DAYS * DAY },
     },
     lifecycle: [
       {
@@ -115,8 +116,12 @@ const publicFlags = new Set([
 ]);
 export function parseActivation(option) {
   if (option === undefined) return [];
-  const names = option.startsWith("--enable=") ? option.slice(9).split(",") : [];
-  if (!names.length || names.some((name) => !Object.hasOwn(features, name)))
+  const names = option
+    .slice(9)
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+  if (!option.startsWith("--enable=") || names.some((name) => !Object.hasOwn(features, name)))
     throw new Error("Choose features with --enable=" + Object.keys(features).join(","));
   return [...new Set(names)];
 }
@@ -127,11 +132,17 @@ function liveVars(settings) {
   );
 }
 export function settingsFingerprint(settings) {
+  const vars = Object.entries(liveVars(settings)).sort(([a], [b]) => a.localeCompare(b));
+  const secrets = (settings?.bindings ?? [])
+    .filter((binding) => binding.type === "secret_text")
+    .map((binding) => binding.name)
+    .sort();
   return createHash("sha256")
-    .update(JSON.stringify([!!settings, Object.entries(liveVars(settings)).sort(([a], [b]) => a.localeCompare(b))]))
+    .update(JSON.stringify([!!settings, vars, secrets]))
     .digest("hex");
 }
 function releaseVars(profile, sitekey, baseline, live, enable, publicWorker = false) {
+  // Dashboard settings win over defaults. Deployment identity comes from the verified profile.
   const vars = { ...baseline, ...live };
   for (const flag of Object.values(features)) {
     if (publicWorker && !publicFlags.has(flag)) continue;
@@ -167,7 +178,13 @@ function releaseVars(profile, sitekey, baseline, live, enable, publicWorker = fa
       ),
     );
   }
-  return { ...vars, AUTH_MODE: vars.AUTH_MODE ?? "local", CF_ACCOUNT_ID: profile.account, CF_ZONE_ID: profile.zone };
+  return {
+    ...vars,
+    AUTH_MODE: vars.AUTH_MODE ?? "local",
+    CF_ACCOUNT_ID: profile.account,
+    CF_ZONE_ID: profile.zone,
+    AUDIT_ARCHIVE_LOCK_DAYS: String(AUDIT_LOCK_DAYS),
+  };
 }
 export function deploymentConfigs(
   profile,
@@ -444,10 +461,13 @@ export async function provision(
         body: { name: `${profile.name}-platform`, domains, mode: "managed", clearance_level: "no_clearance" },
       });
       mkdirSync(directory, { recursive: true, mode: 0o700 });
-      writeFileSync(resolve(directory, "turnstile.env"), `TURNSTILE_SECRET_KEY=${widget.secret}\n`, {
-        mode: 0o600,
-        flag: "wx",
-      });
+      const temporary = resolve(directory, `turnstile-${randomBytes(8).toString("hex")}.env`);
+      try {
+        writeFileSync(temporary, `TURNSTILE_SECRET_KEY=${widget.secret}\n`, { mode: 0o600, flag: "wx" });
+        renameSync(temporary, resolve(directory, "turnstile.env"));
+      } finally {
+        rmSync(temporary, { force: true });
+      }
     }
   }
   const databases = await inventory(api, `/d1/database?name=${encodeURIComponent(profile.name)}`);
@@ -675,19 +695,20 @@ async function configureFreeManaged(profile, api, apply) {
 /** Create unreachable shells so secrets can be installed before any public route. */
 export async function bootstrap(profile, api, directory, environment = process.env, execute = spawnSync) {
   const secretsPath = resolve(directory, "bootstrap.env");
-  let authSecret = environment.BETTER_AUTH_SECRET;
+  const staging = profile.environment === "staging";
+  let authSecret = staging ? environment.PLATFORM_STAGING_BETTER_AUTH_SECRET : environment.BETTER_AUTH_SECRET;
   if (profile.environment === "production" && !authSecret)
     throw new Error(
       "BETTER_AUTH_SECRET must be supplied from the existing production installation; it is never generated or replaced.",
     );
-  const names = profile.environment === "staging" ? [profile.name, profile.publicName] : [profile.publicName];
+  const names = staging ? [profile.name, profile.publicName] : [profile.publicName];
   const states = await Promise.all(
     names.map((name) => api(`/workers/scripts/${name}/settings`, { allowMissing: true })),
   );
   for (const state of states) liveVars(state);
-  let bootstrapToken = environment.BOOTSTRAP_TOKEN;
-  const stagingSetupPending = profile.environment === "staging" && !liveVars(states[0]).BETTER_AUTH_URL;
-  if (profile.environment === "staging") {
+  let bootstrapToken = environment.PLATFORM_STAGING_BOOTSTRAP_TOKEN;
+  const stagingSetupPending = staging && !liveVars(states[0]).BETTER_AUTH_URL;
+  if (staging) {
     const local = existsSync(secretsPath) ? readFileSync(secretsPath, "utf8") : "";
     const recorded = local.match(/^BETTER_AUTH_SECRET=(.+)$/m)?.[1];
     const recordedBootstrap = local.match(/^BOOTSTRAP_TOKEN=(.+)$/m)?.[1];
@@ -709,6 +730,8 @@ export async function bootstrap(profile, api, directory, environment = process.e
       !bootstrapToken
     )
       throw new Error("Supply the original staging BOOTSTRAP_TOKEN.");
+    if (/[\r\n]/.test(authSecret ?? "") || /[\r\n]/.test(bootstrapToken ?? ""))
+      throw new Error("Staging identity credentials must be single-line values.");
     if (!local && authSecret.length >= 32 && !states.some(Boolean)) {
       mkdirSync(directory, { recursive: true, mode: 0o700 });
       writeFileSync(secretsPath, `BETTER_AUTH_SECRET=${authSecret}\nBOOTSTRAP_TOKEN=${bootstrapToken}\n`, {
@@ -753,7 +776,11 @@ export async function bootstrap(profile, api, directory, environment = process.e
       ["TURNSTILE_SECRET_KEY", challenge.secret],
       ...(name === profile.name && stagingSetupPending ? [["BOOTSTRAP_TOKEN", bootstrapToken]] : []),
     ]) {
-      if (settings?.bindings.some((binding) => binding.name === key && binding.type === "secret_text")) continue;
+      if (
+        key !== "TURNSTILE_SECRET_KEY" &&
+        settings?.bindings.some((binding) => binding.name === key && binding.type === "secret_text")
+      )
+        continue;
       await api(`/workers/scripts/${name}/secrets`, {
         method: "PUT",
         body: { name: key, text: value, type: "secret_text" },

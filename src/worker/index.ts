@@ -1,4 +1,4 @@
-import { canonicalRedirect } from "./canonical-redirect";
+import { canonicalOrigin, canonicalRedirect, invalidCanonicalOrigin } from "./canonical-redirect";
 import { backgroundUsage, withUsage, addUsage } from "./usage";
 import { publicReadFailure } from "./public-utils";
 import {
@@ -7177,9 +7177,11 @@ app.put("/api/pages/:pageId/forms", (c) => formsSettingsResponse(c.req.raw, c.en
 app.get("/api/spaces/:spaceId/publications", (c) =>
   publicationSettingsResponse(c.req.raw, c.env, c.req.param("spaceId")),
 );
-app.post("/api/spaces/:spaceId/publications/table-options", (c) =>
-  publicationTableOptionsResponse(c.req.raw, c.env, c.req.param("spaceId")),
-);
+const readOnlyPostRequests = new WeakSet<Request>();
+app.post("/api/spaces/:spaceId/publications/table-options", (c) => {
+  readOnlyPostRequests.add(c.req.raw);
+  return publicationTableOptionsResponse(c.req.raw, c.env, c.req.param("spaceId"));
+});
 app.put("/api/spaces/:spaceId/publications", (c) =>
   publicationSettingsResponse(c.req.raw, c.env, c.req.param("spaceId")),
 );
@@ -7635,22 +7637,24 @@ export async function runSecurityMaintenance(env: Env) {
 
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext) {
-    if (env.CANONICAL_REDIRECTS_ENABLED === "true") {
-      const redirect = canonicalRedirect(request, env.BETTER_AUTH_URL);
-      if (redirect) return redirect;
-    }
     const requestId = crypto.randomUUID();
     const rayId = request.headers.get("cf-ray") ?? undefined;
-    return withUsage(env, "http.application", async (usageEnv) =>
-      withObservabilityContext(
-        usageEnv,
-        {
-          trigger: "fetch",
-          requestId,
-          correlationId: requestId,
-          ...(rayId ? { rayId } : {}),
-        },
-        async () => {
+    return withObservabilityContext(
+      env,
+      {
+        trigger: "fetch",
+        requestId,
+        correlationId: requestId,
+        ...(rayId ? { rayId } : {}),
+      },
+      async () => {
+        if (env.CANONICAL_REDIRECTS_ENABLED === "true") {
+          const origin = canonicalOrigin(env.BETTER_AUTH_URL);
+          if (!origin) return invalidCanonicalOrigin("application");
+          const redirect = canonicalRedirect(request, origin);
+          if (redirect) return redirect;
+        }
+        return withUsage(env, "http.application", async (usageEnv) => {
           const startedAt = performance.now();
           addUsage({ requests: 1 });
           let response: Response;
@@ -7711,11 +7715,7 @@ export default {
           if (
             response.status < 400 &&
             ["POST", "PATCH", "PUT", "DELETE"].includes(request.method) &&
-            // Draft scope previews are read-only despite accepting a POST body.
-            !(
-              request.method === "POST" &&
-              /^\/api\/spaces\/[^/]+\/publications\/table-options$/.test(new URL(request.url).pathname)
-            ) &&
+            !readOnlyPostRequests.has(request) &&
             usageEnv.PLATFORM &&
             (usageEnv.SEMANTIC_SEARCH_ENABLED === "true" ||
               usageEnv.PUBLIC_PUBLISHING_ENABLED === "true" ||
@@ -7752,8 +7752,8 @@ export default {
             headers,
             webSocket: response.webSocket,
           });
-        },
-      ),
+        });
+      },
     );
   },
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext) {

@@ -165,8 +165,9 @@ seconds apart. Failed phases and deadline scans retain private retries from one 
 blocking healthy phases. Enabled semantic backlog without a matching current-generation job schedules another
 bounded sweep; existing job leases and backoff still apply.
 Successful Queue delivery avoids an additional job-settlement coordinator RPC except when a recorded publication
-failure requires coordinator retirement. That notification follows owned-lease release. Missing or failed Queue
-delivery retains coordinator recovery at the actual deadline.
+failure requires coordinator retirement. That notification follows owned-lease release. If Queue delivery is missing or
+fails, the coordinator keeps the job's retry deadline separately from the immediate retirement wake. A failed D1 scan
+can back off without discarding that deadline.
 
 Owners can remove unavailable table-view selections explicitly to regain capacity within the 200-selection limit.
 An owner-only read-only draft-scope query supplies all included table controls, including tables hidden from the

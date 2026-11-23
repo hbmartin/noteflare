@@ -500,6 +500,7 @@ See [the coordinated release runbook](implementation/cloudflare-platform-release
 | `AUDIT_BUCKET`               | Optional private R2 archive bucket; defaults to the existing private BUCKET under audit/.                                                                                       |
 | `AUDIT_HOT_DAYS`             | Searchable audit retention; default 30, range 1–365 days; archive verification precedes pruning.                                                                                |
 | `AUDIT_ARCHIVE_DAYS`         | Verified R2 audit archive retention; default 365, range 1–3650 days.                                                                                                            |
+| `AUDIT_ARCHIVE_LOCK_DAYS`    | Minimum age of both archive objects before cleanup. The managed release supplies 365 to match the dedicated bucket lock.                                                        |
 | `AUDIT_PIPELINE`             | Optional Basin audit stream binding. A send acknowledgement is not archive proof.                                                                                               |
 | `HEATMAP_PIPELINE`           | Optional Basin aggregate-only analytics stream binding.                                                                                                                         |
 | `HEATMAP_HMAC_KEY`           | Separate secret of at least 32 characters for page/week reader pseudonyms; never exported.                                                                                      |

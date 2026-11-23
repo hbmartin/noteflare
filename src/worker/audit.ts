@@ -2,6 +2,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Env } from "./env";
 import { sha256Hex } from "../shared/import-integrity";
 import { HttpError } from "./http";
+import { inheritDatabaseInstrumentation, usageBindings } from "./usage";
+import { logger } from "./observability";
+
+const DAY_MS = 86400_000;
 
 export type AuditEvent = {
   id: string;
@@ -128,12 +132,16 @@ function auditDatabase(database: D1Database): D1Database {
     withSession: source.withSession.bind(source),
   };
   auditSources.set(wrapped, source);
+  inheritDatabaseInstrumentation(source, wrapped);
   return wrapped;
 }
 
 export function withAuditRequest<T>(env: Env, correlationId: string, run: (requestEnv: Env) => Promise<T>) {
   if (env.AUDIT_ENABLED !== "true") return run(env);
-  return context.run({ type: "system", id: null, correlationId }, () => run({ ...env, DB: auditDatabase(env.DB) }));
+  const bindings = usageBindings(env);
+  return context.run({ type: "system", id: null, correlationId }, () =>
+    run({ ...bindings, DB: auditDatabase(bindings.DB) }),
+  );
 }
 
 export function initializeLocalAudit(sql: SqlStorage) {
@@ -232,6 +240,10 @@ export async function immutableAuditObject(
 export async function archiveAudit(env: Env) {
   if (env.AUDIT_ENABLED !== "true") return;
   const bucket = env.AUDIT_BUCKET ?? env.BUCKET;
+  const configuredDays = Math.max(
+    retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650),
+    env.AUDIT_BUCKET ? retention(env.AUDIT_ARCHIVE_LOCK_DAYS, 0, 3650) : 0,
+  );
   // Bound memory and make an ambiguous PUT recoverable by deterministic content identity.
   const rows = await env.DB.prepare(`SELECT * FROM audit_events WHERE archive_id IS NULL
     ORDER BY workspace_id,committed_at,id LIMIT 10`).all<AuditRow>();
@@ -254,8 +266,6 @@ export async function archiveAudit(env: Env) {
     );
     const firstAt = events[0]!.committed_at,
       lastAt = events.at(-1)!.committed_at;
-    const configuredDays = retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650);
-    const day = 86400_000;
     const identity = {
       schemaVersion: 1,
       id,
@@ -270,7 +280,7 @@ export async function archiveAudit(env: Env) {
     const manifest = await immutableAuditObject(
       bucket,
       `${key}.manifest.json`,
-      JSON.stringify({ ...identity, expiresAt: lastAt + configuredDays * day }),
+      JSON.stringify({ ...identity, expiresAt: lastAt + configuredDays * DAY_MS }),
       { httpMetadata: { contentType: "application/json" } },
       "audit_manifest_verification_failed",
       (text) => {
@@ -283,7 +293,7 @@ export async function archiveAudit(env: Env) {
             !Number.isSafeInteger(value.expiresAt)
           )
             return false;
-          const days = (value.expiresAt - lastAt) / day;
+          const days = (value.expiresAt - lastAt) / DAY_MS;
           if (!Number.isInteger(days) || days < 1 || days > 3650) return false;
           originalDays = days;
           return true;
@@ -294,7 +304,7 @@ export async function archiveAudit(env: Env) {
       4096,
     );
     // A retry with a shorter policy cannot shorten the manifest's original retention.
-    const retentionMs = Math.max(originalDays, configuredDays) * day;
+    const retentionMs = Math.max(originalDays, configuredDays) * DAY_MS;
     const deletableAt = Math.max(lastAt, verified.uploaded.getTime(), manifest.uploaded.getTime()) + retentionMs;
     await env.DB.batch([
       env.DB.prepare(
@@ -308,32 +318,37 @@ export async function archiveAudit(env: Env) {
   }
   await env.DB.prepare(`DELETE FROM audit_events WHERE committed_at<? AND archive_id IN (SELECT id FROM audit_archives WHERE verified_at IS NOT NULL)
     ${env.BASIN_ENABLED === "true" ? "AND basin_exported_at IS NOT NULL" : ""}`)
-    .bind(Date.now() - retention(env.AUDIT_HOT_DAYS, 30, 365) * 86400_000)
+    .bind(Date.now() - retention(env.AUDIT_HOT_DAYS, 30, 365) * DAY_MS)
     .run();
   const expired = await env.DB.prepare(
-    "SELECT id,object_key,expires_at FROM audit_archives WHERE expires_at<? LIMIT 10",
+    "SELECT id,object_key,expires_at FROM audit_archives WHERE expires_at<? ORDER BY expires_at,id LIMIT 10",
   )
     .bind(Date.now())
     .all<{ id: string; object_key: string; expires_at: number }>();
   for (const row of expired.results) {
-    const objects = await Promise.all([bucket.head(row.object_key), bucket.head(`${row.object_key}.manifest.json`)]);
-    const eligibleAt = Math.max(
-      row.expires_at,
-      ...objects
-        .filter((object) => object !== null)
-        .map((object) => object.uploaded.getTime() + retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650) * 86400_000),
-    );
-    if (eligibleAt > Date.now()) {
-      // Reconcile legacy expiry records and retention changes before attempting any delete.
+    const keys = [row.object_key, `${row.object_key}.manifest.json`];
+    const now = Date.now();
+    let nextCheck = row.expires_at;
+    try {
+      const objects = (await Promise.all(keys.map((key) => bucket.head(key)))).filter((object) => object !== null);
+      nextCheck = Math.max(nextCheck, ...objects.map((object) => object.uploaded.getTime() + configuredDays * DAY_MS));
+      if (nextCheck <= now && objects.length) {
+        await bucket.delete(keys);
+        if ((await Promise.all(keys.map((key) => bucket.head(key)))).some(Boolean))
+          throw new Error("audit_archive_delete_incomplete");
+      }
+    } catch {
+      // Keep the archive pointer and let the remaining rows advance even if a stronger lock blocks deletion.
+      nextCheck = Math.max(nextCheck, now + DAY_MS);
+      logger.warn("audit.archive.delete_deferred", "platform", "Audit archive deletion will be retried");
+    }
+    if (nextCheck > now) {
       await env.DB.prepare("UPDATE audit_archives SET expires_at=max(expires_at,?) WHERE id=?")
-        .bind(eligibleAt, row.id)
+        .bind(nextCheck, row.id)
         .run();
       continue;
     }
-    await bucket.delete([row.object_key, `${row.object_key}.manifest.json`]);
-    // Do not erase the journal's archive pointer after a partial/locked deletion.
-    if ((await bucket.head(row.object_key)) || (await bucket.head(`${row.object_key}.manifest.json`))) continue;
-    await env.DB.prepare("DELETE FROM audit_archives WHERE id=? AND expires_at<?").bind(row.id, Date.now()).run();
+    await env.DB.prepare("DELETE FROM audit_archives WHERE id=? AND expires_at<?").bind(row.id, now).run();
   }
 }
 export async function exportAuditToBasin(env: Env) {

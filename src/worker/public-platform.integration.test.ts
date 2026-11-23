@@ -157,6 +157,10 @@ it("avoids maintenance wakes for table previews while preserving settings-write 
     expect(await response.json()).toEqual({ tables: roots.length ? [{ id: "table", title: "table" }] : [] });
     expect(wake).not.toHaveBeenCalled();
   }
+  const encoded = await fetchSettings("/table%2Doptions", { roots: ["home"] });
+  expect(encoded.status).toBe(200);
+  expect(await encoded.json()).toEqual({ tables: [{ id: "table", title: "table" }] });
+  expect(wake).not.toHaveBeenCalled();
   const saved = await fetchSettings(
     "",
     {
@@ -167,7 +171,7 @@ it("avoids maintenance wakes for table previews while preserving settings-write 
     "PUT",
   );
   expect(saved.status).toBe(200);
-  expect(wake).toHaveBeenCalledExactlyOnceWith(undefined);
+  expect(wake).toHaveBeenCalledExactlyOnceWith(undefined, undefined);
   expect((await fetchSettings("/table-options", { roots: ["home"] })).status).toBe(200);
   expect(wake).toHaveBeenCalledTimes(1);
 });

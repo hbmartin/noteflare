@@ -507,11 +507,12 @@ export function portableOverrides(
 }
 
 export function assertSingleWorkerTarget(
+  target,
   name,
   productionName,
   coordinated = existsSync(resolve("wrangler.public.jsonc")),
 ) {
-  if (name === productionName && coordinated)
+  if (coordinated && (target === "production" || name === productionName || name === `${productionName}-public`))
     throw new Error(
       "This production checkout requires a coordinated application/public release. Use the gated Deploy workflow described in docs/implementation/cloudflare-production-enablement.md; the single-Worker deploy command cannot apply this release.",
     );
@@ -532,7 +533,7 @@ async function prepare(forced, dryRun, liveUpload = false) {
       ? process.env.WRANGLER_CI_OVERRIDE_NAME ||
         unstable_readConfig({ config: "wrangler.jsonc", env: candidate }, { hideWarnings: true }).name
       : name;
-    assertSingleWorkerTarget(candidateName, production.name);
+    assertSingleWorkerTarget(candidate, candidateName, production.name);
   }
   let connection, settings;
   if (

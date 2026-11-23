@@ -106,6 +106,7 @@ export interface AppBindings {
   AUDIT_BUCKET?: R2Bucket;
   AUDIT_HOT_DAYS?: string;
   AUDIT_ARCHIVE_DAYS?: string;
+  AUDIT_ARCHIVE_LOCK_DAYS?: string;
   BASIN_ENABLED?: "true" | "false";
   AUDIT_PIPELINE?: { send(records: Record<string, unknown>[]): Promise<void> };
   HEATMAP_PIPELINE?: { send(records: Record<string, unknown>[]): Promise<void> };

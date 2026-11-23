@@ -189,7 +189,7 @@ async function runPlatformJobObserved(env: Env, id: string, handlers: PlatformHa
           { workspaceId: remaining.workspace_id, kind: remaining.kind, key: remaining.job_key },
           due,
         ));
-      if (maintenanceRequired) await wakePlatformBestEffort(env);
+      if (maintenanceRequired) await wakePlatformBestEffort(env, undefined, queued ? undefined : due);
       else if (!queued) await wakePlatformBestEffort(env, due);
     } else if (maintenanceRequired) {
       await wakePlatformBestEffort(env);

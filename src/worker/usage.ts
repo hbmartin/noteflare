@@ -92,14 +92,29 @@ function wrapBucket(bucket: R2Bucket): R2Bucket {
 }
 /** Proxies carry no request state: counters live exclusively in AsyncLocalStorage. */
 const wrapped = new WeakSet<Env>();
+const instrumented = new WeakSet<D1Database | R2Bucket>();
+
+/** Audit wraps D1 to add transaction context while retaining the underlying instrumentation. */
+export function inheritDatabaseInstrumentation(source: D1Database, wrapper: D1Database) {
+  if (instrumented.has(source)) instrumented.add(wrapper);
+}
+
 export function usageBindings(env: Env): Env {
   if (env.COST_REPORTING_ENABLED !== "true" || wrapped.has(env)) return env;
+  function bucket(binding: R2Bucket) {
+    if (instrumented.has(binding)) return binding;
+    const proxy = wrapBucket(binding);
+    instrumented.add(proxy);
+    return proxy;
+  }
+  const database = instrumented.has(env.DB) ? env.DB : wrapDatabase(env.DB);
+  instrumented.add(database);
   const result = {
     ...env,
-    DB: wrapDatabase(env.DB),
-    BUCKET: wrapBucket(env.BUCKET),
-    ...(env.PUBLICATIONS_BUCKET ? { PUBLICATIONS_BUCKET: wrapBucket(env.PUBLICATIONS_BUCKET) } : {}),
-    ...(env.AUDIT_BUCKET ? { AUDIT_BUCKET: wrapBucket(env.AUDIT_BUCKET) } : {}),
+    DB: database,
+    BUCKET: bucket(env.BUCKET),
+    ...(env.PUBLICATIONS_BUCKET ? { PUBLICATIONS_BUCKET: bucket(env.PUBLICATIONS_BUCKET) } : {}),
+    ...(env.AUDIT_BUCKET ? { AUDIT_BUCKET: bucket(env.AUDIT_BUCKET) } : {}),
   };
   wrapped.add(result);
   return result;

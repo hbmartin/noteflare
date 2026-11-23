@@ -3102,7 +3102,10 @@ export async function expireJobArtifacts(env: Env) {
       await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${row.id}`, row.attempt, "documents/");
       await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/documents/`);
     }
-    if (row.type === "export") await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${row.id}`, row.attempt, "output/");
+    if (row.type === "export") {
+      await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${row.id}`, row.attempt, "output/");
+      await deleteR2AttemptArtifacts(env.BUCKET, `job-artifacts/${row.id}`, row.attempt);
+    }
     await env.DB.prepare(`UPDATE jobs SET input_key = NULL, output_key = NULL, updated_at = ? WHERE id = ?`)
       .bind(Date.now(), row.id)
       .run();

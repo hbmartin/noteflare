@@ -54,7 +54,7 @@ async function fetchModels(token: string, funding: AiFunding): Promise<ProviderM
     response = await fetch("https://api.openai.com/v1/models", {
       headers: { authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(20_000),
-      redirect: "error",
+      redirect: "manual",
     });
   } catch {
     throw new HttpError(503, "ai_model_unavailable", "Model access is temporarily unavailable. Retry shortly.");

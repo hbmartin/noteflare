@@ -64,7 +64,7 @@ function requireConfiguration(env: Env) {
 type Discovery = { issuer: string; authorization_endpoint: string; token_endpoint: string; jwks_uri: string };
 async function discovery() {
   const response = await fetch(`${ISSUER}/.well-known/openid-configuration`, {
-    redirect: "error",
+    redirect: "manual",
     signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok)
@@ -107,7 +107,7 @@ async function exchange(env: Env, endpoint: string, params: URLSearchParams) {
     method: "POST",
     headers,
     body: params,
-    redirect: "error",
+    redirect: "manual",
     signal: AbortSignal.timeout(20_000),
   });
 }
@@ -201,7 +201,7 @@ export async function finishChatgptConnection(
       "chatgpt_plan_scope_missing",
       "ChatGPT did not grant plan inference and refresh access. Reconnect with the required permissions.",
     );
-  const keysResponse = await fetch(config.jwks_uri, { redirect: "error", signal: AbortSignal.timeout(15_000) });
+  const keysResponse = await fetch(config.jwks_uri, { redirect: "manual", signal: AbortSignal.timeout(15_000) });
   if (!keysResponse.ok)
     throw new HttpError(503, "chatgpt_unavailable", "ChatGPT signing keys are temporarily unavailable.");
   let identity;

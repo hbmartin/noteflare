@@ -72,7 +72,9 @@ beforeEach(async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (resource: RequestInfo | URL, init?: RequestInit) => {
-      const url = new URL(resource instanceof Request ? resource.url : String(resource));
+      const request = new Request(resource, init);
+      expect(request.redirect).toBe("manual");
+      const url = new URL(request.url);
       if (url.pathname.endsWith("openid-configuration"))
         return Response.json({
           issuer: "https://auth.openai.com",

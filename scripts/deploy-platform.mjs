@@ -9,7 +9,7 @@ import { platformConnection, platformProfile, settingsFingerprint } from "./clou
 export async function deployPlatform(
   environment = "production",
   execute = spawnSync,
-  { dryRun = false, connect = platformConnection, readFingerprints } = {},
+  { dryRun = false, checkLive = false, connect = platformConnection, readFingerprints } = {},
 ) {
   const profile = platformProfile(environment);
   const files = [
@@ -62,28 +62,46 @@ export async function deployPlatform(
     );
     if (check.status !== 0) throw new Error("Coordinated Worker dry build failed.");
   }
-  if (dryRun) return;
+  if (dryRun && !checkLive) return;
   const fingerprints = readFingerprints
     ? readFingerprints()
     : JSON.parse(readFileSync(resolve(`.wrangler/platform/${environment}/settings-fingerprints.json`), "utf8"));
   const { api } = await connect(profile);
-  for (const [index, path] of files.entries()) {
-    const name = index ? profile.publicName : profile.name;
+  const names = [profile.name, profile.publicName];
+  async function verifyLiveSettings(name) {
     const settings = await api(`/workers/scripts/${name}/settings`, { allowMissing: true });
     if (settingsFingerprint(settings) !== fingerprints[name])
       throw new Error(`Live settings for ${name} changed after preparation. Prepare again before deploying.`);
-    const result = execute(process.execPath, [wrangler, "deploy", "--config", path], { stdio: "inherit" });
-    if (result.status !== 0)
+  }
+  // A disagreement already present on either Worker must prevent both uploads.
+  await Promise.all(names.map(verifyLiveSettings));
+  if (dryRun) return;
+  const uploaded = [];
+  for (const [index, path] of files.entries()) {
+    const name = names[index];
+    try {
+      await verifyLiveSettings(name);
+      const result = execute(process.execPath, [wrangler, "deploy", "--config", path], { stdio: "inherit" });
+      if (result.status !== 0) throw new Error(`Upload of ${name} did not report success. Check its live deployment.`);
+      uploaded.push(name);
+    } catch (error) {
+      const progress = uploaded.length ? `Confirmed uploads: ${uploaded.join(", ")}.` : "No upload confirmed.";
       throw new Error(
-        "Coordinated deployment incomplete; keep feature traffic paused and complete the forward deployment.",
+        `${error.message} ${progress} Keep feature traffic paused and prepare both Workers from fresh live settings.`,
+        { cause: error },
       );
+    }
   }
 }
 if (import.meta.main) {
   try {
-    if (process.argv.slice(3).some((option) => option !== "--dry-run"))
-      throw new Error("Usage: deploy-platform.mjs [production|staging] [--dry-run]");
-    await deployPlatform(process.argv[2] ?? "production", spawnSync, { dryRun: process.argv.includes("--dry-run") });
+    const [environment, ...options] = process.argv.slice(2);
+    if (options.some((option) => !["--dry-run", "--check-live"].includes(option)))
+      throw new Error("Usage: deploy-platform.mjs [production|staging] [--dry-run [--check-live]]");
+    await deployPlatform(environment, spawnSync, {
+      dryRun: options.includes("--dry-run"),
+      checkLive: options.includes("--check-live"),
+    });
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

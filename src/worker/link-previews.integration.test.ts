@@ -634,8 +634,11 @@ describe("link previews", () => {
     );
     vi.stubGlobal("fetch", fetcher);
     const first = await linkPreview(imageBindings(), "workspace", pageUrl);
-    await env.DB.prepare("UPDATE link_preview_cache SET expires_at = 1, refresh_until = ? WHERE id = ?")
-      .bind(Date.now() + 30_000, first.id)
+    const expiredImage = `link-previews/metadata-v2/workspace/${first.id}/already-expired`;
+    await env.DB.prepare(
+      "UPDATE link_preview_cache SET expires_at=1, refresh_until=?, image_key=?, image_mime='image/webp' WHERE id=?",
+    )
+      .bind(Date.now() + 30_000, expiredImage, first.id)
       .run();
     await pruneLinkPreviews(env);
     expect(await env.DB.prepare("SELECT id FROM link_preview_cache WHERE id = ?").bind(first.id).first()).toBeTruthy();
@@ -645,6 +648,11 @@ describe("link previews", () => {
     fetcher.mockResolvedValueOnce(new Response("unavailable", { status: 503 }));
     const refreshed = await linkPreview(imageBindings(), "workspace", pageUrl);
     expect(refreshed.title).toBe("Original title");
+    expect(refreshed.imageUrl).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE id=?").bind(first.id).first("image_key"),
+    ).toBeNull();
+    expect(await env.DB.prepare("SELECT image_key FROM link_preview_image_gc").first("image_key")).toBe(expiredImage);
     expect(refreshed.expiresAt - Date.now()).toBeLessThanOrEqual(5 * 60 * 1000);
   });
 
