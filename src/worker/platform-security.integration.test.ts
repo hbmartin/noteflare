@@ -664,7 +664,13 @@ it("keeps an expired audit archive hidden from the owner while its partial delet
       retained.delete(key);
     },
   } as unknown as R2Bucket;
-  const configured: Env = { ...testEnv, AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket };
+  const configured: Env = {
+    ...testEnv,
+    AUDIT_ENABLED: "true",
+    AUDIT_BUCKET: bucket,
+    AUDIT_ARCHIVE_DAYS: "30",
+    AUDIT_ARCHIVE_LOCK_DAYS: "365",
+  };
   await archiveAudit(configured);
   expect(retained).toEqual(new Set([`${key}.manifest.json`]));
   expect(
@@ -681,6 +687,23 @@ it("keeps an expired audit archive hidden from the owner while its partial delet
   expect(await list.json()).toEqual({ archives: [] });
   expect((await request("/locked")).status).toBe(404);
   expect(get).not.toHaveBeenCalled();
+  async function budgets(configuration: Env) {
+    const response = await worker.fetch(
+      new Request("http://example.test/api/platform", { headers: { cookie } }),
+      configuration,
+      createExecutionContext(),
+    );
+    expect(response.status).toBe(200);
+    return response.json();
+  }
+  expect(await budgets(configured)).toMatchObject({
+    budgets: { auditArchiveDays: 30, auditArchiveLockDays: 365, auditArchiveStorageMinimumDays: 365 },
+  });
+  const fallback = { ...configured };
+  delete fallback.AUDIT_BUCKET;
+  expect(await budgets(fallback)).toMatchObject({
+    budgets: { auditArchiveDays: 30, auditArchiveLockDays: null, auditArchiveStorageMinimumDays: 30 },
+  });
 });
 
 it("authorizes the cost API freshly before serving a cached workspace report", async () => {

@@ -15,6 +15,7 @@ import {
   bootstrap,
   platformConnection,
   parseActivation,
+  main,
 } from "./cloudflare-platform.mjs";
 import { validatePlatformConfiguration } from "./platform-config.mjs";
 
@@ -243,7 +244,8 @@ describe("Cloudflare platform provisioning", () => {
       const productionIds = new Set(configs[worker].ratelimits.map((binding) => binding.namespace_id));
       expect(stage[worker].ratelimits.every((binding) => !productionIds.has(binding.namespace_id))).toBe(true);
     }
-    expect(parseActivation("--enable= , ")).toEqual([]);
+    for (const option of ["--enable=", "--enable= ", "--enable=,"])
+      expect(() => parseActivation(option)).toThrow("Choose features");
     expect(() => parseActivation("--enable=semantic, access")).toThrow("Choose features");
   });
   it("checks existing private buckets and reads back merged policy updates idempotently", async () => {
@@ -297,47 +299,70 @@ describe("Cloudflare platform provisioning", () => {
     expect(next.changes.every((change) => !change.changed)).toBe(true);
   });
   it("never generates a replacement production authentication secret", async () => {
-    const api = vi.fn(),
+    const api = vi.fn(async (path) => (path.endsWith("-public/settings") ? null : { bindings: [] })),
       execute = vi.fn();
     await expect(bootstrap(platformProfile(), api, "/tmp/noteflare-bootstrap-test", {}, execute)).rejects.toThrow(
       "never generated or replaced",
     );
-    expect(api).not.toHaveBeenCalled();
+    expect(api.mock.calls.map(([path]) => path)).toEqual([
+      "/workers/scripts/cloudflare-realtime-notes/settings",
+      "/workers/scripts/cloudflare-realtime-notes-public/settings",
+    ]);
     expect(execute).not.toHaveBeenCalled();
   });
   it.each([false, true])(
-    "blocks bootstrap when either Worker still uses the old widget (public %s)",
-    async (onlyPublic) => {
+    "initializes identity separately from the old Turnstile sitekey (existing public %s)",
+    async (existingPublic) => {
       const profile = platformProfile();
       const directory = mkdtempSync(join(tmpdir(), "noteflare-bootstrap-mismatch-"));
-      const execute = vi.fn();
-      const mismatched = onlyPublic ? profile.publicName : profile.name;
-      const api = vi.fn(async (path) => {
-        if (path.endsWith("/settings"))
-          return {
-            bindings: [
-              {
-                type: "plain_text",
-                name: "TURNSTILE_SITE_KEY",
-                text: path === `/workers/scripts/${mismatched}/settings` ? "previous-widget" : "managed-widget",
-              },
-            ],
-          };
+      const execute = vi.fn(() => ({ status: 0 }));
+      const appSettings = {
+        bindings: [
+          { type: "plain_text", name: "TURNSTILE_SITE_KEY", text: "previous-widget" },
+          { type: "secret_text", name: "BETTER_AUTH_SECRET" },
+        ],
+      };
+      const api = vi.fn(async (path, options) => {
+        if (path === `/workers/scripts/${profile.name}/settings`) return appSettings;
+        if (path === `/workers/scripts/${profile.publicName}/settings`)
+          return existingPublic ? { bindings: appSettings.bindings.slice(0, 1) } : { bindings: [] };
         if (path.startsWith("/challenges/widgets?"))
           return { result: [{ name: `${profile.name}-platform`, sitekey: "managed-widget" }] };
+        if (path === "/challenges/widgets/managed-widget")
+          return {
+            name: `${profile.name}-platform`,
+            sitekey: "managed-widget",
+            secret: "test-secret",
+            domains: [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname],
+          };
+        if (path.endsWith("/secrets") && options?.method === "PUT") return {};
         throw new Error(`Unexpected request ${path}`);
       });
+      if (!existingPublic) api.mockImplementationOnce(async () => appSettings).mockResolvedValueOnce(null);
       try {
-        await expect(
-          bootstrap(profile, api, directory, { BETTER_AUTH_SECRET: "x".repeat(32) }, execute),
-        ).rejects.toThrow(`Live Turnstile sitekey differs for ${mismatched}`);
-        expect(execute).not.toHaveBeenCalled();
-        expect(api.mock.calls.map(([path]) => path.split("?")[0])).toEqual([
-          `/workers/scripts/${profile.name}/settings`,
-          `/workers/scripts/${profile.publicName}/settings`,
-          "/challenges/widgets",
+        const result = await bootstrap(
+          profile,
+          api,
+          directory,
+          {
+            BETTER_AUTH_SECRET: "x".repeat(32),
+            CF_ANALYTICS_API_TOKEN: "analytics-test-token",
+          },
+          execute,
+        );
+        expect(result.awaitingTurnstileReplacement).toEqual(
+          existingPublic ? [profile.name, profile.publicName] : [profile.name],
+        );
+        expect(execute).toHaveBeenCalledTimes(existingPublic ? 0 : 1);
+        const writes = api.mock.calls
+          .filter(([, options]) => options?.method === "PUT")
+          .map(([path, options]) => [path, options.body.name]);
+        const publicPath = `/workers/scripts/${profile.publicName}/secrets`;
+        expect(writes).toEqual([
+          [publicPath, "BETTER_AUTH_SECRET"],
+          [`/workers/scripts/${profile.name}/secrets`, "CF_ANALYTICS_API_TOKEN"],
+          ...(!existingPublic ? [[publicPath, "TURNSTILE_SECRET_KEY"]] : []),
         ]);
-        expect(readdirSync(directory)).toEqual([]);
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }
@@ -357,13 +382,13 @@ describe("Cloudflare platform provisioning", () => {
     const api = vi.fn(async (path) => (path.endsWith("-public/settings") ? { bindings: [] } : null));
     await expect(
       bootstrap(platformProfile("staging"), api, "/tmp/noteflare-missing-bootstrap-test", {}),
-    ).rejects.toThrow("original staging BETTER_AUTH_SECRET");
+    ).rejects.toThrow("PLATFORM_STAGING_BETTER_AUTH_SECRET");
     expect(api.mock.calls.map(([path]) => path)).toEqual([
       "/workers/scripts/cloudflare-realtime-notes-platform-staging/settings",
       "/workers/scripts/cloudflare-realtime-notes-platform-staging-public/settings",
     ]);
   });
-  it("uses staging-only credentials and refreshes Turnstile without replacing identity secrets", async () => {
+  it("initializes staging credentials and skips installed secrets on a rerun", async () => {
     const profile = platformProfile("staging");
     const directory = mkdtempSync(join(tmpdir(), "noteflare-bootstrap-"));
     let configured = false;
@@ -384,7 +409,12 @@ describe("Cloudflare platform provisioning", () => {
       if (path.startsWith("/challenges/widgets?"))
         return { result: [{ name: `${profile.name}-platform`, sitekey: "staging-widget" }] };
       if (path === "/challenges/widgets/staging-widget")
-        return { secret: configured ? "rotated-test-secret" : "initial-test-secret" };
+        return {
+          name: `${profile.name}-platform`,
+          sitekey: "staging-widget",
+          secret: "initial-test-secret",
+          domains: [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname],
+        };
       if (path.endsWith("/secrets") && options.method === "PUT") return {};
       throw new Error(`Unexpected fixture request: ${path}`);
     });
@@ -402,15 +432,23 @@ describe("Cloudflare platform provisioning", () => {
       execute.mockClear();
       await bootstrap(profile, api, directory, productionOnly, execute);
       expect(execute).not.toHaveBeenCalled();
-      expect(api.mock.calls.filter(([, options]) => options?.method === "PUT")).toEqual(
-        [profile.name, profile.publicName].map((name) => [
-          `/workers/scripts/${name}/secrets`,
-          { method: "PUT", body: { name: "TURNSTILE_SECRET_KEY", text: "rotated-test-secret", type: "secret_text" } },
-        ]),
-      );
+      expect(api.mock.calls.filter(([, options]) => options?.method === "PUT")).toEqual([]);
       expect(readFileSync(join(directory, "bootstrap.env"), "utf8")).toBe(persisted);
     } finally {
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  it("rejects replayed workflow activations and malformed empty selections before provider preflight", async () => {
+    vi.stubEnv("GITHUB_ACTIONS", "true");
+    vi.stubEnv("GITHUB_RUN_ATTEMPT", "2");
+    try {
+      await expect(main(["prepare", "production", "--enable= "])).rejects.toThrow("Choose features");
+      await expect(main(["prepare", "production", "--enable= forms, tables, turnstile "])).rejects.toThrow(
+        "new dispatch",
+      );
+      await expect(main(["prepare", "production", "--replace-turnstile"])).rejects.toThrow("new dispatch");
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
   it("pins an explicit widget replacement in the prepared release without writing its secret", async () => {
@@ -418,6 +456,7 @@ describe("Cloudflare platform provisioning", () => {
     const directory = mkdtempSync(join(tmpdir(), "noteflare-replace-widget-"));
     const base = unstable_readConfig({ config: "wrangler.jsonc", env: "production" }, { hideWarnings: true });
     const rules = retentionRules();
+    let partialActivation = false;
     const widget = {
       name: `${profile.name}-platform`,
       sitekey: "managed-widget",
@@ -446,6 +485,12 @@ describe("Cloudflare platform provisioning", () => {
             { type: "plain_text", name: "TURNSTILE_SITE_KEY", text: "previous-widget" },
             { type: "plain_text", name: "TURNSTILE_ENABLED", text: "true" },
             { type: "secret_text", name: "BETTER_AUTH_SECRET" },
+            ...(partialActivation && path === `/workers/scripts/${profile.name}/settings`
+              ? [
+                  { type: "plain_text", name: "FORMS_ENABLED", text: "true" },
+                  { type: "plain_text", name: "TABLE_AUTHORITY_ENABLED", text: "true" },
+                ]
+              : []),
           ],
         };
       throw new Error(`Unexpected request ${path}`);
@@ -453,12 +498,18 @@ describe("Cloudflare platform provisioning", () => {
     try {
       await expect(prepare(profile, api, directory)).rejects.toThrow("--replace-turnstile");
       expect(readdirSync(directory)).toEqual([]);
-      const prepared = await prepare(profile, api, directory, false, [], true);
+      partialActivation = true;
+      await expect(prepare(profile, api, directory, false, [], true)).rejects.toThrow(
+        "FORMS_ENABLED (application true, public false)",
+      );
+      expect(readdirSync(directory)).toEqual([]);
+      const prepared = await prepare(profile, api, directory, false, ["forms", "tables"], true);
       const manifest = readFileSync(join(directory, "settings-fingerprints.json"), "utf8");
       expect(JSON.parse(manifest).turnstileReplacementSitekey).toBe(widget.sitekey);
       for (const path of Object.values(prepared)) {
         const content = readFileSync(path, "utf8");
         expect(JSON.parse(content).vars.TURNSTILE_SITE_KEY).toBe(widget.sitekey);
+        expect(JSON.parse(content).vars.FORMS_ENABLED).toBe("true");
         expect(content).not.toContain(widget.secret);
       }
       expect(manifest).not.toContain(widget.secret);

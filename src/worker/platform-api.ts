@@ -6,7 +6,7 @@ import { assertSameOrigin, HttpError } from "./http";
 import { object } from "../shared/validation";
 import { freshSecurityAuthorization } from "./security";
 import { beginKeyRotation, encryptionKeyStatus } from "./secrets";
-import { auditStatement, listAudit } from "./audit";
+import { auditRetention, auditStatement, listAudit } from "./audit";
 import { heatmapContext, readHeatmap, recordHeatmap } from "./heatmaps";
 import { costOptions, platformCosts } from "./platform-costs";
 
@@ -108,6 +108,7 @@ platformApi.get("/platform", async (c) => {
       ),
     ]),
   ]);
+  const retention = auditRetention(c.env);
   return c.json({
     capabilities: platformCapabilities(c.env),
     operatorSettings: { application: operatorSnapshot(c.env), publicWorker },
@@ -127,7 +128,9 @@ platformApi.get("/platform", async (c) => {
       semanticDailyTokens: Number(c.env.SEMANTIC_DAILY_TOKEN_LIMIT ?? 100000),
       formsDaily: Number(c.env.FORMS_DAILY_LIMIT ?? 100),
       auditHotDays: Number(c.env.AUDIT_HOT_DAYS ?? 30),
-      auditArchiveDays: Number(c.env.AUDIT_ARCHIVE_DAYS ?? 365),
+      auditArchiveDays: retention.configuredDays,
+      auditArchiveLockDays: retention.lockDays,
+      auditArchiveStorageMinimumDays: retention.storageMinimumDays,
     },
   });
 });

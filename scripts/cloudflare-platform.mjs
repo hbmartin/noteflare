@@ -121,9 +121,22 @@ export function parseActivation(option) {
     .split(",")
     .map((name) => name.trim())
     .filter(Boolean);
-  if (!option.startsWith("--enable=") || names.some((name) => !Object.hasOwn(features, name)))
+  if (!option.startsWith("--enable=") || !names.length || names.some((name) => !Object.hasOwn(features, name)))
     throw new Error("Choose features with --enable=" + Object.keys(features).join(","));
   return [...new Set(names)];
+}
+export function assertSharedReleaseFlags(application, publicWorker) {
+  const mismatched = [...publicFlags].flatMap((flag) => {
+    const app = application[flag] ?? "false";
+    const pub = publicWorker[flag] ?? "false";
+    if (![app, pub].every((value) => value === "true" || value === "false"))
+      throw new Error(`Invalid shared flag: ${flag}.`);
+    return app === pub ? [] : [`${flag} (application ${app}, public ${pub})`];
+  });
+  if (mismatched.length)
+    throw new Error(
+      `Shared release flags differ: ${mismatched.join(", ")}. Align the live flags or explicitly enable the intended features in a fresh release.`,
+    );
 }
 function liveVars(settings) {
   if (settings && !Array.isArray(settings.bindings)) throw new Error("Invalid Worker settings readback.");
@@ -136,9 +149,12 @@ function workerSettings(profile, api) {
     [profile.name, profile.publicName].map((name) => api(`/workers/scripts/${name}/settings`, { allowMissing: true })),
   );
 }
-export function assertLiveTurnstileSitekey(settings, sitekey, worker) {
+function turnstileMatches(settings, sitekey) {
   const vars = liveVars(settings);
-  if ((vars.TURNSTILE_SITE_KEY || vars.TURNSTILE_ENABLED === "true") && vars.TURNSTILE_SITE_KEY !== sitekey)
+  return vars.TURNSTILE_SITE_KEY ? vars.TURNSTILE_SITE_KEY === sitekey : vars.TURNSTILE_ENABLED !== "true";
+}
+export function assertLiveTurnstileSitekey(settings, sitekey, worker) {
+  if (!turnstileMatches(settings, sitekey))
     throw new Error(`Live Turnstile sitekey differs for ${worker}. Prepare an explicit --replace-turnstile release.`);
 }
 export function settingsFingerprint(settings) {
@@ -552,6 +568,7 @@ export async function prepare(profile, api, directory, cutoverReady = false, ena
     publicVars: liveVars(publicSettings),
     enable,
   });
+  assertSharedReleaseFlags(configs.application.vars, configs.publicWorker.vars);
   const secretNames = (workerState) => [
     ...(workerState?.bindings ?? []).filter((binding) => binding.type === "secret_text").map((binding) => binding.name),
     ...(replaceTurnstile ? ["TURNSTILE_SECRET_KEY"] : []),
@@ -726,19 +743,24 @@ async function configureFreeManaged(profile, api, apply) {
     throw new Error("Free managed protection readback failed; keep the release gated.");
   return "Free managed execution verified for application/public hostnames";
 }
+function hasInstalledSecret(settings, name) {
+  return settings?.bindings.some((binding) => binding.name === name && binding.type === "secret_text");
+}
 /** Create unreachable shells so secrets can be installed before any public route. */
 export async function bootstrap(profile, api, directory, environment = process.env, execute = spawnSync) {
   const secretsPath = resolve(directory, "bootstrap.env");
   const staging = profile.environment === "staging";
   let authSecret = staging ? environment.PLATFORM_STAGING_BETTER_AUTH_SECRET : environment.BETTER_AUTH_SECRET;
-  if (profile.environment === "production" && !authSecret)
-    throw new Error(
-      "BETTER_AUTH_SECRET must be supplied from the existing production installation; it is never generated or replaced.",
-    );
   const names = staging ? [profile.name, profile.publicName] : [profile.publicName];
   const [applicationSettings, publicSettings] = await workerSettings(profile, api);
   const states = staging ? [applicationSettings, publicSettings] : [publicSettings];
   if (!staging && !applicationSettings) throw new Error("Production application Worker is missing.");
+  for (const settings of [applicationSettings, publicSettings]) liveVars(settings);
+  const needsAuthSecret = states.some((settings) => !hasInstalledSecret(settings, "BETTER_AUTH_SECRET"));
+  if (!staging && needsAuthSecret && !authSecret)
+    throw new Error(
+      "BETTER_AUTH_SECRET must be supplied from the existing production installation; it is never generated or replaced.",
+    );
   let bootstrapToken = environment.PLATFORM_STAGING_BOOTSTRAP_TOKEN;
   let persistIdentity = false;
   const stagingSetupPending = staging && !liveVars(states[0]).BETTER_AUTH_URL;
@@ -753,36 +775,41 @@ export async function bootstrap(profile, api, directory, environment = process.e
       throw new Error("Supplied staging credentials conflict with the recorded installation credentials.");
     authSecret ??= recorded;
     bootstrapToken ??= recordedBootstrap;
-    if (states.some(Boolean) && !authSecret) throw new Error("Supply the original staging BETTER_AUTH_SECRET.");
+    if (needsAuthSecret && states.some(Boolean) && !authSecret)
+      throw new Error(
+        "Supply the original PLATFORM_STAGING_BETTER_AUTH_SECRET or restore the recorded staging credentials.",
+      );
     if (!states.some(Boolean)) {
       authSecret ??= randomBytes(48).toString("base64url");
       bootstrapToken ??= randomBytes(48).toString("base64url");
     }
-    if (
-      stagingSetupPending &&
-      !states[0]?.bindings?.some((binding) => binding.type === "secret_text" && binding.name === "BOOTSTRAP_TOKEN") &&
-      !bootstrapToken
-    )
-      throw new Error("Supply the original staging BOOTSTRAP_TOKEN.");
+    if (stagingSetupPending && !hasInstalledSecret(states[0], "BOOTSTRAP_TOKEN") && !bootstrapToken)
+      throw new Error(
+        "Supply the original PLATFORM_STAGING_BOOTSTRAP_TOKEN or restore the recorded staging credentials.",
+      );
     if (/[\r\n]/.test(authSecret ?? "") || /[\r\n]/.test(bootstrapToken ?? ""))
       throw new Error("Staging identity credentials must be single-line values.");
     persistIdentity = !local && !states.some(Boolean);
   }
-  if (!authSecret || authSecret.length < 32) throw new Error("A valid installation authentication secret is required.");
-  const widget = await findWidget(profile, api);
-  if (!widget) throw new Error("Provision the environment’s Turnstile widget first.");
-  assertLiveTurnstileSitekey(applicationSettings, widget.sitekey, profile.name);
-  assertLiveTurnstileSitekey(publicSettings, widget.sitekey, profile.publicName);
-  const challenge = await api(`/challenges/widgets/${widget.sitekey}`);
-  if (!challenge.secret) throw new Error("Turnstile secret is unavailable; configure Worker secrets explicitly.");
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  if (persistIdentity)
+  if (needsAuthSecret && (!authSecret || authSecret.length < 32))
+    throw new Error("A valid installation authentication secret is required.");
+  if (persistIdentity) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
     writeFileSync(secretsPath, `BETTER_AUTH_SECRET=${authSecret}\nBOOTSTRAP_TOKEN=${bootstrapToken}\n`, {
       mode: 0o600,
       flag: "wx",
     });
+  }
+  const putSecret = (worker, name, text) =>
+    api(`/workers/scripts/${worker}/secrets`, {
+      method: "PUT",
+      body: { name, text, type: "secret_text" },
+    });
   const workerPath = resolve(directory, "bootstrap-worker.mjs");
-  writeFileSync(workerPath, 'export default { fetch() { return new Response("Not found.", { status: 404 }); } };\n');
+  if (states.some((settings) => !settings)) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(workerPath, 'export default { fetch() { return new Response("Not found.", { status: 404 }); } };\n');
+  }
   for (const [index, name] of names.entries()) {
     const settings = states[index];
     if (!settings) {
@@ -808,33 +835,37 @@ export async function bootstrap(profile, api, directory, environment = process.e
     }
     for (const [key, value] of [
       ["BETTER_AUTH_SECRET", authSecret],
-      ["TURNSTILE_SECRET_KEY", challenge.secret],
       ...(name === profile.name && stagingSetupPending ? [["BOOTSTRAP_TOKEN", bootstrapToken]] : []),
-    ]) {
-      if (
-        key !== "TURNSTILE_SECRET_KEY" &&
-        settings?.bindings.some((binding) => binding.name === key && binding.type === "secret_text")
-      )
-        continue;
-      await api(`/workers/scripts/${name}/secrets`, {
-        method: "PUT",
-        body: { name: key, text: value, type: "secret_text" },
-      });
+    ])
+      if (!hasInstalledSecret(settings, key)) await putSecret(name, key, value);
+  }
+  if (environment.CF_ANALYTICS_API_TOKEN)
+    await putSecret(profile.name, "CF_ANALYTICS_API_TOKEN", environment.CF_ANALYTICS_API_TOKEN);
+
+  const widget = await findWidget(profile, api);
+  if (!widget) throw new Error("Provision the environment’s Turnstile widget to finish bootstrap.");
+  const workers = [
+    [profile.name, applicationSettings],
+    [profile.publicName, publicSettings],
+  ];
+  const awaitingTurnstileReplacement = [];
+  const missingTurnstile = [];
+  for (const [name, settings] of workers) {
+    if (!turnstileMatches(settings, widget.sitekey)) awaitingTurnstileReplacement.push(name);
+    else if (!hasInstalledSecret(settings, "TURNSTILE_SECRET_KEY")) missingTurnstile.push(name);
+  }
+  if (missingTurnstile.length) {
+    const secret = await turnstileReplacementSecret(profile, api, widget.sitekey);
+    for (const name of missingTurnstile) {
+      const live = await api(`/workers/scripts/${name}/settings`);
+      if (!turnstileMatches(live, widget.sitekey)) awaitingTurnstileReplacement.push(name);
+      else if (!hasInstalledSecret(live, "TURNSTILE_SECRET_KEY")) await putSecret(name, "TURNSTILE_SECRET_KEY", secret);
     }
   }
-  if (profile.environment === "production")
-    await api(`/workers/scripts/${profile.name}/secrets`, {
-      method: "PUT",
-      body: { name: "TURNSTILE_SECRET_KEY", text: challenge.secret, type: "secret_text" },
-    });
-  if (environment.CF_ANALYTICS_API_TOKEN)
-    await api(`/workers/scripts/${profile.name}/secrets`, {
-      method: "PUT",
-      body: { name: "CF_ANALYTICS_API_TOKEN", text: environment.CF_ANALYTICS_API_TOKEN, type: "secret_text" },
-    });
   return {
     publicIngress: states.at(-1) ? "unchanged; unverified" : "private shell; ingress disabled",
     secrets: "installed without changing production application identity",
+    awaitingTurnstileReplacement,
   };
 }
 export async function platformConnection(profile, options) {
@@ -855,6 +886,13 @@ export async function main(argv = process.argv.slice(2)) {
   )
     throw new Error("Only prepare accepts --enable and --replace-turnstile, once each.");
   const enable = parseActivation(activation[0]);
+  if (
+    command === "prepare" &&
+    process.env.GITHUB_ACTIONS === "true" &&
+    Number(process.env.GITHUB_RUN_ATTEMPT) > 1 &&
+    (enable.length || replaceTurnstile)
+  )
+    throw new Error("Review current Worker settings and start a new dispatch for activation or widget replacement.");
   if (!["plan", "apply", "prepare", "bootstrap", "edges-plan", "edges-apply"].includes(command))
     throw new Error(
       "Usage: cloudflare-platform.mjs plan|apply|prepare|bootstrap|edges-plan|edges-apply [production|staging]",
