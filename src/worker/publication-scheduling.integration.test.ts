@@ -98,7 +98,7 @@ it.each([false, true])(
         if (key === "prepare")
           return (sql: string) => {
             const statement = target.prepare(sql);
-            if (!sql.includes("SELECT min(due)")) return statement;
+            if (!sql.includes("SELECT min(job_due)")) return statement;
             return new Proxy(statement, {
               get(original, method) {
                 if (method === "bind")
@@ -627,7 +627,7 @@ it("retains a final-scan retry and concurrent wake when the deadline query fails
       if (key === "prepare")
         return (sql: string) => {
           const statement = target.prepare(sql);
-          if (!sql.includes("SELECT min(due)")) return statement;
+          if (!sql.includes("SELECT min(job_due)")) return statement;
           calls++;
           return new Proxy(statement, {
             get(item, method) {
@@ -709,7 +709,7 @@ it.each([false, true])("keeps a maintenance retry deadline when the scan fails a
     get(target, key) {
       if (key === "prepare")
         return (sql: string) => {
-          if (sql.includes("SELECT min(due)")) throw new Error("deadline scan unavailable");
+          if (sql.includes("SELECT min(job_due)")) throw new Error("deadline scan unavailable");
           return target.prepare(sql);
         };
       const value = Reflect.get(target, key, target);
