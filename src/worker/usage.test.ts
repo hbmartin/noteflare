@@ -1,6 +1,6 @@
 import { expect, it, vi } from "vitest";
 import type { Env } from "./env";
-import { withUsage, setUsageIdentity, addUsage, usageBindings } from "./usage";
+import { withUsage, backgroundUsage, setUsageIdentity, addUsage, usageBindings } from "./usage";
 import { USAGE_COUNTERS } from "../shared/platform-costs";
 
 function fixture() {
@@ -106,3 +106,58 @@ it("preserves the disabled portable path without allocating proxies or events", 
   });
   expect(f.writeDataPoint).not.toHaveBeenCalled();
 });
+
+it("reports late resource work once in an independent scope without adding HTTP requests", async () => {
+  const { env, writeDataPoint } = fixture();
+  const pending: Promise<unknown>[] = [];
+  const owner = {
+    waitUntil(work: Promise<unknown>) {
+      pending.push(work);
+    },
+  };
+  function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+  const first = deferred(),
+    second = deferred();
+  for (const [workspaceId, gate] of [
+    ["a", first],
+    ["b", second],
+  ] as const) {
+    await withUsage(
+      env,
+      "http",
+      async (scope) => {
+        addUsage({ requests: 1 });
+        backgroundUsage(owner, scope, "document.cleanup", { workspaceId, pageId: "page" }, async (bindings) => {
+          await gate.promise;
+          await bindings.DB.prepare("select 1").all();
+          await bindings.BUCKET.get("object");
+        });
+      },
+      { workspaceId },
+    );
+  }
+  expect(writeDataPoint).toHaveBeenCalledTimes(2);
+  second.resolve();
+  await pending[1];
+  first.resolve();
+  await Promise.all(pending);
+  const points = writeDataPoint.mock.calls.map(([point]) => point);
+  expect(points.map((point) => point.blobs.slice(1))).toEqual([
+    ["a", "", "http"],
+    ["b", "", "http"],
+    ["b", "page", "document.cleanup"],
+    ["a", "page", "document.cleanup"],
+  ]);
+  expect(points.map((point) => counters(point))).toEqual([
+    expect.objectContaining({ requests: 1, r2ClassB: 0, d1RowsRead: 0 }),
+    expect.objectContaining({ requests: 1, r2ClassB: 0, d1RowsRead: 0 }),
+    expect.objectContaining({ requests: 0, r2ClassB: 1, d1RowsRead: 12 }),
+    expect.objectContaining({ requests: 0, r2ClassB: 1, d1RowsRead: 12 }),
+  ]);
+}, 3000);

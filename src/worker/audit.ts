@@ -212,6 +212,8 @@ export async function immutableAuditObject(
   body: string,
   options: R2PutOptions,
   failure: string,
+  verify: (text: string) => boolean = (text) => text === body,
+  maxBytes = Infinity,
 ) {
   let object = await bucket.get(key);
   if (!object) {
@@ -223,7 +225,7 @@ export async function immutableAuditObject(
     }
     object = await bucket.get(key);
   }
-  if (!object || (await object.text()) !== body) throw new Error(failure);
+  if (!object || object.size > maxBytes || !verify(await object.text())) throw new Error(failure);
   return object;
 }
 
@@ -252,30 +254,48 @@ export async function archiveAudit(env: Env) {
     );
     const firstAt = events[0]!.committed_at,
       lastAt = events.at(-1)!.committed_at;
-    const expiresAt = lastAt + retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650) * 86400_000;
+    const configuredDays = retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650);
+    const day = 86400_000;
+    const identity = {
+      schemaVersion: 1,
+      id,
+      workspaceId,
+      key,
+      digest,
+      eventCount: events.length,
+      firstAt,
+      lastAt,
+    };
+    let originalDays = configuredDays;
     const manifest = await immutableAuditObject(
       bucket,
       `${key}.manifest.json`,
-      JSON.stringify({
-        schemaVersion: 1,
-        id,
-        workspaceId,
-        key,
-        digest,
-        eventCount: events.length,
-        firstAt,
-        lastAt,
-        expiresAt,
-      }),
+      JSON.stringify({ ...identity, expiresAt: lastAt + configuredDays * day }),
       { httpMetadata: { contentType: "application/json" } },
       "audit_manifest_verification_failed",
+      (text) => {
+        try {
+          const value = JSON.parse(text);
+          if (
+            !value ||
+            Object.keys(value).length !== Object.keys(identity).length + 1 ||
+            !Object.entries(identity).every(([field, expected]) => value[field] === expected) ||
+            !Number.isSafeInteger(value.expiresAt)
+          )
+            return false;
+          const days = (value.expiresAt - lastAt) / day;
+          if (!Number.isInteger(days) || days < 1 || days > 3650) return false;
+          originalDays = days;
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      4096,
     );
-    // Locks measure age from upload, including a manifest written on a later retry.
-    const deletableAt = Math.max(
-      expiresAt,
-      verified.uploaded.getTime() + retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650) * 86400_000,
-      manifest.uploaded.getTime() + retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650) * 86400_000,
-    );
+    // A retry with a shorter policy cannot shorten the manifest's original retention.
+    const retentionMs = Math.max(originalDays, configuredDays) * day;
+    const deletableAt = Math.max(lastAt, verified.uploaded.getTime(), manifest.uploaded.getTime()) + retentionMs;
     await env.DB.batch([
       env.DB.prepare(
         `INSERT INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)

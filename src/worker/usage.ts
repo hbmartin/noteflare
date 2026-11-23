@@ -131,3 +131,14 @@ export async function withUsage<T>(
     }
   });
 }
+
+/** Start detached work before creating its promises so it cannot update a finished request scope. */
+export function backgroundUsage<T>(
+  owner: { waitUntil(promise: Promise<unknown>): void },
+  env: Env,
+  operation: string,
+  identity: UsageIdentity,
+  task: (bindings: Env) => Promise<T>,
+) {
+  owner.waitUntil(storage.exit(() => withUsage(env, operation, task, identity)));
+}

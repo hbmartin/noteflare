@@ -1,4 +1,4 @@
-import { withUsage, usageBindings } from "./usage";
+import { backgroundUsage, withUsage, usageBindings } from "./usage";
 import { checkpointStatements } from "./document-changes";
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { SLACK_PRODUCT_SESSION_ACCESS_SQL } from "./slack-identity";
@@ -881,7 +881,18 @@ export class Document extends YServer {
       // partyserver runs onStart behind its initialization gate. Never await
       // external journal reads there: recovery has a durable wake and its own queue.
       await this.scheduleCommentAnchorRetry(Date.now() + ALARM_RETRY_DELAY_MS);
-      this.state.waitUntil(this.sweepCommentAnchors().catch((error) => this.retryCommentAnchors(error)));
+      backgroundUsage(
+        this.state,
+        this.bindings,
+        "document.comment_anchor_cleanup",
+        {
+          workspaceId: this.state.storage.sql
+            .exec<{ workspace_id: string }>("SELECT workspace_id FROM audit_identity WHERE id=1")
+            .toArray()[0]?.workspace_id,
+          pageId: this.ids.pageId,
+        },
+        () => this.sweepCommentAnchors().catch((error) => this.retryCommentAnchors(error)),
+      );
     }
   }
 
@@ -2621,16 +2632,21 @@ export class Document extends YServer {
             .bind(superseded, superseded)
             .first())
         ) {
-          this.state.waitUntil(
-            this.bindings.BUCKET.delete(superseded).catch((error: unknown) => {
-              logger.error(
-                "document.projection_delete.failed",
-                "document",
-                "Superseded document projection deletion failed.",
-                { pageId, epoch },
-                error,
-              );
-            }),
+          backgroundUsage(
+            this.state,
+            this.bindings,
+            "document.projection_cleanup",
+            { workspaceId: page.workspace_id, pageId },
+            (env) =>
+              env.BUCKET.delete(superseded).catch((error: unknown) => {
+                logger.error(
+                  "document.projection_delete.failed",
+                  "document",
+                  "Superseded document projection deletion failed.",
+                  { pageId, epoch },
+                  error,
+                );
+              }),
           );
         }
         if (versionStatementIndex >= 0 && !results[versionStatementIndex]?.meta.changes && versionKey) {
@@ -2640,8 +2656,8 @@ export class Document extends YServer {
         }
 
         if (pageProjected && !effectsSuppressed) {
-          this.state.waitUntil(
-            sweepOutbox(this.bindings).catch((error) =>
+          backgroundUsage(this.state, this.bindings, "outbox.sweep", {}, (env) =>
+            sweepOutbox(env).catch((error) =>
               logger.error(
                 "document.webhook_enqueue.failed",
                 "document",
@@ -2659,8 +2675,8 @@ export class Document extends YServer {
           const mentionTargetUserIds = [
             ...new Set([...oldUserTargets.results.map((row) => row.id), ...currentUserTargets.map((row) => row.id)]),
           ];
-          this.state.waitUntil(
-            broadcastWorkspaceEvent(this.bindings, page.workspace_id, {
+          backgroundUsage(this.state, this.bindings, "workspace.broadcast", { workspaceId: page.workspace_id }, (env) =>
+            broadcastWorkspaceEvent(env, page.workspace_id, {
               type: "projection-updated",
               pageId,
               backlinkTargetIds,
@@ -2680,19 +2696,24 @@ export class Document extends YServer {
             metadataAtStart.last_editor_id &&
             (newMentionIds.length || watcherIds.length)
           ) {
-            this.state.waitUntil(
-              Promise.all([
-                broadcastWorkspaceEvent(this.bindings, page.workspace_id, { type: "notifications-invalidated" }),
-                sweepOutbox(this.bindings),
-              ]).catch((error) =>
-                logger.error(
-                  "document.notification_enqueue.failed",
-                  "document",
-                  "Document notification enqueue failed.",
-                  { pageId },
-                  error,
+            backgroundUsage(this.state, this.bindings, "document.notify", {}, (env) =>
+              Promise.allSettled([
+                broadcastWorkspaceEvent(env, page.workspace_id, { type: "notifications-invalidated" }),
+                sweepOutbox(env),
+              ])
+                .then((deliveries) => {
+                  const failure = deliveries.find((result) => result.status === "rejected");
+                  if (failure) throw failure.reason;
+                })
+                .catch((error) =>
+                  logger.error(
+                    "document.notification_enqueue.failed",
+                    "document",
+                    "Document notification enqueue failed.",
+                    { pageId },
+                    error,
+                  ),
                 ),
-              ),
             );
           }
         }
@@ -2726,16 +2747,21 @@ export class Document extends YServer {
         );
 
       if (pageProjected && versionKey) {
-        this.state.waitUntil(
-          this.pruneVersions(pageId).catch((error) => {
-            logger.error(
-              "document.version_prune.failed",
-              "document",
-              "Document version pruning failed.",
-              { pageId },
-              error,
-            );
-          }),
+        backgroundUsage(
+          this.state,
+          this.bindings,
+          "document.version_cleanup",
+          { workspaceId: page?.workspace_id, pageId },
+          () =>
+            this.pruneVersions(pageId).catch((error) => {
+              logger.error(
+                "document.version_prune.failed",
+                "document",
+                "Document version pruning failed.",
+                { pageId },
+                error,
+              );
+            }),
         );
       }
     } catch (error) {
@@ -3104,16 +3130,21 @@ export class Document extends YServer {
             (key): key is string => Boolean(key && key !== structuredKey && key !== thumbnailKey),
           );
           if (oldObjects.length) {
-            this.state.waitUntil(
-              this.bindings.BUCKET.delete(oldObjects).catch((error: unknown) => {
-                logger.error(
-                  "diagram.projection_delete.failed",
-                  "document",
-                  "Superseded diagram projection deletion failed.",
-                  { pageId, epoch },
-                  error,
-                );
-              }),
+            backgroundUsage(
+              this.state,
+              this.bindings,
+              "document.projection_cleanup",
+              { workspaceId: page.workspace_id, pageId },
+              (env) =>
+                env.BUCKET.delete(oldObjects).catch((error: unknown) => {
+                  logger.error(
+                    "diagram.projection_delete.failed",
+                    "document",
+                    "Superseded diagram projection deletion failed.",
+                    { pageId, epoch },
+                    error,
+                  );
+                }),
             );
           }
         }
@@ -3124,8 +3155,8 @@ export class Document extends YServer {
         }
 
         if (pageProjected) {
-          this.state.waitUntil(
-            sweepOutbox(this.bindings).catch((error) =>
+          backgroundUsage(this.state, this.bindings, "outbox.sweep", {}, (env) =>
+            sweepOutbox(env).catch((error) =>
               logger.error(
                 "diagram.webhook_enqueue.failed",
                 "document",
@@ -3143,8 +3174,8 @@ export class Document extends YServer {
           const mentionTargetUserIds = [
             ...new Set([...oldUserTargets.results.map((row) => row.id), ...currentUserTargets.map((row) => row.id)]),
           ];
-          this.state.waitUntil(
-            broadcastWorkspaceEvent(this.bindings, page.workspace_id, {
+          backgroundUsage(this.state, this.bindings, "workspace.broadcast", { workspaceId: page.workspace_id }, (env) =>
+            broadcastWorkspaceEvent(env, page.workspace_id, {
               type: "projection-updated",
               pageId,
               backlinkTargetIds,
@@ -3164,19 +3195,24 @@ export class Document extends YServer {
             metadataAtStart.last_editor_id &&
             (newMentionIds.length || watcherIds.length)
           ) {
-            this.state.waitUntil(
-              Promise.all([
-                broadcastWorkspaceEvent(this.bindings, page.workspace_id, { type: "notifications-invalidated" }),
-                sweepOutbox(this.bindings),
-              ]).catch((error) =>
-                logger.error(
-                  "diagram.notification_enqueue.failed",
-                  "document",
-                  "Diagram notification enqueue failed.",
-                  { pageId },
-                  error,
+            backgroundUsage(this.state, this.bindings, "document.notify", {}, (env) =>
+              Promise.allSettled([
+                broadcastWorkspaceEvent(env, page.workspace_id, { type: "notifications-invalidated" }),
+                sweepOutbox(env),
+              ])
+                .then((deliveries) => {
+                  const failure = deliveries.find((result) => result.status === "rejected");
+                  if (failure) throw failure.reason;
+                })
+                .catch((error) =>
+                  logger.error(
+                    "diagram.notification_enqueue.failed",
+                    "document",
+                    "Diagram notification enqueue failed.",
+                    { pageId },
+                    error,
+                  ),
                 ),
-              ),
             );
           }
         }
@@ -3196,16 +3232,21 @@ export class Document extends YServer {
       this.metadata.snapshot_seq = maximum;
       this.metadata.last_version_at = versionAt;
       if (pageProjected && versionKey) {
-        this.state.waitUntil(
-          this.pruneVersions(pageId).catch((error) =>
-            logger.error(
-              "diagram.version_prune.failed",
-              "document",
-              "Diagram version pruning failed.",
-              { pageId },
-              error,
+        backgroundUsage(
+          this.state,
+          this.bindings,
+          "document.version_cleanup",
+          { workspaceId: page?.workspace_id, pageId },
+          () =>
+            this.pruneVersions(pageId).catch((error) =>
+              logger.error(
+                "diagram.version_prune.failed",
+                "document",
+                "Diagram version pruning failed.",
+                { pageId },
+                error,
+              ),
             ),
-          ),
         );
       }
     } catch (error) {

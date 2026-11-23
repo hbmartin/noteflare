@@ -661,10 +661,17 @@ it("authorizes the cost API freshly before serving a cached workspace report", a
     OBSERVABILITY_DATASET: "cost_test",
     CF_ANALYTICS_API_TOKEN: "private",
   };
-  async function request() {
+  const publicSettings = vi.fn(async () => ({
+    origin: "https://public.example.com",
+    version: "public-version",
+    observedAt: 1,
+    values: { FORMS_ENABLED: { value: false, source: "configured" as const, missing: [] } },
+  }));
+  configured.PUBLIC_OPERATOR_SETTINGS = { getOperatorSettings: publicSettings };
+  async function request(path = "/api/platform/costs") {
     const context = createExecutionContext();
     const response = await worker.fetch(
-      new Request("http://example.test/api/platform/costs", { headers: { cookie } }),
+      new Request(`http://example.test${path}`, { headers: { cookie } }),
       configured,
       context,
     );
@@ -673,7 +680,21 @@ it("authorizes the cost API freshly before serving a cached workspace report", a
   }
   expect((await request()).status).toBe(200);
   expect(fetcher).toHaveBeenCalledTimes(3);
+  const settings = await request("/api/platform");
+  expect(settings.headers.get("cache-control")).toBe("private, no-store");
+  const status = await settings.json();
+  expect(status).toMatchObject({
+    operatorSettings: {
+      application: { values: { COST_REPORTING_ENABLED: { value: true } } },
+      publicWorker: { version: "public-version", values: { FORMS_ENABLED: { value: false } } },
+    },
+  });
+  expect(JSON.stringify(status)).not.toContain('"private"');
+  publicSettings.mockRejectedValueOnce(new Error("Older Worker"));
+  expect(await (await request("/api/platform")).json()).toMatchObject({ operatorSettings: { publicWorker: null } });
   await env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE user_id=?").bind(user!.id).run();
   expect((await request()).status).toBe(403);
+  expect((await request("/api/platform")).status).toBe(403);
+  expect(publicSettings).toHaveBeenCalledTimes(2);
   expect(fetcher).toHaveBeenCalledTimes(3);
 });

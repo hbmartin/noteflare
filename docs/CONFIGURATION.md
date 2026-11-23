@@ -465,6 +465,11 @@ making history calls. After settling, incomplete searches retain timestamp progr
 
 See [the coordinated release runbook](implementation/cloudflare-platform-release.md) for dependency order, Free allowances and deployment gates. No optional paid resources are automatically provisioned.
 
+| Name                          | Meaning                                                                            |
+| ----------------------------- | ---------------------------------------------------------------------------------- |
+| `CANONICAL_REDIRECTS_ENABLED` | Redirect alternate ingress to the canonical Worker origin in managed releases.     |
+| `PUBLIC_OPERATOR_SETTINGS`    | Private service binding for reading public Worker settings in the owner dashboard. |
+
 | Name                         | Meaning                                                                                                                                                                         |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PLATFORM`                   | SQLite PlatformCoordinator binding; durable background recovery in separate alarm invocations.                                                                                  |

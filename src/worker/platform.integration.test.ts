@@ -132,6 +132,43 @@ describe("durable platform release", () => {
     expect(results.filter(Boolean)).toHaveLength(3);
     expect(await env.DB.prepare("SELECT amount FROM platform_usage").first("amount")).toBe(3);
   });
+  it("resumes a verified immutable archive after the retention policy changes", async () => {
+    const day = 86400_000;
+    await auditStatement(env.DB, {
+      id: "retention-retry",
+      workspaceId: "workspace",
+      actorType: "system",
+      actorId: null,
+      action: "page.update",
+      targetType: "page",
+      targetId: "page",
+      outcome: "success",
+      committedAt: Date.now() - day,
+    }).run();
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "batch")
+          return async () => {
+            throw new Error("interrupted D1 commit");
+          };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const config = { ...bindings(), AUDIT_ENABLED: "true" as const };
+    await expect(archiveAudit({ ...config, DB: db, AUDIT_ARCHIVE_DAYS: "400" })).rejects.toThrow("interrupted D1");
+    const manifestKey = (await env.BUCKET.list({ prefix: "audit/" })).objects.find((object) =>
+      object.key.endsWith(".json"),
+    )!.key;
+    const before = (await env.BUCKET.head(manifestKey))!;
+    await archiveAudit({ ...config, AUDIT_ARCHIVE_DAYS: "365" });
+    const archived = await env.DB.prepare("SELECT expires_at FROM audit_archives").first<number>("expires_at");
+    expect(archived).toBeGreaterThanOrEqual(before.uploaded.getTime() + 400 * day);
+    expect((await env.BUCKET.head(manifestKey))?.version).toBe(before.version);
+    expect(
+      await env.DB.prepare("SELECT archive_id FROM audit_events WHERE id='retention-retry'").first("archive_id"),
+    ).toEqual(expect.stringMatching(/^audit:/));
+  });
   it("requires verified archive bytes before pruning old searchable events", async () => {
     const event = {
       id: "event",

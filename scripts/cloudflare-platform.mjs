@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { resolve } from "node:path";
 import { unstable_readConfig } from "wrangler";
@@ -95,31 +95,88 @@ export function edgeRules(profile) {
     },
   };
 }
-function activeVars(profile, sitekey) {
-  return {
+const features = {
+  semantic: "SEMANTIC_SEARCH_ENABLED",
+  images: "IMAGES_ENABLED",
+  publishing: "PUBLIC_PUBLISHING_ENABLED",
+  audit: "AUDIT_ENABLED",
+  turnstile: "TURNSTILE_ENABLED",
+  forms: "FORMS_ENABLED",
+  tables: "TABLE_AUTHORITY_ENABLED",
+  costs: "COST_REPORTING_ENABLED",
+};
+const publicFlags = new Set([
+  features.images,
+  features.publishing,
+  features.turnstile,
+  features.forms,
+  features.tables,
+  features.costs,
+]);
+export function parseActivation(option) {
+  if (option === undefined) return [];
+  const names = option.startsWith("--enable=") ? option.slice(9).split(",") : [];
+  if (!names.length || names.some((name) => !Object.hasOwn(features, name)))
+    throw new Error("Choose features with --enable=" + Object.keys(features).join(","));
+  return [...new Set(names)];
+}
+function liveVars(settings) {
+  if (settings && !Array.isArray(settings.bindings)) throw new Error("Invalid Worker settings readback.");
+  return Object.fromEntries(
+    (settings?.bindings ?? []).filter((binding) => binding.type === "plain_text").map(({ name, text }) => [name, text]),
+  );
+}
+export function settingsFingerprint(settings) {
+  return createHash("sha256")
+    .update(JSON.stringify([!!settings, Object.entries(liveVars(settings)).sort(([a], [b]) => a.localeCompare(b))]))
+    .digest("hex");
+}
+function releaseVars(profile, sitekey, baseline, live, enable, publicWorker = false) {
+  const vars = { ...baseline, ...live };
+  for (const flag of Object.values(features)) {
+    if (publicWorker && !publicFlags.has(flag)) continue;
+    const value = live[flag] ?? "false";
+    if (value !== "true" && value !== "false") throw new Error(`Invalid flag: ${flag}.`);
+    vars[flag] = value;
+  }
+  for (const name of enable) {
+    const flag = features[name];
+    if (!publicWorker || publicFlags.has(flag)) vars[flag] = "true";
+  }
+  Object.assign(vars, {
     BETTER_AUTH_URL: profile.appOrigin,
     PUBLIC_BASE_URL: profile.publicOrigin,
-    AUTH_MODE: "local",
-    SEMANTIC_SEARCH_ENABLED: "true",
-    SEMANTIC_MAX_STORED_CHUNKS: "10000",
-    SEMANTIC_DAILY_QUERY_LIMIT: "2000",
-    SEMANTIC_DAILY_TOKEN_LIMIT: "100000",
-    IMAGES_ENABLED: "true",
-    PUBLIC_PUBLISHING_ENABLED: "true",
-    AUDIT_ENABLED: "true",
-    AUDIT_HOT_DAYS: "30",
-    AUDIT_ARCHIVE_DAYS: "365",
-    TURNSTILE_ENABLED: "true",
     TURNSTILE_SITE_KEY: sitekey,
-    FORMS_ENABLED: "true",
-    TABLE_AUTHORITY_ENABLED: "true",
-    COST_REPORTING_ENABLED: "true",
     OBSERVABILITY_DATASET: profile.dataset,
-    CF_ACCOUNT_ID: profile.account,
-    CF_ZONE_ID: profile.zone,
-  };
+    CANONICAL_REDIRECTS_ENABLED: "true",
+  });
+  if (publicWorker) {
+    // Read back only public settings that this Worker uses.
+    return Object.fromEntries(
+      Object.entries(vars).filter(
+        ([key]) =>
+          publicFlags.has(key) ||
+          [
+            "BETTER_AUTH_URL",
+            "PUBLIC_BASE_URL",
+            "TURNSTILE_SITE_KEY",
+            "OBSERVABILITY_DATASET",
+            "CANONICAL_REDIRECTS_ENABLED",
+            "FORMS_DAILY_LIMIT",
+          ].includes(key),
+      ),
+    );
+  }
+  return { ...vars, AUTH_MODE: vars.AUTH_MODE ?? "local", CF_ACCOUNT_ID: profile.account, CF_ZONE_ID: profile.zone };
 }
-export function deploymentConfigs(profile, databaseId, sitekey, base, publicBase) {
+export function deploymentConfigs(
+  profile,
+  databaseId,
+  sitekey,
+  base,
+  publicBase,
+  { applicationVars = {}, publicVars = {}, enable = [] } = {},
+) {
   const allowed = new Set([
     "name",
     "main",
@@ -136,6 +193,7 @@ export function deploymentConfigs(profile, databaseId, sitekey, base, publicBase
     "durable_objects",
     "workflows",
     "queues",
+    "pipelines",
     "ratelimits",
     "migrations",
     "triggers",
@@ -147,7 +205,7 @@ export function deploymentConfigs(profile, databaseId, sitekey, base, publicBase
   publicBase = Object.fromEntries(Object.entries(publicBase).filter(([key]) => allowed.has(key)));
   const shared = {
     account_id: profile.account,
-    workers_dev: false,
+    workers_dev: true,
     preview_urls: false,
     ai: { binding: "AI" },
     images: { binding: "IMAGES" },
@@ -166,7 +224,7 @@ export function deploymentConfigs(profile, databaseId, sitekey, base, publicBase
     ...shared,
     name: profile.name,
     main: resolve("src/worker/index.ts"),
-    assets: { ...base.assets, directory: resolve("dist/client") },
+    assets: { ...base.assets, binding: "ASSETS", run_worker_first: true, directory: resolve("dist/client") },
     routes: [{ pattern: new URL(profile.appOrigin).hostname, custom_domain: true }],
     r2_buckets: [
       { binding: "BUCKET", bucket_name: profile.original },
@@ -174,7 +232,8 @@ export function deploymentConfigs(profile, databaseId, sitekey, base, publicBase
       { binding: "AUDIT_BUCKET", bucket_name: profile.audit },
     ],
     vectorize: [{ binding: "SEMANTIC_INDEX", index_name: profile.index }],
-    vars: { ...base.vars, ...activeVars(profile, sitekey) },
+    services: [{ binding: "PUBLIC_OPERATOR_SETTINGS", service: profile.publicName }],
+    vars: releaseVars(profile, sitekey, base.vars, applicationVars, enable),
   };
   if (profile.environment === "staging") {
     application.workflows = [
@@ -196,7 +255,6 @@ export function deploymentConfigs(profile, databaseId, sitekey, base, publicBase
       ],
     };
   }
-  if (base.vars.AUTH_MODE === "access_required") application.vars.AUTH_MODE = "access_required";
   const publicWorker = {
     ...publicBase,
     ...shared,
@@ -207,25 +265,16 @@ export function deploymentConfigs(profile, databaseId, sitekey, base, publicBase
     durable_objects: {
       bindings: publicBase.durable_objects.bindings.map((binding) => ({ ...binding, script_name: profile.name })),
     },
-    vars: Object.fromEntries(
-      Object.entries({ ...publicBase.vars, ...activeVars(profile, sitekey) }).filter(
-        ([key]) =>
-          ![
-            "AUTH_MODE",
-            "CF_ACCOUNT_ID",
-            "CF_ZONE_ID",
-            "SEMANTIC_SEARCH_ENABLED",
-            "SEMANTIC_MAX_STORED_CHUNKS",
-            "SEMANTIC_DAILY_QUERY_LIMIT",
-            "SEMANTIC_DAILY_TOKEN_LIMIT",
-            "AUDIT_ENABLED",
-            "AUDIT_HOT_DAYS",
-            "AUDIT_ARCHIVE_DAYS",
-          ].includes(key),
-      ),
-    ),
+    vars: releaseVars(profile, sitekey, publicBase.vars, publicVars, enable, true),
   };
   delete publicWorker.ai;
+  if (profile.environment === "staging") {
+    for (const worker of [application, publicWorker])
+      worker.ratelimits = (worker.ratelimits ?? []).map((binding) => ({
+        ...binding,
+        namespace_id: String(Number(binding.namespace_id) + 1000),
+      }));
+  }
   return { application, publicWorker };
 }
 const equal = isDeepStrictEqual;
@@ -236,14 +285,30 @@ function contains(actual, expected) {
 }
 async function policy(api, path, wanted, apply) {
   const current = await api(path);
+  if (path.endsWith("/lock")) {
+    wanted = wanted.map((desired) => {
+      const rule = current.rules?.find((item) => item.id === desired.id && item.enabled);
+      if (!rule) return desired;
+      const oldPrefix = rule.prefix ?? "";
+      const covers = desired.prefix.startsWith(oldPrefix);
+      const duration = rule.condition?.maxAgeSeconds;
+      if (
+        covers &&
+        (rule.condition?.type === "Indefinite" ||
+          (rule.condition?.type === "Age" && duration >= desired.condition.maxAgeSeconds))
+      )
+        return rule;
+      if (
+        rule.condition?.type !== "Age" ||
+        !Number.isSafeInteger(duration) ||
+        duration > desired.condition.maxAgeSeconds ||
+        !oldPrefix.startsWith(desired.prefix)
+      )
+        throw new Error("Refusing to weaken an existing audit lock.");
+      return desired;
+    });
+  }
   for (const rule of current.rules ?? []) {
-    if (
-      path.endsWith("/lock") &&
-      wanted.some((item) => item.id === rule.id) &&
-      rule.enabled &&
-      (rule.condition?.type !== "Age" || rule.condition.maxAgeSeconds > 365 * DAY)
-    )
-      throw new Error("Refusing to weaken an existing audit lock.");
     if (
       path.endsWith("/lifecycle") &&
       rule.enabled &&
@@ -268,28 +333,64 @@ async function policy(api, path, wanted, apply) {
   }
   return { path, changed: !equal(rules, current.rules ?? []) };
 }
+async function inventory(api, path, { cursor = false, select = (value) => value } = {}) {
+  const items = [];
+  const seen = new Set();
+  let next;
+  for (let page = 1; page <= 1000; page++) {
+    const query = new URLSearchParams({ per_page: "100" });
+    if (cursor) {
+      if (next) query.set("cursor", next);
+    } else query.set("page", String(page));
+    const { result, result_info: info } = await api(`${path}${path.includes("?") ? "&" : "?"}${query}`, {
+      paginated: true,
+    });
+    const batch = select(result);
+    if (!Array.isArray(batch)) throw new Error("Cloudflare returned an invalid resource inventory.");
+    items.push(...batch);
+    if (cursor) {
+      next = info?.cursor;
+      if (!next) return items;
+      if (seen.has(next)) throw new Error("Cloudflare repeated a resource inventory cursor.");
+      seen.add(next);
+    } else if (
+      typeof info?.total_pages === "number" ? page >= info.total_pages : batch.length < (info?.per_page || 100)
+    ) {
+      return items;
+    }
+  }
+  throw new Error("Cloudflare resource inventory exceeded the page limit.");
+}
+function exactMatch(items, name, field = "name") {
+  const matches = items.filter((item) => item[field] === name);
+  if (matches.length > 1) throw new Error(`Ambiguous Cloudflare resource: ${name}.`);
+  return matches[0];
+}
+function findWidget(profile, api) {
+  return inventory(api, "/challenges/widgets").then((widgets) => exactMatch(widgets, `${profile.name}-platform`));
+}
 export async function provision(
   profile,
   api,
   { apply = false, directory = resolve(`.wrangler/platform/${profile.environment}`) } = {},
 ) {
   const changes = [];
-  const buckets = await api("/r2/buckets");
+  const buckets = await inventory(api, "/r2/buckets", { cursor: true, select: (value) => value?.buckets });
   for (const name of [profile.original, profile.publications, profile.audit]) {
-    if (!buckets.buckets.some((bucket) => bucket.name === name)) {
+    if (!buckets.some((bucket) => bucket.name === name)) {
       changes.push(`create private bucket ${name}`);
       if (apply) await api("/r2/buckets", { method: "POST", body: { name } });
     }
-    if (!apply && !buckets.buckets.some((bucket) => bucket.name === name)) continue;
+    if (!apply && !buckets.some((bucket) => bucket.name === name)) continue;
     const managed = await api(`/r2/buckets/${name}/domains/managed`);
     const custom = await api(`/r2/buckets/${name}/domains/custom`);
     if (managed.enabled || custom.domains?.some((domain) => domain.enabled))
       throw new Error(`Bucket ${name} has public access; refuse to expose installation storage.`);
   }
   const rules = retentionRules();
-  if (apply || buckets.buckets.some((bucket) => bucket.name === profile.audit))
+  if (apply || buckets.some((bucket) => bucket.name === profile.audit))
     changes.push(await policy(api, `/r2/buckets/${profile.audit}/lock`, [rules.lock], apply));
-  if (apply || buckets.buckets.some((bucket) => bucket.name === profile.original))
+  if (apply || buckets.some((bucket) => bucket.name === profile.original))
     changes.push(await policy(api, `/r2/buckets/${profile.original}/lifecycle`, rules.lifecycle, apply));
   let index = await api(`/vectorize/v2/indexes/${profile.index}`, { allowMissing: true });
   if (!index) {
@@ -331,8 +432,7 @@ export async function provision(
       }
     }
   }
-  const widgets = await api("/challenges/widgets?per_page=100");
-  let widget = widgets.find((item) => item.name === `${profile.name}-platform`);
+  let widget = await findWidget(profile, api);
   const domains = [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname];
   if (widget && !domains.every((domain) => widget.domains.includes(domain)))
     throw new Error("Existing Turnstile widget has different hostnames; update it explicitly.");
@@ -350,10 +450,8 @@ export async function provision(
       });
     }
   }
-  const databases = await api("/d1/database?per_page=100");
-  let database = databases.find(
-    (item) => item.name === (profile.environment === "production" ? "cloudflare-realtime-notes" : profile.name),
-  );
+  const databases = await inventory(api, `/d1/database?name=${encodeURIComponent(profile.name)}`);
+  let database = exactMatch(databases, profile.name);
   if (!database) {
     changes.push("create staging D1 database");
     if (apply && profile.environment === "staging")
@@ -362,16 +460,16 @@ export async function provision(
   if (!database && profile.environment === "production")
     throw new Error("Production database missing; refusing to create a replacement.");
   if (profile.environment === "staging") {
-    const queues = await api("/queues?per_page=100");
+    const queues = await inventory(api, "/queues");
     for (const queue_name of [`${profile.name}-delivery`, `${profile.name}-dlq`])
-      if (!queues.some((queue) => queue.queue_name === queue_name)) {
+      if (!exactMatch(queues, queue_name, "queue_name")) {
         changes.push(`create staging queue ${queue_name}`);
         if (apply) await api("/queues", { method: "POST", body: { queue_name } });
       }
   }
   return { changes, databaseId: database?.uuid ?? database?.id, sitekey: widget?.sitekey };
 }
-export async function prepare(profile, api, directory, cutoverReady = false) {
+export async function prepare(profile, api, directory, cutoverReady = false, enable = []) {
   const state = await provision(profile, api);
   if (
     !state.databaseId ||
@@ -379,12 +477,11 @@ export async function prepare(profile, api, directory, cutoverReady = false) {
     state.changes.some((change) => typeof change === "string" || change.changed)
   )
     throw new Error("Platform resources are not ready. Run platform:provision apply and repeat preflight.");
-  const settings = await api(`/workers/scripts/${profile.name}/settings`, { allowMissing: true });
-  const saved = Object.fromEntries(
-    (settings?.bindings ?? [])
-      .filter((binding) => binding.type === "plain_text")
-      .map((binding) => [binding.name, binding.text]),
+  const [settings, publicSettings] = await Promise.all(
+    [profile.name, profile.publicName].map((name) => api(`/workers/scripts/${name}/settings`, { allowMissing: true })),
   );
+  const saved = liveVars(settings);
+  if (profile.environment === "production" && !settings) throw new Error("Production Worker settings are missing.");
   if (profile.environment === "production" && saved.BETTER_AUTH_URL !== profile.appOrigin && !cutoverReady)
     throw new Error(
       "Origin cutover requires completed staging acceptance and verified owner recovery; set PLATFORM_CUTOVER_READY=true only after those checks.",
@@ -396,24 +493,15 @@ export async function prepare(profile, api, directory, cutoverReady = false) {
     state.databaseId !== base.d1_databases.find((binding) => binding.binding === "DB")?.database_id
   )
     throw new Error("Production database identity differs from the reviewed configuration; refusing a replacement.");
-  // Preserve an explicitly enabled operator Access configuration and installed integrations.
-  base.vars = { ...base.vars, ...saved };
-  const configs = deploymentConfigs(profile, state.databaseId, state.sitekey, base, publicBase);
-  if (saved.AUTH_MODE === "access_required") configs.application.vars.AUTH_MODE = saved.AUTH_MODE;
+  const configs = deploymentConfigs(profile, state.databaseId, state.sitekey, base, publicBase, {
+    applicationVars: saved,
+    publicVars: liveVars(publicSettings),
+    enable,
+  });
   const secretNames = (settings?.bindings ?? [])
     .filter((binding) => binding.type === "secret_text")
     .map((binding) => binding.name);
-  const analyticsReady = secretNames.includes("CF_ANALYTICS_API_TOKEN");
-  // Staging can exercise the included products before the operator supplies SQL access.
-  // Production remains gated on the complete owner-reporting configuration.
-  if (!analyticsReady && profile.environment === "staging") {
-    configs.application.vars.COST_REPORTING_ENABLED = "false";
-    configs.publicWorker.vars.COST_REPORTING_ENABLED = "false";
-  }
   validatePlatformConfiguration(configs.application, { secretNames });
-  if (!analyticsReady && profile.environment === "production")
-    throw new Error("Configure the application’s CF_ANALYTICS_API_TOKEN with Account Analytics Read.");
-  const publicSettings = await api(`/workers/scripts/${profile.publicName}/settings`, { allowMissing: true });
   validatePlatformConfiguration(configs.publicWorker, {
     publicWorker: true,
     secretNames: (publicSettings?.bindings ?? [])
@@ -423,10 +511,16 @@ export async function prepare(profile, api, directory, cutoverReady = false) {
   mkdirSync(directory, { recursive: true });
   for (const [name, config] of Object.entries(configs))
     writeFileSync(resolve(directory, `${name}.jsonc`), JSON.stringify(config, null, 2) + "\n");
+  writeFileSync(
+    resolve(directory, "settings-fingerprints.json"),
+    JSON.stringify({
+      [profile.name]: settingsFingerprint(settings),
+      [profile.publicName]: settingsFingerprint(publicSettings),
+    }) + "\n",
+  );
   return {
     application: resolve(directory, "application.jsonc"),
     publicWorker: resolve(directory, "publicWorker.jsonc"),
-    analytics: analyticsReady ? "configured" : "unavailable; staging product checks may proceed without SQL access",
   };
 }
 export async function configureEdges(
@@ -507,20 +601,20 @@ export async function configureEdges(
         throw new Error("Schema evaluation readback failed.");
       if (enforceSchema) {
         const entry = await api(`${zone}/rulesets/phases/http_request_firewall_custom/entrypoint`);
-        const ref = schemaRef,
-          existing = entry.rules?.find((item) => item.ref === ref);
+        const existing = entry.rules?.find((item) => item.ref === schemaRef);
+        const rule = {
+          ref: schemaRef,
+          action: "block",
+          enabled: true,
+          description: "NoteFlare evaluated API schema",
+          expression: `(http.host eq "${new URL(profile.appOrigin).hostname}" and starts_with(http.request.uri.path, "/v1/") and cf.schema_validation.uploaded.violated)`,
+        };
         await api(`${zone}/rulesets/${entry.id}/rules${existing ? `/${existing.id}` : ""}`, {
           method: existing ? "PATCH" : "POST",
-          body: {
-            ref,
-            action: "block",
-            enabled: true,
-            description: "NoteFlare evaluated API schema",
-            expression: `(http.host eq "${new URL(profile.appOrigin).hostname}" and starts_with(http.request.uri.path, "/v1/") and cf.schema_validation.uploaded.violated)`,
-          },
+          body: rule,
         });
         const readback = await api(`${zone}/rulesets/phases/http_request_firewall_custom/entrypoint`);
-        if (!readback.rules?.some((rule) => rule.ref === ref && rule.enabled && rule.action === "block"))
+        if (!readback.rules?.some((item) => contains(item, rule)))
           throw new Error("Schema mitigation readback failed.");
       }
     }
@@ -528,8 +622,8 @@ export async function configureEdges(
   return results;
 }
 async function configureFreeManaged(profile, api, apply) {
-  const inventory = await api("/__zone/rulesets");
-  const free = inventory.find(
+  const rulesets = await api("/__zone/rulesets");
+  const free = rulesets.find(
     (item) =>
       item.kind === "managed" &&
       item.phase === "http_request_firewall_managed" &&
@@ -580,36 +674,59 @@ async function configureFreeManaged(profile, api, apply) {
 }
 /** Create unreachable shells so secrets can be installed before any public route. */
 export async function bootstrap(profile, api, directory, environment = process.env, execute = spawnSync) {
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
   const secretsPath = resolve(directory, "bootstrap.env");
   let authSecret = environment.BETTER_AUTH_SECRET;
   if (profile.environment === "production" && !authSecret)
     throw new Error(
       "BETTER_AUTH_SECRET must be supplied from the existing production installation; it is never generated or replaced.",
     );
+  const names = profile.environment === "staging" ? [profile.name, profile.publicName] : [profile.publicName];
+  const states = await Promise.all(
+    names.map((name) => api(`/workers/scripts/${name}/settings`, { allowMissing: true })),
+  );
+  for (const state of states) liveVars(state);
+  let bootstrapToken = environment.BOOTSTRAP_TOKEN;
+  const stagingSetupPending = profile.environment === "staging" && !liveVars(states[0]).BETTER_AUTH_URL;
   if (profile.environment === "staging") {
-    if (existsSync(secretsPath))
-      authSecret = readFileSync(secretsPath, "utf8").match(/^BETTER_AUTH_SECRET=(.+)$/m)?.[1];
-    else {
+    const local = existsSync(secretsPath) ? readFileSync(secretsPath, "utf8") : "";
+    const recorded = local.match(/^BETTER_AUTH_SECRET=(.+)$/m)?.[1];
+    const recordedBootstrap = local.match(/^BOOTSTRAP_TOKEN=(.+)$/m)?.[1];
+    if (
+      (recorded && authSecret && recorded !== authSecret) ||
+      (recordedBootstrap && bootstrapToken && recordedBootstrap !== bootstrapToken)
+    )
+      throw new Error("Supplied staging credentials conflict with the recorded installation credentials.");
+    authSecret ??= recorded;
+    bootstrapToken ??= recordedBootstrap;
+    if (states.some(Boolean) && !authSecret) throw new Error("Supply the original staging BETTER_AUTH_SECRET.");
+    if (!states.some(Boolean)) {
       authSecret ??= randomBytes(48).toString("base64url");
-      writeFileSync(
-        secretsPath,
-        `BETTER_AUTH_SECRET=${authSecret}\nBOOTSTRAP_TOKEN=${randomBytes(48).toString("base64url")}\n`,
-        { mode: 0o600, flag: "wx" },
-      );
+      bootstrapToken ??= randomBytes(48).toString("base64url");
+    }
+    if (
+      stagingSetupPending &&
+      !states[0]?.bindings?.some((binding) => binding.type === "secret_text" && binding.name === "BOOTSTRAP_TOKEN") &&
+      !bootstrapToken
+    )
+      throw new Error("Supply the original staging BOOTSTRAP_TOKEN.");
+    if (!local && authSecret.length >= 32 && !states.some(Boolean)) {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      writeFileSync(secretsPath, `BETTER_AUTH_SECRET=${authSecret}\nBOOTSTRAP_TOKEN=${bootstrapToken}\n`, {
+        mode: 0o600,
+        flag: "wx",
+      });
     }
   }
   if (!authSecret || authSecret.length < 32) throw new Error("A valid installation authentication secret is required.");
-  const widgets = await api("/challenges/widgets?per_page=100");
-  const widget = widgets.find((item) => item.name === `${profile.name}-platform`);
+  const widget = await findWidget(profile, api);
   if (!widget) throw new Error("Provision the environment’s Turnstile widget first.");
   const challenge = await api(`/challenges/widgets/${widget.sitekey}`);
   if (!challenge.secret) throw new Error("Turnstile secret is unavailable; configure Worker secrets explicitly.");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
   const workerPath = resolve(directory, "bootstrap-worker.mjs");
   writeFileSync(workerPath, 'export default { fetch() { return new Response("Not found.", { status: 404 }); } };\n');
-  const names = profile.environment === "staging" ? [profile.name, profile.publicName] : [profile.publicName];
-  for (const name of names) {
-    const settings = await api(`/workers/scripts/${name}/settings`, { allowMissing: true });
+  for (const [index, name] of names.entries()) {
+    const settings = states[index];
     if (!settings) {
       const path = resolve(directory, `bootstrap-${name}.jsonc`);
       writeFileSync(
@@ -631,46 +748,51 @@ export async function bootstrap(profile, api, directory, environment = process.e
       );
       if (result.status !== 0) throw new Error("Private Worker shell deployment failed.");
     }
-    await api(`/workers/scripts/${name}/secrets`, {
-      method: "PUT",
-      body: { name: "BETTER_AUTH_SECRET", text: authSecret, type: "secret_text" },
-    });
-    await api(`/workers/scripts/${name}/secrets`, {
-      method: "PUT",
-      body: { name: "TURNSTILE_SECRET_KEY", text: challenge.secret, type: "secret_text" },
-    });
-    if (name === profile.name) {
-      const bootstrapToken = readFileSync(secretsPath, "utf8").match(/^BOOTSTRAP_TOKEN=(.+)$/m)?.[1];
+    for (const [key, value] of [
+      ["BETTER_AUTH_SECRET", authSecret],
+      ["TURNSTILE_SECRET_KEY", challenge.secret],
+      ...(name === profile.name && stagingSetupPending ? [["BOOTSTRAP_TOKEN", bootstrapToken]] : []),
+    ]) {
+      if (settings?.bindings.some((binding) => binding.name === key && binding.type === "secret_text")) continue;
       await api(`/workers/scripts/${name}/secrets`, {
         method: "PUT",
-        body: { name: "BOOTSTRAP_TOKEN", text: bootstrapToken, type: "secret_text" },
+        body: { name: key, text: value, type: "secret_text" },
       });
     }
   }
-  // Production application identity stays untouched. Install only the new product credentials.
-  await api(`/workers/scripts/${profile.name}/secrets`, {
-    method: "PUT",
-    body: { name: "TURNSTILE_SECRET_KEY", text: challenge.secret, type: "secret_text" },
-  });
+  if (profile.environment === "production")
+    await api(`/workers/scripts/${profile.name}/secrets`, {
+      method: "PUT",
+      body: { name: "TURNSTILE_SECRET_KEY", text: challenge.secret, type: "secret_text" },
+    });
   if (environment.CF_ANALYTICS_API_TOKEN)
     await api(`/workers/scripts/${profile.name}/secrets`, {
       method: "PUT",
       body: { name: "CF_ANALYTICS_API_TOKEN", text: environment.CF_ANALYTICS_API_TOKEN, type: "secret_text" },
     });
   return {
-    publicIngress: "disabled until the coordinated deployment",
+    publicIngress: states.at(-1) ? "unchanged; unverified" : "private shell; ingress disabled",
     secrets: "installed without changing production application identity",
   };
 }
+export async function platformConnection(profile, options) {
+  if (process.env.CLOUDFLARE_ACCOUNT_ID && process.env.CLOUDFLARE_ACCOUNT_ID !== profile.account)
+    throw new Error("Cloudflare account override differs from the selected platform profile.");
+  const connection = await cloudflare(profile.account, options);
+  if (connection.account !== profile.account) throw new Error("Cloudflare account differs from the selected profile.");
+  return connection;
+}
 export async function main(argv = process.argv.slice(2)) {
-  const [command = "plan", environment = "production"] = argv;
+  const [command = "plan", environment = "production", option, ...extra] = argv;
+  if (extra.length || (option && command !== "prepare")) throw new Error("Only prepare accepts --enable.");
+  const enable = parseActivation(option);
   if (!["plan", "apply", "prepare", "bootstrap", "edges-plan", "edges-apply"].includes(command))
     throw new Error(
       "Usage: cloudflare-platform.mjs plan|apply|prepare|bootstrap|edges-plan|edges-apply [production|staging]",
     );
   const profile = platformProfile(environment),
     directory = resolve(`.wrangler/platform/${environment}`);
-  const { api } = await cloudflare(profile.account, {
+  const { api } = await platformConnection(profile, {
     request: (url, options) => {
       const zoneRequest = url.includes("/__zone/");
       if (zoneRequest && !process.env.CF_EDGE_API_TOKEN)
@@ -692,7 +814,7 @@ export async function main(argv = process.argv.slice(2)) {
     : command === "bootstrap"
       ? await bootstrap(profile, api, directory)
       : command === "prepare"
-        ? await prepare(profile, api, directory, process.env.PLATFORM_CUTOVER_READY === "true")
+        ? await prepare(profile, api, directory, process.env.PLATFORM_CUTOVER_READY === "true", enable)
         : await provision(profile, api, { apply: command === "apply", directory });
   console.log(JSON.stringify(result, null, 2));
 }

@@ -1,7 +1,10 @@
+import { OperatorSettingsView } from "./OperatorSettings";
+import type { OperatorSettings } from "../shared/operator-settings";
 import { useCallback, useEffect, useState } from "react";
 import { api, apiErrorMessage, json } from "./api";
 import { PlatformCosts } from "./PlatformCosts";
 type Status = {
+  operatorSettings?: OperatorSettings;
   capabilities: Record<string, { enabled: boolean; ready: boolean; missing: string[] }>;
   jobs: { kind: string; pending: number; oldestAt: number; failures: number }[];
   usage: { metric: string; period: string; amount: number }[];
@@ -100,6 +103,7 @@ export function PlatformSettings() {
       </button>
       {status && (
         <>
+          {status.operatorSettings && <OperatorSettingsView settings={status.operatorSettings} />}
           <table>
             <thead>
               <tr>

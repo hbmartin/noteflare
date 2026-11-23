@@ -1,3 +1,4 @@
+import type { OperatorSnapshot } from "../shared/operator-settings";
 import type { Document } from "./document";
 import type { TableAuthority } from "./table-authority";
 import type { WorkspaceEvents } from "./workspace-events";
@@ -42,6 +43,8 @@ export interface AppBindings {
   ASSETS: Fetcher;
   BETTER_AUTH_SECRET: string;
   BETTER_AUTH_URL: string;
+  CANONICAL_REDIRECTS_ENABLED?: "true";
+  PUBLIC_OPERATOR_SETTINGS?: { getOperatorSettings(): Promise<OperatorSnapshot> };
   BOOTSTRAP_TOKEN: string;
   DO_LOCATION_HINT?: DurableObjectLocationHint;
   WORKFLOW_INLINE?: "true";
@@ -116,7 +119,9 @@ declare global {
   namespace Cloudflare {
     interface Env extends Omit<
       AppBindings,
+      | "ASSETS"
       | "BROWSER"
+      | "PUBLIC_OPERATOR_SETTINGS"
       | "CHATGPT_CONNECTION_ENABLED"
       | "EXPANDED_EMBEDS_ENABLED"
       | "EDITOR_BLOCKS_V2_ENABLED"

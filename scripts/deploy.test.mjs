@@ -19,6 +19,7 @@ import {
   integrityDatabaseID,
   queryD1,
   selectTarget,
+  assertSingleWorkerTarget,
   verifyBuild,
   withSecretsFile,
 } from "./deploy.mjs";
@@ -475,6 +476,9 @@ describe("deployment targets and portable configuration", () => {
     expect(selectTarget({ ...selection, environment: "staging" })).toBe("staging");
     expect(selectTarget({ ...selection, environment: "", workersCI: false })).toBe("");
     expect(selectTarget({ ...selection, environment: "production", forced: "portable" })).toBe("");
+    expect(() => assertSingleWorkerTarget(selection.name, production.name, true)).toThrow("coordinated");
+    expect(() => assertSingleWorkerTarget("new-notes", production.name, true)).not.toThrow();
+
     expect(selectTarget({ ...selection, forced: "production", settings: null })).toBe("production");
   });
   it("resolves an exact origin and preserves custom domains", () => {

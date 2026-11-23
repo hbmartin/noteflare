@@ -1,11 +1,16 @@
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { unstable_readConfig } from "wrangler";
 import { validatePlatformConfiguration } from "./platform-config.mjs";
-import { platformProfile } from "./cloudflare-platform.mjs";
+import { platformConnection, platformProfile, settingsFingerprint } from "./cloudflare-platform.mjs";
 
-export function deployPlatform(environment = "production", execute = spawnSync, { dryRun = false } = {}) {
+export async function deployPlatform(
+  environment = "production",
+  execute = spawnSync,
+  { dryRun = false, connect = platformConnection, readFingerprints } = {},
+) {
   const profile = platformProfile(environment);
   const files = [
     resolve(`.wrangler/platform/${environment}/application.jsonc`),
@@ -18,8 +23,15 @@ export function deployPlatform(environment = "production", execute = spawnSync, 
     if (
       config.account_id !== profile.account ||
       config.name !== (index ? profile.publicName : profile.name) ||
-      config.workers_dev !== false ||
+      config.workers_dev !== true ||
       config.preview_urls !== false ||
+      config.vars.CANONICAL_REDIRECTS_ENABLED !== "true" ||
+      (!index &&
+        (config.assets?.run_worker_first !== true ||
+          config.assets.binding !== "ASSETS" ||
+          !config.services?.some(
+            (binding) => binding.binding === "PUBLIC_OPERATOR_SETTINGS" && binding.service === profile.publicName,
+          ))) ||
       config.vars.BETTER_AUTH_URL !== profile.appOrigin ||
       config.vars.PUBLIC_BASE_URL !== profile.publicOrigin ||
       config.routes?.length !== 1 ||
@@ -51,7 +63,15 @@ export function deployPlatform(environment = "production", execute = spawnSync, 
     if (check.status !== 0) throw new Error("Coordinated Worker dry build failed.");
   }
   if (dryRun) return;
-  for (const path of files) {
+  const fingerprints = readFingerprints
+    ? readFingerprints()
+    : JSON.parse(readFileSync(resolve(`.wrangler/platform/${environment}/settings-fingerprints.json`), "utf8"));
+  const { api } = await connect(profile);
+  for (const [index, path] of files.entries()) {
+    const name = index ? profile.publicName : profile.name;
+    const settings = await api(`/workers/scripts/${name}/settings`, { allowMissing: true });
+    if (settingsFingerprint(settings) !== fingerprints[name])
+      throw new Error(`Live settings for ${name} changed after preparation. Prepare again before deploying.`);
     const result = execute(process.execPath, [wrangler, "deploy", "--config", path], { stdio: "inherit" });
     if (result.status !== 0)
       throw new Error(
@@ -63,7 +83,7 @@ if (import.meta.main) {
   try {
     if (process.argv.slice(3).some((option) => option !== "--dry-run"))
       throw new Error("Usage: deploy-platform.mjs [production|staging] [--dry-run]");
-    deployPlatform(process.argv[2] ?? "production", spawnSync, { dryRun: process.argv.includes("--dry-run") });
+    await deployPlatform(process.argv[2] ?? "production", spawnSync, { dryRun: process.argv.includes("--dry-run") });
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;
