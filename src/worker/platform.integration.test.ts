@@ -12,6 +12,7 @@ import {
 } from "./platform-jobs";
 import { finalizeHeatmaps, heatmapWeek, readHeatmap } from "./heatmaps";
 import { backgroundUsage, withUsage } from "./usage";
+import { logger } from "./observability";
 
 beforeEach(async () => {
   await reset();
@@ -315,7 +316,7 @@ describe("durable platform release", () => {
       }
     },
   );
-  it("reconciles a legacy expiry from the newer manifest upload before deleting either object", async () => {
+  it("extends physical retention after a policy increase without rewriting the legacy owner expiry", async () => {
     await env.DB.prepare(
       "INSERT INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at) VALUES('legacy','workspace','audit/legacy','digest',1,1,1,1,1)",
     ).run();
@@ -329,13 +330,57 @@ describe("durable platform release", () => {
       ...bindings(),
       AUDIT_ENABLED: "true",
       AUDIT_BUCKET: bucket,
-      AUDIT_ARCHIVE_DAYS: "1",
+      AUDIT_ARCHIVE_DAYS: "730",
       AUDIT_ARCHIVE_LOCK_DAYS: "365",
     });
     expect(remove).not.toHaveBeenCalled();
     expect(
       await env.DB.prepare("SELECT expires_at,cleanup_not_before FROM audit_archives WHERE id='legacy'").first(),
-    ).toEqual({ expires_at: 1, cleanup_not_before: uploaded + 365 * 86400_000 });
+    ).toEqual({ expires_at: 1, cleanup_not_before: uploaded + 730 * 86400_000 });
+  });
+  it("logs a safe transient cleanup failure and retries on the next eligible maintenance run", async () => {
+    const started = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(started);
+    const warn = vi.spyOn(logger, "warn");
+    const key = "audit/retry.ndjson";
+    const objects = new Set([key, `${key}.manifest.json`]);
+    await env.DB.prepare(
+      `INSERT INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at)
+       VALUES('retry','workspace',?,'digest',1,1,1,1,1)`,
+    )
+      .bind(key)
+      .run();
+    const remove = vi.fn(async (keys: string[]) => {
+      if (Date.now() === started) throw Object.assign(new Error("private provider detail"), { status: 503 });
+      for (const objectKey of keys) objects.delete(objectKey);
+    });
+    const bucket = {
+      delete: remove,
+      head: async (object: string) => (objects.has(object) ? { uploaded: new Date(1) } : null),
+    } as unknown as R2Bucket;
+    const configured: Env = { ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket };
+    const pointer = () =>
+      env.DB.prepare("SELECT expires_at,cleanup_not_before FROM audit_archives WHERE id='retry'").first();
+    try {
+      await archiveAudit(configured);
+      expect(await pointer()).toEqual({ expires_at: 1, cleanup_not_before: started + 600_000 });
+      expect(warn).toHaveBeenCalledWith(
+        "audit.archive.delete_deferred",
+        "platform",
+        "Audit archive deletion will be retried",
+        { step: "delete", reason: "transient" },
+      );
+      clock.mockReturnValue(started + 599_999);
+      await archiveAudit(configured);
+      expect(remove).toHaveBeenCalledTimes(1);
+      clock.mockReturnValue(started + 600_000);
+      await archiveAudit(configured);
+      expect(await pointer()).toBeNull();
+      expect(objects.size).toBe(0);
+    } finally {
+      clock.mockRestore();
+      warn.mockRestore();
+    }
   });
   it("publishes only finalized exact five-reader groups and never exports reader keys", async () => {
     const week = heatmapWeek(Date.now()) - 7 * 86400_000;

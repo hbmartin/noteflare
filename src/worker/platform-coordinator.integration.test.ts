@@ -118,6 +118,123 @@ it("accounts for active job leases when choosing the next maintenance deadline",
   expect((await alarmAt(10, {})).alarm).toBe(lease);
 });
 
+function recoveryJob(id: string, due: number, lease: number | null = null) {
+  return env.DB.prepare(
+    `INSERT INTO platform_jobs(id,workspace_id,kind,job_key,generation,payload_json,available_at,created_at,updated_at,lease_until)
+     VALUES(?,'workspace','semantic',?,'1','{}',?,0,0,?)`,
+  ).bind(id, id, due, lease);
+}
+
+it.each([false, true])("keeps due jobs eligible after a failed scan (Queue %s)", async (useQueue) => {
+  const now = Date.now();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  const wasSent = vi.fn(async () => {
+    throw new Error("Queue unavailable");
+  });
+  await env.DB.batch([recoveryJob("first", now - 2), recoveryJob("second", now - 1)]);
+  try {
+    await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
+      const mutable = instance as unknown as { env: Env };
+      const original = mutable.env;
+      const DB = new Proxy(env.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              if (sql.includes("SELECT min(due) due FROM (")) throw new Error("Final scan unavailable");
+              return target.prepare(sql);
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      mutable.env = { ...original, DB, SEMANTIC_SEARCH_ENABLED: "false" };
+      if (useQueue) mutable.env.PLATFORM_QUEUE = { send: wasSent, sendBatch: wasSent, metrics: wasSent };
+      else delete mutable.env.PLATFORM_QUEUE;
+      try {
+        await instance.wake(undefined, now - 2);
+        await instance.alarm();
+        clock.mockReturnValue(now + 5000);
+        await state.storage.put("phase", 2);
+        await instance.alarm();
+        expect(await env.DB.prepare("SELECT count(*) FROM platform_jobs").first("count(*)")).toBe(useQueue ? 2 : 1);
+        expect(wasSent).toHaveBeenCalledTimes(useQueue ? 2 : 0);
+        clock.mockReturnValue(now + 10_000);
+        await state.storage.put("phase", 10);
+        await instance.alarm();
+        expect(await state.storage.getAlarm()).toBe(now + 15_000);
+      } finally {
+        await state.storage.deleteAlarm();
+        mutable.env = original;
+      }
+    });
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+it("retains a wake recorded after the phase 2 deadline read and clears it after recovery drains", async () => {
+  const now = Date.now();
+  const due = now + 25_000;
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  await recoveryJob("first", now - 1).run();
+  try {
+    await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
+      const mutable = instance as unknown as { env: Env };
+      const original = mutable.env;
+      let enqueueDuringRead = true;
+      const DB = new Proxy(env.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              const statement = target.prepare(sql);
+              if (!sql.startsWith("SELECT min(max(available_at")) return statement;
+              return {
+                async first(column: string) {
+                  const observed = await statement.first(column);
+                  if (enqueueDuringRead) {
+                    enqueueDuringRead = false;
+                    await recoveryJob("leased", now, due).run();
+                    await instance.wake(due, due);
+                  }
+                  return observed;
+                },
+              };
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      mutable.env = { ...original, DB, SEMANTIC_SEARCH_ENABLED: "false" };
+      delete mutable.env.PLATFORM_QUEUE;
+      try {
+        await instance.wake(undefined, now - 1);
+        await state.storage.put("phase", 2);
+        await instance.alarm();
+        expect((await state.storage.get<{ jobRetryAt: number }>("schedule"))?.jobRetryAt).toBe(now - 1);
+        clock.mockReturnValue(due);
+        await state.storage.put("phase", 2);
+        await instance.alarm();
+        expect((await state.storage.get<{ jobRetryAt: number | null }>("schedule"))?.jobRetryAt).toBeNull();
+        expect(await env.DB.prepare("SELECT id FROM platform_jobs").first()).toBeNull();
+        clock.mockReturnValue(due + 5000);
+        await state.storage.put("phase", 10);
+        await instance.alarm();
+        clock.mockReturnValue(due + 10_000);
+        await instance.alarm();
+        clock.mockReturnValue(due + 15_000);
+        await state.storage.put("phase", 10);
+        await instance.alarm();
+        expect(await state.storage.getAlarm()).toBeNull();
+      } finally {
+        await state.storage.deleteAlarm();
+        mutable.env = original;
+      }
+    });
+  } finally {
+    clock.mockRestore();
+  }
+});
+
 describe("publication recovery deadlines", () => {
   async function pendingPublication(now: number) {
     const checkpoint = JSON.stringify({ version: 2, offset: 3 });

@@ -1,22 +1,88 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { unstable_readConfig } from "wrangler";
 import { validatePlatformConfiguration } from "./platform-config.mjs";
 import {
   assertLiveTurnstileSitekey,
+  assertSharedReleaseFlags,
   platformConnection,
   platformProfile,
   settingsFingerprint,
   turnstileReplacementSecret,
 } from "./cloudflare-platform.mjs";
 
+const secretDirectoryPrefix = "noteflare-turnstile-release-";
+const maxUploadShutdownMs = 5000;
+
+function processGone(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error.code === "ESRCH";
+  }
+}
+
+export function cleanAbandonedSecrets(directory = tmpdir(), now = Date.now()) {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(secretDirectoryPrefix)) continue;
+    const path = join(directory, entry.name);
+    try {
+      const info = lstatSync(path);
+      if (!info.isDirectory() || (process.getuid && info.uid !== process.getuid()) || now - info.mtimeMs < 86_400_000)
+        continue;
+      const ownerFile = join(path, "owner.json");
+      if (!lstatSync(ownerFile).isFile()) continue;
+      const { parent, child } = JSON.parse(readFileSync(ownerFile, "utf8"));
+      if (processGone(parent) && (child === null || processGone(child))) rmSync(path, { recursive: true, force: true });
+    } catch {
+      // Ownership could not be established, or another deployment already cleaned up.
+    }
+  }
+}
+
+export async function runWrangler(program, args, { stdio, signal, onChild }) {
+  signal?.throwIfAborted();
+  const child = spawn(program, args, { stdio });
+  let killTimer;
+  const stopChild = () => {
+    child.kill("SIGTERM");
+    killTimer = setTimeout(() => child.kill("SIGKILL"), maxUploadShutdownMs);
+    killTimer.unref();
+  };
+  const finished = new Promise((resolveExit) => {
+    // A failed spawn also emits close with a nonzero status.
+    child.on("error", () => {});
+    child.once("close", (status) => resolveExit({ status }));
+  });
+  signal?.addEventListener("abort", stopChild, { once: true });
+  try {
+    if (child.pid) onChild?.(child.pid);
+    return await finished;
+  } catch (error) {
+    stopChild();
+    await finished;
+    throw error;
+  } finally {
+    clearTimeout(killTimer);
+    signal?.removeEventListener("abort", stopChild);
+  }
+}
+
 export async function deployPlatform(
   environment = "production",
-  execute = spawnSync,
-  { dryRun = false, checkLive = false, connect = platformConnection, readFingerprints } = {},
+  execute = runWrangler,
+  {
+    dryRun = false,
+    checkLive = false,
+    connect = platformConnection,
+    readFingerprints,
+    signal = new AbortController().signal,
+  } = {},
 ) {
   if (checkLive && !dryRun) throw new Error("--check-live requires --dry-run.");
   const profile = platformProfile(environment);
@@ -24,7 +90,7 @@ export async function deployPlatform(
     resolve(`.wrangler/platform/${environment}/application.jsonc`),
     resolve(`.wrangler/platform/${environment}/publicWorker.jsonc`),
   ];
-  let databaseId, sitekey;
+  let databaseId, sitekey, applicationVars;
   for (const [index, path] of files.entries()) {
     const config = unstable_readConfig({ config: path, env: "" }, { hideWarnings: true });
     validatePlatformConfiguration(config, { publicWorker: index === 1 });
@@ -55,11 +121,13 @@ export async function deployPlatform(
     if (!workerSitekey || (index && workerSitekey !== sitekey))
       throw new Error("Prepared Workers must use the same Turnstile sitekey; repeat platform preflight.");
     sitekey = workerSitekey;
+    if (index) assertSharedReleaseFlags(applicationVars, config.vars);
+    else applicationVars = config.vars;
   }
   // Both bundles must build before either Worker is uploaded.
   const wrangler = createRequire(import.meta.url).resolve("wrangler");
   for (const path of files) {
-    const check = execute(
+    const check = await execute(
       process.execPath,
       [
         wrangler,
@@ -70,8 +138,9 @@ export async function deployPlatform(
         "--outdir",
         resolve(`.wrangler/platform/${environment}/dry-${files.indexOf(path)}`),
       ],
-      { stdio: "inherit" },
+      { stdio: "inherit", signal },
     );
+    signal?.throwIfAborted();
     if (check.status !== 0) throw new Error("Coordinated Worker dry build failed.");
   }
   if (dryRun && !checkLive) return;
@@ -91,12 +160,18 @@ export async function deployPlatform(
   }
   // A disagreement already present on either Worker must prevent both uploads.
   await Promise.all(names.map(verifyLiveSettings));
+  signal?.throwIfAborted();
   const secret = replacement ? await turnstileReplacementSecret(profile, api, replacement) : undefined;
+  signal?.throwIfAborted();
   if (dryRun) return;
-  const temporary = secret ? mkdtempSync(join(tmpdir(), "noteflare-turnstile-")) : undefined;
+  cleanAbandonedSecrets();
+  const temporary = secret ? mkdtempSync(join(tmpdir(), secretDirectoryPrefix)) : undefined;
+  const recordOwner = (child) =>
+    writeFileSync(join(temporary, "owner.json"), JSON.stringify({ parent: process.pid, child }), { mode: 0o600 });
   try {
     const secretArgs = [];
     if (temporary) {
+      recordOwner(null);
       const secretFile = join(temporary, "secrets.json");
       writeFileSync(secretFile, JSON.stringify({ TURNSTILE_SECRET_KEY: secret }), { mode: 0o600, flag: "wx" });
       secretArgs.push("--secrets-file", secretFile);
@@ -106,12 +181,18 @@ export async function deployPlatform(
       const name = names[index];
       try {
         await verifyLiveSettings(name);
-        const result = execute(process.execPath, [wrangler, "deploy", "--config", path, ...secretArgs], {
+        signal?.throwIfAborted();
+        const result = await execute(process.execPath, [wrangler, "deploy", "--config", path, ...secretArgs], {
           stdio: "inherit",
+          signal,
+          onChild: temporary ? recordOwner : undefined,
         });
-        if (result.status !== 0)
+        if (result.status !== 0) {
+          signal?.throwIfAborted();
           throw new Error(`Upload of ${name} did not report success. Check its live deployment.`);
+        }
         uploaded.push(name);
+        signal?.throwIfAborted();
       } catch (error) {
         const progress = uploaded.length ? `Confirmed uploads: ${uploaded.join(", ")}.` : "No upload confirmed.";
         throw new Error(
@@ -125,16 +206,29 @@ export async function deployPlatform(
   }
 }
 if (import.meta.main) {
+  const cancellation = new AbortController();
+  const interrupt = () => cancellation.abort(new Error("Deployment interrupted."));
+  const terminate = () => cancellation.abort(new Error("Deployment terminated."));
+  process.on("SIGINT", interrupt);
+  process.on("SIGTERM", terminate);
   try {
     const [environment, ...options] = process.argv.slice(2);
     if (options.some((option) => !["--dry-run", "--check-live"].includes(option)))
       throw new Error("Usage: deploy-platform.mjs [production|staging] [--dry-run [--check-live]]");
-    await deployPlatform(environment, spawnSync, {
+    await deployPlatform(environment, runWrangler, {
       dryRun: options.includes("--dry-run"),
       checkLive: options.includes("--check-live"),
+      signal: cancellation.signal,
     });
   } catch (error) {
     console.error(error.message);
-    process.exitCode = 1;
+    process.exitCode = cancellation.signal.aborted
+      ? cancellation.signal.reason.message === "Deployment interrupted."
+        ? 130
+        : 143
+      : 1;
+  } finally {
+    process.off("SIGINT", interrupt);
+    process.off("SIGTERM", terminate);
   }
 }

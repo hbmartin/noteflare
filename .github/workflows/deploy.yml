@@ -173,10 +173,6 @@ jobs:
           REPLACE_TURNSTILE_WIDGET: ${{ inputs.replace_turnstile_widget }}
         run: |
           args=()
-          if [[ -n "${ENABLE_PLATFORM_FEATURES}" || "${REPLACE_TURNSTILE_WIDGET}" == "true" ]] && [ "${GITHUB_RUN_ATTEMPT}" -gt 1 ]; then
-            echo "Review current Worker settings and start a new dispatch for any remaining activation or widget replacement."
-            exit 1
-          fi
           if [ -n "${ENABLE_PLATFORM_FEATURES}" ]; then
             args+=("--enable=${ENABLE_PLATFORM_FEATURES}")
           fi

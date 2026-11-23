@@ -213,6 +213,20 @@ function retention(value: string | undefined, fallback: number, max: number) {
   const parsed = Number(value ?? fallback);
   return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= max ? parsed : fallback;
 }
+export function auditRetention(env: Env) {
+  const configuredDays = retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650);
+  const lockDays = env.AUDIT_BUCKET ? retention(env.AUDIT_ARCHIVE_LOCK_DAYS, 0, 3650) || null : null;
+  return { configuredDays, lockDays, storageMinimumDays: Math.max(configuredDays, lockDays ?? 0) };
+}
+
+function auditCleanupFailure(error: unknown) {
+  if (error && typeof error === "object") {
+    if ("code" in error && error.code === "ObjectLockedByBucketPolicy") return "lock";
+    const status = "status" in error ? error.status : "statusCode" in error ? error.statusCode : undefined;
+    if (status === 429 || status === 502 || status === 503 || status === 504) return "transient";
+  }
+  return "unknown";
+}
 /** Reconcile ambiguous PUTs and bucket-lock races without overwriting verified bytes. */
 export async function immutableAuditObject(
   bucket: R2Bucket,
@@ -240,10 +254,7 @@ export async function immutableAuditObject(
 export async function archiveAudit(env: Env) {
   if (env.AUDIT_ENABLED !== "true") return;
   const bucket = env.AUDIT_BUCKET ?? env.BUCKET;
-  const configuredDays = Math.max(
-    retention(env.AUDIT_ARCHIVE_DAYS, 365, 3650),
-    env.AUDIT_BUCKET ? retention(env.AUDIT_ARCHIVE_LOCK_DAYS, 0, 3650) : 0,
-  );
+  const { storageMinimumDays: configuredDays } = auditRetention(env);
   // Bound memory and make an ambiguous PUT recoverable by deterministic content identity.
   const rows = await env.DB.prepare(`SELECT * FROM audit_events WHERE archive_id IS NULL
     ORDER BY workspace_id,committed_at,id LIMIT 10`).all<AuditRow>();
@@ -332,18 +343,27 @@ export async function archiveAudit(env: Env) {
     const keys = [row.object_key, `${row.object_key}.manifest.json`];
     const now = Date.now();
     let nextCheck = row.expires_at;
+    let step = "read_metadata";
+    let reason: ReturnType<typeof auditCleanupFailure> | "incomplete" | undefined;
     try {
       const objects = (await Promise.all(keys.map((key) => bucket.head(key)))).filter((object) => object !== null);
       nextCheck = Math.max(nextCheck, ...objects.map((object) => object.uploaded.getTime() + configuredDays * DAY_MS));
       if (nextCheck <= now && objects.length) {
+        step = "delete";
         await bucket.delete(keys);
-        if ((await Promise.all(keys.map((key) => bucket.head(key)))).some(Boolean))
-          throw new Error("audit_archive_delete_incomplete");
+        step = "verify_deletion";
+        if ((await Promise.all(keys.map((key) => bucket.head(key)))).some(Boolean)) reason = "incomplete";
       }
-    } catch {
+    } catch (error) {
+      reason = auditCleanupFailure(error);
+    }
+    if (reason) {
       // Keep the archive pointer and let the remaining rows advance even if a stronger lock blocks deletion.
-      nextCheck = Math.max(nextCheck, now + DAY_MS);
-      logger.warn("audit.archive.delete_deferred", "platform", "Audit archive deletion will be retried");
+      nextCheck = Math.max(nextCheck, now + (reason === "transient" ? 600_000 : DAY_MS));
+      logger.warn("audit.archive.delete_deferred", "platform", "Audit archive deletion will be retried", {
+        step,
+        reason,
+      });
     }
     if (nextCheck > now) {
       await env.DB.prepare(

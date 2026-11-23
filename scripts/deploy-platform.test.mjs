@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { unstable_readConfig } from "wrangler";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { deployPlatform } from "./deploy-platform.mjs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { cleanAbandonedSecrets, deployPlatform, runWrangler } from "./deploy-platform.mjs";
 import { platformProfile, settingsFingerprint } from "./cloudflare-platform.mjs";
 
 vi.mock("wrangler", () => ({ unstable_readConfig: vi.fn() }));
@@ -70,6 +73,19 @@ it("rejects a mismatched public database before uploading either Worker", async 
   });
   const execute = vi.fn();
   await expect(deployPlatform("production", execute)).rejects.toThrow("reviewed database");
+  expect(execute).not.toHaveBeenCalled();
+});
+it("rejects drift between prepared shared flags before building either Worker", async () => {
+  vi.mocked(unstable_readConfig).mockImplementation(({ config }) => {
+    const publicWorker = config.endsWith("publicWorker.jsonc");
+    const worker = configuration(publicWorker);
+    if (!publicWorker) worker.vars.TABLE_AUTHORITY_ENABLED = "true";
+    return worker;
+  });
+  const execute = vi.fn();
+  await expect(deployPlatform("production", execute)).rejects.toThrow(
+    "TABLE_AUTHORITY_ENABLED (application true, public false)",
+  );
   expect(execute).not.toHaveBeenCalled();
 });
 
@@ -189,6 +205,28 @@ describe("coordinated Turnstile replacement", () => {
     expect(api.mock.calls.some(([path]) => path === `/challenges/widgets/${sitekey}`)).toBe(true);
   });
 
+  it("rejects a cancelled preflight even when the widget lookup succeeds", async () => {
+    const { api, fingerprints } = fixture();
+    const cancellation = new AbortController();
+    const execute = vi.fn(() => ({ status: 0 }));
+    const connect = async () => ({
+      api: async (path) => {
+        if (path === `/challenges/widgets/${sitekey}`) cancellation.abort(new Error("Preflight interrupted."));
+        return api(path);
+      },
+    });
+    await expect(
+      deployPlatform("production", execute, {
+        dryRun: true,
+        checkLive: true,
+        connect,
+        readFingerprints: fingerprints,
+        signal: cancellation.signal,
+      }),
+    ).rejects.toThrow("Preflight interrupted.");
+    expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
+  });
+
   it.each([{ secret: "" }, { domains: [] }, { name: "renamed-widget" }])(
     "rejects a missing or changed widget before uploading either Worker",
     async (patch) => {
@@ -244,6 +282,60 @@ describe("coordinated Turnstile replacement", () => {
     expect(files.every((file) => !existsSync(file))).toBe(true);
     expect(live.get(profile.publicName)).toEqual(activeSitekey(sitekey));
   });
+
+  it("waits for an interrupted upload to exit before removing the private file", async () => {
+    const { connect, fingerprints } = fixture();
+    const cancellation = new AbortController();
+    let uploadFile,
+      exited = false;
+    const execute = vi.fn(async (program, args, options) => {
+      if (args.includes("--dry-run")) return { status: 0 };
+      uploadFile = args[args.indexOf("--secrets-file") + 1];
+      const result = await runWrangler(program, ["-e", "setTimeout(() => {}, 10000)"], {
+        ...options,
+        onChild(pid) {
+          options.onChild(pid);
+          cancellation.abort(new Error("Deployment interrupted."));
+        },
+      });
+      exited = true;
+      expect(existsSync(uploadFile)).toBe(true);
+      return result;
+    });
+    await expect(
+      deployPlatform("production", execute, {
+        connect,
+        readFingerprints: fingerprints,
+        signal: cancellation.signal,
+      }),
+    ).rejects.toThrow("Deployment interrupted. No upload confirmed.");
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(exited).toBe(true);
+    expect(existsSync(uploadFile)).toBe(false);
+  });
+});
+
+it("reclaims only old secret directories whose recorded processes have exited", () => {
+  const directory = mkdtempSync(join(tmpdir(), "noteflare-release-cleanup-test-"));
+  const ended = spawnSync(process.execPath, ["-e", ""]).pid;
+  const old = new Date(Date.now() - 172_800_000);
+  function release(parent, child, modified) {
+    const path = mkdtempSync(join(directory, "noteflare-turnstile-release-"));
+    writeFileSync(join(path, "owner.json"), JSON.stringify({ parent, child }), { mode: 0o600 });
+    utimesSync(path, modified, modified);
+    return path;
+  }
+  try {
+    const abandoned = release(ended, ended, old);
+    const liveParent = release(process.pid, null, old);
+    const liveChild = release(ended, process.pid, old);
+    const recent = release(ended, null, new Date());
+    cleanAbandonedSecrets(directory);
+    expect(existsSync(abandoned)).toBe(false);
+    expect([liveParent, liveChild, recent].map(existsSync)).toEqual([true, true, true]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 it("refuses Worker-first routing without the asset binding", async () => {

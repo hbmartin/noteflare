@@ -32,6 +32,7 @@ type MaintenanceSchedule = {
   wakeAt: number | null;
   wakeKind?: "immediate" | "deadline";
   jobRetryAt?: number | null;
+  jobRetryRevision?: number;
   retries?: Record<string, { attempts: number; at: number }>;
 };
 
@@ -80,10 +81,11 @@ export class PlatformCoordinator extends DurableObject<Env> {
       );
       // A request may belong to a phase that has already finished this cycle.
       const immediate = at === undefined || !Number.isFinite(at) || at <= Date.now();
-      const retryAt =
-        jobRetryAt !== undefined && Number.isFinite(jobRetryAt)
-          ? Math.min(state.jobRetryAt ?? Infinity, jobRetryAt)
-          : state.jobRetryAt;
+      const tracksRetry = jobRetryAt !== undefined && Number.isFinite(jobRetryAt);
+      if (tracksRetry) {
+        state.jobRetryAt = Math.min(state.jobRetryAt ?? Infinity, jobRetryAt);
+        state.jobRetryRevision = (state.jobRetryRevision ?? 0) + 1;
+      }
       const earlierWake =
         state.wakeAt === null ||
         next < state.wakeAt ||
@@ -92,8 +94,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
         state.wakeAt = next;
         state.wakeKind = immediate ? "immediate" : "deadline";
       }
-      if (earlierWake || retryAt !== state.jobRetryAt)
-        await this.ctx.storage.put("schedule", { ...state, jobRetryAt: retryAt ?? null });
+      if (earlierWake || tracksRetry) await this.ctx.storage.put("schedule", state);
       const current = await this.ctx.storage.getAlarm();
       if (current === null || current > next) await this.ctx.storage.setAlarm(next);
     });
@@ -143,15 +144,12 @@ export class PlatformCoordinator extends DurableObject<Env> {
         (state.wakeKind === "immediate" || (state.wakeAt !== null && state.wakeAt <= Date.now()))
           ? null
           : state.wakeAt;
-      // Only the job recovery phase can consume a due fallback deadline.
-      const jobRetryAt = state.jobRetryAt ?? Infinity;
       await this.ctx.storage.put("schedule", {
         ...state,
         active: true,
         running: true,
         scanning: false,
         wakeAt,
-        jobRetryAt: phase === 2 && jobRetryAt <= Date.now() ? null : (state.jobRetryAt ?? null),
       });
       return true;
     });
@@ -165,9 +163,25 @@ export class PlatformCoordinator extends DurableObject<Env> {
           case 1:
             await enqueuePendingPublications(alarmEnv);
             break;
-          case 2:
+          case 2: {
+            const revision = (await this.scheduleState()).jobRetryRevision ?? 0;
             await recoverPlatformJobs(alarmEnv, platformHandlers, alarmEnv.PLATFORM_QUEUE ? 10 : 1);
+            const next = await alarmEnv.DB.prepare(
+              "SELECT min(max(available_at,coalesce(lease_until,0))) due FROM platform_jobs",
+            ).first<number>("due");
+            // A wake can arrive while the D1 query is in flight, even when its deadline
+            // is later than the previous minimum. Keep that wake through reconciliation.
+            await this.ctx.blockConcurrencyWhile(async () => {
+              const state = await this.scheduleState();
+              const due =
+                (state.jobRetryRevision ?? 0) === revision
+                  ? (next ?? Infinity)
+                  : Math.min(next ?? Infinity, state.jobRetryAt ?? Infinity);
+              state.jobRetryAt = Number.isFinite(due) ? due : null;
+              await this.ctx.storage.put("schedule", state);
+            });
             break;
+          }
           case 3:
             await archiveAudit(alarmEnv);
             break;
