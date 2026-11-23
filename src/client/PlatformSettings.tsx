@@ -20,7 +20,7 @@ type Status = {
     buildingPages: number;
     today: { tokens: number; queries: number };
   };
-  budgets: Record<string, number>;
+  budgets: Record<string, number | null>;
   archive: { pending: number; oldestAt: number | null };
 };
 type AuditEvent = {
@@ -128,7 +128,7 @@ export function PlatformSettings() {
             {Object.entries(status.budgets).map(([name, value]) => (
               <div key={name}>
                 <dt>{name}</dt>
-                <dd>{value.toLocaleString()}</dd>
+                <dd>{value?.toLocaleString() ?? "Not configured"}</dd>
               </div>
             ))}
           </dl>

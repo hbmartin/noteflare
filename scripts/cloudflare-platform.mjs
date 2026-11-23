@@ -149,13 +149,29 @@ function workerSettings(profile, api) {
     [profile.name, profile.publicName].map((name) => api(`/workers/scripts/${name}/settings`, { allowMissing: true })),
   );
 }
-function turnstileMatches(settings, sitekey) {
-  const vars = liveVars(settings);
-  return vars.TURNSTILE_SITE_KEY ? vars.TURNSTILE_SITE_KEY === sitekey : vars.TURNSTILE_ENABLED !== "true";
+function hasInstalledSecret(settings, name) {
+  return settings?.bindings.some((binding) => binding.name === name && binding.type === "secret_text");
 }
-export function assertLiveTurnstileSitekey(settings, sitekey, worker) {
-  if (!turnstileMatches(settings, sitekey))
-    throw new Error(`Live Turnstile sitekey differs for ${worker}. Prepare an explicit --replace-turnstile release.`);
+export function turnstilePairing(settings, sitekey) {
+  const vars = liveVars(settings);
+  if (vars.TURNSTILE_SITE_KEY === sitekey) return "matched";
+  if (
+    !vars.TURNSTILE_SITE_KEY &&
+    vars.TURNSTILE_ENABLED !== "true" &&
+    !hasInstalledSecret(settings, "TURNSTILE_SECRET_KEY")
+  )
+    return "first";
+  return "replace";
+}
+export function firstTurnstilePairWorkers(names, settings, sitekey) {
+  return names.filter((worker, index) => {
+    const pairing = turnstilePairing(settings[index], sitekey);
+    if (pairing === "replace")
+      throw new Error(
+        `Live Turnstile pairing differs or is unknown for ${worker}. Prepare an explicit --replace-turnstile release.`,
+      );
+    return pairing === "first";
+  });
 }
 export function settingsFingerprint(settings) {
   const vars = Object.entries(liveVars(settings)).sort(([a], [b]) => a.localeCompare(b));
@@ -546,12 +562,11 @@ export async function prepare(profile, api, directory, cutoverReady = false, ena
   )
     throw new Error("Platform resources are not ready. Run platform:provision apply and repeat preflight.");
   const [settings, publicSettings] = await workerSettings(profile, api);
+  if (!settings || !publicSettings) throw new Error("Both Worker shells must exist. Run platform bootstrap first.");
   const saved = liveVars(settings);
-  if (!replaceTurnstile) {
-    assertLiveTurnstileSitekey(settings, state.sitekey, profile.name);
-    assertLiveTurnstileSitekey(publicSettings, state.sitekey, profile.publicName);
-  }
-  if (profile.environment === "production" && !settings) throw new Error("Production Worker settings are missing.");
+  const firstPair = replaceTurnstile
+    ? []
+    : firstTurnstilePairWorkers([profile.name, profile.publicName], [settings, publicSettings], state.sitekey);
   if (profile.environment === "production" && saved.BETTER_AUTH_URL !== profile.appOrigin && !cutoverReady)
     throw new Error(
       "Origin cutover requires completed staging acceptance and verified owner recovery; set PLATFORM_CUTOVER_READY=true only after those checks.",
@@ -569,14 +584,14 @@ export async function prepare(profile, api, directory, cutoverReady = false, ena
     enable,
   });
   assertSharedReleaseFlags(configs.application.vars, configs.publicWorker.vars);
-  const secretNames = (workerState) => [
+  const secretNames = (workerState, name) => [
     ...(workerState?.bindings ?? []).filter((binding) => binding.type === "secret_text").map((binding) => binding.name),
-    ...(replaceTurnstile ? ["TURNSTILE_SECRET_KEY"] : []),
+    ...(replaceTurnstile || firstPair.includes(name) ? ["TURNSTILE_SECRET_KEY"] : []),
   ];
-  validatePlatformConfiguration(configs.application, { secretNames: secretNames(settings) });
+  validatePlatformConfiguration(configs.application, { secretNames: secretNames(settings, profile.name) });
   validatePlatformConfiguration(configs.publicWorker, {
     publicWorker: true,
-    secretNames: secretNames(publicSettings),
+    secretNames: secretNames(publicSettings, profile.publicName),
   });
   mkdirSync(directory, { recursive: true });
   for (const [name, config] of Object.entries(configs))
@@ -587,6 +602,7 @@ export async function prepare(profile, api, directory, cutoverReady = false, ena
       [profile.name]: settingsFingerprint(settings),
       [profile.publicName]: settingsFingerprint(publicSettings),
       ...(replaceTurnstile ? { turnstileReplacementSitekey: state.sitekey } : {}),
+      ...(firstPair.length ? { turnstileFirstPair: { sitekey: state.sitekey, workers: firstPair } } : {}),
     }) + "\n",
   );
   return {
@@ -743,9 +759,6 @@ async function configureFreeManaged(profile, api, apply) {
     throw new Error("Free managed protection readback failed; keep the release gated.");
   return "Free managed execution verified for application/public hostnames";
 }
-function hasInstalledSecret(settings, name) {
-  return settings?.bindings.some((binding) => binding.name === name && binding.type === "secret_text");
-}
 /** Create unreachable shells so secrets can be installed before any public route. */
 export async function bootstrap(profile, api, directory, environment = process.env, execute = spawnSync) {
   const secretsPath = resolve(directory, "bootstrap.env");
@@ -849,23 +862,29 @@ export async function bootstrap(profile, api, directory, environment = process.e
     [profile.publicName, publicSettings],
   ];
   const awaitingTurnstileReplacement = [];
+  const awaitingTurnstileFirstPair = [];
   const missingTurnstile = [];
+  function canFillTurnstile(name, settings) {
+    const pairing = turnstilePairing(settings, widget.sitekey);
+    if (pairing === "replace") awaitingTurnstileReplacement.push(name);
+    if (pairing === "first") awaitingTurnstileFirstPair.push(name);
+    return pairing === "matched" && !hasInstalledSecret(settings, "TURNSTILE_SECRET_KEY");
+  }
   for (const [name, settings] of workers) {
-    if (!turnstileMatches(settings, widget.sitekey)) awaitingTurnstileReplacement.push(name);
-    else if (!hasInstalledSecret(settings, "TURNSTILE_SECRET_KEY")) missingTurnstile.push(name);
+    if (canFillTurnstile(name, settings)) missingTurnstile.push(name);
   }
   if (missingTurnstile.length) {
     const secret = await turnstileReplacementSecret(profile, api, widget.sitekey);
     for (const name of missingTurnstile) {
       const live = await api(`/workers/scripts/${name}/settings`);
-      if (!turnstileMatches(live, widget.sitekey)) awaitingTurnstileReplacement.push(name);
-      else if (!hasInstalledSecret(live, "TURNSTILE_SECRET_KEY")) await putSecret(name, "TURNSTILE_SECRET_KEY", secret);
+      if (canFillTurnstile(name, live)) await putSecret(name, "TURNSTILE_SECRET_KEY", secret);
     }
   }
   return {
     publicIngress: states.at(-1) ? "unchanged; unverified" : "private shell; ingress disabled",
     secrets: "installed without changing production application identity",
     awaitingTurnstileReplacement,
+    awaitingTurnstileFirstPair,
   };
 }
 export async function platformConnection(profile, options) {

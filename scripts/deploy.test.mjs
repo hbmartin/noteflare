@@ -26,6 +26,30 @@ import {
 import { metadataIntegrityCheck } from "./integrity.mjs";
 
 afterEach(() => vi.unstubAllEnvs());
+it.each(["initial credentials", "OAuth renewal", "settings request"])(
+  "cancels Cloudflare %s without retrying",
+  async (step) => {
+    const cancellation = new AbortController();
+    const reason = new Error("Deployment cancelled");
+    const stop = (signal) => {
+      cancellation.abort(reason);
+      signal.throwIfAborted();
+    };
+    const credentials = { type: "oauth", token: "test-oauth-token" };
+    const readCredentials = vi.fn(async (signal) => stop(signal));
+    if (step !== "initial credentials") readCredentials.mockResolvedValueOnce(credentials);
+    const request = vi.fn(async (_url, { signal }) => stop(signal));
+    if (step === "OAuth renewal") request.mockResolvedValueOnce(Response.json({ success: false }, { status: 401 }));
+    const run = async () => {
+      const { api } = await cloudflare("0".repeat(32), { readCredentials, request, signal: cancellation.signal });
+      await api("/workers/scripts/test/settings");
+    };
+    await expect(run()).rejects.toBe(reason);
+    expect(readCredentials).toHaveBeenCalledTimes(step === "OAuth renewal" ? 2 : 1);
+    expect(request).toHaveBeenCalledTimes(step === "initial credentials" ? 0 : 1);
+  },
+);
+
 const existingDB = "11111111-1111-1111-1111-111111111111";
 const newDB = "22222222-2222-2222-2222-222222222222";
 const placeholderID = "00000000-0000-0000-0000-000000000000";

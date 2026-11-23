@@ -220,6 +220,12 @@ export function auditRetention(env: Env) {
 }
 
 function auditCleanupFailure(error: unknown) {
+  // The Workers binding exposes the R2 code in a plain Error's message.
+  if (error instanceof Error) {
+    const code = /^(?:R2 )?(?:head|delete): [\s\S]* \((\d+)\)$/.exec(error.message)?.[1];
+    if (code === "10069") return "lock";
+    if (code === "10001" || code === "10043" || code === "10058") return "transient";
+  }
   if (error && typeof error === "object") {
     if ("code" in error && error.code === "ObjectLockedByBucketPolicy") return "lock";
     const status = "status" in error ? error.status : "statusCode" in error ? error.statusCode : undefined;
