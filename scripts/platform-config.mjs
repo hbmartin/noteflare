@@ -10,6 +10,7 @@ export function validatePlatformConfiguration(config, { secretNames, publicWorke
   const secret = (name) => {
     if (secretNames) need(names.has(name), `set the ${name} Worker secret before enabling this capability`);
   };
+  need(!Object.hasOwn(vars, "TURNSTILE_SECRET_KEY"), "configure TURNSTILE_SECRET_KEY as a Worker secret");
   if (publicWorker) secret("BETTER_AUTH_SECRET");
   if (publicWorker) {
     for (const name of names)
