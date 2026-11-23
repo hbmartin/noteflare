@@ -168,12 +168,16 @@ jobs:
         run: |
           args=()
           if [ -n "${ENABLE_PLATFORM_FEATURES}" ]; then
+            if [ "${GITHUB_RUN_ATTEMPT}" -gt 1 ]; then
+              echo "Review current Worker flags and start a new dispatch for any remaining activation."
+              exit 1
+            fi
             args+=("--enable=${ENABLE_PLATFORM_FEATURES}")
           fi
           pnpm platform:provision prepare production "${args[@]}"
 
-      - name: Build both prepared Workers before migrations
-        run: pnpm deploy:platform production --dry-run
+      - name: Build both Workers and verify live settings before migrations
+        run: pnpm deploy:platform production --dry-run --check-live
 
       # Migrations must complete before the Worker is deployed. The Worker
       # queries the search, reference, mention, deletion-job, archive-disconnect,

@@ -1,5 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { canonicalRedirect } from "./canonical-redirect";
+import { canonicalOrigin, canonicalRedirect, invalidCanonicalOrigin } from "./canonical-redirect";
 import { operatorSnapshot } from "./operator-settings";
 import { withUsage, setUsageIdentity, addUsage } from "./usage";
 import type { Env } from "./env";
@@ -238,10 +238,13 @@ async function publishedResponse(
 }
 export async function fetchPublic(request: Request, env: Env, context: ExecutionContext): Promise<Response> {
   try {
-    const url = new URL(request.url),
-      canonical = !!env.PUBLIC_BASE_URL && url.origin === new URL(env.PUBLIC_BASE_URL).origin;
-    if (env.CANONICAL_REDIRECTS_ENABLED === "true" && url.hostname.endsWith(".workers.dev")) {
-      const redirect = canonicalRedirect(request, env.PUBLIC_BASE_URL);
+    const url = new URL(request.url);
+    const managed = env.CANONICAL_REDIRECTS_ENABLED === "true";
+    const origin = managed ? canonicalOrigin(env.PUBLIC_BASE_URL) : null;
+    if (managed && !origin) return invalidCanonicalOrigin("public");
+    const canonical = !!env.PUBLIC_BASE_URL && url.origin === (origin ?? new URL(env.PUBLIC_BASE_URL)).origin;
+    if (origin && url.hostname.endsWith(".workers.dev")) {
+      const redirect = canonicalRedirect(request, origin);
       if (redirect) return redirect;
     }
     const host = canonical

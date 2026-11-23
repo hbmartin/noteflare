@@ -204,6 +204,7 @@ export async function platformCosts(env: Env, workspaceId: string, options: Opti
           "Live storage byte-days",
           "Fixed subscriptions and shared account allowances",
           "Installation work without a workspace attribution",
+          "Streamed response bytes and uninstrumented background work",
           ...(total.usage.d1Queries > total.usage.d1MeasuredQueries ? ["D1 rows for first/raw queries"] : []),
         ],
       },

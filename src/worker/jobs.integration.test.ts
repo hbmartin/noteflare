@@ -1969,15 +1969,19 @@ describe("job execution", () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
     const key = `jobs/${jobId}/result.md`;
+    const orphan = `job-artifacts/${jobId}/attempts/1/orphan`;
+    const future = `job-artifacts/${jobId}/attempts/3/future`;
+    const source = `jobs/${jobId}/attempts/3/output/future.md`;
     const timestamp = Date.now();
     await env.BUCKET.put(key, "# Export", {
       httpMetadata: { contentType: "text/markdown; charset=utf-8" },
       customMetadata: { filename: "Export.md" },
     });
+    await Promise.all([orphan, future, source].map((artifact) => env.BUCKET.put(artifact, "attempt artifact")));
     await env.DB.prepare(
       `INSERT INTO jobs
-        (id, workspace_id, space_id, type, status, requested_by, output_key, expires_at, created_at, updated_at)
-       SELECT ?, workspace_id, space_id, 'export', 'succeeded', ?, ?, ?, ?, ? FROM pages WHERE id = ?`,
+        (id, workspace_id, space_id, type, status, requested_by, output_key, expires_at, created_at, updated_at, attempt)
+       SELECT ?, workspace_id, space_id, 'export', 'succeeded', ?, ?, ?, ?, ?, 2 FROM pages WHERE id = ?`,
     )
       .bind(jobId, installed.userId, key, timestamp + 10_000, timestamp, timestamp, installed.pageId)
       .run();
@@ -1990,12 +1994,17 @@ describe("job execution", () => {
     expect(download.status).toBe(200);
     expect(download.headers.get("content-disposition")).toContain("Export.md");
     expect(await download.text()).toBe("# Export");
+    await expireJobArtifacts(env);
+    expect(await env.BUCKET.head(key)).not.toBeNull();
 
     await env.DB.prepare(`UPDATE jobs SET expires_at = ? WHERE id = ?`)
       .bind(timestamp - 1, jobId)
       .run();
     await expireJobArtifacts(env);
     expect(await env.BUCKET.get(key)).toBeNull();
+    expect(await env.BUCKET.head(orphan)).toBeNull();
+    expect(await env.BUCKET.head(future)).not.toBeNull();
+    expect(await env.BUCKET.head(source)).not.toBeNull();
     expect(
       (await env.DB.prepare(`SELECT output_key FROM jobs WHERE id = ?`).bind(jobId).first())?.output_key,
     ).toBeNull();

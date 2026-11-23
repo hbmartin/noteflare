@@ -1,5 +1,5 @@
 import { createExecutionContext, env } from "cloudflare:test";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import worker from "./index";
 import { fetchPublic } from "./public-worker";
 
@@ -17,6 +17,36 @@ it("redirects the application alias before assets, authorization, or writes", as
     expect(reply.headers.has("set-cookie")).toBe(false);
   }
 });
+
+it.each(["", "not-an-origin", "http://app.example.com", "https://user:secret@app.example.com"])(
+  "rejects invalid managed origins before routing",
+  async (origin) => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const ctx = createExecutionContext();
+    const config = {
+      ...env,
+      BETTER_AUTH_URL: origin,
+      PUBLIC_BASE_URL: origin,
+      CANONICAL_REDIRECTS_ENABLED: "true" as const,
+    };
+    try {
+      const responses = await Promise.all([
+        worker.fetch(new Request("https://app.account.workers.dev/assets/app.js"), config, ctx),
+        fetchPublic(new Request("https://public.account.workers.dev/forms/key"), config, ctx),
+      ]);
+      for (const response of responses) {
+        expect(response.status).toBe(503);
+        expect(response.headers.get("cache-control")).toBe("no-store");
+        expect(response.headers.has("location")).toBe(false);
+      }
+      expect(log).toHaveBeenCalledTimes(2);
+      expect(log.mock.calls.map(([record]) => record.event)).toEqual(["http.origin.invalid", "http.origin.invalid"]);
+      expect(JSON.stringify(log.mock.calls)).not.toContain("user:secret");
+    } finally {
+      log.mockRestore();
+    }
+  },
+);
 
 it("redirects public aliases and leaves canonical and unknown customer hosts to public routing", async () => {
   const config = {

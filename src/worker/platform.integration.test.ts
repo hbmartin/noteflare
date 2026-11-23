@@ -1,6 +1,7 @@
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env, MemberContext } from "./env";
+import { USAGE_COUNTERS } from "../shared/platform-costs";
 import { auditStatement, archiveAudit, setAuditActor, withAuditRequest } from "./audit";
 import {
   enqueuePlatformJob,
@@ -10,7 +11,7 @@ import {
   reservePlatformUsage,
 } from "./platform-jobs";
 import { finalizeHeatmaps, heatmapWeek, readHeatmap } from "./heatmaps";
-import { withUsage } from "./usage";
+import { backgroundUsage, withUsage } from "./usage";
 
 beforeEach(async () => {
   await reset();
@@ -50,6 +51,41 @@ describe("durable platform release", () => {
       await env.DB.prepare("SELECT actor_id FROM audit_events WHERE target_id='instrumented-page'").first("actor_id"),
     ).toBe("owner");
     expect(writeDataPoint).toHaveBeenCalledTimes(1);
+  });
+  it.each([false, true])("counts audited background queries and storage once with parent usage %s", async (parent) => {
+    const writeDataPoint = vi.fn();
+    const pending: Promise<unknown>[] = [];
+    const config = {
+      ...bindings(),
+      COST_REPORTING_ENABLED: "true" as const,
+      AUDIT_ENABLED: "true" as const,
+      OBSERVABILITY: { writeDataPoint },
+    };
+    const work = (source: Env) =>
+      withAuditRequest(source, "background-parent", async (audited) => {
+        setAuditActor({ type: "user", id: "owner", workspaceId: "workspace" });
+        backgroundUsage({ waitUntil: (promise) => pending.push(promise) }, audited, "background", {}, async (bg) => {
+          await bg.DB.prepare("SELECT 1").all();
+          await bg.BUCKET.get("missing-artifact");
+          await withAuditRequest(bg, "background-child", async (nested) => {
+            setAuditActor({ type: "user", id: "owner", workspaceId: "workspace" });
+            await nested.DB.batch([pageInsert(nested.DB, "instrumented-background"), nested.DB.prepare("SELECT 1")]);
+          });
+        });
+      });
+    if (parent) await withUsage(config, "http", work);
+    else await work(config);
+    await Promise.all(pending);
+    const points = writeDataPoint.mock.calls.map(([point]) => point).filter((point) => point.blobs[3] === "background");
+    expect(points).toHaveLength(1);
+    const counters = Object.fromEntries(USAGE_COUNTERS.map((key, index) => [key, points[0].doubles[index]]));
+    // The mutation batch includes two audit context statements and two caller statements.
+    expect(counters).toMatchObject({ requests: 0, d1Queries: 5, d1MeasuredQueries: 5, r2ClassB: 1 });
+    expect(
+      await env.DB.prepare("SELECT actor_id FROM audit_events WHERE target_id='instrumented-background'").first(
+        "actor_id",
+      ),
+    ).toBe("owner");
   });
   it("commits audit evidence with mutations and rolls both back together", async () => {
     await withAuditRequest({ ...bindings(), AUDIT_ENABLED: "true" }, "request", async (configured) => {
@@ -213,7 +249,13 @@ describe("durable platform release", () => {
       outcome: "success",
       committedAt: started - 400 * 86400_000,
     }).run();
-    await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true" });
+    await archiveAudit({
+      ...bindings(),
+      AUDIT_ENABLED: "true",
+      AUDIT_BUCKET: env.BUCKET,
+      AUDIT_ARCHIVE_DAYS: "1",
+      AUDIT_ARCHIVE_LOCK_DAYS: "365",
+    });
     const archive = await env.DB.prepare("SELECT object_key,expires_at FROM audit_archives").first<{
       object_key: string;
       expires_at: number;
@@ -221,26 +263,44 @@ describe("durable platform release", () => {
     expect(archive!.expires_at).toBeGreaterThanOrEqual(started + 365 * 86400_000);
     expect(await env.BUCKET.head(archive!.object_key)).not.toBeNull();
   });
-  it("keeps archive journal records after a partial or silently rejected delete", async () => {
-    const key = "audit/locked.ndjson";
-    await env.BUCKET.put(key, "retained");
-    await env.BUCKET.put(`${key}.manifest.json`, "{}");
-    await env.DB.prepare(
-      "INSERT INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at) VALUES('locked','workspace',?,'digest',1,1,1,1,1)",
-    )
-      .bind(key)
-      .run();
-    const bucket = new Proxy(env.BUCKET, {
-      get(target, property) {
-        if (property === "delete") return async () => {};
-        if (property === "head") return async () => ({ uploaded: new Date(1) });
-        const value = Reflect.get(target, property, target);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-    await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket });
-    expect(await env.DB.prepare("SELECT id FROM audit_archives WHERE id='locked'").first()).not.toBeNull();
-  });
+  it.each([false, true])(
+    "defers a locked archive and keeps cleaning after a failed delete (throws %s)",
+    async (throws) => {
+      const key = "audit/locked.ndjson";
+      const eligible = "audit/eligible.ndjson";
+      const objects = new Set([key, `${key}.manifest.json`, eligible, `${eligible}.manifest.json`]);
+      await env.DB.batch(
+        [
+          ["locked", key, 1],
+          ["eligible", eligible, 2],
+        ].map(([id, object, expiry]) =>
+          env.DB.prepare(
+            "INSERT INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at) VALUES(?,'workspace',?,'digest',1,1,1,1,?)",
+          ).bind(id, object, expiry),
+        ),
+      );
+      const remove = vi.fn(async (keys: string[]) => {
+        if (keys.includes(key)) {
+          // Leave the manifest behind after an interrupted deletion.
+          objects.delete(key);
+          if (throws) throw new Error("object locked");
+        } else for (const object of keys) objects.delete(object);
+      });
+      const bucket = {
+        delete: remove,
+        head: async (object: string) => (objects.has(object) ? { uploaded: new Date(1) } : null),
+      } as unknown as R2Bucket;
+      const started = Date.now();
+      await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket });
+      expect(
+        await env.DB.prepare("SELECT expires_at FROM audit_archives WHERE id='locked'").first("expires_at"),
+      ).toBeGreaterThanOrEqual(started + 86400_000);
+      expect(await env.DB.prepare("SELECT id FROM audit_archives WHERE id='eligible'").first()).toBeNull();
+      expect(objects).toEqual(new Set([`${key}.manifest.json`]));
+      await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket });
+      expect(remove).toHaveBeenCalledTimes(2);
+    },
+  );
   it("reconciles a legacy expiry from the newer manifest upload before deleting either object", async () => {
     await env.DB.prepare(
       "INSERT INTO audit_archives(id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at) VALUES('legacy','workspace','audit/legacy','digest',1,1,1,1,1)",
@@ -251,7 +311,13 @@ describe("durable platform release", () => {
       head: vi.fn(async (key: string) => ({ uploaded: new Date(key.endsWith(".json") ? uploaded : 1) })),
       delete: remove,
     } as unknown as R2Bucket;
-    await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket });
+    await archiveAudit({
+      ...bindings(),
+      AUDIT_ENABLED: "true",
+      AUDIT_BUCKET: bucket,
+      AUDIT_ARCHIVE_DAYS: "1",
+      AUDIT_ARCHIVE_LOCK_DAYS: "365",
+    });
     expect(remove).not.toHaveBeenCalled();
     expect(await env.DB.prepare("SELECT expires_at FROM audit_archives WHERE id='legacy'").first("expires_at")).toBe(
       uploaded + 365 * 86400_000,

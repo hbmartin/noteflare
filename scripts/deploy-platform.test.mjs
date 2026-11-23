@@ -83,6 +83,58 @@ it("leaves a newer operator change in place", async () => {
   expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
 });
 
+it.each([true, false])(
+  "detects public settings drift before either upload or migrations (dry run %s)",
+  async (dryRun) => {
+    const execute = vi.fn(() => ({ status: 0 }));
+    const baseline = { bindings: [] };
+    await expect(
+      deployPlatform("production", execute, {
+        dryRun,
+        checkLive: true,
+        connect: async () => ({
+          api: async (path) =>
+            path.includes(profile.publicName)
+              ? { bindings: [{ type: "plain_text", name: "FORMS_ENABLED", text: "false" }] }
+              : baseline,
+        }),
+        readFingerprints: () => ({
+          [profile.name]: settingsFingerprint(baseline),
+          [profile.publicName]: settingsFingerprint(baseline),
+        }),
+      }),
+    ).rejects.toThrow(`Live settings for ${profile.publicName} changed`);
+    expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
+  },
+);
+
+it("reports a partial release and accepts fresh settings for the forward release", async () => {
+  const baseline = { bindings: [] };
+  const live = new Map([profile.name, profile.publicName].map((name) => [name, baseline]));
+  let failPublic = true;
+  const execute = vi.fn((_node, args) => {
+    if (args.includes("--dry-run")) return { status: 0 };
+    const name = args.at(-1).endsWith("publicWorker.jsonc") ? profile.publicName : profile.name;
+    if (name === profile.publicName && failPublic) return { status: 1 };
+    live.set(name, { bindings: [{ type: "plain_text", name: "FORMS_ENABLED", text: "false" }] });
+    return { status: 0 };
+  });
+  const connect = async () => ({ api: async (path) => live.get(path.split("/")[3]) });
+  const fingerprints = () => Object.fromEntries([...live].map(([name, state]) => [name, settingsFingerprint(state)]));
+  const prepared = fingerprints();
+  await expect(deployPlatform("production", execute, { connect, readFingerprints: () => prepared })).rejects.toThrow(
+    `Confirmed uploads: ${profile.name}.`,
+  );
+  await expect(deployPlatform("production", execute, { connect, readFingerprints: () => prepared })).rejects.toThrow(
+    `Live settings for ${profile.name} changed`,
+  );
+  failPublic = false;
+  await expect(
+    deployPlatform("production", execute, { connect, readFingerprints: fingerprints }),
+  ).resolves.toBeUndefined();
+  expect(live.get(profile.publicName)).toEqual(live.get(profile.name));
+});
+
 it("refuses Worker-first routing without the asset binding", async () => {
   vi.mocked(unstable_readConfig).mockReturnValue({ ...configuration(false), assets: { run_worker_first: true } });
   const execute = vi.fn();

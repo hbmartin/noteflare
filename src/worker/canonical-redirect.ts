@@ -1,7 +1,21 @@
-export function canonicalRedirect(request: Request, origin: string | undefined): Response | undefined {
-  if (!origin) return undefined;
+import { logger } from "./observability";
+
+export function canonicalOrigin(origin: string | undefined): URL | null {
+  try {
+    const url = new URL(origin ?? "");
+    return url.protocol === "https:" && url.href === `${url.origin}/` ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+export function invalidCanonicalOrigin(worker: "application" | "public"): Response {
+  logger.error("http.origin.invalid", "http", "Canonical Worker origin is missing or invalid", { operation: worker });
+  return new Response("Service unavailable.", { status: 503, headers: { "cache-control": "no-store" } });
+}
+
+export function canonicalRedirect(request: Request, target: URL): Response | undefined {
   const source = new URL(request.url);
-  const target = new URL(origin);
   if (source.origin === target.origin) return undefined;
   target.pathname = source.pathname;
   target.search = source.search;

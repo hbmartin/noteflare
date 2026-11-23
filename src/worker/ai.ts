@@ -817,7 +817,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
           input: providerInput,
         }),
         signal: combinedSignal,
-        redirect: "error",
+        redirect: "manual",
       });
       if (!upstream.ok) {
         if ([401, 403].includes(upstream.status))

@@ -228,7 +228,9 @@ beforeEach(async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (resource: RequestInfo | URL, init?: RequestInit) => {
-      const url = new URL(resource instanceof Request ? resource.url : String(resource));
+      const upstreamRequest = new Request(resource, init);
+      expect(upstreamRequest.redirect).toBe("manual");
+      const url = new URL(upstreamRequest.url);
       if (url.pathname === "/v1/models") return Response.json({ data: [{ id: "test-fast" }, { id: "test-best" }] });
       if (url.pathname !== "/v1/responses") throw new Error("Unexpected external request.");
       expect(new Headers(init?.headers).get("authorization")).toBe("Bearer operator-private-test-key");

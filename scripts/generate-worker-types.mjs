@@ -20,8 +20,9 @@ const result = spawnSync(
   ],
   { encoding: "utf8" },
 );
-if (result.status !== 0) {
-  process.stderr.write(result.stderr);
+if (result.error || result.status !== 0) {
+  if (result.error) console.error(`Could not start Wrangler: ${result.error.message}`);
+  if (result.stderr) process.stderr.write(result.stderr);
   process.exitCode = result.status ?? 1;
 } else {
   const path = "worker-configuration.d.ts";

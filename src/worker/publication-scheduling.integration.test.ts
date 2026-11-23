@@ -338,7 +338,7 @@ it("delays retry delivery and preserves coordinator recovery if Queue send fails
     },
   });
   expect(send).toHaveBeenCalledWith({ platformJobId: platformJobId(intent) }, { delaySeconds: 2 });
-  expect(wake).toHaveBeenCalledWith(now + 2000);
+  expect(wake).toHaveBeenCalledWith(now + 2000, undefined);
   expect(await env.DB.prepare("SELECT available_at,lease_token,lease_until FROM platform_jobs").first()).toEqual({
     available_at: now + 2000,
     lease_token: null,
@@ -395,7 +395,10 @@ it.each([false, true])(
       },
     );
     expect(send).not.toHaveBeenCalled();
-    expect(wake).toHaveBeenCalledExactlyOnceWith(maintenanceRequired ? undefined : now + 60000);
+    expect(wake).toHaveBeenCalledExactlyOnceWith(
+      maintenanceRequired ? undefined : now + 60000,
+      maintenanceRequired ? now + 60000 : undefined,
+    );
     expect(await env.DB.prepare("SELECT generation,lease_token FROM platform_jobs").first()).toEqual({
       generation: "2",
       lease_token: "foreign",
@@ -681,6 +684,55 @@ it("retains a final-scan retry and concurrent wake when the deadline query fails
     expect((await state.storage.get<{ retries: object }>("schedule"))!.retries).toEqual({});
     expect(await state.storage.getAlarm()).toBeNull();
   });
+});
+
+it.each([false, true])("keeps a maintenance retry deadline when the scan fails and Queue is %s", async (hasQueue) => {
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const due = now + 70_000;
+  const bindings = configured();
+  if (hasQueue)
+    bindings.PLATFORM_QUEUE = {
+      send: async () => {
+        throw new Error("Queue unavailable");
+      },
+    } as unknown as Queue;
+  await enqueuePlatformJob(bindings, intent);
+  await runPlatformJob(bindings, platformJobId(intent), {
+    fixture: async () => {
+      // Settlement reads this new generation's real deadline after releasing the predecessor.
+      await env.DB.prepare("UPDATE platform_jobs SET generation='2',available_at=?").bind(due).run();
+      throw new PlatformJobMaintenanceRequired(new Error("retirement required"));
+    },
+  });
+  const database = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          if (sql.includes("SELECT min(due)")) throw new Error("deadline scan unavailable");
+          return target.prepare(sql);
+        };
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await coordinator(
+    async (instance, state) => {
+      expect(await state.storage.getAlarm()).toBe(now + 1000);
+      now += 1000;
+      for (let phase = 0; phase <= 10; phase++) {
+        await instance.alarm();
+        if (phase < 10) now += 5000;
+      }
+      expect(await state.storage.getAlarm()).toBe(due);
+      expect(await state.storage.get("schedule")).toMatchObject({
+        jobRetryAt: due,
+        retries: { scan: { attempts: 1 } },
+      });
+      await state.storage.deleteAlarm();
+    },
+    { DB: database },
+  );
 });
 
 it.each(["disabled", "missing-ai", "missing-index", "deferred", "leased"])(

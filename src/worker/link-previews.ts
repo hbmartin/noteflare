@@ -386,8 +386,6 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     title = existing.title;
     description = existing.description;
     siteName = existing.site_name;
-    imageKey = existing.image_key;
-    imageMime = existing.image_mime;
   }
   const expiresAt = Date.now() + (succeeded ? SUCCESS_TTL : FAILURE_TTL);
   const save = env.DB.prepare(
