@@ -9,6 +9,8 @@ import {
   provision,
   configureEdges,
   bootstrap,
+  platformConnection,
+  parseActivation,
 } from "./cloudflare-platform.mjs";
 import { validatePlatformConfiguration } from "./platform-config.mjs";
 
@@ -84,13 +86,19 @@ describe("Cloudflare platform provisioning", () => {
         ],
       },
     };
+    let nextId = 0;
     const api = vi.fn(async (path, options = {}) => {
       if (path === "/__zone/rulesets") return [free];
       const phase = Object.keys(entries).find((name) => path.includes(`/phases/${name}/`));
       if (phase) return structuredClone(entries[phase]);
       const entry = Object.values(entries).find((item) => path.includes(`/rulesets/${item.id}/rules`));
       if (entry && options.method) {
-        entry.rules = mergeRules(entry.rules, [{ id: "owned", ...options.body }]);
+        if (options.method === "POST") entry.rules.push({ id: `created-${++nextId}`, ...options.body });
+        else {
+          const rule = entry.rules.find((item) => item.id === path.split("/").at(-1));
+          if (!rule) throw new Error("Unknown rule");
+          Object.assign(rule, options.body);
+        }
         return {};
       }
       throw new Error(path);
@@ -106,6 +114,11 @@ describe("Cloudflare platform provisioning", () => {
     expect(managed.expression).toContain('"public-staging.sparkedinnovations.training"');
     managed.action_parameters.overrides = { rules: [{ id: "operator-override", enabled: false }] };
     await configureEdges(platformProfile("staging"), api, { apply: true });
+    expect(entries.http_request_firewall_custom.rules.map((rule) => rule.ref)).toEqual([
+      "operator-protection",
+      "noteflare_public_methods",
+      "noteflare_public_methods_staging",
+    ]);
     expect(entries.http_request_firewall_managed.rules).toHaveLength(2);
     expect(entries.http_request_firewall_managed.rules[1].action_parameters.overrides).toEqual(
       managed.action_parameters.overrides,
@@ -196,10 +209,29 @@ describe("Cloudflare platform provisioning", () => {
     expect(configs.publicWorker.r2_buckets.map((item) => item.binding)).toEqual(["BUCKET", "PUBLICATIONS_BUCKET"]);
     expect(configs.publicWorker.durable_objects.bindings.every((item) => item.script_name === base.name)).toBe(true);
     expect(configs.application).not.toHaveProperty("configPath");
-    base.vars.AUTH_MODE = "access_required";
-    expect(
-      deploymentConfigs(platformProfile(), "database", "sitekey", base, publicBase).application.vars.AUTH_MODE,
-    ).toBe("access_required");
+    const stage = deploymentConfigs(platformProfile("staging"), "database", "sitekey", base, publicBase, {
+      applicationVars: { AUTH_MODE: "access_required", IMAGES_ENABLED: "false", AUDIT_ARCHIVE_DAYS: "730" },
+      publicVars: { PUBLIC_PUBLISHING_ENABLED: "false", FORMS_DAILY_LIMIT: "22" },
+      enable: parseActivation("--enable=semantic,costs"),
+    });
+    expect(stage.application.vars).toMatchObject({
+      AUTH_MODE: "access_required",
+      IMAGES_ENABLED: "false",
+      AUDIT_ARCHIVE_DAYS: "730",
+      SEMANTIC_SEARCH_ENABLED: "true",
+      COST_REPORTING_ENABLED: "true",
+      FORMS_ENABLED: "false",
+    });
+    expect(stage.publicWorker.vars).toMatchObject({
+      PUBLIC_PUBLISHING_ENABLED: "false",
+      FORMS_DAILY_LIMIT: "22",
+      COST_REPORTING_ENABLED: "true",
+    });
+    for (const worker of ["application", "publicWorker"]) {
+      const productionIds = new Set(configs[worker].ratelimits.map((binding) => binding.namespace_id));
+      expect(stage[worker].ratelimits.every((binding) => !productionIds.has(binding.namespace_id))).toBe(true);
+    }
+    expect(() => parseActivation("--enable=access")).toThrow("Choose features");
   });
   it("checks existing private buckets and reads back merged policy updates idempotently", async () => {
     const profile = platformProfile(),
@@ -211,31 +243,40 @@ describe("Cloudflare platform provisioning", () => {
       abortMultipartUploadsTransition: { condition: { type: "Age", maxAge: 604800 } },
     };
     policies.set(`/r2/buckets/${profile.original}/lifecycle`, { rules: [multipart] });
-    policies.set(`/r2/buckets/${profile.audit}/lock`, { rules: [] });
+    const lockPath = `/r2/buckets/${profile.audit}/lock`;
+    const globalLock = { ...retentionRules().lock, prefix: "" };
+    policies.set(lockPath, { rules: [globalLock] });
     const api = vi.fn(async (path, options = {}) => {
       if (policies.has(path)) {
         if (options.method) policies.set(path, options.body);
         return structuredClone(policies.get(path));
       }
-      if (path === "/r2/buckets")
-        return { buckets: [profile.original, profile.publications, profile.audit].map((name) => ({ name })) };
+      if (path === "/r2/buckets?per_page=100")
+        return { result: { buckets: [{ name: profile.original }] }, result_info: { cursor: "next" } };
+      if (path === "/r2/buckets?per_page=100&cursor=next")
+        return { result: { buckets: [profile.publications, profile.audit].map((name) => ({ name })) } };
       if (path.endsWith("/domains/managed")) return { enabled: false };
       if (path.endsWith("/domains/custom")) return { domains: [] };
       if (path.endsWith("/metadata_index/list"))
         return { metadataIndexes: [{ propertyName: "spaceId", indexType: "String" }] };
       if (path.startsWith("/vectorize")) return { config: { dimensions: 384, metric: "cosine" } };
-      if (path.startsWith("/challenges"))
-        return [
-          {
-            sitekey: "sitekey",
-            name: `${profile.name}-platform`,
-            domains: [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname],
-          },
-        ];
-      if (path.startsWith("/d1")) return [{ name: profile.name, uuid: "database" }];
+      if (path.startsWith("/challenges") || path.startsWith("/d1")) {
+        if (path.endsWith("page=1")) return { result: [], result_info: { total_pages: 2 } };
+        if (path.startsWith("/d1")) return { result: [{ name: profile.name, uuid: "database" }] };
+        return {
+          result: [
+            {
+              sitekey: "sitekey",
+              name: `${profile.name}-platform`,
+              domains: [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname],
+            },
+          ],
+        };
+      }
       throw new Error(path);
     });
     await provision(profile, api, { apply: true });
+    expect(policies.get(lockPath).rules).toEqual([globalLock]);
     expect(policies.get(`/r2/buckets/${profile.original}/lifecycle`).rules).toContainEqual(multipart);
     const writes = api.mock.calls.filter(([, options]) => options?.method).length;
     const next = await provision(profile, api, { apply: true });
@@ -250,6 +291,26 @@ describe("Cloudflare platform provisioning", () => {
     );
     expect(api).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
+  });
+  it("rejects a different account before reading credentials", async () => {
+    vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "a".repeat(32));
+    const readCredentials = vi.fn();
+    try {
+      await expect(platformConnection(platformProfile(), { readCredentials })).rejects.toThrow("account override");
+      expect(readCredentials).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it("requires the original staging secret if either Worker already exists", async () => {
+    const api = vi.fn(async (path) => (path.endsWith("-public/settings") ? { bindings: [] } : null));
+    await expect(
+      bootstrap(platformProfile("staging"), api, "/tmp/noteflare-missing-bootstrap-test", {}),
+    ).rejects.toThrow("original staging BETTER_AUTH_SECRET");
+    expect(api.mock.calls.map(([path]) => path)).toEqual([
+      "/workers/scripts/cloudflare-realtime-notes-platform-staging/settings",
+      "/workers/scripts/cloudflare-realtime-notes-platform-staging-public/settings",
+    ]);
   });
   it("rejects public Worker secrets beyond its two required purposes", () => {
     const config = deploymentConfigs(

@@ -10,6 +10,10 @@ on:
       - main
   workflow_dispatch:
     inputs:
+      enable_platform_features:
+        description: Comma-separated features to enable (semantic,images,publishing,audit,turnstile,forms,tables,costs)
+        required: false
+        type: string
       confirm_platform_cutover_ready:
         description: Staging acceptance and owner password/MFA recovery are verified for the canonical-domain cutover
         required: false
@@ -159,7 +163,14 @@ jobs:
         run: pnpm build:worker
 
       - name: Validate provisioned platform and prepare coordinated configs
-        run: pnpm platform:provision prepare production
+        env:
+          ENABLE_PLATFORM_FEATURES: ${{ inputs.enable_platform_features }}
+        run: |
+          args=()
+          if [ -n "${ENABLE_PLATFORM_FEATURES}" ]; then
+            args+=("--enable=${ENABLE_PLATFORM_FEATURES}")
+          fi
+          pnpm platform:provision prepare production "${args[@]}"
 
       - name: Build both prepared Workers before migrations
         run: pnpm deploy:platform production --dry-run

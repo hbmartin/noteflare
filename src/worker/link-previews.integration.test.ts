@@ -6,6 +6,25 @@ const pageUrl = "https://www.public-preview.org/article";
 const imageUrl = "https://images.public-preview.org/cover.png";
 const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
 
+// RIFF with a pixel chunk and EXIF/XMP chunks returned by the Images binding.
+const transformed = Uint8Array.from([
+  82, 73, 70, 70, 34, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 1, 0, 0, 0, 1, 0, 69, 88, 73, 70, 1, 0, 0, 0, 2, 0, 88,
+  77, 80, 32, 1, 0, 0, 0, 3, 0,
+]);
+function imageBindings() {
+  return {
+    ...env,
+    IMAGES_ENABLED: "true" as const,
+    IMAGES: {
+      input: () => ({
+        transform: () => ({
+          output: async () => ({ response: () => new Response(transformed) }),
+        }),
+      }),
+    } as unknown as ImagesBinding,
+  };
+}
+
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
@@ -38,26 +57,53 @@ describe("link previews", () => {
           : new Response("missing", { status: 404 }),
     );
     vi.stubGlobal("fetch", fetcher);
-    const first = await linkPreview(env, "workspace", pageUrl);
+    const first = await linkPreview(imageBindings(), "workspace", pageUrl);
     expect(first).toMatchObject({
       title: "Article",
       description: "A useful summary",
-      imageUrl: `/api/link-previews/${first.id}/image`,
+      imageUrl: `/api/link-previews/${first.id}/image?v=2`,
     });
-    expect((await linkPreview(env, "workspace", pageUrl)).id).toBe(first.id);
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).id).toBe(first.id);
     expect(fetcher).toHaveBeenCalledTimes(2);
-    const image = await linkPreviewImage(env, "workspace", first.id);
-    expect(image.headers.get("content-type")).toBe("image/png");
+    const image = await linkPreviewImage(imageBindings(), "workspace", first.id);
+    expect(image.headers.get("content-type")).toBe("image/webp");
+    expect(new Uint8Array(await image.arrayBuffer())).toEqual(
+      Uint8Array.from([82, 73, 70, 70, 14, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 1, 0, 0, 0, 1, 0]),
+    );
     expect(image.headers.get("x-content-type-options")).toBe("nosniff");
-    await expect(linkPreviewImage(env, "other-workspace", first.id)).rejects.toMatchObject({ status: 404 });
+    await expect(linkPreviewImage(imageBindings(), "other-workspace", first.id)).rejects.toMatchObject({ status: 404 });
     await env.DB.prepare("UPDATE link_preview_cache SET expires_at = 1 WHERE id = ?").bind(first.id).run();
     const oldKey = (await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE id = ?")
       .bind(first.id)
       .first<{ image_key: string }>())!.image_key;
     await pruneLinkPreviews(env);
-    await expect(linkPreviewImage(env, "workspace", first.id)).rejects.toMatchObject({ status: 404 });
+    await expect(linkPreviewImage(imageBindings(), "workspace", first.id)).rejects.toMatchObject({ status: 404 });
     expect(await env.DB.prepare("SELECT id FROM link_preview_cache WHERE id = ?").bind(first.id).first()).toBeNull();
     expect(await env.BUCKET.get(oldKey)).toBeNull();
+  });
+
+  it("keeps text with Images disabled and never serves an unversioned image", async () => {
+    const fetcher = vi.fn(
+      async () =>
+        new Response(`<title>Article</title><meta property="og:image" content="${imageUrl}">`, {
+          headers: { "content-type": "text/html" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    const disabled = { ...env, IMAGES_ENABLED: "false" as const };
+    const preview = await linkPreview(disabled, "workspace", pageUrl);
+    expect(preview).toMatchObject({ title: "Article", imageUrl: null });
+    expect(fetcher).toHaveBeenCalledOnce();
+    const legacyKey = "link-previews/workspace/unsanitized";
+    await env.BUCKET.put(legacyKey, png);
+    await env.DB.prepare("UPDATE link_preview_cache SET image_key=?,image_mime='image/webp' WHERE id=?")
+      .bind(legacyKey, preview.id)
+      .run();
+    expect(await linkPreview(imageBindings(), "workspace", pageUrl)).toMatchObject({
+      title: "Article",
+      imageUrl: null,
+    });
+    await expect(linkPreviewImage(imageBindings(), "workspace", preview.id)).rejects.toMatchObject({ status: 404 });
   });
 
   it("retries R2 cleanup after a bucket failure without losing the key", async () => {
@@ -71,7 +117,7 @@ describe("link previews", () => {
           : new Response(png, { headers: { "content-type": "image/png" } }),
       ),
     );
-    const preview = await linkPreview(env, "workspace", pageUrl);
+    const preview = await linkPreview(imageBindings(), "workspace", pageUrl);
     const key = (await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE id = ?")
       .bind(preview.id)
       .first<{ image_key: string }>())!.image_key;
@@ -109,12 +155,12 @@ describe("link previews", () => {
           : new Response(png, { headers: { "content-type": "image/png" } }),
       ),
     );
-    const first = await linkPreview(env, "workspace", pageUrl);
+    const first = await linkPreview(imageBindings(), "workspace", pageUrl);
     const oldKey = (await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE id = ?")
       .bind(first.id)
       .first<{ image_key: string }>())!.image_key;
     await env.DB.prepare("UPDATE link_preview_cache SET expires_at = 1 WHERE id = ?").bind(first.id).run();
-    const second = await linkPreview(env, "workspace", pageUrl);
+    const second = await linkPreview(imageBindings(), "workspace", pageUrl);
     const newKey = (await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE id = ?")
       .bind(first.id)
       .first<{ image_key: string }>())!.image_key;
@@ -134,7 +180,7 @@ describe("link previews", () => {
         : new Response(png, { headers: { "content-type": "image/png" } }),
     );
     vi.stubGlobal("fetch", fetcher);
-    const first = await linkPreview(env, "workspace", pageUrl);
+    const first = await linkPreview(imageBindings(), "workspace", pageUrl);
     const key = (await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE id=?")
       .bind(first.id)
       .first<{ image_key: string }>())!.image_key;
@@ -145,7 +191,7 @@ describe("link previews", () => {
         headers: { "content-type": "text/html" },
       });
     });
-    const refreshed = await linkPreview(env, "workspace", pageUrl);
+    const refreshed = await linkPreview(imageBindings(), "workspace", pageUrl);
     expect(refreshed.title).toBe("New title");
     expect(refreshed.imageUrl).toBeNull();
     await pruneLinkPreviews(env);
@@ -157,7 +203,7 @@ describe("link previews", () => {
       "fetch",
       vi.fn(async () => new Response("<title>Original</title>", { headers: { "content-type": "text/html" } })),
     );
-    const first = await linkPreview(env, "workspace", pageUrl);
+    const first = await linkPreview(imageBindings(), "workspace", pageUrl);
     await env.DB.prepare("UPDATE link_preview_cache SET expires_at=1 WHERE id=?").bind(first.id).run();
     const fetcher = vi.fn(
       async () => new Response("<title>Updated remote</title>", { headers: { "content-type": "text/html" } }),
@@ -194,7 +240,9 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    expect((await linkPreview({ ...env, DB: db as D1Database }, "workspace", pageUrl)).title).toBe("Updated remote");
+    expect((await linkPreview({ ...imageBindings(), DB: db as D1Database }, "workspace", pageUrl)).title).toBe(
+      "Updated remote",
+    );
     expect(
       (
         await env.DB.prepare("SELECT title FROM link_preview_cache WHERE id=?")
@@ -221,9 +269,9 @@ describe("link previews", () => {
           : new Response("missing", { status: 404 }),
     );
     vi.stubGlobal("fetch", fetcher);
-    const preview = await linkPreview(env, "workspace", pageUrl);
+    const preview = await linkPreview(imageBindings(), "workspace", pageUrl);
     expect(preview.title).toBe("It’s useful");
-    expect(preview.imageUrl).toBe(`/api/link-previews/${preview.id}/image`);
+    expect(preview.imageUrl).toBe(`/api/link-previews/${preview.id}/image?v=2`);
     expect(fetcher).toHaveBeenCalledWith(decodedImage, expect.anything());
   });
 
@@ -237,7 +285,7 @@ describe("link previews", () => {
           }),
       ),
     );
-    expect((await linkPreview(env, "workspace", pageUrl)).title).toBe("Tips & Tricks — It’s here");
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).title).toBe("Tips & Tricks — It’s here");
   });
 
   it("keeps the card image-free when R2 rejects the image", async () => {
@@ -261,7 +309,7 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const preview = await linkPreview({ ...env, BUCKET: bucket }, "workspace", pageUrl);
+    const preview = await linkPreview({ ...imageBindings(), BUCKET: bucket }, "workspace", pageUrl);
     expect(preview.imageUrl).toBeNull();
     expect(
       (
@@ -306,7 +354,7 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    await expect(linkPreview({ ...env, DB: db, BUCKET: bucket }, "workspace", pageUrl)).rejects.toThrow(
+    await expect(linkPreview({ ...imageBindings(), DB: db, BUCKET: bucket }, "workspace", pageUrl)).rejects.toThrow(
       "D1 unavailable",
     );
     const staged = await env.DB.prepare("SELECT image_key FROM link_preview_image_gc").first<{ image_key: string }>();
@@ -339,8 +387,8 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const preview = await linkPreview({ ...env, DB: db }, "workspace", pageUrl);
-    expect(preview.imageUrl).toBe(`/api/link-previews/${preview.id}/image`);
+    const preview = await linkPreview({ ...imageBindings(), DB: db }, "workspace", pageUrl);
+    expect(preview.imageUrl).toBe(`/api/link-previews/${preview.id}/image?v=2`);
     const row = await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE workspace_id=?")
       .bind("workspace")
       .first<{ image_key: string }>();
@@ -383,7 +431,7 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const preview = await linkPreview({ ...env, DB: db }, "workspace", pageUrl);
+    const preview = await linkPreview({ ...imageBindings(), DB: db }, "workspace", pageUrl);
     expect(preview.title).toBe("Newer result");
     expect(loserKey).toBeTruthy();
     expect(await env.BUCKET.get(loserKey)).toBeNull();
@@ -402,9 +450,9 @@ describe("link previews", () => {
         }),
     );
     vi.stubGlobal("fetch", fetcher);
-    const first = linkPreview(env, "workspace", pageUrl);
+    const first = linkPreview(imageBindings(), "workspace", pageUrl);
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
-    const pending = linkPreview(env, "workspace", pageUrl);
+    const pending = linkPreview(imageBindings(), "workspace", pageUrl);
     expect(fetcher).toHaveBeenCalledOnce();
     release(new Response("<title>Finished</title>", { headers: { "content-type": "text/html" } }));
     expect((await first).title).toBe("Finished");
@@ -420,12 +468,12 @@ describe("link previews", () => {
         }),
     );
     vi.stubGlobal("fetch", fetcher);
-    const first = linkPreview(env, "workspace", pageUrl);
+    const first = linkPreview(imageBindings(), "workspace", pageUrl);
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
     const gate = vi.fn(async () => {
       throw new Error("rate limited");
     });
-    await expect(linkPreview(env, "workspace", pageUrl, gate)).rejects.toThrow("rate limited");
+    await expect(linkPreview(imageBindings(), "workspace", pageUrl, gate)).rejects.toThrow("rate limited");
     expect(gate).toHaveBeenCalledOnce();
     release(new Response("<title>Finished</title>", { headers: { "content-type": "text/html" } }));
     await first;
@@ -445,7 +493,7 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    await expect(linkPreview({ ...env, DB: db }, "workspace", pageUrl)).rejects.toMatchObject({
+    await expect(linkPreview({ ...imageBindings(), DB: db }, "workspace", pageUrl)).rejects.toMatchObject({
       status: 429,
       code: "preview_cache_full",
     });
@@ -470,7 +518,7 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    await expect(linkPreview({ ...env, BUCKET: bucket }, "workspace", pageUrl)).rejects.toMatchObject({
+    await expect(linkPreview({ ...imageBindings(), BUCKET: bucket }, "workspace", pageUrl)).rejects.toMatchObject({
       status: 429,
       code: "preview_cache_full",
     });
@@ -494,7 +542,7 @@ describe("link previews", () => {
     ).run();
     const fetcher = vi.fn(async () => new Response("<title>New</title>", { headers: { "content-type": "text/html" } }));
     vi.stubGlobal("fetch", fetcher);
-    expect((await linkPreview(env, "workspace", pageUrl)).title).toBe("New");
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).title).toBe("New");
     expect(
       (
         await env.DB.prepare("SELECT COUNT(*) AS count FROM link_preview_cache WHERE workspace_id='workspace'").first<{
@@ -516,7 +564,9 @@ describe("link previews", () => {
     )
       .bind(Date.now() + 60_000)
       .run();
-    await expect(linkPreview(env, "workspace", "https://www.public-preview.org/another")).rejects.toMatchObject({
+    await expect(
+      linkPreview(imageBindings(), "workspace", "https://www.public-preview.org/another"),
+    ).rejects.toMatchObject({
       status: 429,
       code: "preview_cache_full",
     });
@@ -528,8 +578,10 @@ describe("link previews", () => {
       async () => new Response(null, { status: 302, headers: { location: "https://127.0.0.1/admin" } }),
     );
     vi.stubGlobal("fetch", fetcher);
-    await expect(linkPreview(env, "workspace", "https://127.0.0.1/admin")).rejects.toMatchObject({ status: 400 });
-    const fallback = await linkPreview(env, "workspace", pageUrl);
+    await expect(linkPreview(imageBindings(), "workspace", "https://127.0.0.1/admin")).rejects.toMatchObject({
+      status: 400,
+    });
+    const fallback = await linkPreview(imageBindings(), "workspace", pageUrl);
     expect(fallback.imageUrl).toBeNull();
     expect(fallback.title).toBe("www.public-preview.org");
     expect(fetcher).toHaveBeenCalledTimes(1);
@@ -541,7 +593,7 @@ describe("link previews", () => {
         new Response(null, { status: 302, headers: { location: `/hop-${fetcher.mock.calls.length}` } }),
     );
     vi.stubGlobal("fetch", fetcher);
-    expect((await linkPreview(env, "workspace", pageUrl)).title).toBe("www.public-preview.org");
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).title).toBe("www.public-preview.org");
     expect(fetcher).toHaveBeenCalledTimes(4);
     for (const call of fetcher.mock.calls) expect(call[1].redirect).toBe("manual");
   });
@@ -553,7 +605,7 @@ describe("link previews", () => {
         : new Response("<script>bad()</script>", { headers: { "content-type": "text/html" } }),
     );
     vi.stubGlobal("fetch", fetcher);
-    expect((await linkPreview(env, "workspace", pageUrl)).imageUrl).toBeNull();
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).imageUrl).toBeNull();
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
@@ -563,14 +615,14 @@ describe("link previews", () => {
       .mockResolvedValueOnce(new Response("unavailable", { status: 503 }))
       .mockResolvedValueOnce(new Response("<title>Recovered</title>", { headers: { "content-type": "text/html" } }));
     vi.stubGlobal("fetch", fetcher);
-    const fallback = await linkPreview(env, "workspace", pageUrl);
+    const fallback = await linkPreview(imageBindings(), "workspace", pageUrl);
     expect(fallback.title).toBe("www.public-preview.org");
     expect(fallback.expiresAt - Date.now()).toBeLessThanOrEqual(5 * 60 * 1000);
-    expect((await linkPreview(env, "workspace", pageUrl)).title).toBe(fallback.title);
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).title).toBe(fallback.title);
     expect(fetcher).toHaveBeenCalledTimes(1);
     await env.DB.prepare("UPDATE link_preview_cache SET expires_at = 1 WHERE id = ?").bind(fallback.id).run();
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
-    const refreshed = await linkPreview(env, "workspace", pageUrl);
+    const refreshed = await linkPreview(imageBindings(), "workspace", pageUrl);
     expect(refreshed.title).toBe("Recovered");
     expect(refreshed.id).toBe(fallback.id);
     expect(fetcher).toHaveBeenCalledTimes(2);
@@ -581,17 +633,17 @@ describe("link previews", () => {
       async () => new Response("<title>Original title</title>", { headers: { "content-type": "text/html" } }),
     );
     vi.stubGlobal("fetch", fetcher);
-    const first = await linkPreview(env, "workspace", pageUrl);
+    const first = await linkPreview(imageBindings(), "workspace", pageUrl);
     await env.DB.prepare("UPDATE link_preview_cache SET expires_at = 1, refresh_until = ? WHERE id = ?")
       .bind(Date.now() + 30_000, first.id)
       .run();
     await pruneLinkPreviews(env);
     expect(await env.DB.prepare("SELECT id FROM link_preview_cache WHERE id = ?").bind(first.id).first()).toBeTruthy();
-    expect((await linkPreview(env, "workspace", pageUrl)).title).toBe("Original title");
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).title).toBe("Original title");
     expect(fetcher).toHaveBeenCalledOnce();
     await env.DB.prepare("UPDATE link_preview_cache SET refresh_until = 1 WHERE id = ?").bind(first.id).run();
     fetcher.mockResolvedValueOnce(new Response("unavailable", { status: 503 }));
-    const refreshed = await linkPreview(env, "workspace", pageUrl);
+    const refreshed = await linkPreview(imageBindings(), "workspace", pageUrl);
     expect(refreshed.title).toBe("Original title");
     expect(refreshed.expiresAt - Date.now()).toBeLessThanOrEqual(5 * 60 * 1000);
   });
@@ -605,7 +657,7 @@ describe("link previews", () => {
         : new Response("<script>bad()</script>", { headers: { "content-type": "image/png" } }),
     );
     vi.stubGlobal("fetch", fetcher);
-    expect((await linkPreview(env, "workspace", pageUrl)).imageUrl).toBeNull();
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).imageUrl).toBeNull();
     await env.DB.prepare("UPDATE link_preview_cache SET expires_at = 1").run();
     fetcher.mockImplementation(async (url: string) =>
       url === pageUrl
@@ -614,7 +666,7 @@ describe("link previews", () => {
           })
         : new Response(new Uint8Array(2 * 1024 * 1024 + 1), { headers: { "content-type": "image/png" } }),
     );
-    expect((await linkPreview(env, "workspace", pageUrl)).imageUrl).toBeNull();
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).imageUrl).toBeNull();
   });
 
   it("returns a safe miss when an R2 image disappears after metadata was cached", async () => {
@@ -628,13 +680,13 @@ describe("link previews", () => {
           : new Response(png, { headers: { "content-type": "image/png" } }),
       ),
     );
-    const preview = await linkPreview(env, "workspace", pageUrl);
+    const preview = await linkPreview(imageBindings(), "workspace", pageUrl);
     const row = await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE id = ?")
       .bind(preview.id)
       .first<{ image_key: string }>();
     expect(row?.image_key).toBeTruthy();
     await env.BUCKET.delete(row!.image_key);
-    await expect(linkPreviewImage(env, "workspace", preview.id)).rejects.toMatchObject({ status: 404 });
-    expect((await linkPreview(env, "workspace", pageUrl)).url).toBe(pageUrl);
+    await expect(linkPreviewImage(imageBindings(), "workspace", preview.id)).rejects.toMatchObject({ status: 404 });
+    expect((await linkPreview(imageBindings(), "workspace", pageUrl)).url).toBe(pageUrl);
   });
 });

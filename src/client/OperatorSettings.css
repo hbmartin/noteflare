@@ -1,0 +1,51 @@
+.operator-worker-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 2rem;
+  overflow-wrap: anywhere;
+}
+
+.operator-worker-details dt {
+  font-weight: 600;
+}
+
+.operator-worker-details dd {
+  margin-inline-start: 0;
+}
+
+.operator-settings-scroll {
+  max-inline-size: 100%;
+  max-block-size: min(30rem, 70vh);
+  overflow: auto;
+  container-type: inline-size;
+}
+
+.operator-settings-table thead {
+  position: sticky;
+  inset-block-start: 0;
+  background: Canvas;
+}
+
+@container (width < 34rem) {
+  .operator-settings-table,
+  .operator-settings-table tbody,
+  .operator-settings-table tr,
+  .operator-settings-table th,
+  .operator-settings-table td {
+    display: block;
+  }
+
+  .operator-settings-table thead {
+    display: none;
+  }
+
+  .operator-settings-table td:nth-child(2)::before {
+    content: "Application: ";
+    font-weight: 600;
+  }
+
+  .operator-settings-table td:nth-child(3)::before {
+    content: "Public: ";
+    font-weight: 600;
+  }
+}

@@ -158,8 +158,8 @@ export async function sanitizedPreview(env: Env, bytes: Uint8Array): Promise<Uin
       .transform(IMAGE_PRESETS["preview-v1"])
       .output({ format: "image/webp", quality: 80, anim: false });
     const response = result.response();
-    if (!response.ok) return null;
-    return new Uint8Array(await response.arrayBuffer());
+    if (!response.ok || !response.body) return null;
+    return await privateImageBytes(response.body);
   } catch {
     return null;
   }

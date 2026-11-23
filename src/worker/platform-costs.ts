@@ -1,3 +1,5 @@
+import { ID_PATTERN } from "../shared/validation";
+import { logger } from "./observability";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import {
@@ -22,12 +24,12 @@ export function costOptions(parameters: URLSearchParams): Options {
   if (
     !Object.hasOwn(windows, window) ||
     !["cost", "requests", "latency"].includes(sort) ||
-    (pageId !== null && (!pageId || pageId.length > 128))
+    (pageId !== null && !ID_PATTERN.test(pageId))
   )
-    throw new HttpError(422, "invalid_cost_query", "Choose a supported usage window and sort order.");
+    throw new HttpError(422, "invalid_cost_query", "Choose a supported usage window, sort order and page ID.");
   return { window: window as CostWindow, sort: sort as CostSort, ...(pageId ? { pageId } : {}) };
 }
-const literal = (value: string) => `'${value.replaceAll("'", "''")}'`;
+
 const columns = USAGE_COUNTERS.map((key, index) => `SUM(_sample_interval * double${index + 1}) AS ${key}`).join(",\n");
 const costExpression = Object.entries(USAGE_RATES)
   .map(
@@ -38,7 +40,9 @@ const costExpression = Object.entries(USAGE_RATES)
   .join(" + ");
 export function costQueries(dataset: string, workspaceId: string, options: Options) {
   if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(dataset)) throw new Error("invalid_analytics_dataset");
-  const where = `FROM ${dataset} WHERE blob1=${literal(USAGE_SCHEMA)} AND blob2=${literal(workspaceId)} AND timestamp >= NOW() - INTERVAL '${windows[options.window]}' HOUR${options.pageId ? ` AND blob3=${literal(options.pageId)}` : ""}`;
+  if (!ID_PATTERN.test(workspaceId) || (options.pageId !== undefined && !ID_PATTERN.test(options.pageId)))
+    throw new Error("analytics_identifier_invalid");
+  const where = `FROM ${dataset} WHERE blob1='${USAGE_SCHEMA}' AND blob2='${workspaceId}' AND timestamp >= NOW() - INTERVAL '${windows[options.window]}' HOUR${options.pageId ? ` AND blob3='${options.pageId}'` : ""}`;
   const select = `${columns}, MIN(timestamp) AS firstObserved, MAX(_sample_interval) AS sampleInterval`;
   const order =
     options.sort === "cost" ? "estimatedCostUsd" : options.sort === "requests" ? "requests" : "durationMs / operations";
@@ -61,7 +65,7 @@ async function query(env: Env, sql: string): Promise<Record<string, unknown>[]> 
   );
   if (!response.ok) {
     await response.body?.cancel();
-    throw new Error("analytics_query_failed");
+    throw new Error(`analytics_http_${response.status}`);
   }
   const reader = response.body?.getReader();
   if (!reader) throw new Error("analytics_response_missing");
@@ -114,6 +118,24 @@ function row(source: Record<string, unknown> = {}, pageId: string | null = null,
     estimatedCostUsd: usageCost(usage),
     averageLatencyMs: usage.operations ? usage.durationMs / usage.operations : null,
   };
+}
+function analyticsFailureCode(error: unknown) {
+  if (!(error instanceof Error)) return "analytics_failure";
+  if (error.name === "TimeoutError" || error.name === "AbortError") return "analytics_timeout";
+  if (error instanceof SyntaxError) return "analytics_response_invalid";
+  const code = error.message;
+  return /^analytics_http_[1-5]\d{2}$/.test(code) ||
+    [
+      "analytics_response_missing",
+      "analytics_response_too_large",
+      "analytics_response_invalid",
+      "analytics_counter_invalid",
+      "analytics_identifier_invalid",
+      "analytics_page_invalid",
+      "invalid_analytics_dataset",
+    ].includes(code)
+    ? code
+    : "analytics_failure";
 }
 const cache = new Map<string, { expiresAt: number; value: PlatformCostReport }>();
 export async function platformCosts(env: Env, workspaceId: string, options: Options): Promise<PlatformCostReport> {
@@ -189,7 +211,10 @@ export async function platformCosts(env: Env, workspaceId: string, options: Opti
     if (cache.size >= 100) cache.delete(cache.keys().next().value!);
     cache.set(key, { expiresAt: Date.now() + 60_000, value });
     return value;
-  } catch {
+  } catch (error) {
+    logger.warn("platform.costs.unavailable", "platform", "Usage reporting query failed.", {
+      code: analyticsFailureCode(error),
+    });
     throw new HttpError(
       503,
       "cost_reporting_unavailable",

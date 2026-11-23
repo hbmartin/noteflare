@@ -1,3 +1,4 @@
+import { backgroundUsage } from "./usage";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { z } from "zod";
@@ -398,8 +399,8 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
   }).catch((error: unknown) => {
     logger.warn("mcp.page_event.failed", "mcp", "Page event delivery failed.", { pageId: page.id }, error);
   });
-  context.waitUntil(
-    sweepOutbox(env).catch((error: unknown) => {
+  backgroundUsage(context, env, "outbox.sweep", {}, (bindings) =>
+    sweepOutbox(bindings).catch((error: unknown) => {
       logger.warn(
         "mcp.page_webhook.failed",
         "mcp",
@@ -626,11 +627,11 @@ async function commentTool(
     if (!committed) throw error;
     return committed;
   }
-  context.waitUntil(
+  backgroundUsage(context, env, "comment.followup", {}, (bindings) =>
     Promise.allSettled([
-      broadcastWorkspaceEvent(env, access.member.workspace.id, { type: "comments-invalidated", pageId: page.id }),
-      broadcastWorkspaceEvent(env, access.member.workspace.id, { type: "notifications-invalidated" }),
-      sweepOutbox(env),
+      broadcastWorkspaceEvent(bindings, access.member.workspace.id, { type: "comments-invalidated", pageId: page.id }),
+      broadcastWorkspaceEvent(bindings, access.member.workspace.id, { type: "notifications-invalidated" }),
+      sweepOutbox(bindings),
     ]).then((results) => {
       for (const delivery of results)
         if (delivery.status === "rejected")

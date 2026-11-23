@@ -16,17 +16,39 @@ function fixture() {
     },
   } as unknown as Env;
 }
-it("bounds the query interface and safely quotes identifiers and opaque IDs", () => {
-  for (const query of ["window=all", "sort=drop", "pageId=", `pageId=${"x".repeat(129)}`])
+it("rejects unsupported IDs before querying and preserves opaque workspace and page IDs", () => {
+  for (const query of ["window=all", "sort=drop", "pageId=", `pageId=${"x".repeat(101)}`])
     expect(() => costOptions(new URLSearchParams(query))).toThrow("Choose a supported usage");
+  for (const pageId of ["page'quoted", "page\\", "page\\'quoted", "page\n"]) {
+    expect(() => costOptions(new URLSearchParams({ pageId }))).toThrow("Choose a supported usage");
+    expect(() => costQueries("notes", "workspace", { window: "24h", sort: "cost", pageId })).toThrow(
+      "analytics_identifier_invalid",
+    );
+  }
   expect(() => costQueries("bad;drop", "workspace", { window: "7d", sort: "cost" })).toThrow(
     "invalid_analytics_dataset",
   );
-  const queries = costQueries("notes", "workspace'quoted", { window: "24h", sort: "latency", pageId: "page'quoted" });
+  const queries = costQueries("notes", "workspace-1", { window: "24h", sort: "latency", pageId: "page_1" });
   expect(queries[2]).toContain("LIMIT 50");
-  expect(queries[0]).toContain("workspace''quoted");
-  expect(queries[0]).toContain("page''quoted");
-  USAGE_COUNTERS.forEach((key, index) =>
+  expect(queries[0]).toContain("blob2='workspace-1'");
+  expect(queries[0]).toContain("blob3='page_1'");
+  const persistedV1 = [
+    "requests",
+    "durationMs",
+    "bytes",
+    "r2ClassA",
+    "r2ClassB",
+    "d1RowsRead",
+    "d1RowsWritten",
+    "embeddingTokens",
+    "vectorQueryDimensions",
+    "vectorWriteDimensions",
+    "d1Queries",
+    "d1MeasuredQueries",
+    "operations",
+  ];
+  expect(USAGE_COUNTERS.slice(0, persistedV1.length)).toEqual(persistedV1);
+  persistedV1.forEach((key, index) =>
     expect(queries[0]).toContain(`SUM(_sample_interval * double${index + 1}) AS ${key}`),
   );
 });

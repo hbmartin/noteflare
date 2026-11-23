@@ -1,3 +1,6 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
+import { canonicalRedirect } from "./canonical-redirect";
+import { operatorSnapshot } from "./operator-settings";
 import { withUsage, setUsageIdentity, addUsage } from "./usage";
 import type { Env } from "./env";
 import { classifyError } from "./http";
@@ -87,27 +90,41 @@ async function shareResponse(
   const pageId = segments[2] === "pages" ? segments[3] : undefined;
   const page = await resolveSharedPage(env, key, pageId);
   if (!page) return missing();
-  setUsageIdentity(page.workspace_id, page.id);
   const version = `share:${page.id}:${page.access_generation ?? 1}:${page.content_generation ?? 1}:images:${Number(publicImagesEnabled(env))}`;
+  if (segments[2] === "assets" && segments.length === 4) {
+    const attachment = await env.DB.prepare("SELECT page_id FROM attachments WHERE id=?")
+      .bind(segments[3])
+      .first<{ page_id: string }>();
+    const source = attachment ? await resolveSharedPage(env, key, attachment.page_id) : null;
+    if (!source) return missing();
+    setUsageIdentity(source.workspace_id, source.page_id);
+    return cached(
+      request,
+      version,
+      !page.password_hash,
+      context,
+      async () => (await publicAttachment(env, source, segments[3]!)) ?? missing(),
+    );
+  }
+  if (segments[2] === "diagram-thumbnails" && segments.length === 4) {
+    const sourceId = new URL(request.url).searchParams.get("source");
+    const source = sourceId ? await resolveSharedPage(env, key, sourceId) : null;
+    const diagram = await resolveSharedDiagram(env, key, segments[3]!.replace(/\.svg$/, ""));
+    if (!source || !diagram) return missing();
+    setUsageIdentity(diagram.workspace_id, diagram.page_id);
+    return cached(
+      request,
+      version,
+      !page.password_hash,
+      context,
+      async () => (await publicDiagramThumbnail(env, diagram, source)) ?? missing(),
+    );
+  }
+  setUsageIdentity(page.workspace_id, segments[2] === "sitemap.xml" ? undefined : page.page_id);
   return cached(request, version, !page.password_hash, context, async () => {
     if (segments[2] === "sitemap.xml") {
       const sitemap = await publicSitemap(env, page, key, new URL(request.url).origin);
       return sitemap ? new Response(sitemap, { headers: { "content-type": "application/xml" } }) : missing();
-    }
-    // Attachment routes carry their owning page ID; no arbitrary object path is accepted.
-    if (segments[2] === "assets" && segments.length === 4) {
-      const attachment = await env.DB.prepare("SELECT page_id,mime FROM attachments WHERE id=?")
-        .bind(segments[3])
-        .first<{ page_id: string; mime: string }>();
-      const source = attachment ? await resolveSharedPage(env, key, attachment.page_id) : null;
-      if (!attachment || !source) return missing();
-      return (await publicAttachment(env, source, segments[3]!)) ?? missing();
-    }
-    if (segments[2] === "diagram-thumbnails" && segments.length === 4) {
-      const sourceId = new URL(request.url).searchParams.get("source");
-      const source = sourceId ? await resolveSharedPage(env, key, sourceId) : null,
-        diagram = await resolveSharedDiagram(env, key, segments[3]!.replace(/\.svg$/, ""));
-      return source && diagram ? ((await publicDiagramThumbnail(env, diagram, source)) ?? missing()) : missing();
     }
     if (segments.length > 2 && !(segments[2] === "pages" && segments.length === 4)) return missing();
     const html = await renderPublicShare(env, page, key, new URL(request.url).origin, {
@@ -223,6 +240,10 @@ export async function fetchPublic(request: Request, env: Env, context: Execution
   try {
     const url = new URL(request.url),
       canonical = !!env.PUBLIC_BASE_URL && url.origin === new URL(env.PUBLIC_BASE_URL).origin;
+    if (env.CANONICAL_REDIRECTS_ENABLED === "true" && url.hostname.endsWith(".workers.dev")) {
+      const redirect = canonicalRedirect(request, env.PUBLIC_BASE_URL);
+      if (redirect) return redirect;
+    }
     const host = canonical
       ? null
       : await env.DB.prepare(
@@ -264,13 +285,18 @@ export async function fetchPublic(request: Request, env: Env, context: Execution
     return Response.json(classified.body, { status: classified.status, headers: { "cache-control": "no-store" } });
   }
 }
-export default {
-  fetch: (request: Request, env: Env, context: ExecutionContext) =>
-    withUsage(env, "http.public", async (bindings) => {
+export default class PublicWorker extends WorkerEntrypoint<Env> {
+  getOperatorSettings() {
+    return operatorSnapshot(this.env, true);
+  }
+
+  fetch(request: Request) {
+    return withUsage(this.env, "http.public", async (bindings) => {
       addUsage({ requests: 1 });
-      const response = await fetchPublic(request, bindings, context);
+      const response = await fetchPublic(request, bindings, this.ctx);
       const length = response.headers.get("content-length");
       if (length && /^\d+$/.test(length)) addUsage({ bytes: Number(length) });
       return response;
-    }),
-};
+    });
+  }
+}

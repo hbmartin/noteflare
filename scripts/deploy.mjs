@@ -506,11 +506,34 @@ export function portableOverrides(
   };
 }
 
-async function prepare(forced, dryRun) {
+export function assertSingleWorkerTarget(
+  name,
+  productionName,
+  coordinated = existsSync(resolve("wrangler.public.jsonc")),
+) {
+  if (name === productionName && coordinated)
+    throw new Error(
+      "This production checkout requires a coordinated application/public release. Use the gated Deploy workflow described in docs/implementation/cloudflare-production-enablement.md; the single-Worker deploy command cannot apply this release.",
+    );
+}
+async function prepare(forced, dryRun, liveUpload = false) {
   const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
   validatePlatformConfiguration(root);
   const production = unstable_readConfig({ config: "wrangler.jsonc", env: "production" }, { hideWarnings: true });
   const name = process.env.WRANGLER_CI_OVERRIDE_NAME || root.name;
+  if (liveUpload) {
+    const candidate =
+      forced === "production"
+        ? "production"
+        : forced === "portable"
+          ? ""
+          : (process.env.CLOUDFLARE_ENV ?? (process.env.WORKERS_CI === "1" ? "" : "production"));
+    const candidateName = candidate
+      ? process.env.WRANGLER_CI_OVERRIDE_NAME ||
+        unstable_readConfig({ config: "wrangler.jsonc", env: candidate }, { hideWarnings: true }).name
+      : name;
+    assertSingleWorkerTarget(candidateName, production.name);
+  }
   let connection, settings;
   if (
     forced === "portable" ||
@@ -806,7 +829,7 @@ export async function main(argv) {
       ? "production"
       : undefined;
   const dryRun = options.includes("--dry-run");
-  const context = await prepare(forced, dryRun);
+  const context = await prepare(forced, dryRun, action === "deploy" && !dryRun);
   let manifest;
   if (action === "deploy" && process.env.WORKERS_CI === "1" && existsSync(manifestPath)) {
     manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -831,10 +854,6 @@ export async function main(argv) {
     if (result.error || result.status !== 0) throw new Error("Worker dry run failed.");
     return;
   }
-  if (context.target === "production" && existsSync(resolve("wrangler.public.jsonc")))
-    throw new Error(
-      "This production checkout requires a coordinated application/public release. Use the gated Deploy workflow described in docs/implementation/cloudflare-production-enablement.md; the single-Worker deploy command cannot apply this release.",
-    );
   const connection = await cloudflare(config.account_id ?? manifest.account ?? undefined);
   const integrityDB = integrityDatabaseID(config, connection.account, manifest.account);
   await deployPrepared(manifest, {

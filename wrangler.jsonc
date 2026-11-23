@@ -17,6 +17,7 @@
   "version_metadata": { "binding": "CF_VERSION_METADATA" },
   "analytics_engine_datasets": [{ "binding": "OBSERVABILITY", "dataset": "noteflare" }],
   "assets": {
+    "binding": "ASSETS",
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*", "/parties/*", "/v1/*", "/share/*", "/mcp", "/oauth/*", "/.well-known/oauth-*"],
   },
@@ -125,9 +126,11 @@
   "env": {
     "production": {
       "name": "cloudflare-realtime-notes",
-      "workers_dev": false,
+      "workers_dev": true,
       "preview_urls": false,
       "routes": [{ "pattern": "notes.sparkedinnovations.training", "custom_domain": true }],
+      "services": [{ "binding": "PUBLIC_OPERATOR_SETTINGS", "service": "cloudflare-realtime-notes-public" }],
+      "assets": { "binding": "ASSETS", "not_found_handling": "single-page-application", "run_worker_first": true },
       "ai": { "binding": "AI" },
       "vectorize": [{ "binding": "SEMANTIC_INDEX", "index_name": "cloudflare-realtime-notes-semantic" }],
       "images": { "binding": "IMAGES" },
@@ -193,6 +196,7 @@
         { "name": "CLIENT_TELEMETRY_PREAUTH_LIMIT", "namespace_id": "2106", "simple": { "limit": 300, "period": 60 } },
       ],
       "vars": {
+        "CANONICAL_REDIRECTS_ENABLED": "true",
         "PUBLIC_BASE_URL": "https://public.sparkedinnovations.training",
         "CF_ACCOUNT_ID": "940db9a80e285cf3f700d5d903d8e182",
         "CF_ZONE_ID": "986af780c629979d91800d7e569f4b9c",

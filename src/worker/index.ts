@@ -1,4 +1,5 @@
-import { withUsage, addUsage } from "./usage";
+import { canonicalRedirect } from "./canonical-redirect";
+import { backgroundUsage, withUsage, addUsage } from "./usage";
 import { publicReadFailure } from "./public-utils";
 import {
   prepareCommentSubmission,
@@ -773,8 +774,8 @@ function sendWorkspaceEvent(
   workspaceId: string,
   event: WorkspaceEvent,
 ) {
-  c.executionCtx.waitUntil(
-    broadcastWorkspaceEvent(c.env, workspaceId, event).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "workspace.broadcast", { workspaceId }, (env) =>
+    broadcastWorkspaceEvent(env, workspaceId, event).catch((error) => {
       logger.error(
         "workspace_event.broadcast.failed",
         "workspace-events",
@@ -789,7 +790,7 @@ function sendWorkspaceEvent(
 // Call only after mutations that can create Activity or share-refresh outbox work.
 function sweepMutationOutbox(c: Parameters<typeof sendWorkspaceEvent>[0]) {
   if (c.env.WORKSPACE_ACTIVITY_ENABLED === "true" || c.env.SLACK_SHARE_REFRESH_ENABLED === "true")
-    c.executionCtx.waitUntil(sweepOutbox(c.env));
+    backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
 }
 function sendMutationEvent(c: Parameters<typeof sendWorkspaceEvent>[0], workspaceId: string, event: WorkspaceEvent) {
   sweepMutationOutbox(c);
@@ -803,8 +804,8 @@ function sendCommentMutationEvents(
 ) {
   sendWorkspaceEvent(c, workspaceId, { type: "comments-invalidated", pageId });
   sendWorkspaceEvent(c, workspaceId, { type: "notifications-invalidated" });
-  c.executionCtx.waitUntil(
-    sweepOutbox(c.env).catch((error) =>
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, (env) =>
+    sweepOutbox(env).catch((error) =>
       logger.error(
         "comment.notification_enqueue.failed",
         "comments",
@@ -2170,8 +2171,8 @@ app.post("/api/templates", async (c) => {
       isTemplate: true,
     },
   });
-  c.executionCtx.waitUntil(
-    startJobExecution(c.env, job).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "job.start", { workspaceId: member.workspace.id }, (env) =>
+    startJobExecution(env, job).catch((error) => {
       logger.error(
         "workflow.template_create.start_failed",
         "workflow",
@@ -2217,8 +2218,8 @@ app.post("/api/templates/:id/instantiate", async (c) => {
       isTemplate: false,
     },
   });
-  c.executionCtx.waitUntil(
-    startJobExecution(c.env, job).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "job.start", { workspaceId: member.workspace.id }, (env) =>
+    startJobExecution(env, job).catch((error) => {
       logger.error(
         "workflow.template_instantiate.start_failed",
         "workflow",
@@ -2303,8 +2304,8 @@ app.post("/api/import-uploads", async (c) => {
     throw error;
   }
   const uploaded = (await c.env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(job.id).first<JobRow>())!;
-  c.executionCtx.waitUntil(
-    startJobExecution(c.env, uploaded).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "job.start", { workspaceId: member.workspace.id }, (env) =>
+    startJobExecution(env, uploaded).catch((error) => {
       logger.error(
         "workflow.import_inspect.start_failed",
         "workflow",
@@ -2381,8 +2382,8 @@ async function refreshImportPreview(
       "import_preview_changed",
       "This import changed. Refresh it and review the latest preview.",
     );
-  c.executionCtx.waitUntil(
-    startJobExecution(c.env, refreshed).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "job.start", { workspaceId: member.workspace.id }, (env) =>
+    startJobExecution(env, refreshed).catch((error) => {
       logger.error(
         "workflow.import_reinspect.start_failed",
         "workflow",
@@ -2484,8 +2485,8 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
     );
   }
   const confirmed = await jobForMember(c.env, member, job.id);
-  c.executionCtx.waitUntil(
-    startJobExecution(c.env, confirmed).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "job.start", { workspaceId: member.workspace.id }, (env) =>
+    startJobExecution(env, confirmed).catch((error) => {
       logger.error(
         "workflow.import_confirmed.start_failed",
         "workflow",
@@ -2535,8 +2536,8 @@ app.post("/api/jobs/search-reindex", async (c) => {
     .first<JobRow>();
   if (existing) return c.json({ job: jobJson(existing), coalesced: true });
   const job = await createJob(c.env, { member, type: "search_reindex" });
-  c.executionCtx.waitUntil(
-    startJobExecution(c.env, job).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "job.start", { workspaceId: member.workspace.id }, (env) =>
+    startJobExecution(env, job).catch((error) => {
       logger.error(
         "workflow.search_reindex.start_failed",
         "workflow",
@@ -2561,8 +2562,8 @@ app.post("/api/jobs/comment-migration", async (c) => {
     .first<JobRow>();
   if (existing) return c.json({ job: jobJson(existing), coalesced: true });
   const job = await createJob(c.env, { member, type: "comment_migration" });
-  c.executionCtx.waitUntil(
-    startJobExecution(c.env, job).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "job.start", { workspaceId: member.workspace.id }, (env) =>
+    startJobExecution(env, job).catch((error) => {
       logger.error(
         "workflow.comment_migration.start_failed",
         "workflow",
@@ -2587,8 +2588,8 @@ app.post("/api/jobs/:id/cancel", async (c) => {
   if (!canceling) {
     throw new HttpError(409, "job_not_cancelable", "This job is no longer running.");
   }
-  c.executionCtx.waitUntil(
-    finishPendingJobCleanup(c.env, job).catch((error) =>
+  backgroundUsage(c.executionCtx, c.env, "job.cleanup", { workspaceId: member.workspace.id }, (env) =>
+    finishPendingJobCleanup(env, job).catch((error) =>
       logger.error(
         "workflow.canceled.cleanup_failed",
         "workflow",
@@ -2704,8 +2705,8 @@ app.post("/api/jobs/:id/retry", async (c) => {
     )
     .first<JobRow>();
   if (!retried) throw new HttpError(409, "job_not_retryable", "This job was already retried.");
-  c.executionCtx.waitUntil(
-    startJobExecution(c.env, retried).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "job.start", { workspaceId: member.workspace.id }, (env) =>
+    startJobExecution(env, retried).catch((error) => {
       logger.error(
         "workflow.job.restart_failed",
         "workflow",
@@ -2725,8 +2726,8 @@ app.post("/api/jobs/:id/cleanup", async (c) => {
   if (!job.cleanup_target || !isCleanupJobStatus(job.status)) {
     throw new HttpError(409, "job_cleanup_not_pending", "This job does not have cleanup pending.");
   }
-  c.executionCtx.waitUntil(
-    finishPendingJobCleanup(c.env, job).catch((error) =>
+  backgroundUsage(c.executionCtx, c.env, "job.cleanup", { workspaceId: member.workspace.id }, (env) =>
+    finishPendingJobCleanup(env, job).catch((error) =>
       logger.error(
         "workflow.cleanup.retry_failed",
         "workflow",
@@ -2851,8 +2852,8 @@ app.post("/api/webhooks", async (c) => {
     text(input.url, "url", 2_000),
     input.events,
   );
-  c.executionCtx.waitUntil(
-    sendWebhookVerification(c.env, created.subscription.id)
+  backgroundUsage(c.executionCtx, c.env, "webhook.verify", { workspaceId: member.workspace.id }, (env) =>
+    sendWebhookVerification(env, created.subscription.id)
       .then((result) => {
         if (!result.ok) {
           logger.error(
@@ -2937,7 +2938,7 @@ app.get("/api/slack/oauth/callback", async (c) => {
   const code = text(c.req.query("code"), "code", 500);
   const state = text(c.req.query("state"), "state", 500);
   await finishSlackOAuth(c.env, member, code, state);
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.redirect("/?view=settings&slack=connected", 303);
 });
 
@@ -2986,11 +2987,11 @@ app.post("/api/slack/commands", async (c) => {
         openSlackSearch(...args),
       deadlineAt,
       (work) => {
-        c.executionCtx.waitUntil(work.then(() => sweepOutbox(c.env)));
+        backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, (env) => work.then(() => sweepOutbox(env)));
       },
     ),
   );
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return response.text ? c.json(response) : c.body(null, 200);
 });
 
@@ -3004,7 +3005,7 @@ app.post("/api/slack/events", async (c) => {
     throw new HttpError(422, "invalid_slack_event", "Slack event payload is invalid.");
   }
   const result = (await acceptSlackReply(c.env, payload)) ? { ok: true } : await handleSlackEvent(c.env, payload);
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json(result);
 });
 
@@ -3039,11 +3040,11 @@ app.post("/api/slack/interactions", async (c) => {
   }
   const product = await beforeAck(() => acceptSlackProductInteraction(c.env, payload, deadlineAt));
   if (product.handled) {
-    c.executionCtx.waitUntil(sweepOutbox(c.env));
+    backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
     return c.json(product.response ?? {});
   }
   if (await beforeAck(() => acceptSlackThreadAction(c.env, payload))) {
-    c.executionCtx.waitUntil(sweepOutbox(c.env));
+    backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
     return c.json({ ok: true });
   }
   let workspace: Awaited<ReturnType<typeof acceptSlackWorkspaceInteraction>>;
@@ -3057,7 +3058,7 @@ app.post("/api/slack/interactions", async (c) => {
     throw error;
   }
   if (workspace.handled) {
-    c.executionCtx.waitUntil(sweepOutbox(c.env));
+    backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
     if (payload.type === "view_submission") return c.body(null, 200);
     return c.json(workspace.response ?? { ok: true });
   }
@@ -3141,7 +3142,7 @@ app.patch("/api/slack/channels/:id", async (c) => {
         : text(body.digestTimezone, "digestTimezone", 100),
     digestOpenWork: body.digestOpenWork === undefined ? existing.digestOpenWork : (body.digestOpenWork as boolean),
   });
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json({ subscription });
 });
 app.get("/api/slack/channels", async (c) => {
@@ -3174,7 +3175,7 @@ app.post("/api/slack/channels/:id/verify-recovery", async (c) => {
   if (!mapping) throw new HttpError(404, "mapping_unavailable", "This mapping is unavailable.");
   const body = await c.req.json<{ cursor?: string }>().catch(() => ({ cursor: undefined }));
   const summary = await verifySlackMapping(c.env, mapping.id, body.cursor, deadline);
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json(summary);
 });
 
@@ -3226,7 +3227,7 @@ app.post("/api/slack/channels", async (c) => {
     ...(body.digestTimezone === undefined ? {} : { digestTimezone: text(body.digestTimezone, "digestTimezone", 100) }),
     ...(typeof body.digestOpenWork === "boolean" ? { digestOpenWork: body.digestOpenWork } : {}),
   });
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json({ subscription }, 201);
 });
 
@@ -3253,7 +3254,7 @@ app.patch("/api/slack/channels/:id/pause", async (c) => {
   if (body.mode === "snooze" && hours === undefined)
     throw new HttpError(422, "invalid_slack_pause", "Choose 1, 8, or 24 hours.");
   await setSlackChannelPause(c.env, member, c.req.param("id"), body.mode, body.mode === "snooze" ? hours : undefined);
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json({
     subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
   });
@@ -3266,7 +3267,7 @@ app.post("/api/slack/channels/:id/repair-notifications", async (c) => {
   await repairSlackChannelNotifications(c.env, member, c.req.param("id"));
   if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await wakeRound2Mapping(c.env, c.req.param("id"));
   const summary = await verifySlackMapping(c.env, c.req.param("id"), undefined, deadline);
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json(summary);
 });
 
@@ -3274,7 +3275,7 @@ app.delete("/api/slack/channels/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   await deleteSlackChannelSubscription(c.env, member, c.req.param("id"));
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json({ ok: true });
 });
 
@@ -3303,8 +3304,8 @@ app.post("/api/pages/:id/exports", async (c) => {
     spaceId: page.space_id ?? `${member.workspace.id}-general`,
     options: { pageId: page.id, format, portable },
   });
-  c.executionCtx.waitUntil(
-    startJobExecution(c.env, job).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "job.start", { workspaceId: member.workspace.id }, (env) =>
+    startJobExecution(env, job).catch((error) => {
       logger.error(
         "workflow.export.start_failed",
         "workflow",
@@ -4955,8 +4956,8 @@ app.post("/api/deletion-jobs/:id/retry", async (c) => {
   const jobId = c.req.param("id");
   if ((await queueDeletionRetry(c.env, member.workspace.id, jobId)) === "missing")
     throw new HttpError(404, "deletion_job_not_found", "This pending deletion is no longer available.");
-  c.executionCtx.waitUntil(
-    processDeletionJob(c.env, jobId).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "page.cleanup", { workspaceId: member.workspace.id }, (env) =>
+    processDeletionJob(env, jobId).catch((error) => {
       logger.error("deletion.cleanup.failed", "deletion", "Deletion recheck failed.", { jobId }, error);
     }),
   );
@@ -4971,8 +4972,8 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   if (existing) {
     const retry = await queueDeletionRetry(c.env, member.workspace.id, existing.jobId);
     if (retry !== "missing")
-      c.executionCtx.waitUntil(
-        processDeletionJob(c.env, existing.jobId).catch((error) => {
+      backgroundUsage(c.executionCtx, c.env, "page.cleanup", { workspaceId: member.workspace.id }, (env) =>
+        processDeletionJob(env, existing.jobId).catch((error) => {
           logger.error(
             "deletion.cleanup.failed",
             "deletion",
@@ -4999,8 +5000,8 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   const { jobId, pageIds } = await acceptPageDeletion(c.env, member.workspace.id, member.user.id, page.id);
   sendMutationEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: true });
   if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
-  c.executionCtx.waitUntil(
-    processDeletionJob(c.env, jobId).catch((error) => {
+  backgroundUsage(c.executionCtx, c.env, "page.cleanup", { workspaceId: member.workspace.id }, (env) =>
+    processDeletionJob(env, jobId).catch((error) => {
       logger.error("deletion.cleanup.failed", "deletion", "Immediate deletion cleanup failed.", { jobId }, error);
     }),
   );
@@ -5262,7 +5263,7 @@ app.post("/api/pages/:id/linked-tables/:tableId/tasks", async (c) => {
     pageId: tableId,
     ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
   });
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json(result, 201);
 });
 
@@ -5290,7 +5291,7 @@ app.patch("/api/pages/:id/linked-tables/:tableId/tasks/:rowId", async (c) => {
     pageId: tableId,
     ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
   });
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json(result);
 });
 
@@ -6186,7 +6187,7 @@ app.post("/api/task-lists/:pageId/tasks", async (c) => {
     pageId,
     ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
   });
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   return c.json(result, 201);
 });
 app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
@@ -6201,7 +6202,7 @@ app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
     ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
     forceRefresh: body.archived === true,
   });
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, sweepOutbox);
   if (body.archived !== true) return c.json(result);
   const pageIds = result.pageIds ?? [result.detailPageId];
   const operationId = typeof body.operationId === "string" ? body.operationId : "";
@@ -7145,13 +7146,18 @@ async function publicPageResponse(c: Context<{ Bindings: Env }>, pageId?: string
     throw error;
   }
   if (!html) return c.text("Not found", 404);
-  c.executionCtx.waitUntil(
-    c.env.DB.prepare(
-      `UPDATE share_links SET views = views + 1, last_accessed_at = ? WHERE id = ? AND revoked_at IS NULL`,
-    )
-      .bind(Date.now(), share.id)
-      .run()
-      .then(() => undefined),
+  backgroundUsage(
+    c.executionCtx,
+    c.env,
+    "share.view",
+    { workspaceId: share.workspace_id, pageId: share.page_id },
+    (env) =>
+      env.DB.prepare(
+        `UPDATE share_links SET views = views + 1, last_accessed_at = ? WHERE id = ? AND revoked_at IS NULL`,
+      )
+        .bind(Date.now(), share.id)
+        .run()
+        .then(() => undefined),
   );
   return c.html(html, 200, { "cache-control": "no-store" });
 }
@@ -7629,6 +7635,10 @@ export async function runSecurityMaintenance(env: Env) {
 
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext) {
+    if (env.CANONICAL_REDIRECTS_ENABLED === "true") {
+      const redirect = canonicalRedirect(request, env.BETTER_AUTH_URL);
+      if (redirect) return redirect;
+    }
     const requestId = crypto.randomUUID();
     const rayId = request.headers.get("cf-ray") ?? undefined;
     return withUsage(env, "http.application", async (usageEnv) =>
@@ -7713,8 +7723,8 @@ export default {
               usageEnv.HEATMAPS_ENABLED === "true" ||
               new URL(request.url).pathname.startsWith("/api/platform/keys"))
           )
-            context.waitUntil(
-              wakePlatform(usageEnv).catch(() =>
+            backgroundUsage(context, usageEnv, "platform.wake", {}, (bindings) =>
+              wakePlatform(bindings).catch(() =>
                 logger.warn("platform.wake.failed", "platform", "Scheduled recovery will retry platform work"),
               ),
             );

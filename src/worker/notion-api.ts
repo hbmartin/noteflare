@@ -1,3 +1,4 @@
+import { backgroundUsage } from "./usage";
 import { imageDerivative } from "./images";
 import { readSession, type ReadDatabase } from "./read-session";
 import { trackRealtimeWorkspace } from "./realtime-access";
@@ -215,16 +216,16 @@ function capability(principal: IntegrationPrincipal, name: keyof IntegrationPrin
 }
 
 function enqueueWebhooks(c: Context<ApiContext>) {
-  c.executionCtx.waitUntil(
-    sweepOutbox(c.env).catch((error) =>
+  backgroundUsage(c.executionCtx, c.env, "outbox.sweep", {}, (env) =>
+    sweepOutbox(env).catch((error) =>
       logger.error("notion_api.webhook_enqueue.failed", "notion-api", "Webhook enqueue failed.", {}, error),
     ),
   );
 }
 
 function enqueueWorkspaceEvent(c: Context<ApiContext>, workspaceId: string, event: WorkspaceEvent) {
-  c.executionCtx.waitUntil(
-    broadcastWorkspaceEvent(c.env, workspaceId, event).catch((error) =>
+  backgroundUsage(c.executionCtx, c.env, "workspace.broadcast", { workspaceId }, (env) =>
+    broadcastWorkspaceEvent(env, workspaceId, event).catch((error) =>
       logger.error(
         "notion_api.workspace_broadcast.failed",
         "notion-api",
@@ -1186,16 +1187,21 @@ notionApi.patch("/pages/:pageId/markdown", async (c) => {
     if (task.row.expires_at <= Date.now() || task.row.page_id !== page.id || task.row.request_json !== requestJson)
       throw new NotionError(409, "conflict_error", "Idempotency-Key was used for another request.");
     if (task.created)
-      c.executionCtx.waitUntil(
-        runNotionMarkdownTask(c.env, task.row.id).catch((error) =>
-          logger.error(
-            "notion_api.markdown_task.start_failed",
-            "notion-api",
-            "Queued Markdown task could not start.",
-            { taskId: task.row.id },
-            error,
+      backgroundUsage(
+        c.executionCtx,
+        c.env,
+        "notion.markdown",
+        { workspaceId: principal.workspaceId, pageId: page.id },
+        (env) =>
+          runNotionMarkdownTask(env, task.row.id).catch((error) =>
+            logger.error(
+              "notion_api.markdown_task.start_failed",
+              "notion-api",
+              "Queued Markdown task could not start.",
+              { taskId: task.row.id },
+              error,
+            ),
           ),
-        ),
       );
     return c.json(markdownTaskJson(task.row, c.req.url), 202);
   }
@@ -1779,8 +1785,8 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
       if (root) workspaceEvent = { type: "pages-upserted", pages: [pageJson(root)] };
     }
     if (inTrash === true) {
-      c.executionCtx.waitUntil(
-        processArchiveDisconnectTargets(c.env, mutationResults[0]?.results ?? []).catch((error) =>
+      backgroundUsage(c.executionCtx, c.env, "page.archive_disconnect", { workspaceId: principal.workspaceId }, (env) =>
+        processArchiveDisconnectTargets(env, mutationResults[0]?.results ?? []).catch((error) =>
           logger.error("notion_api.archive_disconnect.failed", "notion-api", "Archive disconnect failed.", {}, error),
         ),
       );

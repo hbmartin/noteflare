@@ -174,14 +174,20 @@ function metadata(html: string) {
   };
 }
 
-function responsePreview(row: CacheRow) {
+const previewImagePrefix = "link-previews/metadata-v2/";
+function safePreviewImage(env: Env, key: string | null, mime: string | null) {
+  return (
+    env.IMAGES_ENABLED === "true" && !!env.IMAGES && mime === "image/webp" && !!key?.startsWith(previewImagePrefix)
+  );
+}
+function responsePreview(env: Env, row: CacheRow) {
   return {
     id: row.id,
     url: row.canonical_url,
     title: row.title,
     description: row.description,
     siteName: row.site_name,
-    imageUrl: row.image_key ? `/api/link-previews/${row.id}/image` : null,
+    imageUrl: safePreviewImage(env, row.image_key, row.image_mime) ? `/api/link-previews/${row.id}/image?v=2` : null,
     expiresAt: row.expires_at,
   };
 }
@@ -193,7 +199,7 @@ async function waitForRefresh(env: Env, workspaceId: string, id: string) {
     const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
       .bind(id, workspaceId)
       .first<CacheRow>();
-    if (current && current.refresh_until === 0 && current.expires_at > Date.now()) return responsePreview(current);
+    if (current && current.refresh_until === 0 && current.expires_at > Date.now()) return responsePreview(env, current);
   }
   throw new HttpError(503, "preview_pending", "Link preview is still being fetched. Try again shortly.");
 }
@@ -241,11 +247,11 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     .first<CacheRow>();
   const now = Date.now();
   if (existing && existing.refresh_until > now) {
-    if (existing.fetched_at > 0) return responsePreview(existing);
+    if (existing.fetched_at > 0) return responsePreview(env, existing);
     await beforeFetch?.();
     return waitForRefresh(env, workspaceId, id);
   }
-  if (existing && existing.expires_at > now) return responsePreview(existing);
+  if (existing && existing.expires_at > now) return responsePreview(env, existing);
   await beforeFetch?.();
   let leaseUntil = 0;
   if (existing) {
@@ -285,7 +291,7 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
       }
       return current.refresh_until > now && current.fetched_at <= 0
         ? waitForRefresh(env, workspaceId, id)
-        : responsePreview(current);
+        : responsePreview(env, current);
     }
     if (existing && !claimedLease)
       throw new HttpError(503, "preview_pending", "Link preview is still being fetched. Try again shortly.");
@@ -324,7 +330,7 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
       if (current)
         return current.refresh_until > now && current.fetched_at <= 0
           ? waitForRefresh(env, workspaceId, id)
-          : responsePreview(current);
+          : responsePreview(env, current);
       throw new HttpError(503, "preview_pending", "Link preview is still being fetched. Try again shortly.");
     }
   }
@@ -346,30 +352,25 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     description = parsed.description;
     siteName = parsed.siteName || siteName;
     succeeded = true;
-    if (parsed.image) {
+    if (parsed.image && env.IMAGES_ENABLED === "true" && env.IMAGES) {
       let stagedKey: string | null = null;
       try {
         const image = await fetchPublic(publicUrl(parsed.image, page.url.href), signal);
         const mime = image.response.headers.get("content-type")?.split(";", 1)[0]?.toLowerCase() ?? "";
         if (image.response.ok && IMAGE_MIMES.has(mime)) {
-          let bytes = await boundedBytes(image.response, MAX_IMAGE);
-          let outputMime = mime;
+          const bytes = await boundedBytes(image.response, MAX_IMAGE);
           if (rasterSignature(mime, bytes)) {
-            if (env.IMAGES_ENABLED === "true") {
-              const sanitized = await sanitizedPreview(env, bytes);
-              if (!sanitized) throw new Error("preview_transform_unavailable");
-              bytes = sanitized;
-              outputMime = "image/webp";
-            }
-            const key = `link-previews/${workspaceId}/${id}/${crypto.randomUUID()}`;
+            const sanitized = await sanitizedPreview(env, bytes);
+            if (!sanitized) throw new Error("preview_transform_unavailable");
+            const key = `${previewImagePrefix}${workspaceId}/${id}/${crypto.randomUUID()}`;
             // Reserve the key for cleanup before writing R2; D1 and R2 cannot commit atomically.
             await env.DB.prepare("INSERT OR IGNORE INTO link_preview_image_gc (image_key,queued_at) VALUES (?,?)")
               .bind(key, Date.now() + 5 * 60_000)
               .run();
             stagedKey = key;
-            await putImage(env, key, bytes, outputMime, signal);
+            await putImage(env, key, sanitized, "image/webp", signal);
             imageKey = key;
-            imageMime = outputMime;
+            imageMime = "image/webp";
             stagedKey = null;
           }
         }
@@ -432,7 +433,7 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
       // The staged key stays reserved for scheduled cleanup when D1 is unreadable.
       throw cause;
     }
-    if (current && current.refresh_until === 0 && current.expires_at > Date.now()) return responsePreview(current);
+    if (current && current.refresh_until === 0 && current.expires_at > Date.now()) return responsePreview(env, current);
     throw cause;
   }
   if (!saved[1]?.meta.changes) {
@@ -440,10 +441,10 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
       .bind(id, workspaceId)
       .first<CacheRow>();
-    if (current && current.refresh_until === 0 && current.expires_at > Date.now()) return responsePreview(current);
+    if (current && current.refresh_until === 0 && current.expires_at > Date.now()) return responsePreview(env, current);
     throw new HttpError(503, "preview_pending", "Link preview is still being fetched. Try again shortly.");
   }
-  return responsePreview({
+  return responsePreview(env, {
     id,
     workspace_id: workspaceId,
     canonical_url: url.href,
@@ -466,16 +467,16 @@ export async function linkPreviewImage(env: Env, workspaceId: string, id: string
   )
     .bind(id, workspaceId, Date.now(), Date.now())
     .first<{ image_key: string | null; image_mime: string | null }>();
-  if (!row?.image_key || !row.image_mime || !IMAGE_MIMES.has(row.image_mime)) {
+  if (!row?.image_key || !safePreviewImage(env, row.image_key, row.image_mime)) {
     throw new HttpError(404, "preview_not_found", "Preview image not found.");
   }
   const object = await env.BUCKET.get(row.image_key);
   if (!object) throw new HttpError(404, "preview_not_found", "Preview image not found.");
   return new Response(object.body, {
     headers: {
-      "content-type": row.image_mime,
+      "content-type": "image/webp",
       "content-length": String(object.size),
-      "cache-control": "private, max-age=300",
+      "cache-control": "private, no-store",
       "x-content-type-options": "nosniff",
     },
   });

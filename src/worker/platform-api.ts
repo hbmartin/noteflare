@@ -1,3 +1,4 @@
+import { operatorSnapshot, readPublicOperatorSettings } from "./operator-settings";
 import { Hono } from "hono";
 import type { Env } from "./env";
 import { requireMember, requireOwner } from "./auth";
@@ -75,34 +76,41 @@ platformApi.get("/platform/costs", async (c) => {
 platformApi.get("/platform", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
-  const [jobs, usage, settings, archives, semantic, semanticUsage] = await c.env.DB.batch([
-    c.env.DB.prepare(
-      `SELECT kind,count(*) pending,min(created_at) oldestAt,sum(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) failures,max(attempts) maxAttempts FROM platform_jobs WHERE workspace_id=? GROUP BY kind`,
-    ).bind(member.workspace.id),
-    c.env.DB.prepare(
-      "SELECT metric,period,amount FROM platform_usage WHERE workspace_id=? AND period>=? ORDER BY period DESC,metric LIMIT 100",
-    ).bind(member.workspace.id, new Date(Date.now() - 7 * 86400_000).toISOString().slice(0, 10)),
-    c.env.DB.prepare("SELECT heatmaps_enabled FROM platform_settings WHERE workspace_id=?").bind(member.workspace.id),
-    c.env.DB.prepare(
-      "SELECT count(*) pending,min(committed_at) oldestAt FROM audit_events WHERE workspace_id=? AND archive_id IS NULL",
-    ).bind(member.workspace.id),
-    c.env.DB.prepare(`SELECT
+  c.header("cache-control", "private, no-store");
+  const [publicWorker, [jobs, usage, settings, archives, semantic, semanticUsage]] = await Promise.all([
+    readPublicOperatorSettings(c.env),
+    c.env.DB.batch([
+      c.env.DB.prepare(
+        `SELECT kind,count(*) pending,min(created_at) oldestAt,sum(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) failures,max(attempts) maxAttempts FROM platform_jobs WHERE workspace_id=? GROUP BY kind`,
+      ).bind(member.workspace.id),
+      c.env.DB.prepare(
+        "SELECT metric,period,amount FROM platform_usage WHERE workspace_id=? AND period>=? ORDER BY period DESC,metric LIMIT 100",
+      ).bind(member.workspace.id, new Date(Date.now() - 7 * 86400_000).toISOString().slice(0, 10)),
+      c.env.DB.prepare("SELECT heatmaps_enabled FROM platform_settings WHERE workspace_id=?").bind(member.workspace.id),
+      c.env.DB.prepare(
+        "SELECT count(*) pending,min(committed_at) oldestAt FROM audit_events WHERE workspace_id=? AND archive_id IS NULL",
+      ).bind(member.workspace.id),
+      c.env.DB.prepare(`SELECT
       (SELECT count(*) FROM semantic_documents WHERE workspace_id=?) indexedPages,
       (SELECT count(*) FROM semantic_chunks WHERE workspace_id=?) storedChunks,
       (SELECT count(*) FROM semantic_chunks) installationStoredChunks,
       (SELECT count(*) FROM semantic_dirty WHERE workspace_id=? AND pending=1) pendingPages,
       (SELECT min(updated_at) FROM semantic_dirty WHERE workspace_id=? AND pending=1) oldestPendingAt,
       (SELECT count(*) FROM semantic_builds b JOIN semantic_dirty d ON d.page_id=b.page_id AND d.generation=b.generation WHERE d.workspace_id=?) buildingPages`).bind(
-      member.workspace.id,
-      member.workspace.id,
-      member.workspace.id,
-      member.workspace.id,
-      member.workspace.id,
-    ),
-    c.env.DB.prepare("SELECT tokens,queries FROM semantic_usage WHERE day=?").bind(Math.floor(Date.now() / 86400_000)),
+        member.workspace.id,
+        member.workspace.id,
+        member.workspace.id,
+        member.workspace.id,
+        member.workspace.id,
+      ),
+      c.env.DB.prepare("SELECT tokens,queries FROM semantic_usage WHERE day=?").bind(
+        Math.floor(Date.now() / 86400_000),
+      ),
+    ]),
   ]);
   return c.json({
     capabilities: platformCapabilities(c.env),
+    operatorSettings: { application: operatorSnapshot(c.env), publicWorker },
     queueConfigured: !!c.env.PLATFORM_QUEUE,
     replication: c.env.D1_READ_REPLICATION_ENABLED === "true",
     jobs: jobs!.results,

@@ -1,6 +1,6 @@
 # Cloudflare production enablement
 
-The application origin is `https://notes.sparkedinnovations.training`; public delivery uses `https://public.sparkedinnovations.training`. Both Workers disable workers.dev and preview URLs in the coordinated configuration. Access stays local unless the operator explicitly enables it. Customer SaaS hostnames, Basin and read replication remain separately controlled.
+The application origin is `https://notes.sparkedinnovations.training`; public delivery uses `https://public.sparkedinnovations.training`. Each Worker keeps its workers.dev URL reachable as a redirect to its canonical origin. Preview URLs remain disabled. Redirects preserve the request path, query and method. The canonical application continues to redirect public share routes to public delivery. Public custom hostnames provisioned for customer sites retain their existing publication routing. Access stays local unless the operator explicitly enables it. Customer SaaS hostnames, Basin and read replication remain separately controlled.
 
 ## Prepare and verify resources
 
@@ -16,7 +16,11 @@ In the Cloudflare dashboard, create a custom account token restricted to the dep
 
 On 2026-11-22 the operator approved both scoped tokens in the in-app browser. The account Analytics Read token expires November 22, 2027, and is installed on the production and staging application Workers. The zone-only WAF Edit deployment token expires December 22, 2026. Both verified active; their local environment files under `.wrangler/platform/credentials/` are ignored by Git and have mode 0600. Neither public Worker receives these tokens. Load the deployment token with `node --env-file=.wrangler/platform/credentials/edge.env scripts/cloudflare-platform.mjs edges-plan production`; never place its value in a command argument or log.
 
-Run `pnpm platform:provision prepare production` after provisioning and secret installation. It verifies private buckets, exact index configuration, retention-policy readback and secret names, then generates ignored application.jsonc and publicWorker.jsonc configs beneath the environment's platform directory. This profile enables semantic search, publishing, Images, audit, Turnstile, Forms, TableAuthority and cost reporting while preserving explicitly enabled operator Access. Portable defaults remain disabled. Existing tables require explicit authority migration before publishing a Form.
+Run `pnpm platform:provision prepare production` after provisioning and secret installation. It verifies private buckets, index configuration, retention policies and secret names, then generates ignored Worker configurations. Ordinary preparation takes each Worker's current flags, limits and retention from its deployed settings. Unset feature flags stay disabled. The deployment rechecks these settings before upload and stops if an operator made a newer change.
+
+To activate a feature, pass `--enable=<comma-separated names>` to preparation or use the Deploy workflow's `enable_platform_features` input. For the first full activation, select `semantic,images,publishing,audit,turnstile,forms,tables,costs` after their gates pass. For subsequent activation, select only the intended flags. Forms require Tables and Turnstile on both Workers, and existing destination tables need explicit authority migration. Access remains a separate operator setting.
+
+The owner dashboard shows effective settings and configuration readiness for both Workers. A private service binding reads public Worker settings without using a Cloudflare administrative token. When the peer is unavailable or runs an older version, the dashboard still shows application settings. The first coordinated upload requires both bootstrap shells to exist because the application binds the public Worker and the public Worker uses application Durable Objects.
 
 Staging can prepare and verify the other products without the Analytics token; its cost reporting stays disabled and reports unavailable until that credential is installed. Production preflight requires the token. Provisioning never installs bucket-policy or zone-security credentials on either runtime Worker.
 
@@ -30,7 +34,7 @@ Before changing origins, verify owner password plus MFA/recovery access. Update 
 
 The production workflow builds and preflights both Workers before applying migrations. Its first deployment requires the existing Slack confirmation and the platform cutover confirmation. `pnpm deploy:platform production` dry-builds both prepared configurations, then deploys the application and public Workers in order. Keep public traffic paused through a mixed-version interval and complete forward deployment after a partial upload failure. Generated production configs are the deployment input; directly deploying the baseline source config leaves feature flags disabled.
 
-Slack's production OAuth redirect is `https://notes.sparkedinnovations.training/api/auth/callback/slack`. Update the provider-side allowlist before cutover. Application-generated callbacks use BETTER_AUTH_URL; do not preserve the old workers.dev origin as an extra authentication origin. The GitHub repository variable PRODUCTION_BASE_URL now points at the canonical application origin; its monitoring schedule remains disabled.
+Slack's production OAuth redirect is `https://notes.sparkedinnovations.training/api/auth/callback/slack`. Update the provider-side allowlist before cutover. Application-generated callbacks use BETTER_AUTH_URL; do not preserve the old workers.dev origin as an extra authentication origin. The GitHub repository variable PRODUCTION_BASE_URL now points at the canonical application origin; its monitoring schedule remains disabled. Verify that an existing workers.dev share follows redirects to public delivery and that an application link reaches the canonical login before restoring monitoring.
 
 ## Edge controls and API schemas
 
