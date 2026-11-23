@@ -14,6 +14,11 @@ on:
         description: Comma-separated features to enable (semantic,images,publishing,audit,turnstile,forms,tables,costs)
         required: false
         type: string
+      replace_turnstile_widget:
+        description: Deploy the managed replacement Turnstile widget and its matching secret together
+        required: false
+        default: false
+        type: boolean
       confirm_platform_cutover_ready:
         description: Staging acceptance and owner password/MFA recovery are verified for the canonical-domain cutover
         required: false
@@ -165,14 +170,18 @@ jobs:
       - name: Validate provisioned platform and prepare coordinated configs
         env:
           ENABLE_PLATFORM_FEATURES: ${{ inputs.enable_platform_features }}
+          REPLACE_TURNSTILE_WIDGET: ${{ inputs.replace_turnstile_widget }}
         run: |
           args=()
+          if [[ -n "${ENABLE_PLATFORM_FEATURES}" || "${REPLACE_TURNSTILE_WIDGET}" == "true" ]] && [ "${GITHUB_RUN_ATTEMPT}" -gt 1 ]; then
+            echo "Review current Worker settings and start a new dispatch for any remaining activation or widget replacement."
+            exit 1
+          fi
           if [ -n "${ENABLE_PLATFORM_FEATURES}" ]; then
-            if [ "${GITHUB_RUN_ATTEMPT}" -gt 1 ]; then
-              echo "Review current Worker flags and start a new dispatch for any remaining activation."
-              exit 1
-            fi
             args+=("--enable=${ENABLE_PLATFORM_FEATURES}")
+          fi
+          if [ "${REPLACE_TURNSTILE_WIDGET}" = "true" ]; then
+            args+=("--replace-turnstile")
           fi
           pnpm platform:provision prepare production "${args[@]}"
 

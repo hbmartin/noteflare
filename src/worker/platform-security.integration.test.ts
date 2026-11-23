@@ -20,6 +20,7 @@ import { accessProtectedRequest, enforceAccessBoundary } from "./access";
 import { requireAccessIdentity, verifyAccessAssertion } from "./access-identity";
 import { verifyPublicChallenge, verifyTurnstile } from "./turnstile";
 import { decryptManaged, encryptManaged, runKeyRotationJob } from "./secrets";
+import { archiveAudit } from "./audit";
 
 const testEnv = env as Env;
 const member = { user: { id: "owner" }, workspace: { id: "workspace" }, role: "owner" } as MemberContext;
@@ -632,6 +633,54 @@ describe("Secrets Store encryption", () => {
       )?.completed,
     ).toBe(1);
   });
+});
+
+it("keeps an expired audit archive hidden from the owner while its partial deletion is deferred", async () => {
+  await seed();
+  const signup = await createAuth(testEnv, true).handler(
+    post("http://example.test/api/auth/sign-up/email", {
+      email: "archive-owner@example.test",
+      name: "Archive owner",
+      password: "password123",
+    }),
+  );
+  const cookie = await enrollAccount(signup);
+  const user = await env.DB.prepare("SELECT id FROM user WHERE email='archive-owner@example.test'").first("id");
+  const key = "audit/locked.ndjson";
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
+    ).bind(user),
+    env.DB.prepare(`INSERT INTO audit_archives
+      (id,workspace_id,object_key,digest,event_count,first_at,last_at,verified_at,expires_at)
+      VALUES('locked','workspace',?,'digest',1,1,1,1,1)`).bind(key),
+  ]);
+  const retained = new Set([key, `${key}.manifest.json`]);
+  const get = vi.fn(async () => null);
+  const bucket = {
+    get,
+    head: async (object: string) => (retained.has(object) ? { uploaded: new Date(1) } : null),
+    delete: async () => {
+      retained.delete(key);
+    },
+  } as unknown as R2Bucket;
+  const configured: Env = { ...testEnv, AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket };
+  await archiveAudit(configured);
+  expect(retained).toEqual(new Set([`${key}.manifest.json`]));
+  expect(
+    await env.DB.prepare("SELECT cleanup_not_before FROM audit_archives WHERE id='locked'").first("cleanup_not_before"),
+  ).toBeGreaterThan(Date.now());
+  const request = (path: string) =>
+    worker.fetch(
+      new Request(`http://example.test/api/audit/archives${path}`, { headers: { cookie } }),
+      configured,
+      createExecutionContext(),
+    );
+  const list = await request("");
+  expect(list.status).toBe(200);
+  expect(await list.json()).toEqual({ archives: [] });
+  expect((await request("/locked")).status).toBe(404);
+  expect(get).not.toHaveBeenCalled();
 });
 
 it("authorizes the cost API freshly before serving a cached workspace report", async () => {

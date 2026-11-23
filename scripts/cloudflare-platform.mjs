@@ -131,6 +131,16 @@ function liveVars(settings) {
     (settings?.bindings ?? []).filter((binding) => binding.type === "plain_text").map(({ name, text }) => [name, text]),
   );
 }
+function workerSettings(profile, api) {
+  return Promise.all(
+    [profile.name, profile.publicName].map((name) => api(`/workers/scripts/${name}/settings`, { allowMissing: true })),
+  );
+}
+export function assertLiveTurnstileSitekey(settings, sitekey, worker) {
+  const vars = liveVars(settings);
+  if ((vars.TURNSTILE_SITE_KEY || vars.TURNSTILE_ENABLED === "true") && vars.TURNSTILE_SITE_KEY !== sitekey)
+    throw new Error(`Live Turnstile sitekey differs for ${worker}. Prepare an explicit --replace-turnstile release.`);
+}
 export function settingsFingerprint(settings) {
   const vars = Object.entries(liveVars(settings)).sort(([a], [b]) => a.localeCompare(b));
   const secrets = (settings?.bindings ?? [])
@@ -386,6 +396,25 @@ function exactMatch(items, name, field = "name") {
 function findWidget(profile, api) {
   return inventory(api, "/challenges/widgets").then((widgets) => exactMatch(widgets, `${profile.name}-platform`));
 }
+function widgetDomains(profile) {
+  return [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname];
+}
+function assertWidgetDomains(profile, widget) {
+  if (!widgetDomains(profile).every((domain) => widget.domains?.includes(domain)))
+    throw new Error("Existing Turnstile widget has different hostnames; update it explicitly.");
+}
+export async function turnstileReplacementSecret(profile, api, sitekey) {
+  const widget = await api(`/challenges/widgets/${encodeURIComponent(sitekey)}`);
+  if (
+    widget?.sitekey !== sitekey ||
+    widget.name !== `${profile.name}-platform` ||
+    typeof widget.secret !== "string" ||
+    !widget.secret.trim()
+  )
+    throw new Error("The prepared Turnstile widget or its secret is unavailable. Prepare again before deploying.");
+  assertWidgetDomains(profile, widget);
+  return widget.secret;
+}
 export async function provision(
   profile,
   api,
@@ -450,15 +479,18 @@ export async function provision(
     }
   }
   let widget = await findWidget(profile, api);
-  const domains = [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname];
-  if (widget && !domains.every((domain) => widget.domains.includes(domain)))
-    throw new Error("Existing Turnstile widget has different hostnames; update it explicitly.");
+  if (widget) assertWidgetDomains(profile, widget);
   if (!widget) {
     changes.push("create canonical-host Turnstile widget");
     if (apply) {
       widget = await api("/challenges/widgets", {
         method: "POST",
-        body: { name: `${profile.name}-platform`, domains, mode: "managed", clearance_level: "no_clearance" },
+        body: {
+          name: `${profile.name}-platform`,
+          domains: widgetDomains(profile),
+          mode: "managed",
+          clearance_level: "no_clearance",
+        },
       });
       mkdirSync(directory, { recursive: true, mode: 0o700 });
       const temporary = resolve(directory, `turnstile-${randomBytes(8).toString("hex")}.env`);
@@ -489,7 +521,7 @@ export async function provision(
   }
   return { changes, databaseId: database?.uuid ?? database?.id, sitekey: widget?.sitekey };
 }
-export async function prepare(profile, api, directory, cutoverReady = false, enable = []) {
+export async function prepare(profile, api, directory, cutoverReady = false, enable = [], replaceTurnstile = false) {
   const state = await provision(profile, api);
   if (
     !state.databaseId ||
@@ -497,10 +529,12 @@ export async function prepare(profile, api, directory, cutoverReady = false, ena
     state.changes.some((change) => typeof change === "string" || change.changed)
   )
     throw new Error("Platform resources are not ready. Run platform:provision apply and repeat preflight.");
-  const [settings, publicSettings] = await Promise.all(
-    [profile.name, profile.publicName].map((name) => api(`/workers/scripts/${name}/settings`, { allowMissing: true })),
-  );
+  const [settings, publicSettings] = await workerSettings(profile, api);
   const saved = liveVars(settings);
+  if (!replaceTurnstile) {
+    assertLiveTurnstileSitekey(settings, state.sitekey, profile.name);
+    assertLiveTurnstileSitekey(publicSettings, state.sitekey, profile.publicName);
+  }
   if (profile.environment === "production" && !settings) throw new Error("Production Worker settings are missing.");
   if (profile.environment === "production" && saved.BETTER_AUTH_URL !== profile.appOrigin && !cutoverReady)
     throw new Error(
@@ -518,15 +552,14 @@ export async function prepare(profile, api, directory, cutoverReady = false, ena
     publicVars: liveVars(publicSettings),
     enable,
   });
-  const secretNames = (settings?.bindings ?? [])
-    .filter((binding) => binding.type === "secret_text")
-    .map((binding) => binding.name);
-  validatePlatformConfiguration(configs.application, { secretNames });
+  const secretNames = (workerState) => [
+    ...(workerState?.bindings ?? []).filter((binding) => binding.type === "secret_text").map((binding) => binding.name),
+    ...(replaceTurnstile ? ["TURNSTILE_SECRET_KEY"] : []),
+  ];
+  validatePlatformConfiguration(configs.application, { secretNames: secretNames(settings) });
   validatePlatformConfiguration(configs.publicWorker, {
     publicWorker: true,
-    secretNames: (publicSettings?.bindings ?? [])
-      .filter((binding) => binding.type === "secret_text")
-      .map((binding) => binding.name),
+    secretNames: secretNames(publicSettings),
   });
   mkdirSync(directory, { recursive: true });
   for (const [name, config] of Object.entries(configs))
@@ -536,6 +569,7 @@ export async function prepare(profile, api, directory, cutoverReady = false, ena
     JSON.stringify({
       [profile.name]: settingsFingerprint(settings),
       [profile.publicName]: settingsFingerprint(publicSettings),
+      ...(replaceTurnstile ? { turnstileReplacementSitekey: state.sitekey } : {}),
     }) + "\n",
   );
   return {
@@ -702,11 +736,11 @@ export async function bootstrap(profile, api, directory, environment = process.e
       "BETTER_AUTH_SECRET must be supplied from the existing production installation; it is never generated or replaced.",
     );
   const names = staging ? [profile.name, profile.publicName] : [profile.publicName];
-  const states = await Promise.all(
-    names.map((name) => api(`/workers/scripts/${name}/settings`, { allowMissing: true })),
-  );
-  for (const state of states) liveVars(state);
+  const [applicationSettings, publicSettings] = await workerSettings(profile, api);
+  const states = staging ? [applicationSettings, publicSettings] : [publicSettings];
+  if (!staging && !applicationSettings) throw new Error("Production application Worker is missing.");
   let bootstrapToken = environment.PLATFORM_STAGING_BOOTSTRAP_TOKEN;
+  let persistIdentity = false;
   const stagingSetupPending = staging && !liveVars(states[0]).BETTER_AUTH_URL;
   if (staging) {
     const local = existsSync(secretsPath) ? readFileSync(secretsPath, "utf8") : "";
@@ -732,20 +766,21 @@ export async function bootstrap(profile, api, directory, environment = process.e
       throw new Error("Supply the original staging BOOTSTRAP_TOKEN.");
     if (/[\r\n]/.test(authSecret ?? "") || /[\r\n]/.test(bootstrapToken ?? ""))
       throw new Error("Staging identity credentials must be single-line values.");
-    if (!local && authSecret.length >= 32 && !states.some(Boolean)) {
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
-      writeFileSync(secretsPath, `BETTER_AUTH_SECRET=${authSecret}\nBOOTSTRAP_TOKEN=${bootstrapToken}\n`, {
-        mode: 0o600,
-        flag: "wx",
-      });
-    }
+    persistIdentity = !local && !states.some(Boolean);
   }
   if (!authSecret || authSecret.length < 32) throw new Error("A valid installation authentication secret is required.");
   const widget = await findWidget(profile, api);
   if (!widget) throw new Error("Provision the environment’s Turnstile widget first.");
+  assertLiveTurnstileSitekey(applicationSettings, widget.sitekey, profile.name);
+  assertLiveTurnstileSitekey(publicSettings, widget.sitekey, profile.publicName);
   const challenge = await api(`/challenges/widgets/${widget.sitekey}`);
   if (!challenge.secret) throw new Error("Turnstile secret is unavailable; configure Worker secrets explicitly.");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (persistIdentity)
+    writeFileSync(secretsPath, `BETTER_AUTH_SECRET=${authSecret}\nBOOTSTRAP_TOKEN=${bootstrapToken}\n`, {
+      mode: 0o600,
+      flag: "wx",
+    });
   const workerPath = resolve(directory, "bootstrap-worker.mjs");
   writeFileSync(workerPath, 'export default { fetch() { return new Response("Not found.", { status: 404 }); } };\n');
   for (const [index, name] of names.entries()) {
@@ -810,9 +845,16 @@ export async function platformConnection(profile, options) {
   return connection;
 }
 export async function main(argv = process.argv.slice(2)) {
-  const [command = "plan", environment = "production", option, ...extra] = argv;
-  if (extra.length || (option && command !== "prepare")) throw new Error("Only prepare accepts --enable.");
-  const enable = parseActivation(option);
+  const [command = "plan", environment = "production", ...flags] = argv;
+  const activation = flags.filter((option) => option.startsWith("--enable="));
+  const replaceTurnstile = flags.includes("--replace-turnstile");
+  if (
+    (flags.length && command !== "prepare") ||
+    activation.length > 1 ||
+    flags.length !== activation.length + Number(replaceTurnstile)
+  )
+    throw new Error("Only prepare accepts --enable and --replace-turnstile, once each.");
+  const enable = parseActivation(activation[0]);
   if (!["plan", "apply", "prepare", "bootstrap", "edges-plan", "edges-apply"].includes(command))
     throw new Error(
       "Usage: cloudflare-platform.mjs plan|apply|prepare|bootstrap|edges-plan|edges-apply [production|staging]",
@@ -841,7 +883,14 @@ export async function main(argv = process.argv.slice(2)) {
     : command === "bootstrap"
       ? await bootstrap(profile, api, directory)
       : command === "prepare"
-        ? await prepare(profile, api, directory, process.env.PLATFORM_CUTOVER_READY === "true", enable)
+        ? await prepare(
+            profile,
+            api,
+            directory,
+            process.env.PLATFORM_CUTOVER_READY === "true",
+            enable,
+            replaceTurnstile,
+          )
         : await provision(profile, api, { apply: command === "apply", directory });
   console.log(JSON.stringify(result, null, 2));
 }

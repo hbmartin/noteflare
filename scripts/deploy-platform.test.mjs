@@ -1,10 +1,12 @@
-import { beforeEach, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { unstable_readConfig } from "wrangler";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { deployPlatform } from "./deploy-platform.mjs";
 import { platformProfile, settingsFingerprint } from "./cloudflare-platform.mjs";
 
 vi.mock("wrangler", () => ({ unstable_readConfig: vi.fn() }));
 const profile = platformProfile();
+const activeSitekey = (text) => ({ bindings: [{ type: "plain_text", name: "TURNSTILE_SITE_KEY", text }] });
 function configuration(publicWorker) {
   return {
     account_id: profile.account,
@@ -20,6 +22,7 @@ function configuration(publicWorker) {
       BETTER_AUTH_URL: profile.appOrigin,
       PUBLIC_BASE_URL: profile.publicOrigin,
       CANONICAL_REDIRECTS_ENABLED: "true",
+      TURNSTILE_SITE_KEY: "replacement-sitekey",
     },
     d1_databases: [{ binding: "DB", database_id: "database" }],
     r2_buckets: [
@@ -83,6 +86,20 @@ it("leaves a newer operator change in place", async () => {
   expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
 });
 
+it("rejects the live-check flag by itself before reading configs or contacting Cloudflare", async () => {
+  const execute = vi.fn(),
+    connect = vi.fn(),
+    readFingerprints = vi.fn();
+  vi.mocked(unstable_readConfig).mockClear();
+  await expect(deployPlatform("production", execute, { checkLive: true, connect, readFingerprints })).rejects.toThrow(
+    "--check-live requires --dry-run",
+  );
+  expect(unstable_readConfig).not.toHaveBeenCalled();
+  expect(execute).not.toHaveBeenCalled();
+  expect(connect).not.toHaveBeenCalled();
+  expect(readFingerprints).not.toHaveBeenCalled();
+});
+
 it.each([true, false])(
   "detects public settings drift before either upload or migrations (dry run %s)",
   async (dryRun) => {
@@ -91,7 +108,7 @@ it.each([true, false])(
     await expect(
       deployPlatform("production", execute, {
         dryRun,
-        checkLive: true,
+        checkLive: dryRun,
         connect: async () => ({
           api: async (path) =>
             path.includes(profile.publicName)
@@ -133,6 +150,100 @@ it("reports a partial release and accepts fresh settings for the forward release
     deployPlatform("production", execute, { connect, readFingerprints: fingerprints }),
   ).resolves.toBeUndefined();
   expect(live.get(profile.publicName)).toEqual(live.get(profile.name));
+});
+
+describe("coordinated Turnstile replacement", () => {
+  const names = [profile.name, profile.publicName];
+  const sitekey = "replacement-sitekey";
+  const widget = {
+    name: `${profile.name}-platform`,
+    sitekey,
+    domains: [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname],
+    secret: "replacement-test-secret",
+  };
+  function fixture(detail = widget) {
+    const live = new Map(names.map((name) => [name, activeSitekey("previous-sitekey")]));
+    const api = vi.fn(async (path) => {
+      if (path === `/challenges/widgets/${sitekey}`) return detail;
+      if (path.endsWith("/settings")) return live.get(path.split("/")[3]);
+      throw new Error(`Unexpected API request ${path}`);
+    });
+    const fingerprints = () => ({
+      ...Object.fromEntries(names.map((name) => [name, settingsFingerprint(live.get(name))])),
+      turnstileReplacementSitekey: sitekey,
+    });
+    return { live, api, fingerprints, connect: async () => ({ api }) };
+  }
+
+  it("reads replacement readiness during the live preflight without uploading", async () => {
+    const { api, fingerprints, connect } = fixture();
+    const execute = vi.fn(() => ({ status: 0 }));
+    await deployPlatform("production", execute, {
+      dryRun: true,
+      checkLive: true,
+      connect,
+      readFingerprints: fingerprints,
+    });
+    expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
+    expect(execute.mock.calls.every(([, args]) => !args.includes("--secrets-file"))).toBe(true);
+    expect(api.mock.calls.some(([path]) => path === `/challenges/widgets/${sitekey}`)).toBe(true);
+  });
+
+  it.each([{ secret: "" }, { domains: [] }, { name: "renamed-widget" }])(
+    "rejects a missing or changed widget before uploading either Worker",
+    async (patch) => {
+      const { connect, fingerprints } = fixture({ ...widget, ...patch });
+      const execute = vi.fn(() => ({ status: 0 }));
+      await expect(deployPlatform("production", execute, { connect, readFingerprints: fingerprints })).rejects.toThrow(
+        /widget|hostnames/i,
+      );
+      expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
+    },
+  );
+
+  it("refuses a replacement when the two prepared Worker sitekeys differ", async () => {
+    vi.mocked(unstable_readConfig).mockImplementation(({ config }) => {
+      const publicWorker = config.endsWith("publicWorker.jsonc");
+      const worker = configuration(publicWorker);
+      if (publicWorker) worker.vars.TURNSTILE_SITE_KEY = "previous-sitekey";
+      return worker;
+    });
+    const execute = vi.fn();
+    await expect(deployPlatform("production", execute)).rejects.toThrow("same Turnstile sitekey");
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("carries only the matching secret in both uploads and can recover after a partial release", async () => {
+    const { connect, live, fingerprints } = fixture();
+    let failPublic = true;
+    const files = [];
+    const execute = vi.fn((_node, args) => {
+      const config = args[args.indexOf("--config") + 1];
+      if (args.includes("--dry-run")) return { status: 0 };
+      const name = config.endsWith("publicWorker.jsonc") ? profile.publicName : profile.name;
+      const secretFile = args[args.indexOf("--secrets-file") + 1];
+      files.push(secretFile);
+      expect(statSync(secretFile).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(readFileSync(secretFile, "utf8"))).toEqual({ TURNSTILE_SECRET_KEY: widget.secret });
+      if (name === profile.publicName && failPublic) return { status: 1 };
+      live.set(name, activeSitekey(sitekey));
+      return { status: 0 };
+    });
+    const prepared = fingerprints();
+    await expect(deployPlatform("production", execute, { connect, readFingerprints: () => prepared })).rejects.toThrow(
+      `Confirmed uploads: ${profile.name}.`,
+    );
+    expect(files.every((file) => !existsSync(file))).toBe(true);
+    expect(live.get(profile.publicName)).toEqual(activeSitekey("previous-sitekey"));
+    await expect(deployPlatform("production", execute, { connect, readFingerprints: () => prepared })).rejects.toThrow(
+      "changed after preparation",
+    );
+    failPublic = false;
+    await deployPlatform("production", execute, { connect, readFingerprints: fingerprints });
+    expect(files).toHaveLength(4);
+    expect(files.every((file) => !existsSync(file))).toBe(true);
+    expect(live.get(profile.publicName)).toEqual(activeSitekey(sitekey));
+  });
 });
 
 it("refuses Worker-first routing without the asset binding", async () => {

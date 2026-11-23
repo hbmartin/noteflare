@@ -279,8 +279,11 @@ describe("durable platform release", () => {
           ).bind(id, object, expiry),
         ),
       );
+      const started = Date.now();
+      const retryAt = started + 86400_000;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(started);
       const remove = vi.fn(async (keys: string[]) => {
-        if (keys.includes(key)) {
+        if (keys.includes(key) && Date.now() < retryAt) {
           // Leave the manifest behind after an interrupted deletion.
           objects.delete(key);
           if (throws) throw new Error("object locked");
@@ -290,15 +293,26 @@ describe("durable platform release", () => {
         delete: remove,
         head: async (object: string) => (objects.has(object) ? { uploaded: new Date(1) } : null),
       } as unknown as R2Bucket;
-      const started = Date.now();
-      await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket });
-      expect(
-        await env.DB.prepare("SELECT expires_at FROM audit_archives WHERE id='locked'").first("expires_at"),
-      ).toBeGreaterThanOrEqual(started + 86400_000);
-      expect(await env.DB.prepare("SELECT id FROM audit_archives WHERE id='eligible'").first()).toBeNull();
-      expect(objects).toEqual(new Set([`${key}.manifest.json`]));
-      await archiveAudit({ ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket });
-      expect(remove).toHaveBeenCalledTimes(2);
+      const config = { ...bindings(), AUDIT_ENABLED: "true" as const, AUDIT_BUCKET: bucket };
+      const locked = () =>
+        env.DB.prepare("SELECT expires_at,cleanup_not_before FROM audit_archives WHERE id='locked'").first();
+      try {
+        await archiveAudit(config);
+        expect(await locked()).toEqual({ expires_at: 1, cleanup_not_before: retryAt });
+        expect(await env.DB.prepare("SELECT id FROM audit_archives WHERE id='eligible'").first()).toBeNull();
+        expect(objects).toEqual(new Set([`${key}.manifest.json`]));
+        clock.mockReturnValue(retryAt - 1);
+        await archiveAudit(config);
+        expect(remove).toHaveBeenCalledTimes(2);
+        expect(await locked()).not.toBeNull();
+        clock.mockReturnValue(retryAt);
+        await archiveAudit(config);
+        expect(remove).toHaveBeenCalledTimes(3);
+        expect(objects.size).toBe(0);
+        expect(await locked()).toBeNull();
+      } finally {
+        clock.mockRestore();
+      }
     },
   );
   it("reconciles a legacy expiry from the newer manifest upload before deleting either object", async () => {
@@ -319,9 +333,9 @@ describe("durable platform release", () => {
       AUDIT_ARCHIVE_LOCK_DAYS: "365",
     });
     expect(remove).not.toHaveBeenCalled();
-    expect(await env.DB.prepare("SELECT expires_at FROM audit_archives WHERE id='legacy'").first("expires_at")).toBe(
-      uploaded + 365 * 86400_000,
-    );
+    expect(
+      await env.DB.prepare("SELECT expires_at,cleanup_not_before FROM audit_archives WHERE id='legacy'").first(),
+    ).toEqual({ expires_at: 1, cleanup_not_before: uploaded + 365 * 86400_000 });
   });
   it("publishes only finalized exact five-reader groups and never exports reader keys", async () => {
     const week = heatmapWeek(Date.now()) - 7 * 86400_000;

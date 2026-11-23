@@ -320,10 +320,13 @@ export async function archiveAudit(env: Env) {
     ${env.BASIN_ENABLED === "true" ? "AND basin_exported_at IS NOT NULL" : ""}`)
     .bind(Date.now() - retention(env.AUDIT_HOT_DAYS, 30, 365) * DAY_MS)
     .run();
+  const cleanupAt = Date.now();
   const expired = await env.DB.prepare(
-    "SELECT id,object_key,expires_at FROM audit_archives WHERE expires_at<? ORDER BY expires_at,id LIMIT 10",
+    `SELECT id,object_key,expires_at FROM audit_archives
+     WHERE expires_at<=? AND (cleanup_not_before IS NULL OR cleanup_not_before<=?)
+     ORDER BY expires_at,id LIMIT 10`,
   )
-    .bind(Date.now())
+    .bind(cleanupAt, cleanupAt)
     .all<{ id: string; object_key: string; expires_at: number }>();
   for (const row of expired.results) {
     const keys = [row.object_key, `${row.object_key}.manifest.json`];
@@ -343,12 +346,18 @@ export async function archiveAudit(env: Env) {
       logger.warn("audit.archive.delete_deferred", "platform", "Audit archive deletion will be retried");
     }
     if (nextCheck > now) {
-      await env.DB.prepare("UPDATE audit_archives SET expires_at=max(expires_at,?) WHERE id=?")
+      await env.DB.prepare(
+        "UPDATE audit_archives SET cleanup_not_before=max(coalesce(cleanup_not_before,0),?) WHERE id=?",
+      )
         .bind(nextCheck, row.id)
         .run();
       continue;
     }
-    await env.DB.prepare("DELETE FROM audit_archives WHERE id=? AND expires_at<?").bind(row.id, now).run();
+    await env.DB.prepare(
+      "DELETE FROM audit_archives WHERE id=? AND expires_at<=? AND (cleanup_not_before IS NULL OR cleanup_not_before<=?)",
+    )
+      .bind(row.id, now, now)
+      .run();
   }
 }
 export async function exportAuditToBasin(env: Env) {

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { unstable_readConfig } from "wrangler";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
   edgeRules,
   deploymentConfigs,
   provision,
+  prepare,
   configureEdges,
   bootstrap,
   platformConnection,
@@ -304,6 +305,44 @@ describe("Cloudflare platform provisioning", () => {
     expect(api).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
   });
+  it.each([false, true])(
+    "blocks bootstrap when either Worker still uses the old widget (public %s)",
+    async (onlyPublic) => {
+      const profile = platformProfile();
+      const directory = mkdtempSync(join(tmpdir(), "noteflare-bootstrap-mismatch-"));
+      const execute = vi.fn();
+      const mismatched = onlyPublic ? profile.publicName : profile.name;
+      const api = vi.fn(async (path) => {
+        if (path.endsWith("/settings"))
+          return {
+            bindings: [
+              {
+                type: "plain_text",
+                name: "TURNSTILE_SITE_KEY",
+                text: path === `/workers/scripts/${mismatched}/settings` ? "previous-widget" : "managed-widget",
+              },
+            ],
+          };
+        if (path.startsWith("/challenges/widgets?"))
+          return { result: [{ name: `${profile.name}-platform`, sitekey: "managed-widget" }] };
+        throw new Error(`Unexpected request ${path}`);
+      });
+      try {
+        await expect(
+          bootstrap(profile, api, directory, { BETTER_AUTH_SECRET: "x".repeat(32) }, execute),
+        ).rejects.toThrow(`Live Turnstile sitekey differs for ${mismatched}`);
+        expect(execute).not.toHaveBeenCalled();
+        expect(api.mock.calls.map(([path]) => path.split("?")[0])).toEqual([
+          `/workers/scripts/${profile.name}/settings`,
+          `/workers/scripts/${profile.publicName}/settings`,
+          "/challenges/widgets",
+        ]);
+        expect(readdirSync(directory)).toEqual([]);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
   it("rejects a different account before reading credentials", async () => {
     vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "a".repeat(32));
     const readCredentials = vi.fn();
@@ -334,6 +373,7 @@ describe("Cloudflare platform provisioning", () => {
         return {
           bindings: [
             { type: "plain_text", name: "BETTER_AUTH_URL", text: profile.appOrigin },
+            { type: "plain_text", name: "TURNSTILE_SITE_KEY", text: "staging-widget" },
             ...["BETTER_AUTH_SECRET", "TURNSTILE_SECRET_KEY", "BOOTSTRAP_TOKEN"].map((name) => ({
               type: "secret_text",
               name,
@@ -369,6 +409,59 @@ describe("Cloudflare platform provisioning", () => {
         ]),
       );
       expect(readFileSync(join(directory, "bootstrap.env"), "utf8")).toBe(persisted);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  it("pins an explicit widget replacement in the prepared release without writing its secret", async () => {
+    const profile = platformProfile();
+    const directory = mkdtempSync(join(tmpdir(), "noteflare-replace-widget-"));
+    const base = unstable_readConfig({ config: "wrangler.jsonc", env: "production" }, { hideWarnings: true });
+    const rules = retentionRules();
+    const widget = {
+      name: `${profile.name}-platform`,
+      sitekey: "managed-widget",
+      domains: [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname],
+      secret: "test-secret-must-stay-out-of-prepared-files",
+    };
+    const api = vi.fn(async (path) => {
+      if (path.startsWith("/r2/buckets?"))
+        return {
+          result: { buckets: [profile.original, profile.publications, profile.audit].map((name) => ({ name })) },
+        };
+      if (path.endsWith("/domains/managed")) return { enabled: false };
+      if (path.endsWith("/domains/custom")) return { domains: [] };
+      if (path.endsWith("/lock")) return { rules: [rules.lock] };
+      if (path.endsWith("/lifecycle")) return { rules: rules.lifecycle };
+      if (path.endsWith("/metadata_index/list"))
+        return { metadataIndexes: [{ propertyName: "spaceId", indexType: "String" }] };
+      if (path.startsWith("/vectorize")) return { config: { dimensions: 384, metric: "cosine" } };
+      if (path.startsWith("/challenges/widgets?")) return { result: [widget] };
+      if (path.startsWith("/d1/database?"))
+        return { result: [{ name: profile.name, uuid: base.d1_databases[0].database_id }] };
+      if (path.endsWith("/settings"))
+        return {
+          bindings: [
+            { type: "plain_text", name: "BETTER_AUTH_URL", text: profile.appOrigin },
+            { type: "plain_text", name: "TURNSTILE_SITE_KEY", text: "previous-widget" },
+            { type: "plain_text", name: "TURNSTILE_ENABLED", text: "true" },
+            { type: "secret_text", name: "BETTER_AUTH_SECRET" },
+          ],
+        };
+      throw new Error(`Unexpected request ${path}`);
+    });
+    try {
+      await expect(prepare(profile, api, directory)).rejects.toThrow("--replace-turnstile");
+      expect(readdirSync(directory)).toEqual([]);
+      const prepared = await prepare(profile, api, directory, false, [], true);
+      const manifest = readFileSync(join(directory, "settings-fingerprints.json"), "utf8");
+      expect(JSON.parse(manifest).turnstileReplacementSitekey).toBe(widget.sitekey);
+      for (const path of Object.values(prepared)) {
+        const content = readFileSync(path, "utf8");
+        expect(JSON.parse(content).vars.TURNSTILE_SITE_KEY).toBe(widget.sitekey);
+        expect(content).not.toContain(widget.secret);
+      }
+      expect(manifest).not.toContain(widget.secret);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
