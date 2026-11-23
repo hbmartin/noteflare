@@ -140,6 +140,7 @@ export async function deployPlatform(
       ],
       { stdio: "inherit", signal },
     );
+    signal?.throwIfAborted();
     if (check.status !== 0) throw new Error("Coordinated Worker dry build failed.");
   }
   if (dryRun && !checkLive) return;
@@ -161,8 +162,8 @@ export async function deployPlatform(
   await Promise.all(names.map(verifyLiveSettings));
   signal?.throwIfAborted();
   const secret = replacement ? await turnstileReplacementSecret(profile, api, replacement) : undefined;
-  if (dryRun) return;
   signal?.throwIfAborted();
+  if (dryRun) return;
   cleanAbandonedSecrets();
   const temporary = secret ? mkdtempSync(join(tmpdir(), secretDirectoryPrefix)) : undefined;
   const recordOwner = (child) =>

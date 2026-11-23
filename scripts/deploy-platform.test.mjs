@@ -205,6 +205,28 @@ describe("coordinated Turnstile replacement", () => {
     expect(api.mock.calls.some(([path]) => path === `/challenges/widgets/${sitekey}`)).toBe(true);
   });
 
+  it("rejects a cancelled preflight even when the widget lookup succeeds", async () => {
+    const { api, fingerprints } = fixture();
+    const cancellation = new AbortController();
+    const execute = vi.fn(() => ({ status: 0 }));
+    const connect = async () => ({
+      api: async (path) => {
+        if (path === `/challenges/widgets/${sitekey}`) cancellation.abort(new Error("Preflight interrupted."));
+        return api(path);
+      },
+    });
+    await expect(
+      deployPlatform("production", execute, {
+        dryRun: true,
+        checkLive: true,
+        connect,
+        readFingerprints: fingerprints,
+        signal: cancellation.signal,
+      }),
+    ).rejects.toThrow("Preflight interrupted.");
+    expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
+  });
+
   it.each([{ secret: "" }, { domains: [] }, { name: "renamed-widget" }])(
     "rejects a missing or changed widget before uploading either Worker",
     async (patch) => {
