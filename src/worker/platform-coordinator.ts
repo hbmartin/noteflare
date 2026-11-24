@@ -203,9 +203,15 @@ export class PlatformCoordinator extends DurableObject<Env> {
           case 1:
             await enqueuePendingPublications(alarmEnv);
             break;
-          case 2:
-            await recoverPlatformJobs(alarmEnv, platformHandlers, alarmEnv.PLATFORM_QUEUE ? 10 : 1);
+          case 2: {
+            const { queueSendFailures } = await recoverPlatformJobs(
+              alarmEnv,
+              platformHandlers,
+              alarmEnv.PLATFORM_QUEUE ? 10 : 1,
+            );
+            if (queueSendFailures > 0) throw new Error("platform_queue_recovery_failed");
             break;
+          }
           case 3:
             await archiveAudit(alarmEnv);
             break;

@@ -125,9 +125,10 @@ function recoveryJob(id: string, due: number, lease: number | null = null) {
   ).bind(id, id, due, lease);
 }
 
+const queueSendResponse = { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
+
 it.each([
   { name: "inline recovery", nextAlarm: 15_000, followingAlarm: 70_000 },
-  { name: "Queue recovery", useQueue: true, nextAlarm: 15_000, followingAlarm: 30_000 },
   {
     name: "both reads unavailable",
     failDeadlineRead: true,
@@ -139,21 +140,10 @@ it.each([
   { name: "future deadline", failDeadlineRead: true, availableIn: 30_000, nextAlarm: 30_000, followingAlarm: 70_000 },
 ])(
   "schedules the next alarm after a failed scan with $name",
-  async ({
-    useQueue,
-    failDeadlineRead,
-    wakeAfterRecovery,
-    availableIn = -2,
-    nextAlarm,
-    followingAlarm,
-    scanAttempts = 1,
-  }) => {
+  async ({ failDeadlineRead, wakeAfterRecovery, availableIn = -2, nextAlarm, followingAlarm, scanAttempts = 1 }) => {
     const now = Date.now();
     const cachedDeadline = now + availableIn;
-    const runsInline = !useQueue && cachedDeadline < now;
-    const wasSent = vi.fn(async () => {
-      throw new Error("Queue unavailable");
-    });
+    const runsInline = cachedDeadline < now;
     await env.DB.batch([recoveryJob("first", cachedDeadline), recoveryJob("second", cachedDeadline + 1)]);
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     try {
@@ -174,8 +164,7 @@ it.each([
           },
         });
         mutable.env = { ...original, DB, SEMANTIC_SEARCH_ENABLED: "false" };
-        if (useQueue) mutable.env.PLATFORM_QUEUE = { send: wasSent, sendBatch: wasSent, metrics: wasSent };
-        else delete mutable.env.PLATFORM_QUEUE;
+        delete mutable.env.PLATFORM_QUEUE;
         const alarmPhase = async (phase: number, offset: number) => {
           clock.mockReturnValue(now + offset);
           await state.storage.put("phase", phase);
@@ -188,7 +177,6 @@ it.each([
           await instance.alarm();
           await alarmPhase(2, 5000);
           expect(await env.DB.prepare("SELECT count(*) FROM platform_jobs").first("count(*)")).toBe(runsInline ? 1 : 2);
-          expect(wasSent).toHaveBeenCalledTimes(useQueue ? 2 : 0);
           expect((await schedule())?.jobRetryAt).toBe(cachedDeadline + (runsInline && !failDeadlineRead ? 1 : 0));
           expect((await schedule())?.retries?.[2]).toBeUndefined();
           if (wakeAfterRecovery) await instance.wake();
@@ -212,6 +200,95 @@ it.each([
     }
   },
 );
+
+it.each([
+  { name: "all sends fail and the final scan succeeds", partial: false, failScan: false },
+  { name: "one send fails and the final scan fails", partial: true, failScan: true },
+])("backs off Queue recovery when $name", async ({ partial, failScan }) => {
+  const now = Date.now();
+  const due = now - 1;
+  await env.DB.batch([recoveryJob("first", due), recoveryJob("second", due)]);
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  let queueUnavailable = true;
+  const send = vi.fn(async ({ platformJobId }: { platformJobId: string }) => {
+    if (queueUnavailable && (!partial || platformJobId === "first")) throw new Error("Queue unavailable");
+    // Simulate the consumer finishing an accepted job before the next scan.
+    await env.DB.prepare("DELETE FROM platform_jobs WHERE id=?").bind(platformJobId).run();
+    return queueSendResponse;
+  });
+  try {
+    await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
+      const mutable = instance as unknown as { env: Env };
+      const original = mutable.env;
+      const DB = new Proxy(env.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              if (failScan && queueUnavailable && sql.includes("SELECT min(job_due)"))
+                throw new Error("Final scan unavailable");
+              return target.prepare(sql);
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      mutable.env = {
+        ...original,
+        DB,
+        SEMANTIC_SEARCH_ENABLED: "false",
+        PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
+      };
+      const alarmPhase = async (phase: number, offset: number) => {
+        clock.mockReturnValue(now + offset);
+        await state.storage.put("phase", phase);
+        await instance.alarm();
+      };
+      const retry = async () =>
+        (await state.storage.get<{ retries?: Record<number, { attempts: number; at: number }> }>("schedule"))
+          ?.retries?.[2];
+      const pending = () => env.DB.prepare("SELECT id FROM platform_jobs ORDER BY id").all<{ id: string }>();
+
+      try {
+        await instance.wake(undefined, due);
+        await alarmPhase(0, 0);
+        await alarmPhase(2, 5000);
+        expect(send.mock.calls).toEqual([[{ platformJobId: "first" }], [{ platformJobId: "second" }]]);
+        expect((await pending()).results).toEqual(partial ? [{ id: "first" }] : [{ id: "first" }, { id: "second" }]);
+        expect(await retry()).toEqual({ attempts: 1, at: now + 65_000 });
+        await alarmPhase(10, 10_000);
+        expect(await state.storage.getAlarm()).toBe(now + 65_000);
+
+        clock.mockReturnValue(now + 20_000);
+        await instance.wake();
+        expect(await state.storage.getAlarm()).toBe(now + 21_000);
+        await alarmPhase(0, 21_000);
+        await alarmPhase(2, 26_000);
+        expect(send).toHaveBeenCalledTimes(2);
+        await alarmPhase(10, 31_000);
+        expect(await state.storage.getAlarm()).toBe(now + 65_000);
+
+        await alarmPhase(2, 65_000);
+        expect(send).toHaveBeenCalledTimes(partial ? 3 : 4);
+        expect(await retry()).toEqual({ attempts: 2, at: now + 185_000 });
+        await alarmPhase(10, 70_000);
+        expect(await state.storage.getAlarm()).toBe(now + 185_000);
+
+        queueUnavailable = false;
+        await alarmPhase(2, 185_000);
+        expect(send).toHaveBeenCalledTimes(partial ? 4 : 6);
+        expect(await retry()).toBeUndefined();
+        expect((await pending()).results).toEqual([]);
+        await alarmPhase(10, 190_000);
+        expect(await state.storage.getAlarm()).toBeNull();
+      } finally {
+        await state.storage.deleteAlarm();
+        mutable.env = original;
+      }
+    });
+  } finally {
+    clock.mockRestore();
+  }
+});
 
 it("retains a wake recorded after the phase 2 deadline read and clears it after recovery drains", async () => {
   const now = Date.now();
@@ -281,9 +358,7 @@ it.each([false, true])(
   async (newWake) => {
     const now = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-    const sent = vi.fn(async () => {
-      throw new Error("Queue unavailable");
-    });
+    const sent = vi.fn(async () => queueSendResponse);
     await recoveryJob("queued", now - 1).run();
     try {
       await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
@@ -315,7 +390,7 @@ it.each([false, true])(
           ...original,
           DB,
           SEMANTIC_SEARCH_ENABLED: "false",
-          PLATFORM_QUEUE: { send: sent, sendBatch: sent, metrics: sent },
+          PLATFORM_QUEUE: { send: sent, sendBatch: vi.fn(), metrics: vi.fn() },
         };
         try {
           await state.storage.put("phase", 2);
