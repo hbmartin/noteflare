@@ -325,7 +325,9 @@ describe("Cloudflare platform provisioning", () => {
       const api = vi.fn(async (path, options) => {
         if (path === `/workers/scripts/${profile.name}/settings`) return appSettings;
         if (path === `/workers/scripts/${profile.publicName}/settings`)
-          return existingPublic ? { bindings: appSettings.bindings.slice(0, 1) } : { bindings: [] };
+          return existingPublic
+            ? { bindings: [{ type: "secret_text", name: "TURNSTILE_SECRET_KEY" }] }
+            : { bindings: [] };
         if (path.startsWith("/challenges/widgets?"))
           return { result: [{ name: `${profile.name}-platform`, sitekey: "managed-widget" }] };
         if (path === "/challenges/widgets/managed-widget")
@@ -353,6 +355,7 @@ describe("Cloudflare platform provisioning", () => {
         expect(result.awaitingTurnstileReplacement).toEqual(
           existingPublic ? [profile.name, profile.publicName] : [profile.name],
         );
+        expect(result.awaitingTurnstileFirstPair).toEqual(existingPublic ? [] : [profile.publicName]);
         expect(execute).toHaveBeenCalledTimes(existingPublic ? 0 : 1);
         const writes = api.mock.calls
           .filter(([, options]) => options?.method === "PUT")
@@ -361,7 +364,6 @@ describe("Cloudflare platform provisioning", () => {
         expect(writes).toEqual([
           [publicPath, "BETTER_AUTH_SECRET"],
           [`/workers/scripts/${profile.name}/secrets`, "CF_ANALYTICS_API_TOKEN"],
-          ...(!existingPublic ? [[publicPath, "TURNSTILE_SECRET_KEY"]] : []),
         ]);
       } finally {
         rmSync(directory, { recursive: true, force: true });
@@ -421,7 +423,9 @@ describe("Cloudflare platform provisioning", () => {
     const productionOnly = { BETTER_AUTH_SECRET: "prod-test-secret-".repeat(3), BOOTSTRAP_TOKEN: "prod-test-token" };
     const execute = vi.fn(() => ({ status: 0 }));
     try {
-      await bootstrap(profile, api, directory, productionOnly, execute);
+      const initial = await bootstrap(profile, api, directory, productionOnly, execute);
+      expect(initial.awaitingTurnstileFirstPair).toEqual([profile.name, profile.publicName]);
+      expect(api.mock.calls.filter(([, options]) => options?.body?.name === "TURNSTILE_SECRET_KEY")).toEqual([]);
       const persisted = readFileSync(join(directory, "bootstrap.env"), "utf8");
       expect(persisted).toMatch(/^BETTER_AUTH_SECRET=[\w-]{64}\nBOOTSTRAP_TOKEN=[\w-]{64}\n$/);
       expect(persisted).not.toContain(productionOnly.BETTER_AUTH_SECRET);
@@ -457,6 +461,8 @@ describe("Cloudflare platform provisioning", () => {
     const base = unstable_readConfig({ config: "wrangler.jsonc", env: "production" }, { hideWarnings: true });
     const rules = retentionRules();
     let partialActivation = false;
+    let appWidget = "previous-widget";
+    let publicWidget = "previous-widget";
     const widget = {
       name: `${profile.name}-platform`,
       sitekey: "managed-widget",
@@ -478,12 +484,17 @@ describe("Cloudflare platform provisioning", () => {
       if (path.startsWith("/challenges/widgets?")) return { result: [widget] };
       if (path.startsWith("/d1/database?"))
         return { result: [{ name: profile.name, uuid: base.d1_databases[0].database_id }] };
-      if (path.endsWith("/settings"))
+      if (path.endsWith("/settings")) {
+        const sitekey = path.endsWith("-public/settings") ? publicWidget : appWidget;
         return {
           bindings: [
             { type: "plain_text", name: "BETTER_AUTH_URL", text: profile.appOrigin },
-            { type: "plain_text", name: "TURNSTILE_SITE_KEY", text: "previous-widget" },
-            { type: "plain_text", name: "TURNSTILE_ENABLED", text: "true" },
+            ...(sitekey && sitekey !== "unpaired"
+              ? [{ type: "plain_text", name: "TURNSTILE_SITE_KEY", text: sitekey }]
+              : []),
+            ...(sitekey === "unpaired" || sitekey === widget.sitekey
+              ? [{ type: "secret_text", name: "TURNSTILE_SECRET_KEY" }]
+              : []),
             { type: "secret_text", name: "BETTER_AUTH_SECRET" },
             ...(partialActivation && path === `/workers/scripts/${profile.name}/settings`
               ? [
@@ -493,6 +504,7 @@ describe("Cloudflare platform provisioning", () => {
               : []),
           ],
         };
+      }
       throw new Error(`Unexpected request ${path}`);
     });
     try {
@@ -503,7 +515,7 @@ describe("Cloudflare platform provisioning", () => {
         "FORMS_ENABLED (application true, public false)",
       );
       expect(readdirSync(directory)).toEqual([]);
-      const prepared = await prepare(profile, api, directory, false, ["forms", "tables"], true);
+      const prepared = await prepare(profile, api, directory, false, ["forms", "tables", "turnstile"], true);
       const manifest = readFileSync(join(directory, "settings-fingerprints.json"), "utf8");
       expect(JSON.parse(manifest).turnstileReplacementSitekey).toBe(widget.sitekey);
       for (const path of Object.values(prepared)) {
@@ -513,6 +525,20 @@ describe("Cloudflare platform provisioning", () => {
         expect(content).not.toContain(widget.secret);
       }
       expect(manifest).not.toContain(widget.secret);
+      partialActivation = false;
+      appWidget = "unpaired";
+      publicWidget = "";
+      await expect(prepare(profile, api, directory)).rejects.toThrow("--replace-turnstile");
+      appWidget = "";
+      await prepare(profile, api, directory, false, ["turnstile"]);
+      const latest = () => JSON.parse(readFileSync(join(directory, "settings-fingerprints.json"), "utf8"));
+      expect(latest().turnstileFirstPair).toEqual({
+        sitekey: widget.sitekey,
+        workers: [profile.name, profile.publicName],
+      });
+      appWidget = widget.sitekey;
+      await prepare(profile, api, directory, false, ["turnstile"]);
+      expect(latest().turnstileFirstPair).toEqual({ sitekey: widget.sitekey, workers: [profile.publicName] });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

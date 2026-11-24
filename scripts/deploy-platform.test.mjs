@@ -45,10 +45,11 @@ it("builds both prepared Workers before any upload and supports pre-migration dr
   expect(execute).toHaveBeenCalledTimes(2);
   expect(execute.mock.calls.every(([, args]) => args.includes("--dry-run"))).toBe(true);
   execute.mockClear();
+  const paired = activeSitekey("replacement-sitekey");
   await deployPlatform("production", execute, {
-    connect: async () => ({ api: async () => null }),
+    connect: async () => ({ api: async () => paired }),
     readFingerprints: () =>
-      Object.fromEntries([profile.name, profile.publicName].map((name) => [name, settingsFingerprint(null)])),
+      Object.fromEntries([profile.name, profile.publicName].map((name) => [name, settingsFingerprint(paired)])),
   });
   expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true, false, false]);
 });
@@ -142,14 +143,14 @@ it.each([true, false])(
 );
 
 it("reports a partial release and accepts fresh settings for the forward release", async () => {
-  const baseline = { bindings: [] };
+  const baseline = activeSitekey("replacement-sitekey");
   const live = new Map([profile.name, profile.publicName].map((name) => [name, baseline]));
   let failPublic = true;
   const execute = vi.fn((_node, args) => {
     if (args.includes("--dry-run")) return { status: 0 };
     const name = args.at(-1).endsWith("publicWorker.jsonc") ? profile.publicName : profile.name;
     if (name === profile.publicName && failPublic) return { status: 1 };
-    live.set(name, { bindings: [{ type: "plain_text", name: "FORMS_ENABLED", text: "false" }] });
+    live.set(name, { bindings: [...baseline.bindings, { type: "plain_text", name: "FORMS_ENABLED", text: "false" }] });
     return { status: 0 };
   });
   const connect = async () => ({ api: async (path) => live.get(path.split("/")[3]) });
@@ -203,6 +204,85 @@ describe("coordinated Turnstile replacement", () => {
     expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
     expect(execute.mock.calls.every(([, args]) => !args.includes("--secrets-file"))).toBe(true);
     expect(api.mock.calls.some(([path]) => path === `/challenges/widgets/${sitekey}`)).toBe(true);
+  });
+
+  it("pairs clean Workers and resumes an interrupted first release without overwriting the paired Worker", async () => {
+    const { live, connect } = fixture();
+    const clean = { bindings: [{ type: "secret_text", name: "BETTER_AUTH_SECRET" }] };
+    for (const name of names) live.set(name, clean);
+    const fingerprints = (workers) => ({
+      ...Object.fromEntries(names.map((name) => [name, settingsFingerprint(live.get(name))])),
+      turnstileFirstPair: { sitekey, workers },
+    });
+    let failPublic = true;
+    const deliveries = [];
+    const execute = vi.fn((_node, args) => {
+      if (args.includes("--dry-run")) return { status: 0 };
+      const name = args[args.indexOf("--config") + 1].endsWith("publicWorker.jsonc")
+        ? profile.publicName
+        : profile.name;
+      const flag = args.indexOf("--secrets-file");
+      const secret = flag < 0 ? null : JSON.parse(readFileSync(args[flag + 1], "utf8")).TURNSTILE_SECRET_KEY;
+      deliveries.push([name, secret]);
+      if (name === profile.publicName && failPublic) return { status: 1 };
+      live.set(name, activeSitekey(sitekey));
+      return { status: 0 };
+    });
+    const initial = fingerprints(names);
+    await expect(deployPlatform("production", execute, { connect, readFingerprints: () => initial })).rejects.toThrow(
+      `Confirmed uploads: ${profile.name}.`,
+    );
+    await expect(deployPlatform("production", execute, { connect, readFingerprints: () => initial })).rejects.toThrow(
+      "changed after preparation",
+    );
+    await expect(
+      deployPlatform("production", execute, { connect, readFingerprints: () => fingerprints(names) }),
+    ).rejects.toThrow("first pairing differs");
+    failPublic = false;
+    await deployPlatform("production", execute, {
+      connect,
+      readFingerprints: () => fingerprints([profile.publicName]),
+    });
+    expect(deliveries).toEqual([
+      [profile.name, widget.secret],
+      [profile.publicName, widget.secret],
+      [profile.name, null],
+      [profile.publicName, widget.secret],
+    ]);
+  });
+
+  it("rejects a secret without a live sitekey even if the prepared fingerprints match", async () => {
+    const { live, connect } = fixture();
+    live.set(profile.name, { bindings: [{ type: "secret_text", name: "TURNSTILE_SECRET_KEY" }] });
+    live.set(profile.publicName, activeSitekey(sitekey));
+    const execute = vi.fn(() => ({ status: 0 }));
+    await expect(
+      deployPlatform("production", execute, {
+        connect,
+        readFingerprints: () => Object.fromEntries(names.map((name) => [name, settingsFingerprint(live.get(name))])),
+      }),
+    ).rejects.toThrow("--replace-turnstile");
+    expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
+  });
+
+  it("passes cancellation through settings preflight and starts no upload", async () => {
+    const { fingerprints } = fixture();
+    const cancellation = new AbortController();
+    const execute = vi.fn(() => ({ status: 0 }));
+    const connect = vi.fn(async (_profile, { signal }) => ({
+      api: async () => {
+        cancellation.abort(new Error("Settings interrupted."));
+        signal.throwIfAborted();
+      },
+    }));
+    await expect(
+      deployPlatform("production", execute, {
+        connect,
+        readFingerprints: fingerprints,
+        signal: cancellation.signal,
+      }),
+    ).rejects.toThrow("Settings interrupted.");
+    expect(execute).toHaveBeenCalledTimes(2);
   });
 
   it("rejects a cancelled preflight even when the widget lookup succeeds", async () => {

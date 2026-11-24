@@ -1,21 +1,21 @@
 import { lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { unstable_readConfig } from "wrangler";
 import { validatePlatformConfiguration } from "./platform-config.mjs";
 import {
-  assertLiveTurnstileSitekey,
   assertSharedReleaseFlags,
+  firstTurnstilePairWorkers,
   platformConnection,
   platformProfile,
   settingsFingerprint,
   turnstileReplacementSecret,
 } from "./cloudflare-platform.mjs";
+import { runWrangler } from "./wrangler-process.mjs";
 
+export { runWrangler } from "./wrangler-process.mjs";
 const secretDirectoryPrefix = "noteflare-turnstile-release-";
-const maxUploadShutdownMs = 5000;
 
 function processGone(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
@@ -42,34 +42,6 @@ export function cleanAbandonedSecrets(directory = tmpdir(), now = Date.now()) {
     } catch {
       // Ownership could not be established, or another deployment already cleaned up.
     }
-  }
-}
-
-export async function runWrangler(program, args, { stdio, signal, onChild }) {
-  signal?.throwIfAborted();
-  const child = spawn(program, args, { stdio });
-  let killTimer;
-  const stopChild = () => {
-    child.kill("SIGTERM");
-    killTimer = setTimeout(() => child.kill("SIGKILL"), maxUploadShutdownMs);
-    killTimer.unref();
-  };
-  const finished = new Promise((resolveExit) => {
-    // A failed spawn also emits close with a nonzero status.
-    child.on("error", () => {});
-    child.once("close", (status) => resolveExit({ status }));
-  });
-  signal?.addEventListener("abort", stopChild, { once: true });
-  try {
-    if (child.pid) onChild?.(child.pid);
-    return await finished;
-  } catch (error) {
-    stopChild();
-    await finished;
-    throw error;
-  } finally {
-    clearTimeout(killTimer);
-    signal?.removeEventListener("abort", stopChild);
   }
 }
 
@@ -150,18 +122,30 @@ export async function deployPlatform(
   const replacement = fingerprints.turnstileReplacementSitekey;
   if (replacement !== undefined && replacement !== sitekey)
     throw new Error("Prepared Turnstile replacement sitekey changed; repeat platform preflight.");
-  const { api } = await connect(profile);
+  const firstPair = fingerprints.turnstileFirstPair;
+  const { api } = await connect(profile, { signal });
   const names = [profile.name, profile.publicName];
   async function verifyLiveSettings(name) {
     const settings = await api(`/workers/scripts/${name}/settings`, { allowMissing: true });
     if (settingsFingerprint(settings) !== fingerprints[name])
       throw new Error(`Live settings for ${name} changed after preparation. Prepare again before deploying.`);
-    if (!replacement) assertLiveTurnstileSitekey(settings, sitekey, name);
+    if (!settings) throw new Error(`Worker shell missing for ${name}. Run platform bootstrap first.`);
+    return settings;
   }
   // A disagreement already present on either Worker must prevent both uploads.
-  await Promise.all(names.map(verifyLiveSettings));
+  const settings = await Promise.all(names.map(verifyLiveSettings));
   signal?.throwIfAborted();
-  const secret = replacement ? await turnstileReplacementSecret(profile, api, replacement) : undefined;
+  const pairWorkers = replacement ? names : firstTurnstilePairWorkers(names, settings, sitekey);
+  if (
+    (firstPair !== undefined &&
+      (replacement ||
+        firstPair?.sitekey !== sitekey ||
+        !Array.isArray(firstPair.workers) ||
+        JSON.stringify(firstPair.workers) !== JSON.stringify(pairWorkers))) ||
+    (firstPair === undefined && !replacement && pairWorkers.length)
+  )
+    throw new Error("Prepared Turnstile first pairing differs from the live Workers; repeat platform preflight.");
+  const secret = pairWorkers.length ? await turnstileReplacementSecret(profile, api, sitekey) : undefined;
   signal?.throwIfAborted();
   if (dryRun) return;
   cleanAbandonedSecrets();
@@ -182,11 +166,16 @@ export async function deployPlatform(
       try {
         await verifyLiveSettings(name);
         signal?.throwIfAborted();
-        const result = await execute(process.execPath, [wrangler, "deploy", "--config", path, ...secretArgs], {
-          stdio: "inherit",
-          signal,
-          onChild: temporary ? recordOwner : undefined,
-        });
+        const pairing = pairWorkers.includes(name);
+        const result = await execute(
+          process.execPath,
+          [wrangler, "deploy", "--config", path, ...(pairing ? secretArgs : [])],
+          {
+            stdio: "inherit",
+            signal,
+            onChild: pairing ? recordOwner : undefined,
+          },
+        );
         if (result.status !== 0) {
           signal?.throwIfAborted();
           throw new Error(`Upload of ${name} did not report success. Check its live deployment.`);

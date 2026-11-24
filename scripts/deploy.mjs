@@ -10,6 +10,7 @@ import { emptyDatabaseSchema, emptyMigrationHistory, main as migrate, queryRows 
 
 import { metadataIntegrityCheck } from "./integrity.mjs";
 import { validatePlatformConfiguration } from "./platform-config.mjs";
+import { runWrangler } from "./wrangler-process.mjs";
 
 const require = createRequire(import.meta.url);
 const manifestPath = ".wrangler/noteflare-build.json";
@@ -33,10 +34,18 @@ function wrangler(args, options = {}) {
   });
 }
 
-function wranglerJSON(args) {
-  const result = wrangler(args);
-  if (result.error || result.status !== 0)
-    throw new Error(`Wrangler ${args[0]} failed. Check authentication and permissions.`);
+function withTimeout(signal, timeoutMs) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+async function wranglerJSON(args, signal) {
+  const result = await runWrangler(process.execPath, [require.resolve("wrangler"), ...args], {
+    stdio: ["ignore", "pipe", "ignore"],
+    signal: withTimeout(signal, 300_000),
+  });
+  signal?.throwIfAborted();
+  if (result.status !== 0) throw new Error(`Wrangler ${args[0]} failed. Check authentication and permissions.`);
   try {
     return JSON.parse(result.stdout);
   } catch {
@@ -57,15 +66,22 @@ function validatedCloudflareCredentials(value) {
 
 export async function cloudflare(
   configuredAccount,
-  { readCredentials = () => wranglerJSON(["auth", "token", "--json"]), request = fetch } = {},
+  { readCredentials = (signal) => wranglerJSON(["auth", "token", "--json"], signal), request = fetch, signal } = {},
 ) {
-  let credentials = validatedCloudflareCredentials(await readCredentials());
+  signal?.throwIfAborted();
+  const initialCredentials = await readCredentials(signal);
+  signal?.throwIfAborted();
+  let credentials = validatedCloudflareCredentials(initialCredentials);
   let renewal;
   const renewOAuth = async (failedCredentials) => {
     if (credentials !== failedCredentials) return credentials;
     const pending = (renewal ??= Promise.resolve()
-      .then(readCredentials)
+      .then(() => {
+        signal?.throwIfAborted();
+        return readCredentials(signal);
+      })
       .then((value) => {
+        signal?.throwIfAborted();
         const next = validatedCloudflareCredentials(value);
         if (next.type !== "oauth") throw new Error("Cloudflare authentication method changed. Retry deployment.");
         credentials = next;
@@ -79,7 +95,7 @@ export async function cloudflare(
   };
   let account = process.env.CLOUDFLARE_ACCOUNT_ID ?? configuredAccount;
   if (!account) {
-    const identity = wranglerJSON(["whoami", "--json"]);
+    const identity = await wranglerJSON(["whoami", "--json"], signal);
     if (identity.accounts?.length !== 1)
       throw new Error("Set CLOUDFLARE_ACCOUNT_ID when more than one account is available.");
     account = identity.accounts[0].id;
@@ -89,6 +105,7 @@ export async function cloudflare(
     const payload = body ? JSON.stringify(body) : undefined;
     let canRenew = true;
     for (;;) {
+      signal?.throwIfAborted();
       const sentCredentials = credentials;
       const response = await request(`https://api.cloudflare.com/client/v4/accounts/${account}${path}`, {
         method,
@@ -100,16 +117,19 @@ export async function cloudflare(
           ...(jurisdiction ? { "cf-r2-jurisdiction": jurisdiction } : {}),
         },
         ...(payload ? { body: payload } : {}),
-        signal: AbortSignal.timeout(60_000),
+        signal: withTimeout(signal, 60_000),
       });
+      signal?.throwIfAborted();
       // API responses may contain credentials; report status codes, never bodies.
       if (allowMissing && response.status === 404) return null;
       let value;
       try {
         value = await response.json();
       } catch {
+        signal?.throwIfAborted();
         throw new Error(`Cloudflare ${method} request returned invalid JSON.`);
       }
+      signal?.throwIfAborted();
       const authenticationDenied =
         value?.success === false &&
         (value.errors === undefined ||
