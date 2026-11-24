@@ -347,20 +347,19 @@ describe("durable platform release", () => {
     ["unknown binding code", bindingFailure(10012), "unknown"],
     ["structured status", { status: 503 }, "transient"],
     ["structured statusCode", { statusCode: 502 }, "transient"],
+    ["undefined status with transient statusCode", { status: undefined, statusCode: 503 }, "transient"],
+    ["numeric status with transient statusCode", { status: 400, statusCode: 503 }, "unknown"],
     ["structured lock with transient status", { code: "ObjectLockedByBucketPolicy", status: 503 }, "lock"],
     ["binding lock with transient status", Object.assign(bindingFailure(10069), { status: 503 }), "lock"],
     [
       "binding transient error with structured lock",
       Object.assign(bindingFailure(10043), { code: "ObjectLockedByBucketPolicy" }),
-      "transient",
+      "lock",
     ],
   ] as const)(
     "classifies %s and keeps the archive pointer until its scheduled cleanup retry succeeds",
     async (_name, error, reason) => {
       const waitMs = reason === "transient" ? 600_000 : 86_400_000;
-      const started = Date.now();
-      const clock = vi.spyOn(Date, "now").mockReturnValue(started);
-      const warn = vi.spyOn(logger, "warn");
       const key = "audit/retry.ndjson";
       const objects = new Set([key, `${key}.manifest.json`]);
       await env.DB.prepare(
@@ -369,6 +368,7 @@ describe("durable platform release", () => {
       )
         .bind(key)
         .run();
+      const started = Date.now();
       const remove = vi.fn(async (keys: string[]) => {
         if (Date.now() === started) throw error;
         for (const objectKey of keys) objects.delete(objectKey);
@@ -380,6 +380,8 @@ describe("durable platform release", () => {
       const configured: Env = { ...bindings(), AUDIT_ENABLED: "true", AUDIT_BUCKET: bucket };
       const pointer = () =>
         env.DB.prepare("SELECT expires_at,cleanup_not_before FROM audit_archives WHERE id='retry'").first();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(started);
+      const warn = vi.spyOn(logger, "warn");
       try {
         await archiveAudit(configured);
         expect(await pointer()).toEqual({ expires_at: 1, cleanup_not_before: started + waitMs });
