@@ -33,6 +33,7 @@ type MaintenanceSchedule = {
   wakeKind?: "immediate" | "deadline";
   jobRetryAt?: number | null;
   jobDeadlineRead?: { id: string; wakeAt: number | null };
+  jobDeadlineRefreshed?: true;
   retries?: Record<string, { attempts: number; at: number }>;
 };
 
@@ -142,6 +143,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
     if (due !== undefined) {
       const earliest = Math.min(due ?? Infinity, state.jobDeadlineRead.wakeAt ?? Infinity);
       state.jobRetryAt = Number.isFinite(earliest) ? earliest : null;
+      state.jobDeadlineRefreshed = true;
     }
     delete state.jobDeadlineRead;
   }
@@ -276,13 +278,18 @@ export class PlatformCoordinator extends DurableObject<Env> {
         .first<{ job_due: number | null; maintenance_due: number | null }>();
     });
     await this.ctx.blockConcurrencyWhile(async () => {
-      const state = await this.scheduleState(),
-        notBefore = Date.now() + 5000;
+      const state = await this.scheduleState();
+      const now = Date.now(),
+        notBefore = now + 5000;
       if (readId)
         this.finishJobDeadlineRead(state, readId, scanned === undefined ? undefined : (scanned?.job_due ?? null));
       const retryDue = Math.min(...Object.values(state.retries ?? {}).map((retry) => retry.at));
-      const jobDue = Math.max(state.jobRetryAt ?? Infinity, state.retries?.[2]?.at ?? 0);
+      const jobDeadline = state.jobRetryAt ?? Infinity;
+      // An overdue deadline that neither read could refresh should follow scan backoff.
+      const scanRetryAt = !state.jobDeadlineRefreshed && jobDeadline <= now ? (state.retries?.scan?.at ?? 0) : 0;
+      const jobDue = Math.max(jobDeadline, state.retries?.[2]?.at ?? 0, scanRetryAt);
       const due = Math.min(scanned?.maintenance_due ?? Infinity, state.wakeAt ?? Infinity, jobDue, retryDue);
+      delete state.jobDeadlineRefreshed;
       await this.ctx.storage.put({
         phase: 0,
         schedule: { ...state, active: false, running: false, scanning: false, notBefore },

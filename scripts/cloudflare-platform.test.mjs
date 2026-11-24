@@ -370,6 +370,54 @@ describe("Cloudflare platform provisioning", () => {
       }
     },
   );
+  it("rechecks a matched sitekey and fills only its missing Turnstile secret", async () => {
+    const profile = platformProfile();
+    const widget = {
+      name: `${profile.name}-platform`,
+      sitekey: "managed-widget",
+      secret: "fixture-secret",
+      domains: [new URL(profile.appOrigin).hostname, new URL(profile.publicOrigin).hostname],
+    };
+    const application = `/workers/scripts/${profile.name}`;
+    const publicWorker = `/workers/scripts/${profile.publicName}`;
+    let applicationHasSecret = false;
+    const settings = (hasSecret) => ({
+      bindings: [
+        { type: "plain_text", name: "TURNSTILE_SITE_KEY", text: widget.sitekey },
+        { type: "secret_text", name: "BETTER_AUTH_SECRET" },
+        ...(hasSecret ? [{ type: "secret_text", name: "TURNSTILE_SECRET_KEY" }] : []),
+      ],
+    });
+    const api = vi.fn(async (path, options) => {
+      if (path === `${application}/settings`) return settings(applicationHasSecret);
+      if (path === `${publicWorker}/settings`) return settings(true);
+      if (path.startsWith("/challenges/widgets?")) return { result: [widget] };
+      if (path === `/challenges/widgets/${widget.sitekey}`) return widget;
+      if (path === `${application}/secrets` && options?.method === "PUT") {
+        applicationHasSecret = true;
+        return {};
+      }
+      throw new Error(`Unexpected request ${path}`);
+    });
+    const execute = vi.fn();
+    const run = () => bootstrap(profile, api, join(tmpdir(), "noteflare-bootstrap-test"), {}, execute);
+    await run();
+    expect(api.mock.calls.slice(-2)).toEqual([
+      [`${application}/settings`],
+      [
+        `${application}/secrets`,
+        { method: "PUT", body: { name: "TURNSTILE_SECRET_KEY", text: widget.secret, type: "secret_text" } },
+      ],
+    ]);
+    api.mockClear();
+    await run();
+    expect(api.mock.calls.map(([path]) => path)).toEqual([
+      `${application}/settings`,
+      `${publicWorker}/settings`,
+      expect.stringMatching(/^\/challenges\/widgets\?/),
+    ]);
+    expect(execute).not.toHaveBeenCalled();
+  });
   it("rejects a different account before reading credentials", async () => {
     vi.stubEnv("CLOUDFLARE_ACCOUNT_ID", "a".repeat(32));
     const readCredentials = vi.fn();

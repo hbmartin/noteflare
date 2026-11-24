@@ -103,6 +103,25 @@ it("leaves a newer operator change in place", async () => {
   expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
 });
 
+it.each([profile.name, profile.publicName])(
+  "reports a deleted Worker shell for %s before either upload",
+  async (name) => {
+    const execute = vi.fn(() => ({ status: 0 }));
+    const prepared = activeSitekey("replacement-sitekey");
+    const api = vi.fn(async (path) => (path === `/workers/scripts/${name}/settings` ? null : prepared));
+    await expect(
+      deployPlatform("production", execute, {
+        connect: async () => ({ api }),
+        readFingerprints: () => ({
+          [profile.name]: settingsFingerprint(prepared),
+          [profile.publicName]: settingsFingerprint(prepared),
+        }),
+      }),
+    ).rejects.toThrow(`Worker shell missing for ${name}. Run platform bootstrap first.`);
+    expect(execute.mock.calls.map(([, args]) => args.includes("--dry-run"))).toEqual([true, true]);
+  },
+);
+
 it("rejects the live-check flag by itself before reading configs or contacting Cloudflare", async () => {
   const execute = vi.fn(),
     connect = vi.fn(),

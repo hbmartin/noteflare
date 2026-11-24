@@ -235,9 +235,9 @@ function auditCleanupFailure(error: unknown) {
   const bindingReason = auditCleanupBindingReasons.get(bindingCode ?? "");
   if (bindingReason === "lock" || ("code" in error && error.code === "ObjectLockedByBucketPolicy")) return "lock";
   if (bindingReason === "transient") return "transient";
-  const status = "status" in error ? error.status : undefined;
-  const statusCode = typeof status === "number" ? status : "statusCode" in error ? error.statusCode : undefined;
-  return typeof statusCode === "number" && transientAuditCleanupStatuses.has(statusCode) ? "transient" : "unknown";
+  let status = "status" in error ? error.status : undefined;
+  if (typeof status !== "number" && "statusCode" in error) status = error.statusCode;
+  return typeof status === "number" && transientAuditCleanupStatuses.has(status) ? "transient" : "unknown";
 }
 /** Reconcile ambiguous PUTs and bucket-lock races without overwriting verified bytes. */
 export async function immutableAuditObject(

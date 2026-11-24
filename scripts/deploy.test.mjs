@@ -24,8 +24,35 @@ import {
   withSecretsFile,
 } from "./deploy.mjs";
 import { metadataIntegrityCheck } from "./integrity.mjs";
+import * as wranglerProcess from "./wrangler-process.mjs";
 
 afterEach(() => vi.unstubAllEnvs());
+it.each([
+  {
+    source: "process.stdout.write(Buffer.alloc(1_048_577))",
+    message: "Wrangler auth exceeded the 1 MiB output limit.",
+  },
+  {
+    source: "setInterval(() => {}, 10_000)",
+    timeoutMs: 100,
+    message: "Wrangler auth timed out.",
+  },
+])("reports the actual credential subprocess failure: $message", async ({ source, timeoutMs, message }) => {
+  const runWrangler = wranglerProcess.runWrangler;
+  const runner = vi
+    .spyOn(wranglerProcess, "runWrangler")
+    .mockImplementationOnce((program, _args, options) =>
+      runWrangler(program, ["-e", source], { ...options, timeoutMs: timeoutMs ?? options.timeoutMs }),
+    );
+  const request = vi.fn();
+  try {
+    await expect(cloudflare("0".repeat(32), { request })).rejects.toThrow(message);
+    expect(request).not.toHaveBeenCalled();
+  } finally {
+    runner.mockRestore();
+  }
+});
+
 it.each(["initial credentials", "OAuth renewal", "settings request"])(
   "cancels Cloudflare %s without retrying",
   async (step) => {
