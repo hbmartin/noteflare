@@ -202,15 +202,18 @@ export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, 
     AND (lease_until IS NULL OR lease_until<=?) ORDER BY available_at,id LIMIT ?`)
     .bind(Date.now(), Date.now(), Math.max(1, Math.min(25, limit)))
     .all<{ id: string }>();
+  let queueSendFailures = 0;
   for (const row of rows.results) {
     if (env.PLATFORM_QUEUE) {
       try {
         await env.PLATFORM_QUEUE.send({ platformJobId: row.id });
       } catch {
+        queueSendFailures++;
         recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
       }
     } else await runPlatformJob(env, row.id, handlers);
   }
+  return { queueSendFailures };
 }
 
 export async function consumePlatformQueue(

@@ -2,9 +2,12 @@ import { spawn } from "node:child_process";
 
 const maxShutdownMs = 5000;
 const maxOutputBytes = 1_048_576;
+const maxTimeoutMs = 2_147_483_647;
 
 export async function runWrangler(program, args, { stdio, signal, onChild, timeoutMs }) {
   signal?.throwIfAborted();
+  if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > maxTimeoutMs))
+    throw new RangeError(`Wrangler timeout must be an integer from 1 to ${maxTimeoutMs} milliseconds.`);
   const child = spawn(program, args, { stdio });
   const output = [];
   let bytes = 0,
@@ -45,6 +48,7 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
           stopChild();
         }, timeoutMs);
   timeout?.unref();
+  child.once("exit", () => clearTimeout(timeout));
   try {
     if (child.pid) onChild?.(child.pid);
     return await finished;
