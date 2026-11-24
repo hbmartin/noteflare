@@ -30,6 +30,7 @@ import { absolutePositionToRelativePosition, ySyncPluginKey } from "y-prosemirro
 import * as Y from "yjs";
 import type { CommentThread, SessionUser } from "../shared/types";
 import { api, ApiClientError, apiErrorMessage, json } from "./api";
+import { pagePrefetchPaths, prefetchedOrFetch } from "./page-prefetch";
 
 const finishedWithoutStorage = () => true;
 type NotesThreadMetadata = {
@@ -198,7 +199,8 @@ export class ServerThreadStore extends ThreadStore {
   async refresh(_revision?: number) {
     const generation = ++this.refreshGeneration;
     try {
-      const data = await api<{ threads: CommentThread[] }>(`/api/pages/${encodeURIComponent(this.pageId)}/comments`);
+      // The first load after a hover prefetch reuses it; later refreshes always ask the server.
+      const data = await prefetchedOrFetch<{ threads: CommentThread[] }>(pagePrefetchPaths(this.pageId).comments);
       if (generation === this.refreshGeneration) {
         this.replace(data.threads);
         this.onError("");

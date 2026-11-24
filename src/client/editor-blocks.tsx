@@ -22,6 +22,8 @@ import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import type { Page, SearchTitleSuggestion } from "../shared/types";
 import "katex/dist/katex.min.css";
 import { useNearViewport } from "./near-viewport";
+import { followPageLink } from "./page-links";
+import { pageIntentProps } from "./page-prefetch";
 import { updateHeadingIndex, type IndexedHeading, type HeadingBlock } from "./heading-index";
 
 import { DiagramEmbedContext } from "./diagram-embed-context";
@@ -583,7 +585,9 @@ function SyncedReferenceView({
   return (
     <div className="editor-synced-reference" contentEditable={false} ref={viewportRef}>
       <div className="editor-synced-actions">
-        <a href={`/?page=${encodeURIComponent(sourcePageId)}`}>Edit source</a>
+        <a href={`/?page=${encodeURIComponent(sourcePageId)}`} onClick={(event) => followPageLink(event, sourcePageId)}>
+          Edit source
+        </a>
         <button type="button" onClick={() => setRevision((value) => value + 1)}>
           Refresh
         </button>
@@ -649,7 +653,13 @@ const linkToPage = createReactBlockSpec(
   { type: "linkToPage", propSchema: { pageId: { default: "" }, title: { default: "Linked page" } }, content: "none" },
   {
     render: ({ block }) => (
-      <a className="editor-page-link" contentEditable={false} href={`/?page=${encodeURIComponent(block.props.pageId)}`}>
+      <a
+        className="editor-page-link"
+        contentEditable={false}
+        href={`/?page=${encodeURIComponent(block.props.pageId)}`}
+        onClick={(event) => followPageLink(event, block.props.pageId)}
+        {...pageIntentProps(block.props.pageId)}
+      >
         <span aria-hidden="true">□</span> {block.props.title}
       </a>
     ),
@@ -803,7 +813,7 @@ export function LinkedDiagramView({
           <LiveDiagramEmbed key={pageId} account={liveAccount} pageId={pageId} title={title} />
         </Suspense>
       ) : (
-        <a href={`/?page=${encodeURIComponent(pageId)}`}>
+        <a href={`/?page=${encodeURIComponent(pageId)}`} onClick={(event) => followPageLink(event, pageId)}>
           <img src={`/api/pages/${encodeURIComponent(pageId)}/diagram-thumbnail.svg`} alt="" loading="lazy" />
           <figcaption>
             <span aria-hidden="true">◇</span> {title || "Linked whiteboard"}

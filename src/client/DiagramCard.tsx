@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { subscribeCardPreview, type CardPreviewState } from "./card-preview-pool";
 import { useNearViewport } from "./near-viewport";
+import { followPageLink } from "./page-links";
 
 export function DiagramCard({
   account,
@@ -28,7 +29,11 @@ export function DiagramCard({
         <>
           <a
             href={`/?page=${encodeURIComponent(pageId)}${viewId ? `&view=${encodeURIComponent(viewId)}` : ""}`}
-            onClick={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              // A table view selection still needs the full URL, which in-app navigation does not carry.
+              if (!viewId) followPageLink(event, pageId);
+            }}
           >
             {alias || preview.page.title || "Untitled"}
           </a>

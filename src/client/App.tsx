@@ -61,6 +61,13 @@ import { clearLiveRecoveryCopies, EditorPage } from "./EditorPage";
 import { errorMessageKey } from "./error-messages";
 import { invalidateAllPagePreviews, invalidatePagePreview, PAGE_NAVIGATE_EVENT } from "./mentions";
 import {
+  configurePagePrefetch,
+  invalidatePrefetchedForEvent,
+  pageIntentProps,
+  pagePrefetchPaths,
+  prefetchedOrFetch,
+} from "./page-prefetch";
+import {
   authoritativePageSnapshot,
   mergePages,
   mergePageSnapshot,
@@ -2721,8 +2728,15 @@ function Workspace({
   // Keyed on the selection rather than folded into loadOrganization: the selection
   // changes on every page click, and only the page's own tags depend on it.
   const [organizationRevision, setOrganizationRevision] = useState(0);
+  const activeSpaceIdRef = useRef(activeSpaceId);
+  const loadedPinsSpaceRef = useRef<string | null>(null);
+  const pinsLoadGenerationRef = useRef(0);
+  useEffect(() => {
+    activeSpaceIdRef.current = activeSpaceId;
+  }, [activeSpaceId]);
   const loadOrganization = useCallback(async () => {
     const generation = ++organizationLoadGenerationRef.current;
+    const currentSpaceId = activeSpaceIdRef.current;
     const attempt = startWorkspaceErrorAttempt({ source: "organization" });
     try {
       const [spaceData, favoriteData, tagData, templateData] = await Promise.all([
@@ -2737,22 +2751,26 @@ function Workspace({
       setTags(tagData.tags);
       setTemplates(templateData.templates);
       const selectedSpace = selectedSpaceIdRef.current;
-      const resolvedSpaceId = spaceData.spaces.some((space) => space.id === activeSpaceId)
-        ? activeSpaceId
+      const resolvedSpaceId = spaceData.spaces.some((space) => space.id === currentSpaceId)
+        ? currentSpaceId
         : selectedSpace && spaceData.spaces.some((space) => space.id === selectedSpace)
           ? selectedSpace
           : (spaceData.spaces[0]?.id ?? "");
-      if (resolvedSpaceId !== activeSpaceId) {
+      if (resolvedSpaceId !== currentSpaceId) {
         setActiveSpaceId(resolvedSpaceId);
         if (resolvedSpaceId) localStorage.setItem(`notes:active-space:${member.workspace.id}`, resolvedSpaceId);
       }
+      const pinsGeneration = ++pinsLoadGenerationRef.current;
       const [pinResult] = await Promise.allSettled([
         resolvedSpaceId
           ? api<{ pages: Page[] }>(`/api/spaces/${encodeURIComponent(resolvedSpaceId)}/pins`)
           : Promise.resolve({ pages: [] }),
       ]);
       if (generation !== organizationLoadGenerationRef.current) return;
-      if (pinResult.status === "fulfilled") setPins(pinResult.value.pages);
+      if (pinResult.status === "fulfilled" && pinsGeneration === pinsLoadGenerationRef.current) {
+        loadedPinsSpaceRef.current = resolvedSpaceId;
+        setPins(pinResult.value.pages);
+      }
       if (pinResult.status === "rejected") throw pinResult.reason;
       setOrganizationRevision((current) => current + 1);
       setOrganizationLoadError("");
@@ -2763,21 +2781,39 @@ function Workspace({
       if (generation === organizationLoadGenerationRef.current) setOrganizationLoading(false);
       finishWorkspaceErrorAttempt(attempt);
     }
-  }, [
-    activeSpaceId,
-    clearWorkspaceErrors,
-    finishWorkspaceErrorAttempt,
-    member.workspace.id,
-    startWorkspaceErrorAttempt,
-  ]);
+  }, [clearWorkspaceErrors, finishWorkspaceErrorAttempt, member.workspace.id, startWorkspaceErrorAttempt]);
   useEffect(() => {
     const timer = window.setTimeout(() => void loadOrganization(), 0);
     return () => window.clearTimeout(timer);
   }, [loadOrganization]);
+  // Spaces, favorites, tags and templates are workspace-wide; switching spaces only changes the pins.
+  useEffect(() => {
+    if (!activeSpaceId || loadedPinsSpaceRef.current === null || loadedPinsSpaceRef.current === activeSpaceId) return;
+    const generation = ++pinsLoadGenerationRef.current;
+    void api<{ pages: Page[] }>(`/api/spaces/${encodeURIComponent(activeSpaceId)}/pins`)
+      .then((data) => {
+        if (generation !== pinsLoadGenerationRef.current) return;
+        loadedPinsSpaceRef.current = activeSpaceId;
+        setPins(data.pages);
+      })
+      .catch((error: unknown) => {
+        if (generation !== pinsLoadGenerationRef.current) return;
+        setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
+      });
+  }, [activeSpaceId]);
+  useEffect(() => {
+    // An OAuth consent hand-off leaves the workspace at once; never prefetch private pages for it.
+    configurePagePrefetch({
+      account: member.user.id,
+      enabled: !new URLSearchParams(window.location.search).has("oauthAuthorize"),
+      preloadDiagramEditor: () => import("./DiagramPage"),
+    });
+    return () => configurePagePrefetch({ account: null, enabled: false });
+  }, [member.user.id]);
   useEffect(() => {
     if (!selectedId) return;
     const generation = ++pageTagsLoadGenerationRef.current;
-    void api<{ tags: Tag[] }>(`/api/pages/${encodeURIComponent(selectedId)}/tags`)
+    void prefetchedOrFetch<{ tags: Tag[] }>(pagePrefetchPaths(selectedId).tags)
       .then((data) => {
         if (generation === pageTagsLoadGenerationRef.current && selectedIdRef.current === selectedId) {
           setPageTags({ pageId: selectedId, tags: data.tags });
@@ -2791,10 +2827,6 @@ function Workspace({
 
   // The shell only renders a selection inside the active space, so a deep link or a fallback selection
   // that lands in another space switches the space instead of showing an empty workspace.
-  const activeSpaceIdRef = useRef(activeSpaceId);
-  useEffect(() => {
-    activeSpaceIdRef.current = activeSpaceId;
-  }, [activeSpaceId]);
   useEffect(() => {
     if (!selectedSpaceId || selectedSpaceId === activeSpaceIdRef.current) return;
     setActiveSpaceId(selectedSpaceId);
@@ -2971,6 +3003,7 @@ function Workspace({
   }
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
+      invalidatePrefetchedForEvent(event);
       if (event.type === "workspace-invalidated") {
         // Also the reconnect catch-up: refresh everything another event could have changed.
         invalidateAllPagePreviews();
@@ -5016,7 +5049,7 @@ function SidebarPageLinks({
       </div>
       <div className="sidebar-page-links">
         {pages.map((page) => (
-          <button key={page.id} onClick={() => onSelect(page.id)}>
+          <button key={page.id} onClick={() => onSelect(page.id)} {...pageIntentProps(page.id, page.kind)}>
             <span aria-hidden="true">{icon}</span>
             <span>{page.title}</span>
           </button>

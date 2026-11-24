@@ -1376,3 +1376,24 @@ Source: AFFiNE's November sync work (a workspace state handshake on reconnect, a
 | `tests/e2e/notes.spec.ts` (Chromium, three repeats)             | A 4401 grant-renewal reconnect makes no tree request; a rename made while reconnects were blocked appears within 15 seconds after they resume                                                                                                              |
 | Full Worker suite                                               | 52 files, 2796 tests passed                                                                                                                                                                                                                                |
 | Full unit suite                                                 | 199 files passed                                                                                                                                                                                                                                           |
+
+## Upstream review follow-up: page opening and editor teardown — 24 November 2026
+
+Source: docmost's hover prefetch and request consolidation (#2758, #2759) and its editor teardown fixes (#2702, #2708). Roadmap section E asks for bounded intent preloading after the shell stops making redundant requests. Local evidence only; nothing is deployed.
+
+### Contracts
+
+- Page cards, synced-block "Edit source" links, linked-whiteboard thumbnails and whiteboard page cards open pages inside the running app on an ordinary click. Modified and middle clicks keep the link's browser behavior; a whiteboard card for a table view keeps full navigation because the app route does not carry the view.
+- Watch controls reuse a state read in the last 30 seconds, so the page and space menus no longer refetch it every time they open or close; changing a space watch forgets inherited page states. Switching spaces loads only that space's pins; spaces, favorites, tags and templates load with the workspace.
+- Hovering or focusing a sidebar row, favorite, pin, recent page, page mention or page card for 120 ms prefetches the page's tags and watch state, its comments for documents and whiteboards, and the whiteboard editor bundle. At most two requests run at once, responses older than 30 seconds are discarded, each prefetched response is used once by the next open, and workspace events and account changes discard affected entries. Nothing is prefetched offline, with Data Saver, or during an OAuth consent hand-off.
+- A closed page releases its document once local writes settle, or after 15 seconds with a `client.offline_storage_slow` report if IndexedDB never settles. The editor clears BlockNote's `window.ProseMirror` debug reference when it closes.
+
+### Validation
+
+| Check                                                                      | Result                                                                                                                                                                             |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/client/page-prefetch.test.ts` (new)                                   | Concurrency bound, single use, expiry, event and account invalidation, failure handling, intent delay, and the offline, Data Saver and disabled cases                              |
+| `src/client/page-links.test.tsx` (new), `src/client/WatchControl.test.tsx` | Plain clicks navigate in the app while modified clicks do not; remounted watch controls make no request; a space watch change rereads inherited page states                        |
+| `src/client/App.test.tsx`                                                  | Switching spaces requests only that space's pins (261 tests passed)                                                                                                                |
+| `tests/e2e/editor-teardown.spec.ts` (new, Chromium)                        | After 30 page visits and forced garbage collection at most two page documents remain. The previous editor also passes, so this is a regression guard rather than a reproduced leak |
+| Full unit suite                                                            | 200 files, 3635 tests passed                                                                                                                                                       |

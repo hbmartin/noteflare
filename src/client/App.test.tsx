@@ -302,6 +302,29 @@ describe("App error handling", () => {
     expect(calls()).not.toContain("/api/spaces");
   });
 
+  it("loads only the new space's pins when switching spaces", async () => {
+    const otherSpace: Space = { ...shellGeneralSpace, id: "other-space", name: "Other", slug: "other", position: "a1" };
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/spaces") return { spaces: [shellGeneralSpace, otherSpace] };
+      if (path === "/api/spaces/other-space/pins") return { pages: [] };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "Actions for Roadmap" });
+    const space = await screen.findByRole("combobox", { name: "Current space" });
+    await waitFor(() => expect(space).toBeEnabled());
+    const calls = () => vi.mocked(api).mock.calls.map(([path]) => path);
+    vi.mocked(api).mockClear();
+
+    fireEvent.change(space, { target: { value: "other-space" } });
+
+    await waitFor(() => expect(calls()).toContain("/api/spaces/other-space/pins"));
+    for (const path of ["/api/spaces", "/api/favorites", "/api/tags", "/api/templates"])
+      expect(calls()).not.toContain(path);
+  });
+
   it("catches up every workspace subscriber after missed events", async () => {
     mockShellApi();
     render(<App />);

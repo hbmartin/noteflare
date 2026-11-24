@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { BRANCH_SORT_LABELS, findNode, sortedTree, type BranchSort } from "../shared/tree-model";
 import type { Page, PageKind, PageNode } from "../shared/types";
 import { ActionMenu, Icon, readPreference, savePreference } from "./WorkspaceUI";
+import { cancelPagePrefetch, schedulePagePrefetch } from "./page-prefetch";
 
 export function CreationMenu({
   label,
@@ -174,7 +175,12 @@ export function WorkspaceTree({
         data-tree-page={node.id}
         tabIndex={node.id === focusedId ? 0 : -1}
         onFocus={(event) => {
-          if (event.target === event.currentTarget) setFocused(node.id);
+          if (event.target !== event.currentTarget) return;
+          setFocused(node.id);
+          if (node.id !== selectedId) schedulePagePrefetch(node.id, node.kind);
+        }}
+        onBlur={(event) => {
+          if (event.target === event.currentTarget) cancelPagePrefetch();
         }}
         onClick={(event) => {
           const target = event.target as HTMLElement;
@@ -243,6 +249,11 @@ export function WorkspaceTree({
       >
         <div
           className={`tree-row ${selectedId === node.id ? "selected" : ""} ${drop?.id === node.id ? `drop-${drop.position}` : ""}`}
+          // The row, not the branch: a branch also contains every descendant row.
+          onPointerEnter={() => {
+            if (node.id !== selectedId) schedulePagePrefetch(node.id, node.kind);
+          }}
+          onPointerLeave={cancelPagePrefetch}
           draggable={editable}
           onDragStart={(event) => {
             event.dataTransfer.setData("text/page-id", node.id);

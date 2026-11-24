@@ -98,6 +98,16 @@ function createDurabilityBarrier(
   };
 }
 
+/**
+ * Development builds keep weak references to every collaborative page document
+ * so browser tests can check that closed pages are garbage collected.
+ */
+function trackPageDocument(doc: Y.Doc) {
+  if (!import.meta.env.DEV) return;
+  const host = window as Window & { noteflarePageDocuments?: Array<WeakRef<Y.Doc>> };
+  (host.noteflarePageDocuments ??= []).push(new WeakRef(doc));
+}
+
 export function createCollaboration(
   workspaceId: string,
   pageId: string,
@@ -107,6 +117,7 @@ export function createCollaboration(
   beforeConnect?: () => Promise<boolean>,
 ): CollaborationBundle {
   const doc = new Y.Doc();
+  trackPageDocument(doc);
   const key = offlineDocumentKey(userId, workspaceId, pageId, epoch);
   registerOfflineDocumentKey(userId, workspaceId, key);
   const indexeddb = new IndexeddbPersistence(key, doc);

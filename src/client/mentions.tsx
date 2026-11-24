@@ -7,7 +7,7 @@ import {
   type Extension,
 } from "@blocknote/core";
 import { createReactInlineContentSpec } from "@blocknote/react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { mentionInlineConfig } from "../shared/mention-spec";
 import { dateMentionInlineConfig } from "../shared/date-mention-spec";
 import { dateMentionFromProps, dateMentionWireProps, formatDateMention } from "../shared/date-mentions";
@@ -16,8 +16,10 @@ import { api } from "./api";
 import { coreBlockSpecs, inlineMathSpec } from "./editor-blocks";
 import { DateMentionChip } from "./DateMentionChip";
 import { featureBlockSpecs, featureInlineSpecs } from "./editor-feature-blocks";
+import { PAGE_NAVIGATE_EVENT } from "./page-links";
+import { cancelPagePrefetch, schedulePagePrefetch } from "./page-prefetch";
 
-export const PAGE_NAVIGATE_EVENT = "notes:navigate-page";
+export { PAGE_NAVIGATE_EVENT };
 
 const previewCache = new Map<string, Promise<PagePreview>>();
 
@@ -52,13 +54,24 @@ function MentionChip({
 }) {
   const [preview, setPreview] = useState<PagePreview | null>(null);
   const [open, setOpen] = useState(false);
+  const intent = useRef(false);
 
   const showPreview = () => {
     if (entityType !== "page") return;
     setOpen(true);
+    intent.current = true;
     void loadPreview(entityId)
-      .then(setPreview)
+      .then((loaded) => {
+        setPreview(loaded);
+        // The preview names the page kind, which decides what opening it requests.
+        if (intent.current) schedulePagePrefetch(entityId, loaded.page.kind);
+      })
       .catch(() => setPreview(null));
+  };
+  const hidePreview = () => {
+    setOpen(false);
+    intent.current = false;
+    cancelPagePrefetch();
   };
 
   if (entityType === "user") {
@@ -70,12 +83,12 @@ function MentionChip({
   }
 
   return (
-    <span ref={contentRef} className="mention-wrap" onMouseEnter={showPreview} onMouseLeave={() => setOpen(false)}>
+    <span ref={contentRef} className="mention-wrap" onMouseEnter={showPreview} onMouseLeave={hidePreview}>
       <button
         type="button"
         className="mention-chip mention-page"
         onFocus={showPreview}
-        onBlur={() => setOpen(false)}
+        onBlur={hidePreview}
         onClick={() => window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: entityId }))}
       >
         @{label}
