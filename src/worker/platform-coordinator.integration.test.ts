@@ -127,6 +127,26 @@ function recoveryJob(id: string, due: number, lease: number | null = null) {
 
 const queueSendResponse = { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
 
+function queueRecoveryEnv(source: Env, send: Queue["send"], rejectScan: () => boolean): Env {
+  const DB = new Proxy(source.DB, {
+    get(target, property) {
+      if (property === "prepare")
+        return (sql: string) => {
+          if (rejectScan() && sql.includes("SELECT min(job_due)")) throw new Error("Final scan unavailable");
+          return target.prepare(sql);
+        };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    ...source,
+    DB,
+    SEMANTIC_SEARCH_ENABLED: "false",
+    PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
+  };
+}
+
 it.each([
   { name: "inline recovery", nextAlarm: 15_000, followingAlarm: 70_000 },
   {
@@ -217,24 +237,7 @@ it.each([false, true])("backs off Queue recovery during a total outage (failed s
     await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
       const mutable = instance as unknown as { env: Env };
       const original = mutable.env;
-      const DB = new Proxy(env.DB, {
-        get(target, property) {
-          if (property === "prepare")
-            return (sql: string) => {
-              if (failScan && queueUnavailable && sql.includes("SELECT min(job_due)"))
-                throw new Error("Final scan unavailable");
-              return target.prepare(sql);
-            };
-          const value = Reflect.get(target, property, target);
-          return typeof value === "function" ? value.bind(target) : value;
-        },
-      });
-      mutable.env = {
-        ...original,
-        DB,
-        SEMANTIC_SEARCH_ENABLED: "false",
-        PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
-      };
+      mutable.env = queueRecoveryEnv(original, send, () => failScan && queueUnavailable);
       const alarmPhase = async (phase: number, offset: number) => {
         clock.mockReturnValue(now + offset);
         await state.storage.put("phase", phase);
@@ -304,23 +307,7 @@ it.each([false, true])(
       await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
         const mutable = instance as unknown as { env: Env };
         const original = mutable.env;
-        const DB = new Proxy(env.DB, {
-          get(target, property) {
-            if (property === "prepare")
-              return (sql: string) => {
-                if (rejectScan && sql.includes("SELECT min(job_due)")) throw new Error("Final scan unavailable");
-                return target.prepare(sql);
-              };
-            const value = Reflect.get(target, property, target);
-            return typeof value === "function" ? value.bind(target) : value;
-          },
-        });
-        mutable.env = {
-          ...original,
-          DB,
-          SEMANTIC_SEARCH_ENABLED: "false",
-          PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
-        };
+        mutable.env = queueRecoveryEnv(original, send, () => rejectScan);
         const alarmPhase = async (phase: number, offset: number) => {
           clock.mockReturnValue(now + offset);
           await state.storage.put("phase", phase);
