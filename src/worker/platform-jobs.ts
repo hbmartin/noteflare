@@ -217,6 +217,7 @@ export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, 
       queue_send_failures: number;
     }>();
   let queueSendFailures = 0;
+  // Settle each job before starting the next so a D1 failure leaves later jobs for recovery.
   for (const row of rows.results) {
     if (!queue) {
       await runPlatformJob(env, row.id, handlers);
