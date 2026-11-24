@@ -347,6 +347,8 @@ describe("durable platform release", () => {
     ["unknown binding code", bindingFailure(10012), "unknown"],
     ["structured status", { status: 503 }, "transient"],
     ["structured statusCode", { statusCode: 502 }, "transient"],
+    ["structured rate limit", { status: 429 }, "transient"],
+    ["structured gateway timeout", { status: 504 }, "transient"],
     ["undefined status with transient statusCode", { status: undefined, statusCode: 503 }, "transient"],
     ["numeric status with transient statusCode", { status: 400, statusCode: 503 }, "unknown"],
     ["structured lock with transient status", { code: "ObjectLockedByBucketPolicy", status: 503 }, "lock"],

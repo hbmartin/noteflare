@@ -42,9 +42,12 @@ function withTimeout(signal, timeoutMs) {
 async function wranglerJSON(args, signal) {
   const result = await runWrangler(process.execPath, [require.resolve("wrangler"), ...args], {
     stdio: ["ignore", "pipe", "ignore"],
-    signal: withTimeout(signal, 300_000),
+    signal,
+    timeoutMs: 300_000,
   });
   signal?.throwIfAborted();
+  if (result.failure === "output-limit") throw new Error(`Wrangler ${args[0]} exceeded the 1 MiB output limit.`);
+  if (result.failure === "timeout") throw new Error(`Wrangler ${args[0]} timed out.`);
   if (result.status !== 0) throw new Error(`Wrangler ${args[0]} failed. Check authentication and permissions.`);
   try {
     return JSON.parse(result.stdout);

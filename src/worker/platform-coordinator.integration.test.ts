@@ -125,16 +125,37 @@ function recoveryJob(id: string, due: number, lease: number | null = null) {
   ).bind(id, id, due, lease);
 }
 
-it.each(["inline", "queue", "deadline read"] as const)(
-  "keeps due jobs eligible after a failed scan (%s)",
-  async (caseName) => {
-    const useQueue = caseName === "queue";
+it.each([
+  { name: "inline recovery", nextAlarm: 15_000, followingAlarm: 70_000 },
+  { name: "Queue recovery", useQueue: true, nextAlarm: 15_000, followingAlarm: 30_000 },
+  {
+    name: "both reads unavailable",
+    failDeadlineRead: true,
+    nextAlarm: 70_000,
+    followingAlarm: 200_000,
+    scanAttempts: 2,
+  },
+  { name: "fresh wake", failDeadlineRead: true, wakeAfterRecovery: true, nextAlarm: 15_000, followingAlarm: 70_000 },
+  { name: "future deadline", failDeadlineRead: true, availableIn: 30_000, nextAlarm: 30_000, followingAlarm: 70_000 },
+])(
+  "schedules the next alarm after a failed scan with $name",
+  async ({
+    useQueue,
+    failDeadlineRead,
+    wakeAfterRecovery,
+    availableIn = -2,
+    nextAlarm,
+    followingAlarm,
+    scanAttempts = 1,
+  }) => {
     const now = Date.now();
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const cachedDeadline = now + availableIn;
+    const runsInline = !useQueue && cachedDeadline < now;
     const wasSent = vi.fn(async () => {
       throw new Error("Queue unavailable");
     });
-    await env.DB.batch([recoveryJob("first", now - 2), recoveryJob("second", now - 1)]);
+    await env.DB.batch([recoveryJob("first", cachedDeadline), recoveryJob("second", cachedDeadline + 1)]);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     try {
       await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
         const mutable = instance as unknown as { env: Env };
@@ -144,7 +165,7 @@ it.each(["inline", "queue", "deadline read"] as const)(
             if (property === "prepare")
               return (sql: string) => {
                 if (sql.includes("SELECT min(job_due)")) throw new Error("Final scan unavailable");
-                if (caseName === "deadline read" && sql.startsWith("SELECT min(max(available_at"))
+                if (failDeadlineRead && sql.startsWith("SELECT min(max(available_at"))
                   throw new Error("Job deadline unavailable");
                 return target.prepare(sql);
               };
@@ -155,23 +176,32 @@ it.each(["inline", "queue", "deadline read"] as const)(
         mutable.env = { ...original, DB, SEMANTIC_SEARCH_ENABLED: "false" };
         if (useQueue) mutable.env.PLATFORM_QUEUE = { send: wasSent, sendBatch: wasSent, metrics: wasSent };
         else delete mutable.env.PLATFORM_QUEUE;
+        const alarmPhase = async (phase: number, offset: number) => {
+          clock.mockReturnValue(now + offset);
+          await state.storage.put("phase", phase);
+          await instance.alarm();
+        };
+        const schedule = () =>
+          state.storage.get<{ jobRetryAt: number | null; retries?: Record<string, { attempts: number }> }>("schedule");
         try {
-          await instance.wake(undefined, now - 2);
+          await instance.wake(undefined, cachedDeadline);
           await instance.alarm();
-          clock.mockReturnValue(now + 5000);
-          await state.storage.put("phase", 2);
-          await instance.alarm();
-          expect(await env.DB.prepare("SELECT count(*) FROM platform_jobs").first("count(*)")).toBe(useQueue ? 2 : 1);
+          await alarmPhase(2, 5000);
+          expect(await env.DB.prepare("SELECT count(*) FROM platform_jobs").first("count(*)")).toBe(runsInline ? 1 : 2);
           expect(wasSent).toHaveBeenCalledTimes(useQueue ? 2 : 0);
-          const schedule = await state.storage.get<{ jobRetryAt: number; retries?: Record<number, unknown> }>(
-            "schedule",
-          );
-          expect(schedule?.jobRetryAt).toBe(caseName === "inline" ? now - 1 : now - 2);
-          expect(schedule?.retries?.[2]).toBeUndefined();
-          clock.mockReturnValue(now + 10_000);
-          await state.storage.put("phase", 10);
-          await instance.alarm();
-          expect(await state.storage.getAlarm()).toBe(now + 15_000);
+          expect((await schedule())?.jobRetryAt).toBe(cachedDeadline + (runsInline && !failDeadlineRead ? 1 : 0));
+          expect((await schedule())?.retries?.[2]).toBeUndefined();
+          if (wakeAfterRecovery) await instance.wake();
+          await alarmPhase(10, 10_000);
+          expect(await state.storage.getAlarm()).toBe(now + nextAlarm);
+
+          await alarmPhase(0, nextAlarm);
+          await alarmPhase(2, nextAlarm + 5000);
+          await alarmPhase(10, nextAlarm + 10_000);
+          expect(await state.storage.getAlarm()).toBe(now + followingAlarm);
+          expect((await schedule())?.jobRetryAt).toBe(runsInline && !failDeadlineRead ? null : cachedDeadline);
+          expect((await schedule())?.retries?.scan?.attempts).toBe(scanAttempts);
+          expect((await schedule())?.retries?.[2]).toBeUndefined();
         } finally {
           await state.storage.deleteAlarm();
           mutable.env = original;

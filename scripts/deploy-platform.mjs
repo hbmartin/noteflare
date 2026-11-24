@@ -127,9 +127,9 @@ export async function deployPlatform(
   const names = [profile.name, profile.publicName];
   async function verifyLiveSettings(name) {
     const settings = await api(`/workers/scripts/${name}/settings`, { allowMissing: true });
+    if (!settings) throw new Error(`Worker shell missing for ${name}. Run platform bootstrap first.`);
     if (settingsFingerprint(settings) !== fingerprints[name])
       throw new Error(`Live settings for ${name} changed after preparation. Prepare again before deploying.`);
-    if (!settings) throw new Error(`Worker shell missing for ${name}. Run platform bootstrap first.`);
     return settings;
   }
   // A disagreement already present on either Worker must prevent both uploads.
