@@ -219,19 +219,24 @@ export function auditRetention(env: Env) {
   return { configuredDays, lockDays, storageMinimumDays: Math.max(configuredDays, lockDays ?? 0) };
 }
 
+const auditCleanupBindingReasons = new Map<string, "lock" | "transient">([
+  ["10001", "transient"],
+  ["10043", "transient"],
+  ["10058", "transient"],
+  ["10069", "lock"],
+]);
+const transientAuditCleanupStatuses = new Set([429, 502, 503, 504]);
+
 function auditCleanupFailure(error: unknown) {
   // The Workers binding exposes the R2 code in a plain Error's message.
-  if (error instanceof Error) {
-    const code = /^(?:R2 )?(?:head|delete): [\s\S]* \((\d+)\)$/.exec(error.message)?.[1];
-    if (code === "10069") return "lock";
-    if (code === "10001" || code === "10043" || code === "10058") return "transient";
-  }
-  if (error && typeof error === "object") {
-    if ("code" in error && error.code === "ObjectLockedByBucketPolicy") return "lock";
-    const status = "status" in error ? error.status : "statusCode" in error ? error.statusCode : undefined;
-    if (status === 429 || status === 502 || status === 503 || status === 504) return "transient";
-  }
-  return "unknown";
+  const bindingCode =
+    error instanceof Error ? /^(?:R2 )?(?:head|delete): [\s\S]* \((\d+)\)$/.exec(error.message)?.[1] : undefined;
+  const bindingReason = auditCleanupBindingReasons.get(bindingCode ?? "");
+  if (bindingReason) return bindingReason;
+  if (!error || typeof error !== "object") return "unknown";
+  if ("code" in error && error.code === "ObjectLockedByBucketPolicy") return "lock";
+  const status = "status" in error ? error.status : "statusCode" in error ? error.statusCode : undefined;
+  return typeof status === "number" && transientAuditCleanupStatuses.has(status) ? "transient" : "unknown";
 }
 /** Reconcile ambiguous PUTs and bucket-lock races without overwriting verified bytes. */
 export async function immutableAuditObject(

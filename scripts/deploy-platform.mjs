@@ -161,6 +161,7 @@ export async function deployPlatform(
       secretArgs.push("--secrets-file", secretFile);
     }
     const uploaded = [];
+    // Check settings just before each upload, stopping on failure so the report lists only confirmed uploads.
     for (const [index, path] of files.entries()) {
       const name = names[index];
       try {

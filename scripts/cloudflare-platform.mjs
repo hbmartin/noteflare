@@ -875,6 +875,7 @@ export async function bootstrap(profile, api, directory, environment = process.e
   }
   if (missingTurnstile.length) {
     const secret = await turnstileReplacementSecret(profile, api, widget.sitekey);
+    // Recheck each pairing just before its write. A failed write stops the remaining writes.
     for (const name of missingTurnstile) {
       const live = await api(`/workers/scripts/${name}/settings`);
       if (canFillTurnstile(name, live)) await putSecret(name, "TURNSTILE_SECRET_KEY", secret);
