@@ -482,11 +482,6 @@ export async function mutateTask(
         sql: "INSERT OR IGNORE INTO task_mutation_receipts(workspace_id,actor_id,operation_id,request_hash,row_id,detail_page_id,revision,created_at) VALUES(?,?,?,?,?,?,?,?)",
         binds: [member.workspace.id, member.user.id, operationId, hash, rowId, detailPageId, expectedRevision + 1, now],
       },
-      { sql: `DELETE FROM page_search WHERE page_id IN (${subtree})`, binds: [detailPageId] },
-      {
-        sql: `INSERT INTO page_search(page_id,workspace_id,title,body) SELECT id,workspace_id,title,plain_text FROM pages WHERE id IN (${subtree}) AND archived_at IS NULL AND import_job_id IS NULL`,
-        binds: [detailPageId],
-      },
       ...durableStatements((db) => refreshPageSearchV2SubtreeStatements(db, detailPageId)),
     );
     if (next.assigneeId && next.assigneeId !== previous?.assigneeId && body.archived !== true)
@@ -699,9 +694,6 @@ export async function mutateTask(
           `UPDATE pages SET archived_at=?,archived_by=?,archive_operation_id=? WHERE id IN (${subtree}) AND archived_at IS NULL AND ${guard}`,
         ).bind(now, member.user.id, operationId, detailId, ...guards),
       );
-      statements.push(
-        env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (${subtree}) AND ${guard}`).bind(detailId, ...guards),
-      );
     } else {
       if (body.archived === false) {
         const archived = await env.DB.prepare("SELECT archive_operation_id,archived_at FROM pages WHERE id=?")
@@ -725,30 +717,6 @@ export async function mutateTask(
             archived?.archived_at ?? null,
             ...guards,
           ),
-        );
-        statements.push(
-          env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (${subtree}) AND ${guard}`).bind(
-            detailId,
-            ...guards,
-          ),
-        );
-        statements.push(
-          env.DB.prepare(
-            `INSERT INTO page_search(page_id,workspace_id,title,body)
-             SELECT id,workspace_id,title,coalesce(plain_text,'') FROM pages
-              WHERE id IN (${subtree}) AND archived_at IS NULL AND import_job_id IS NULL AND ${guard}`,
-          ).bind(detailId, ...guards),
-        );
-      } else {
-        statements.push(
-          env.DB.prepare(`DELETE FROM page_search WHERE page_id=? AND ${guard}`).bind(detailId, ...guards),
-        );
-        statements.push(
-          env.DB.prepare(
-            `INSERT INTO page_search(page_id,workspace_id,title,body)
-             SELECT id,workspace_id,title,coalesce(plain_text,'') FROM pages
-              WHERE id=? AND archived_at IS NULL AND import_job_id IS NULL AND ${guard}`,
-          ).bind(detailId, ...guards),
         );
       }
     }

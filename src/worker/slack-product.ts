@@ -628,9 +628,6 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
         env.DB.prepare(
           "UPDATE slack_product_sessions SET result_page_id=?,request_hash=?,state_json=? WHERE id=? AND EXISTS(SELECT 1 FROM pages WHERE id=?)",
         ).bind(pageId, hash, JSON.stringify({ ...state, body }), session.id, pageId),
-        env.DB.prepare(
-          "INSERT INTO page_search(page_id,workspace_id,title,body) SELECT id,workspace_id,title,'' FROM pages WHERE id=?",
-        ).bind(pageId),
         ...refreshPageSearchV2Statements(env.DB, pageId),
         env.DB.prepare(`INSERT INTO subscriptions
           (id,workspace_id,user_id,resource_type,resource_id,created_by,created_at)

@@ -424,6 +424,120 @@ describe("collaboration durability barriers", () => {
     expect(onEvent).not.toHaveBeenCalled();
     bundle.destroy();
   });
+
+  describe("workspace event stream positions", () => {
+    const hello = (seq: number, streamId = "stream-a") => JSON.stringify({ type: "stream-hello", streamId, seq });
+    const event = (seq: number) => JSON.stringify({ type: "organization-invalidated", seq });
+
+    function connect() {
+      const onEvent = vi.fn();
+      const onConnected = vi.fn();
+      const bundle = createWorkspaceEvents("workspace", onEvent, onConnected);
+      const provider = mocks.providers[0]!;
+      const open = () => provider.emit("status", { status: "connected" });
+      return { onEvent, onConnected, bundle, provider, open };
+    }
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("waits for the hello, then resumes without a reload when nothing was missed", () => {
+      const { onEvent, onConnected, bundle, provider, open } = connect();
+      open();
+      expect(onConnected).not.toHaveBeenCalled();
+      provider.emit("custom-message", hello(4));
+      expect(onConnected).toHaveBeenLastCalledWith("initial");
+
+      provider.emit("custom-message", event(5));
+      // The position is stripped before subscribers see the event.
+      expect(onEvent).toHaveBeenLastCalledWith({ type: "organization-invalidated" });
+      provider.emit("custom-message", JSON.stringify({ type: "stream-seq", seq: 6 }));
+      expect(onEvent).toHaveBeenCalledTimes(1);
+
+      open();
+      provider.emit("custom-message", hello(6));
+      expect(onConnected).toHaveBeenLastCalledWith("current");
+      expect(onConnected).toHaveBeenCalledTimes(2);
+      bundle.destroy();
+    });
+
+    it("catches up after missed positions, a new stream, or a skipped event", () => {
+      const { onConnected, bundle, provider, open } = connect();
+      open();
+      provider.emit("custom-message", hello(5));
+      open();
+      provider.emit("custom-message", hello(7));
+      expect(onConnected).toHaveBeenLastCalledWith("catch-up");
+
+      open();
+      provider.emit("custom-message", hello(7, "stream-b"));
+      expect(onConnected).toHaveBeenLastCalledWith("catch-up");
+
+      // A skipped position mid-connection means this connection missed an event.
+      provider.emit("custom-message", event(9));
+      expect(onConnected).toHaveBeenLastCalledWith("catch-up");
+      expect(onConnected).toHaveBeenCalledTimes(4);
+      open();
+      provider.emit("custom-message", hello(9, "stream-b"));
+      expect(onConnected).toHaveBeenLastCalledWith("current");
+      bundle.destroy();
+    });
+
+    it("reloads fully when the server sends no hello, and periodically even when current", () => {
+      vi.useFakeTimers();
+      const { onConnected, bundle, provider, open } = connect();
+      open();
+      provider.emit("sync", true);
+      expect(onConnected).toHaveBeenLastCalledWith("legacy");
+
+      open();
+      vi.advanceTimersByTime(10_000);
+      expect(onConnected).toHaveBeenLastCalledWith("legacy");
+
+      open();
+      provider.emit("custom-message", hello(2));
+      expect(onConnected).toHaveBeenLastCalledWith("initial");
+      vi.advanceTimersByTime(15 * 60_000);
+      open();
+      provider.emit("custom-message", hello(2));
+      expect(onConnected).toHaveBeenLastCalledWith("catch-up");
+      bundle.destroy();
+    });
+
+    it("catches up after an outage even when the position did not move", () => {
+      vi.useFakeTimers();
+      const { onConnected, bundle, provider, open } = connect();
+      open();
+      provider.emit("custom-message", hello(3));
+      // A grant renewal reconnects at once.
+      provider.emit("status", { status: "disconnected" });
+      vi.advanceTimersByTime(2_000);
+      open();
+      provider.emit("custom-message", hello(3));
+      expect(onConnected).toHaveBeenLastCalledWith("current");
+      // Failed reconnects during an outage keep the first disconnect time.
+      provider.emit("status", { status: "disconnected" });
+      vi.advanceTimersByTime(10_000);
+      provider.emit("status", { status: "disconnected" });
+      vi.advanceTimersByTime(10_000);
+      open();
+      provider.emit("custom-message", hello(3));
+      expect(onConnected).toHaveBeenLastCalledWith("catch-up");
+      bundle.destroy();
+    });
+
+    it("removes its listeners and timer on destroy", () => {
+      vi.useFakeTimers();
+      const { onConnected, bundle, provider, open } = connect();
+      open();
+      bundle.destroy();
+      vi.advanceTimersByTime(10_000);
+      provider.emit("sync", true);
+      provider.emit("custom-message", hello(1));
+      expect(onConnected).not.toHaveBeenCalled();
+    });
+  });
 });
 
 it("keeps suspended diagrams paused across retry and visibility paths until authorized resume", async () => {

@@ -1,5 +1,6 @@
 import type { Env } from "./env";
 import { logger, safeTelemetryErrorMessage } from "./observability.ts";
+import { refreshPageSearchV2Statements } from "./search-index.ts";
 
 /**
  * Attachment upload policy, shared by both upload paths, plus the reaper that
@@ -341,6 +342,7 @@ async function resolveCompletedUpload(env: Env, id: string) {
           `UPDATE attachment_uploads SET state = 'committed', updated_at = ? WHERE id = ? AND state = 'r2_complete'`,
         ).bind(timestamp, id),
         env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ? AND state = 'committed'`).bind(id),
+        ...refreshPageSearchV2Statements(env.DB, claimed.page_id),
       ]);
       return true;
     }

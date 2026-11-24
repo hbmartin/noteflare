@@ -1591,7 +1591,6 @@ describe("Notion-compatible API", () => {
       env.DB.prepare(
         `UPDATE pages SET archived_at = ?, archive_operation_id = ?, revision = revision + 1 WHERE id = ?`,
       ).bind(grandchildArchivedAt, grandchildArchiveOperationId, grandchild.id),
-      env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(grandchild.id),
       env.DB.prepare(
         `INSERT INTO archive_disconnect_targets
           (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
@@ -1647,9 +1646,6 @@ describe("Notion-compatible API", () => {
     await expect(
       env.DB.prepare(`SELECT updated_at FROM archive_disconnect_targets WHERE page_id = ?`).bind(grandchild.id).first(),
     ).resolves.toEqual({ updated_at: targetUpdatedAt });
-    await expect(
-      env.DB.prepare(`SELECT COUNT(*) count FROM page_search WHERE page_id = ?`).bind(grandchild.id).first(),
-    ).resolves.toEqual({ count: 0 });
   });
 
   it("routes API comments through watches, notifications, search, webhooks, and realtime invalidation", async () => {

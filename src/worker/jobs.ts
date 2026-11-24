@@ -807,12 +807,6 @@ async function publishTemplateClone(env: Env, job: JobRow, options: TemplateClon
         AND content_epoch = ?
         AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
     ).bind(timestamp, options.targetPageId, job.id, job.attempt, job.id, job.attempt),
-    env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(options.targetPageId),
-    env.DB.prepare(
-      `INSERT INTO page_search (page_id, workspace_id, title, body)
-       SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages
-        WHERE id = ? AND import_job_id IS NULL AND is_template = 0`,
-    ).bind(options.targetPageId),
     ...refreshPageSearchV2Statements(env.DB, options.targetPageId),
     env.DB.prepare(
       `UPDATE jobs SET status = 'succeeded', progress_current = 4, progress_total = 4,

@@ -83,6 +83,12 @@ function authenticatedRequest(cookie: string, path: string, init: RequestInit = 
   return new Request(`http://example.test${path}`, { ...init, headers });
 }
 
+/** A broadcast workspace event without its stream position, which the stream tests cover. */
+function unsequenced(message: string): WorkspaceEvent {
+  const { seq: _seq, ...event } = JSON.parse(message) as WorkspaceEvent & { seq?: number };
+  return event as WorkspaceEvent;
+}
+
 function internalWarmupRequest() {
   return new Request("https://document.internal/noop", {
     headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
@@ -685,9 +691,10 @@ async function clearWorkerDatabase() {
   const baselineAt = Date.now();
   await env.DB.batch([
     env.DB.prepare(`DELETE FROM install_state`),
-    env.DB.prepare(`DELETE FROM page_search`),
     env.DB.prepare(`DELETE FROM link_preview_image_gc`),
     env.DB.prepare(`DELETE FROM link_preview_cache`),
+    // FTS rows have no foreign-key cascade from pages.
+    env.DB.prepare(`DELETE FROM page_search_v2`),
     env.DB.prepare(`DELETE FROM workspaces`),
     env.DB.prepare(`DELETE FROM verification`),
     env.DB.prepare(`DELETE FROM user`),
@@ -2490,7 +2497,7 @@ describe("Worker integration", () => {
         );
 
         expect(invalidOperation.status).toBe(200);
-        expect(delivered.map((message) => JSON.parse(message))).toEqual([
+        expect(delivered.map(unsequenced)).toEqual([
           { type: "pages-removed", pageIds: [installed.pageId], permanently: false },
         ]);
       } finally {
@@ -2552,7 +2559,7 @@ describe("Worker integration", () => {
           ).status,
         ).toBe(200);
 
-        expect(delivered.map((message) => JSON.parse(message))).toEqual([
+        expect(delivered.map(unsequenced)).toEqual([
           {
             type: "pages-upserted",
             pages: [expectedPage],
@@ -2647,7 +2654,7 @@ describe("Worker integration", () => {
       const workspaceEvents = instance as WorkspaceEvents;
       const broadcast = vi
         .spyOn(workspaceEvents, "broadcastCustomMessage")
-        .mockImplementation((message) => void delivered.push(JSON.parse(message) as WorkspaceEvent));
+        .mockImplementation((message) => void delivered.push(unsequenced(message)));
       const close = vi.fn();
       const testEvents = workspaceEvents as unknown as {
         getConnections(): Array<{ close(code: number, reason: string): void }>;
@@ -2696,7 +2703,7 @@ describe("Worker integration", () => {
       const workspaceEvents = instance as WorkspaceEvents;
       const broadcast = vi
         .spyOn(workspaceEvents, "broadcastCustomMessage")
-        .mockImplementation((message) => void delivered.push(JSON.parse(message) as WorkspaceEvent));
+        .mockImplementation((message) => void delivered.push(unsequenced(message)));
       const close = vi.fn();
       const failure = new Error("D1 unavailable");
       const testEvents = workspaceEvents as unknown as {
@@ -2767,7 +2774,7 @@ describe("Worker integration", () => {
       const workspaceEvents = instance as WorkspaceEvents;
       const broadcast = vi
         .spyOn(workspaceEvents, "broadcastCustomMessage")
-        .mockImplementation((message) => void delivered.push(JSON.parse(message) as WorkspaceEvent));
+        .mockImplementation((message) => void delivered.push(unsequenced(message)));
       const request = (event: WorkspaceEvent) =>
         workspaceEvents.onRequest(
           new Request("https://workspace-events.internal/broadcast", {
@@ -2889,6 +2896,68 @@ describe("Worker integration", () => {
       )
     ).json<{ suggestions: Array<{ entityId: string }> }>();
     expect(suggestions.suggestions.map((item) => item.entityId)).toContain(installed.pageId);
+  });
+
+  it("indexes attachment names, titles and tags in the writes that change them", async () => {
+    const installed = await bootstrap();
+    const indexed = () =>
+      env.DB.prepare("SELECT title, tags, attachments FROM page_search_v2 WHERE page_id = ?")
+        .bind(installed.pageId)
+        .first<{ title: string; tags: string; attachments: string }>();
+
+    const form = new FormData();
+    form.set("file", new File(["{}"], "quarterly-forecast.json", { type: "application/json" }));
+    const direct = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/attachments`, {
+        method: "POST",
+        body: form,
+      }),
+    );
+    expect(direct.status).toBe(201);
+    const directId = (await direct.json<{ attachment: { id: string } }>()).attachment.id;
+    expect((await indexed())?.attachments).toContain("quarterly-forecast.json");
+
+    const started = await initUpload(installed.cookie, installed.pageId, {
+      name: "roadmap-recording.mp4",
+      mime: "video/mp4",
+      size: 1_024,
+      partSize: 5 * MIB,
+    });
+    expect((await putUploadPart(installed.cookie, started.body.upload.id, 1, filledBytes(1_024, 3))).status).toBe(200);
+    expect((await completeUpload(installed.cookie, started.body.upload.id)).status).toBe(201);
+    expect((await indexed())?.attachments).toContain("roadmap-recording.mp4");
+
+    const removed = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/attachments/${directId}`, { method: "DELETE" }),
+    );
+    expect(removed.status).toBe(200);
+    expect((await indexed())?.attachments).not.toContain("quarterly-forecast.json");
+
+    const rename = (title: string, revision: number) =>
+      SELF.fetch(
+        authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ title, revision }),
+        }),
+      );
+    expect((await rename("Planning handbook", 1)).status).toBe(200);
+    expect((await indexed())?.title).toBe("Planning handbook");
+    expect((await rename("Stale rename", 1)).status).toBe(409);
+    expect((await indexed())?.title).toBe("Planning handbook");
+
+    const tagRequest = (path: string, method: string, body?: unknown) =>
+      SELF.fetch(
+        authenticatedRequest(installed.cookie, path, {
+          method,
+          headers: { "content-type": "application/json" },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        }),
+      );
+    const tag = (await (await tagRequest("/api/tags", "POST", { name: "draft" })).json<{ tag: { id: string } }>()).tag;
+    expect((await tagRequest(`/api/pages/${installed.pageId}/tags/${tag.id}`, "PUT")).status).toBe(200);
+    expect((await tagRequest(`/api/tags/${tag.id}`, "PATCH", { name: "published" })).status).toBe(200);
+    expect((await indexed())?.tags).toBe("published");
   });
 
   it("replays a deterministic single-shot attachment and rejects changed metadata", async () => {
@@ -4636,13 +4705,14 @@ describe("Worker integration", () => {
       pendingPageIds: [],
       pendingPageIdsTruncated: false,
     });
+    // Archived pages stay indexed so the archive search filter can find them.
     expect(
       (
-        await env.DB.prepare(`SELECT COUNT(*) count FROM page_search WHERE page_id = ?`)
+        await env.DB.prepare(`SELECT COUNT(*) count FROM page_search_v2 WHERE page_id = ?`)
           .bind(installed.pageId)
           .first<{ count: number }>()
       )?.count,
-    ).toBe(0);
+    ).toBe(1);
     expect(
       (
         await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`)
@@ -4866,7 +4936,7 @@ describe("Worker integration", () => {
         expect.objectContaining({ id: child.id, archivedAt: null, revision: 3 }),
       ]),
     );
-    const indexed = await env.DB.prepare(`SELECT page_id FROM page_search WHERE page_id IN (?, ?) ORDER BY page_id`)
+    const indexed = await env.DB.prepare(`SELECT page_id FROM page_search_v2 WHERE page_id IN (?, ?) ORDER BY page_id`)
       .bind(installed.pageId, child.id)
       .all<{ page_id: string }>();
     expect(indexed.results.map((item) => item.page_id)).toEqual([installed.pageId, child.id].sort());
@@ -4900,7 +4970,6 @@ describe("Worker integration", () => {
         `UPDATE pages SET archived_at = ?, archived_by = ?, archive_operation_id = ?, revision = revision + 1
           WHERE id = ?`,
       ).bind(childArchivedAt, installed.userId, childArchiveOperationId, child.id),
-      env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(child.id),
       env.DB.prepare(
         `INSERT INTO archive_disconnect_targets
           (page_id, workspace_id, content_epoch, room, next_attempt_at, created_at, updated_at)
@@ -4950,9 +5019,6 @@ describe("Worker integration", () => {
     await expect(
       env.DB.prepare(`SELECT updated_at FROM archive_disconnect_targets WHERE page_id = ?`).bind(child.id).first(),
     ).resolves.toEqual({ updated_at: targetUpdatedAt });
-    await expect(
-      env.DB.prepare(`SELECT COUNT(*) count FROM page_search WHERE page_id = ?`).bind(child.id).first(),
-    ).resolves.toEqual({ count: 0 });
   });
 
   it("keeps an archived page committed and retries a failed room disconnect", async () => {
@@ -7627,7 +7693,7 @@ describe("Worker integration", () => {
       page_id: table.id,
     });
     // Search rows are seeded for every page, so a batch import is findable immediately.
-    const indexed = await env.DB.prepare(`SELECT COUNT(*) count FROM page_search`).first<{ count: number }>();
+    const indexed = await env.DB.prepare(`SELECT COUNT(*) count FROM page_search_v2`).first<{ count: number }>();
     expect(indexed!.count).toBe(5);
   });
 
@@ -8189,7 +8255,9 @@ describe("Worker integration", () => {
     await waitOnExecutionContext(context);
 
     expect((await env.DB.prepare(`SELECT COUNT(*) count FROM pages`).first<{ count: number }>())?.count).toBe(0);
-    expect((await env.DB.prepare(`SELECT COUNT(*) count FROM page_search`).first<{ count: number }>())?.count).toBe(0);
+    expect((await env.DB.prepare(`SELECT COUNT(*) count FROM page_search_v2`).first<{ count: number }>())?.count).toBe(
+      0,
+    );
     expect((await env.DB.prepare(`SELECT COUNT(*) count FROM deletion_jobs`).first<{ count: number }>())?.count).toBe(
       0,
     );
@@ -9205,7 +9273,7 @@ describe("calm workspace task lists", () => {
     });
     expect(attemptedRooms).toHaveLength(52);
   });
-  it("rebuilds legacy and v2 search rows for a restored task subtree", async () => {
+  it("rebuilds v2 search rows for a restored task subtree", async () => {
     const installed = await bootstrap();
     const list = await taskList(installed);
     const created = await change(installed, list.id, {
@@ -9229,23 +9297,9 @@ describe("calm workspace task lists", () => {
       result.rowId,
     );
     expect(archived.status).toBe(200);
-    await env.DB.batch([
-      env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (?, ?, ?)`).bind(
-        result.detailPageId,
-        activeChild.id,
-        independentChild.id,
-      ),
-      env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id IN (?, ?, ?)`).bind(
-        result.detailPageId,
-        activeChild.id,
-        independentChild.id,
-      ),
-      env.DB.prepare(`INSERT INTO page_search(page_id,workspace_id,title,body) VALUES(?,?,?,'stale')`).bind(
-        independentChild.id,
-        installed.workspaceId,
-        "Stale archived child",
-      ),
-    ]);
+    await env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id IN (?, ?, ?)`)
+      .bind(result.detailPageId, activeChild.id, independentChild.id)
+      .run();
 
     const restored = await change(
       installed,
@@ -9254,10 +9308,6 @@ describe("calm workspace task lists", () => {
       result.rowId,
     );
     expect(restored.status).toBe(200);
-    const legacy = await env.DB.prepare(`SELECT page_id FROM page_search WHERE page_id IN (?, ?, ?) ORDER BY page_id`)
-      .bind(result.detailPageId, activeChild.id, independentChild.id)
-      .all<{ page_id: string }>();
-    expect(legacy.results.map((row) => row.page_id)).toEqual([result.detailPageId, activeChild.id].sort());
     const v2 = await env.DB.prepare(`SELECT page_id FROM page_search_v2 WHERE page_id IN (?, ?, ?) ORDER BY page_id`)
       .bind(result.detailPageId, activeChild.id, independentChild.id)
       .all<{ page_id: string }>();
@@ -9738,3 +9788,159 @@ it.each(["comment_expiry", "security_pruning", "realtime_revocations"] as const)
     }
   },
 );
+
+describe("workspace event stream", () => {
+  async function openWorkspaceEvents(installed: InstalledWorkspace) {
+    const response = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/parties/workspace-events/${installed.workspaceId}`, {
+        headers: { Upgrade: "websocket" },
+      }),
+    );
+    expect(response.status).toBe(101);
+    const socket = response.webSocket!;
+    const messages: Array<Record<string, unknown>> = [];
+    const waiters: Array<() => void> = [];
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data !== "string" || !event.data.startsWith("__YPS:")) return;
+      messages.push(JSON.parse(event.data.slice("__YPS:".length)) as Record<string, unknown>);
+      for (const wake of waiters.splice(0)) wake();
+    });
+    socket.accept();
+    const message = async (position: number) => {
+      while (messages.length <= position) await new Promise<void>((resolve) => waiters.push(resolve));
+      return messages[position]!;
+    };
+    return { socket, messages, message };
+  }
+
+  function broadcast(installed: InstalledWorkspace, event: unknown) {
+    return env.WORKSPACE_EVENTS.getByName(installed.workspaceId).fetch(
+      new Request("https://workspace-events.internal/broadcast", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+        body: JSON.stringify(event),
+      }),
+    );
+  }
+
+  async function streamSeq(installed: InstalledWorkspace) {
+    let seq = -1;
+    await runInDurableObject(env.WORKSPACE_EVENTS.getByName(installed.workspaceId), async (_instance, state) => {
+      seq = state.storage.sql.exec<{ seq: number }>("SELECT seq FROM workspace_event_stream WHERE id=1").one().seq;
+    });
+    return seq;
+  }
+
+  it("opens each connection with a durable position that every event advances", async () => {
+    const installed = await bootstrap();
+    const first = await openWorkspaceEvents(installed);
+    const hello = await first.message(0);
+    expect(hello).toEqual({ type: "stream-hello", streamId: expect.any(String), seq: expect.any(Number) });
+    const start = hello.seq as number;
+
+    expect((await broadcast(installed, { type: "organization-invalidated" })).status).toBe(200);
+    expect(await first.message(1)).toEqual({ type: "organization-invalidated", seq: start + 1 });
+    first.socket.close(1000, "done");
+
+    const second = await openWorkspaceEvents(installed);
+    expect(await second.message(0)).toEqual({ type: "stream-hello", streamId: hello.streamId, seq: start + 1 });
+    second.socket.close(1000, "done");
+
+    await abortAllDurableObjects();
+    const restarted = await openWorkspaceEvents(installed);
+    expect(await restarted.message(0)).toEqual({ type: "stream-hello", streamId: hello.streamId, seq: start + 1 });
+    restarted.socket.close(1000, "done");
+  });
+
+  it("advances connections outside a private event's audience with a tick", async () => {
+    const installed = await bootstrap();
+    const { space_id: spaceId } = (await env.DB.prepare("SELECT space_id FROM pages WHERE id=?")
+      .bind(installed.pageId)
+      .first<{ space_id: string }>())!;
+    const events = await openWorkspaceEvents(installed);
+    const start = (await events.message(0)).seq as number;
+    // The connected member loses sight of the space without the socket being revoked.
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+        VALUES('stream-owner','Other owner','stream-owner@example.test',1,1)`),
+      env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES(?,'stream-owner','owner',1)",
+      ).bind(installed.workspaceId),
+      env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE user_id=?").bind(installed.userId),
+      env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(spaceId),
+      env.DB.prepare("DELETE FROM space_members WHERE space_id=? AND user_id=?").bind(spaceId, installed.userId),
+    ]);
+
+    expect((await broadcast(installed, { type: "comments-invalidated", pageId: installed.pageId })).status).toBe(200);
+    expect(await events.message(1)).toEqual({ type: "stream-seq", seq: start + 1 });
+    events.socket.close(1000, "done");
+  });
+
+  it("records missed deliveries without sending anything", async () => {
+    const installed = await bootstrap();
+    const start = await streamSeq(installed);
+    const stub = env.WORKSPACE_EVENTS.getByName(installed.workspaceId);
+
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as { bindings: Env; queuedDeliveries: number };
+      const database = room.bindings.DB;
+      room.bindings = {
+        ...room.bindings,
+        DB: new Proxy(database, {
+          get(target, key) {
+            if (key === "prepare") return () => ({ bind: () => ({ all: () => Promise.reject(new Error("D1 down")) }) });
+            const value: unknown = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        }),
+      };
+      try {
+        await expect(
+          (instance as WorkspaceEvents).onRequest(
+            new Request("https://workspace-events.internal/broadcast", {
+              method: "POST",
+              headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+              body: JSON.stringify({ type: "comments-invalidated", pageId: installed.pageId }),
+            }),
+          ),
+        ).rejects.toThrow("D1 down");
+      } finally {
+        room.bindings = { ...room.bindings, DB: database };
+      }
+      room.queuedDeliveries = 128;
+      try {
+        const overflow = await (instance as WorkspaceEvents).onRequest(
+          new Request("https://workspace-events.internal/broadcast", {
+            method: "POST",
+            headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+            body: JSON.stringify({ type: "pages-removed", pageIds: [installed.pageId], permanently: false }),
+          }),
+        );
+        expect(overflow.status).toBe(202);
+      } finally {
+        room.queuedDeliveries = 0;
+      }
+    });
+    expect(await streamSeq(installed)).toBe(start + 2);
+
+    const revoke = (generation: number) =>
+      stub.fetch(
+        new Request("https://workspace-events.internal/revoke-rooms", {
+          method: "POST",
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+          body: JSON.stringify({ generation }),
+        }),
+      );
+    let generation = 0;
+    await runInDurableObject(stub, async (_instance, state) => {
+      generation = state.storage.sql
+        .exec<{ generation: number }>("SELECT generation FROM realtime_control WHERE id=1")
+        .one().generation;
+    });
+    // Maintenance retries of an already applied generation change nothing.
+    await revoke(generation);
+    expect(await streamSeq(installed)).toBe(start + 2);
+    await revoke(generation + 1);
+    expect(await streamSeq(installed)).toBe(start + 3);
+  });
+});

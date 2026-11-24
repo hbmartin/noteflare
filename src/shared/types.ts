@@ -508,6 +508,23 @@ export type WorkspaceEvent =
       mentionTargetUserIds: string[];
     };
 
+/**
+ * Delivery bookkeeping on the workspace event socket. A hello opens every
+ * connection with the stream position; a tick advances it for a connection that
+ * was not in an event's audience. Both stay out of `WorkspaceEvent` so they can
+ * never reach page-level subscribers.
+ */
+export type WorkspaceStreamMessage =
+  | { type: "stream-hello"; streamId: string; seq: number }
+  | { type: "stream-seq"; seq: number };
+
+/**
+ * How much a workspace event connection must reload. `initial` and `legacy`
+ * need the full load; `current` resumed without missing an event; `catch-up`
+ * missed events and must refresh everything an event could have changed.
+ */
+export type WorkspaceConnectKind = "initial" | "current" | "catch-up" | "legacy";
+
 export type TableColumn = {
   id: string;
   name: string;

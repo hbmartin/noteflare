@@ -1329,3 +1329,71 @@ The mobile run passes 53/54 and times out after 60 seconds in the unchanged `leg
 The historical CI recovery-test timeouts and production reload/highlighting release gate remain separate; local passing runs do not establish those root causes or declare them resolved. Final delivery-SHA remote CI is reported separately from local acceptance. No remote Sonar dispositions, exclusions or threshold changes are made.
 
 Deployment, remote migrations, receipt compatibility restoration, receipt pruning, portability/trust work and new recovery workflows remain excluded. Unrelated benchmark, documentation and configuration work in the original checkout is untouched; implementation and validation use the attached follow-up worktree.
+
+## Upstream review follow-up: search and version write reduction — 24 November 2026
+
+Source: the November 2026 review of AFFiNE, docmost and Outline. Docmost rebuilt its search vectors only when indexed text changed and skipped unchanged history versions; this increment applies both behaviors through NoteFlare's compaction path. Local evidence only; nothing is deployed.
+
+### Contracts
+
+- `page_search_v2.page_id` is `UNINDEXED`, so each per-page refresh scans the whole FTS table. Compaction now refreshes a page's row only when a fingerprint of its text, headings, title, space, staging and template state differs from the room's record, or when `pages.indexed_seq` no longer matches the projection the room recorded. A failed batch records nothing, a new epoch starts with no record, and a D1 restore that rolls `indexed_seq` back forces a refresh.
+- Writers that change other search inputs refresh the row in the same D1 batch: direct uploads, multipart completion, the upload reaper's commit, attachment deletion, page renames and tag renames. Permanent deletion now removes the page's `page_search_v2` row, which it previously left behind.
+- Automatic versions are skipped when the document (or diagram) and title match the last saved version; `last_version_at` is unchanged, so the next real change saves a version immediately. Forced versions from archive, restore and API mutations are unconditional.
+- Migration `0117_retire_legacy_page_search.sql` replaces the unread legacy FTS5 `page_search` table with an empty view whose `INSTEAD OF` triggers discard writes, so a Worker from before this change keeps working during the deploy window and after a rollback. See [Upgrading](../UPGRADING.md#migration-0117-retired-legacy-search-index).
+- The restore procedure in [Backup and recovery](../BACKUP_AND_RECOVERY.md) now rebuilds `page_search_v2` and `page_title_trigrams` instead of the retired table.
+
+### Validation
+
+| Check                                                                                           | Result                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/worker/search-compaction.integration.test.ts` (new)                                        | 5 passed: unchanged inputs skip the refresh across a restart; a rolled-back `indexed_seq` and a raw title change force one; a failed batch keeps the previous record; type-then-undo saves no version while forced versions always save; diagram layout changes skip search but version new layouts |
+| `src/worker/migrations.integration.test.ts` — 0117                                              | Earlier-Worker DELETE, INSERT, INSERT…SELECT and UPDATE statements succeed against the view and store nothing                                                                                                                                                                                       |
+| `src/worker/index.integration.test.ts`                                                          | Attachment, multipart, deletion, rename (including a stale-revision 409) and tag-rename writes update `page_search_v2` without compaction; permanent deletion leaves no search rows                                                                                                                 |
+| Full Worker suite (`vitest --config vitest.worker.config.ts`)                                   | 52 files, 2793 tests passed                                                                                                                                                                                                                                                                         |
+| `pnpm typecheck:worker`, `pnpm typecheck:worker-tests`, Oxlint on changed files, `pnpm analyze` | Passed                                                                                                                                                                                                                                                                                              |
+
+`INSTEAD OF` triggers are new to this schema; they were verified in the local workerd D1 engine, and production D1 acceptance of migration 0117 remains a deployment check.
+
+## Upstream review follow-up: workspace event catch-up — 24 November 2026
+
+Source: AFFiNE's November sync work (a workspace state handshake on reconnect, and realtime subscriptions restored once per connection). Before this increment every reconnect reloaded the whole page tree, including the routine reconnect every grant renewal forces, while everything else a missed event could have changed (previews, comments, organization, tasks, notifications, jobs and the page-level subscribers) stayed stale. Local evidence only; nothing is deployed.
+
+### Contracts
+
+- Each `WorkspaceEvents` object keeps one durable stream position in its SQLite storage. Every connection starts with a `stream-hello` carrying the position, sent before any await in `onConnect` so no event can precede it. Every event carries the position it consumed; a connection outside a private event's audience receives a `stream-seq` tick instead. A failed delivery, a queue overflow or a new revocation generation advances the position without a message.
+- The browser classifies each connection: `initial` and `legacy` (an object without positions) keep the full load; `current` (same stream and position, no gap, a disconnect shorter than 15 seconds and a full reload within 15 minutes) reloads only unread counts; anything else is a `catch-up`, which dispatches a `workspace-invalidated` to every subscriber. A skipped position mid-connection also catches up at once. Stream bookkeeping never reaches page-level subscribers.
+- `workspace-invalidated` now also refreshes organization, task lists, notifications, comments and, when open, jobs. Diagram embeds recheck access and epoch on it.
+- Card preview and diagram embed pools unsubscribe idempotently, never evict a newer pool under the same key, keep subscribers that pass the same function distinct, and the card pool skips periodic checks while the tab is hidden or offline and makes one up when it becomes visible. See [Upgrading](../UPGRADING.md#workspace-event-stream-positions) for mixed-version behavior.
+
+### Validation
+
+| Check                                                           | Result                                                                                                                                                                                                                                                     |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/worker/index.integration.test.ts` — workspace event stream | Hello precedes events and survives reconnects and object restarts; a private event ticks a non-member connection; a D1 failure, an overflow and a new revocation generation advance the position while maintenance retries of an applied generation do not |
+| `src/client/collaboration.test.ts`                              | All four connection kinds, mid-connection gaps, legacy fallback by sync or timeout, the 15-minute reload, outage detection and listener cleanup                                                                                                            |
+| `src/client/App.test.tsx`                                       | A `current` connection loads no tree or organization; a `catch-up` reloads them and dispatches the invalidation to window subscribers (260 tests passed)                                                                                                   |
+| Pool unit tests                                                 | New idempotence, identity and visibility cases fail against the previous pools and pass now                                                                                                                                                                |
+| `tests/e2e/notes.spec.ts` (Chromium, three repeats)             | A 4401 grant-renewal reconnect makes no tree request; a rename made while reconnects were blocked appears within 15 seconds after they resume                                                                                                              |
+| Full Worker suite                                               | 52 files, 2796 tests passed                                                                                                                                                                                                                                |
+| Full unit suite                                                 | 199 files passed                                                                                                                                                                                                                                           |
+
+## Upstream review follow-up: page opening and editor teardown — 24 November 2026
+
+Source: docmost's hover prefetch and request consolidation (#2758, #2759) and its editor teardown fixes (#2702, #2708). Roadmap section E asks for bounded intent preloading after the shell stops making redundant requests. Local evidence only; nothing is deployed.
+
+### Contracts
+
+- Page cards, synced-block "Edit source" links, linked-whiteboard thumbnails and whiteboard page cards open pages inside the running app on an ordinary click. Modified and middle clicks keep the link's browser behavior; a whiteboard card for a table view keeps full navigation because the app route does not carry the view.
+- Watch controls reuse a state read in the last 30 seconds, so the page and space menus no longer refetch it every time they open or close; changing a space watch forgets inherited page states. Switching spaces loads only that space's pins; spaces, favorites, tags and templates load with the workspace.
+- Hovering or focusing a sidebar row, favorite, pin, recent page, page mention or page card for 120 ms prefetches the page's tags and watch state, its comments for documents and whiteboards, and the whiteboard editor bundle. At most two requests run at once, responses older than 30 seconds are discarded, each prefetched response is used once by the next open, and workspace events and account changes discard affected entries. Nothing is prefetched offline, with Data Saver, or during an OAuth consent hand-off.
+- A closed page releases its document once local writes settle, or after 15 seconds with a `client.offline_storage_slow` report if IndexedDB never settles. The editor clears BlockNote's `window.ProseMirror` debug reference when it closes.
+
+### Validation
+
+| Check                                                                      | Result                                                                                                                                                                             |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/client/page-prefetch.test.ts` (new)                                   | Concurrency bound, single use, expiry, event and account invalidation, failure handling, intent delay, and the offline, Data Saver and disabled cases                              |
+| `src/client/page-links.test.tsx` (new), `src/client/WatchControl.test.tsx` | Plain clicks navigate in the app while modified clicks do not; remounted watch controls make no request; a space watch change rereads inherited page states                        |
+| `src/client/App.test.tsx`                                                  | Switching spaces requests only that space's pins (261 tests passed)                                                                                                                |
+| `tests/e2e/editor-teardown.spec.ts` (new, Chromium)                        | After 30 page visits and forced garbage collection at most two page documents remain. The previous editor also passes, so this is a regression guard rather than a reproduced leak |
+| Full unit suite                                                            | 200 files, 3635 tests passed                                                                                                                                                       |

@@ -120,6 +120,9 @@ function WritingFormattingToolbar() {
     </FormattingToolbar>
   );
 }
+/** How long a closed page waits for local writes before releasing its document. */
+const CLOSED_PAGE_STORAGE_TIMEOUT_MS = 15_000;
+
 export function clearLiveRecoveryCopies(accountKey: string) {
   const [userId, workspaceId] = accountKey.split("\u0000");
   const prefix = `account:${userId}:${workspaceId}:`;
@@ -888,11 +891,29 @@ export function EditorPage({
       next.doc.off("update", documentUpdate);
       if (clearRetryTimer !== undefined) window.clearTimeout(clearRetryTimer);
       next.stop();
+      // Destroy once local writes settle, but never let a hung IndexedDB write keep
+      // the closed page's document and storage connection alive. Closing the
+      // database still lets an in-flight transaction finish.
+      let destroyed = false;
+      let deadline: number | undefined;
+      const destroy = () => {
+        if (destroyed) return;
+        destroyed = true;
+        window.clearTimeout(deadline);
+        next.destroy();
+      };
+      deadline = window.setTimeout(() => {
+        void reportClientError(
+          "client.offline_storage_slow",
+          new Error("Local page writes did not settle after the page closed."),
+        );
+        destroy();
+      }, CLOSED_PAGE_STORAGE_TIMEOUT_MS);
       void pendingWrite
         .catch(() => {})
         .then(async () => {
           if (compacting) await compacting;
-          next.destroy();
+          destroy();
         });
       setBundle(null);
       setStorageLoadingSlow(false);
@@ -1695,6 +1716,16 @@ function MountedCollaborativeEditor({
     [bundle, member, threadStore, uploads],
   );
   const editor = useCreateBlockNote(options, [bundle, pageId]);
+  useEffect(() => {
+    // BlockNote exposes the newest editor on `window` for debugging; that
+    // reference would keep a closed page's document reachable.
+    const global = window as Window & { ProseMirror?: unknown };
+    const exposed = global.ProseMirror;
+    return () => {
+      if (exposed !== undefined && global.ProseMirror === exposed) delete global.ProseMirror;
+    };
+    // eslint-disable-next-line react/exhaustive-effect-dependencies -- Capture the reference each new editor exposes.
+  }, [editor]);
   const [panelLaunch, setPanelLaunch] = useState<WritingLaunchRequest | undefined>();
   const writingBusy = useRef(false);
   const writingBusyChanged = useCallback((busy: boolean) => {

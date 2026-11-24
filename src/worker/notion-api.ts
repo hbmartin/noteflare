@@ -1395,11 +1395,6 @@ notionApi.post("/pages", async (c) => {
   const timestamp = Date.now();
   const publicationStatements = () => {
     const statements: D1PreparedStatement[] = [
-      c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
-        pageId,
-        principal.workspaceId,
-        title,
-      ),
       ...refreshPageSearchV2Statements(c.env.DB, pageId),
       ...webhookEventStatements(c.env.DB, {
         workspaceId: principal.workspaceId,
@@ -1736,37 +1731,8 @@ async function changePage(c: Context<ApiContext>, mode?: "move" | "trash") {
       }),
     );
     if (inTrash === undefined) {
-      statements.push(
-        c.env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(page.id),
-        c.env.DB.prepare(
-          `INSERT INTO page_search (page_id, workspace_id, title, body)
-           SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages
-            WHERE id = ? AND archived_at IS NULL AND import_job_id IS NULL`,
-        ).bind(page.id),
-        ...refreshPageSearchV2Statements(c.env.DB, page.id),
-      );
+      statements.push(...refreshPageSearchV2Statements(c.env.DB, page.id));
     } else {
-      statements.push(
-        c.env.DB.prepare(
-          `DELETE FROM page_search WHERE page_id IN (
-             WITH RECURSIVE tree(id) AS (
-               SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
-             ) SELECT id FROM tree
-           )`,
-        ).bind(page.id),
-      );
-      if (!inTrash) {
-        statements.push(
-          c.env.DB.prepare(
-            `INSERT INTO page_search (page_id, workspace_id, title, body)
-             SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages WHERE id IN (
-               WITH RECURSIVE tree(id) AS (
-                 SELECT ? UNION ALL SELECT child.id FROM pages child JOIN tree parent ON child.parent_id = parent.id
-               ) SELECT id FROM tree
-             ) AND archived_at IS NULL AND import_job_id IS NULL`,
-          ).bind(page.id),
-        );
-      }
       statements.push(...refreshPageSearchV2SubtreeStatements(c.env.DB, page.id));
     }
     const mutationResults = await c.env.DB.batch<{ page_id: string; content_epoch: number }>(statements);

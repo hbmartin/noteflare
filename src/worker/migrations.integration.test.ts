@@ -7,6 +7,39 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("0117 retires the legacy search index while earlier Workers can still write it", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0117"),
+    );
+    await env.DB.prepare(
+      "INSERT INTO page_search(page_id,workspace_id,title,body) VALUES('legacy','workspace','Old title','old body')",
+    ).run();
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+
+    const retired = await env.DB.prepare("SELECT type FROM sqlite_master WHERE name='page_search'").first();
+    expect(retired).toEqual({ type: "view" });
+    const shadowTables = await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'page\\_search\\_%' ESCAPE '\\' AND name NOT LIKE 'page\\_search\\_v2%' ESCAPE '\\'",
+    ).all();
+    expect(shadowTables.results).toEqual([]);
+    // These are the statement shapes an earlier Worker issues during a deploy or rollback.
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM page_search WHERE page_id = ?").bind("legacy"),
+      env.DB.prepare("INSERT INTO page_search(page_id,workspace_id,title,body) VALUES(?,?,?,?)").bind(
+        "legacy",
+        "workspace",
+        "New title",
+        "new body",
+      ),
+      env.DB.prepare(
+        "INSERT INTO page_search(page_id,workspace_id,title,body) SELECT 'selected','workspace','Selected',''",
+      ),
+      env.DB.prepare("UPDATE page_search SET title = 'ignored' WHERE page_id = 'legacy'"),
+    ]);
+    expect((await env.DB.prepare("SELECT COUNT(*) count FROM page_search").first())?.count).toBe(0);
+  });
+
   it("0116 adds redispatch state without moving existing execution or lease deadlines", async () => {
     await applyD1Migrations(
       env.DB,

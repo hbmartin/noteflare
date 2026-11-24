@@ -86,15 +86,35 @@ export function subscribeCardPreview(
       publish({ status: "loading", preview: null });
       void refresh();
     };
+    // A hidden or offline tab skips the periodic check and makes it up once visible.
+    let missedTick = false;
+    const tick = () => {
+      if (document.visibilityState === "hidden" || !navigator.onLine) {
+        missedTick = true;
+        return;
+      }
+      void refresh();
+    };
+    const visibility = () => {
+      if (document.visibilityState === "hidden" || !missedTick) return;
+      missedTick = false;
+      void refresh();
+    };
     window.addEventListener("notes:workspace-event", workspace);
     window.addEventListener("online", online);
-    const timer = window.setInterval(() => void refresh(), 30_000);
-    pool = {
-      subscribe(listener) {
+    document.addEventListener("visibilitychange", visibility);
+    const timer = window.setInterval(tick, 30_000);
+    const current = {
+      subscribe(receiveState: (state: CardPreviewState) => void) {
+        // Wrap each subscription so two cards passing the same function stay distinct.
+        const listener = (next: CardPreviewState) => receiveState(next);
         listeners.add(listener);
         listener(state);
         if (state.status === "loading" && !running) void refresh();
+        let subscribed = true;
         return () => {
+          if (!subscribed) return;
+          subscribed = false;
           listeners.delete(listener);
           if (listeners.size) return;
           active = false;
@@ -102,10 +122,13 @@ export function subscribeCardPreview(
           window.clearInterval(timer);
           window.removeEventListener("notes:workspace-event", workspace);
           window.removeEventListener("online", online);
-          pools.delete(key);
+          document.removeEventListener("visibilitychange", visibility);
+          // A newer pool may already serve this key; never evict it.
+          if (pools.get(key) === current) pools.delete(key);
         };
       },
     };
+    pool = current;
     pools.set(key, pool);
   }
   return pool.subscribe(receive);

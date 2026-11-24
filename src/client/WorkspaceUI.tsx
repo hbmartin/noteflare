@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { Page } from "../shared/types";
+import { pageIntentProps } from "./page-prefetch";
 
 const paths = {
   search: "m21 21-5-5 M19 11a8 8 0 1 1-16 0 8 8 0 0 1 16 0",
@@ -237,7 +238,7 @@ export function RecentPages({
       <h2>Recent pages</h2>
       <div className="recent-pages">
         {recent.map((page) => (
-          <button key={page.id} onClick={() => onSelect(page.id)}>
+          <button key={page.id} onClick={() => onSelect(page.id)} {...pageIntentProps(page.id, page.kind)}>
             <span>{page.icon || <Icon name={page.kind === "document" ? "page" : page.kind} />}</span>
             <strong>{page.title}</strong>
           </button>

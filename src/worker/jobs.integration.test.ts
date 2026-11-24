@@ -446,9 +446,11 @@ describe("job execution", () => {
         timestamp,
         timestamp,
       ),
+      // A stale index row must not expose a page that is still staged.
       env.DB.prepare(
-        `INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, 'Hidden stage', '')`,
-      ).bind(pageId, installed.workspaceId),
+        `INSERT INTO page_search_v2 (page_id, workspace_id, space_id, title, tags, body, comments, attachments, headings)
+         VALUES (?, ?, ?, 'Hidden stage', '', '', '', '', '')`,
+      ).bind(pageId, installed.workspaceId, `${installed.workspaceId}-general`),
     ]);
 
     expect(

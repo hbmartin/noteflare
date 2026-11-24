@@ -273,6 +273,35 @@ Browser receipt v3 retains only unresolved operations. Initialization retires v1
 
 An updated client cannot publish against an older Worker without protocol confirmation. A code rollback also requires reloading tabs into the matching client/Worker pair; retired browser receipt formats are not reconstructed. See the [implementation and validation ledger](implementation/small-team-wiki-release.md#pr-266-storage-and-comment-lifecycle-follow-up--24-october-2026) for the cutover evidence. Keep relations disabled.
 
+## Migration 0117: retired legacy search index
+
+Apply `0117_retire_legacy_page_search.sql` through the ordinary migration runner. It drops the legacy FTS5
+`page_search` table, which nothing has read since `page_search_v2` replaced it, and leaves an empty
+`page_search` view whose `INSTEAD OF` triggers discard writes. Search results do not change.
+
+The runner applies migrations before uploading the Worker, so the previous Worker keeps running for a short
+time and keeps writing the old table. Those writes, and the writes of any Worker you roll back to, now succeed
+and store nothing. Keep the view during a code rollback. A later release may drop it together with its
+triggers.
+
+The updated Worker also refreshes a page's search row when an attachment is added or deleted, when a page is
+renamed, and when a tag is renamed, in the same D1 batch as that change. Compaction rewrites the row only when
+the page's text, headings, title, space, staging or template state changed since the room last recorded it.
+Rooms record that state in Durable Object SQLite on their next compaction; until then the first compaction of
+each room refreshes the row as before. Permanent deletion now also removes the page's `page_search_v2` row.
+
+No feature activation, Durable Object class migration, or quiescence confirmation is needed. Keep relations
+disabled.
+
+## Workspace event stream positions
+
+This release adds no D1 migration. `WorkspaceEvents` objects create a one-row `workspace_event_stream` table in
+their own SQLite storage on first start, send a position when each connection opens, and stamp every event
+with it. Browsers from before this release ignore the new message and the extra field, and keep reloading the
+page tree on every reconnect. Updated browsers connected to an object still running the previous code receive
+no position and fall back to that same behavior, so the Worker and assets can deploy in either order and roll
+back without data changes.
+
 ## Automated deployment guards
 
 The production workflow stops when `0011_page_move_receipt_envelopes.sql` or a guarded Slack migration is pending. Complete the relevant quiescence procedure, then use manual workflow dispatch with `confirm_page_move_receipt_migration_safe` or `confirm_slack_review_migration_safe`. A confirmation records maintenance already completed; it does not pause live consumers. Later releases need no confirmation after these migrations are applied.

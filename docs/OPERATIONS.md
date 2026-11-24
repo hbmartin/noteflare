@@ -463,6 +463,12 @@ compaction, not keystrokes, so they lag edits by up to the 30-second compaction 
 `WorkspaceEvents` Durable Objects hold no authoritative state. They only fan out page-tree and
 projection-invalidation events; losing one costs freshness, not data.
 
+Each object numbers the events it sends with one durable stream position, and every connection starts with
+that position. A browser that reconnects, for example on the five-minute grant renewal, reloads only when the
+position moved while it was away, the disconnect lasted more than 15 seconds, or 15 minutes have passed since
+its last full reload. A failed delivery inside the object also advances the position, so connected browsers
+catch up as soon as they see the gap.
+
 ## The cron is load-bearing
 
 `triggers.crons` in `wrangler.jsonc` is set to `*/15 * * * *`. The scheduled handler retries document-room

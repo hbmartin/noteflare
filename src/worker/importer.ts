@@ -1531,13 +1531,6 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
         WHERE id IN (SELECT value FROM json_each(?)) AND import_job_id IS NULL`,
       )
       .bind(job.id, job.requested_by, job.requested_by, timestamp, pageIds),
-    publicationDb
-      .prepare(
-        `INSERT INTO page_search (page_id, workspace_id, title, body)
-       SELECT id, workspace_id, title, plain_text FROM pages
-        WHERE id IN (SELECT value FROM json_each(?)) AND import_job_id IS NULL AND is_template = 0`,
-      )
-      .bind(pageIds),
     ...refreshPageSearchV2ForIdsStatements(publicationDb, pageIdValues),
     ...(task?.assigneeId && taskRowId && publishedRootId
       ? notificationFanoutStatements(publicationDb, {

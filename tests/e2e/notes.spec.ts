@@ -469,6 +469,75 @@ test("propagates page metadata to an invited editor in realtime", async ({ brows
   }
 });
 
+test("resumes workspace events after a routine reconnect without reloading the tree", async ({ page }) => {
+  const routes: Array<{ close(options?: { code?: number; reason?: string }): Promise<void> }> = [];
+  let hellos = 0;
+  let treeLoadsAfterHello = 0;
+  await page.routeWebSocket("**/parties/workspace-events/**", (route) => {
+    const server = route.connectToServer();
+    server.onMessage((message) => {
+      if (typeof message === "string" && message.includes('"stream-hello"')) hellos += 1;
+      route.send(message);
+    });
+    route.onMessage((message) => server.send(message));
+    routes.push(route);
+  });
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/pages/tree" && hellos > 0) treeLoadsAfterHello += 1;
+  });
+  await signIn(page);
+  await openSidebar(page);
+  // The first connection reports an initial load once its hello arrives.
+  await expect.poll(() => treeLoadsAfterHello, { timeout: 15_000 }).toBeGreaterThan(0);
+  const loadsBefore = treeLoadsAfterHello;
+  const hellosBefore = hellos;
+
+  // A grant renewal closes the socket with 4401; the client reconnects at once.
+  const resumed = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/mentions/unread-count");
+  await routes.at(-1)!.close({ code: 4401, reason: "Authorization expired. Reconnect to continue." });
+  await expect.poll(() => hellos, { timeout: 15_000 }).toBeGreaterThan(hellosBefore);
+  await resumed;
+  expect(treeLoadsAfterHello).toBe(loadsBefore);
+});
+
+test("catches up workspace changes missed while disconnected", async ({ browser, page }, testInfo) => {
+  await signIn(page);
+  const suffix = `${testInfo.project.name}-${Date.now()}`;
+  const inviteURL = await createInvite(page, "editor");
+  const editorContext = await browser.newContext();
+  try {
+    let blocked = false;
+    const routes: Array<{ close(options?: { code?: number; reason?: string }): Promise<void> }> = [];
+    await editorContext.routeWebSocket("**/parties/workspace-events/**", (route) => {
+      if (blocked) {
+        void route.close({ code: 1011, reason: "Unavailable" });
+        return;
+      }
+      route.connectToServer();
+      routes.push(route);
+    });
+    const editorPage = await acceptInvite(editorContext, inviteURL, "editor", suffix);
+    await createPage(page, "Document");
+    const before = `Before ${suffix}`;
+    await page.getByLabel("Page title").fill(before);
+    await page.getByLabel("Page title").press("Enter");
+    await openSidebar(editorPage);
+    await expect(treeLink(editorPage, before)).toBeVisible({ timeout: 15_000 });
+
+    blocked = true;
+    await routes.at(-1)!.close({ code: 4401, reason: "Authorization expired. Reconnect to continue." });
+    const after = `After ${suffix}`;
+    await page.getByLabel("Page title").fill(after);
+    await page.getByLabel("Page title").press("Enter");
+    await expect(treeLink(page, after)).toBeVisible();
+    blocked = false;
+
+    await expect(treeLink(editorPage, after)).toBeVisible({ timeout: 15_000 });
+  } finally {
+    await editorContext.close();
+  }
+});
+
 test("enforces viewer UI permissions and table edit leases", async ({ browser, page }, testInfo) => {
   await signIn(page);
   const suffix = `${testInfo.project.name}-${Date.now()}`;

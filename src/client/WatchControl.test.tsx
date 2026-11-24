@@ -33,4 +33,35 @@ describe("WatchControl", () => {
       expect.objectContaining({ method: "PUT", body: JSON.stringify({ state: "muted" }) }),
     );
   });
+
+  it("reuses a state read moments ago when its menu remounts it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ watch: { state: "watching", source: "page" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const first = render(<WatchControl resourceType="page" resourceId="remounted" />);
+    await screen.findByRole("button", { name: "Mute this page" });
+    first.unmount();
+    render(<WatchControl resourceType="page" resourceId="remounted" />);
+    expect(screen.getByRole("button", { name: "Mute this page" })).toBeEnabled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rereads inherited page states after the space watch changes", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ watch: { state: "none", source: null } }))
+      .mockResolvedValueOnce(jsonResponse({ watch: { state: "none", source: null } }))
+      .mockResolvedValueOnce(jsonResponse({ watch: { state: "watching", source: "space" } }))
+      .mockResolvedValueOnce(jsonResponse({ watch: { state: "watching", source: "space" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const pageControl = render(<WatchControl resourceType="page" resourceId="inherits" />);
+    await screen.findByRole("button", { name: "Watch this page" });
+    pageControl.unmount();
+    render(<WatchControl resourceType="space" resourceId="space-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Watch this space" }));
+    await screen.findByRole("button", { name: "Mute this space" });
+    cleanup();
+    render(<WatchControl resourceType="page" resourceId="inherits" />);
+    expect(await screen.findByRole("button", { name: "Mute this page" })).toHaveTextContent("Watching space");
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
 });

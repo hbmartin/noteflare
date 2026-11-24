@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { WatchState } from "../shared/types";
 import { api, apiErrorMessage, json } from "./api";
+import { forgetValues, prefetchedOrFetch, recentValue, rememberValue } from "./page-prefetch";
 
 export function WatchControl({
   resourceType,
@@ -11,18 +12,20 @@ export function WatchControl({
   resourceId: string;
   compact?: boolean;
 }) {
-  const [watch, setWatch] = useState<WatchState | null>(null);
+  const path = `/api/${resourceType === "page" ? "pages" : "spaces"}/${encodeURIComponent(resourceId)}/watch`;
+  // Menus remount their contents when they open and close; reuse a state read moments ago.
+  const [watch, setWatch] = useState(() => recentValue(path) as WatchState | null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [updateError, setUpdateError] = useState("");
   const label = resourceType === "page" ? "page" : "space";
 
   useEffect(() => {
+    if (recentValue(path)) return undefined;
     let active = true;
-    void api<{ watch: WatchState }>(
-      `/api/${resourceType === "page" ? "pages" : "spaces"}/${encodeURIComponent(resourceId)}/watch`,
-    )
+    void prefetchedOrFetch<{ watch: WatchState }>(path)
       .then((data) => {
+        rememberValue(path, data.watch);
         if (active) setWatch(data.watch);
       })
       .catch((cause) => {
@@ -31,7 +34,7 @@ export function WatchControl({
     return () => {
       active = false;
     };
-  }, [label, resourceId, resourceType]);
+  }, [label, path]);
 
   // Only an initial load failure leaves nothing to render. Replacing a loaded button
   // with this span would strip the control mid-click, taking focus and retry with it.
@@ -61,10 +64,10 @@ export function WatchControl({
       onClick={async () => {
         setBusy(true);
         try {
-          const data = await api<{ watch: WatchState }>(
-            `/api/${resourceType === "page" ? "pages" : "spaces"}/${encodeURIComponent(resourceId)}/watch`,
-            { method: "PUT", body: json({ state: next }) },
-          );
+          const data = await api<{ watch: WatchState }>(path, { method: "PUT", body: json({ state: next }) });
+          // A space watch is inherited by its pages, so their remembered states are stale now.
+          if (resourceType === "space") forgetValues((cached) => cached.startsWith("/api/pages/"));
+          rememberValue(path, data.watch);
           setWatch(data.watch);
           setError("");
           setUpdateError("");

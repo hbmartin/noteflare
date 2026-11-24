@@ -141,7 +141,8 @@ afterEach(async () => {
   await abortAllDurableObjects();
   await env.DB.batch([
     env.DB.prepare(`DELETE FROM install_state`),
-    env.DB.prepare(`DELETE FROM page_search`),
+    // FTS rows have no foreign-key cascade from pages.
+    env.DB.prepare(`DELETE FROM page_search_v2`),
     env.DB.prepare(`DELETE FROM workspaces`),
     env.DB.prepare(`DELETE FROM verification`),
     env.DB.prepare(`DELETE FROM user`),

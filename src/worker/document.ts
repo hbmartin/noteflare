@@ -87,6 +87,13 @@ interface MetaRow extends Record<string, SqlStorageValue> {
   last_version_at: number;
   last_editor_id: string | null;
   notify_edit: number;
+  // Fingerprint of the inputs of this page's `page_search_v2` row at the last
+  // projection, with the `pages.indexed_seq` that projection wrote. Both must
+  // match before a compaction may skip the full-table FTS refresh.
+  search_index_key: string | null;
+  search_index_seq: number;
+  // Content fingerprint of the most recent automatic or forced version.
+  version_content_hash: string | null;
 }
 
 interface PageProjectionRow {
@@ -95,6 +102,22 @@ interface PageProjectionRow {
   title: string;
   archived_at: number | null;
   import_job_id: string | null;
+  is_template: number;
+  indexed_seq: number;
+}
+
+const PAGE_PROJECTION_COLUMNS = "workspace_id, space_id, title, archived_at, import_job_id, is_template, indexed_seq";
+
+/** Fingerprint every `pages` input of the page's `page_search_v2` row that compaction owns. */
+function searchIndexKey(plainText: string, headings: string, page: PageProjectionRow) {
+  return sha256Hex(
+    canonicalJson([plainText, headings, page.title, page.space_id, page.import_job_id, page.is_template]),
+  );
+}
+
+/** Whether the page's search row already reflects these inputs, as of the projection D1 still records. */
+function searchIndexCurrent(metadata: MetaRow, key: string, page: PageProjectionRow) {
+  return metadata.search_index_key === key && metadata.search_index_seq === page.indexed_seq;
 }
 
 interface RestoreRecoveryRow extends Record<string, SqlStorageValue> {
@@ -743,6 +766,15 @@ export class Document extends YServer {
     }
     if (!metaColumns.some((column) => column.name === "content_kind")) {
       sql.exec(`ALTER TABLE document_meta ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'document'`);
+    }
+    if (!metaColumns.some((column) => column.name === "search_index_key")) {
+      sql.exec(`ALTER TABLE document_meta ADD COLUMN search_index_key TEXT`);
+    }
+    if (!metaColumns.some((column) => column.name === "search_index_seq")) {
+      sql.exec(`ALTER TABLE document_meta ADD COLUMN search_index_seq INTEGER NOT NULL DEFAULT -1`);
+    }
+    if (!metaColumns.some((column) => column.name === "version_content_hash")) {
+      sql.exec(`ALTER TABLE document_meta ADD COLUMN version_content_hash TEXT`);
     }
     const hadMetadata = Boolean(
       sql.exec<{ present: number }>(`SELECT EXISTS(SELECT 1 FROM document_meta WHERE id = 1) present`).one().present,
@@ -2254,8 +2286,7 @@ export class Document extends YServer {
       });
 
       const page = await this.bindings.DB.prepare(
-        `SELECT workspace_id, space_id, title, archived_at, import_job_id
-           FROM pages WHERE id = ? AND content_epoch = ?`,
+        `SELECT ${PAGE_PROJECTION_COLUMNS} FROM pages WHERE id = ? AND content_epoch = ?`,
       )
         .bind(pageId, epoch)
         .first<PageProjectionRow>();
@@ -2271,6 +2302,8 @@ export class Document extends YServer {
       let versionStatementIndex = -1;
       let versionSaved = false;
       let pageProjected = false;
+      let searchKey: string | null = null;
+      let versionContentHash: string | null = null;
       const effectsSuppressed =
         suppressExternalEffects &&
         (page?.import_job_id?.startsWith("notion-create:") === true ||
@@ -2315,10 +2348,17 @@ export class Document extends YServer {
         const watcherIds = watcherRows.results
           .map((row) => row.id)
           .filter((id) => !newMentionIds.includes(id) && !contributorIds.includes(id));
+        const headingsText = projectDocumentHeadings(json);
+        searchKey = await searchIndexKey(projection.plainText, headingsText, page);
+        const searchCurrent = searchIndexCurrent(metadataAtStart, searchKey, page);
+        versionContentHash = await sha256Hex(canonicalJson([json, page.title]));
+        // Forced versions (archive, restore, API mutations) are unconditional. An
+        // automatic version is skipped when it would duplicate the previous one,
+        // e.g. after edits that were undone or only touched collaborator state.
         const makeVersion = Boolean(
           forceVersion ||
-          !metadataAtStart.last_version_at ||
-          timestamp - metadataAtStart.last_version_at >= VERSION_INTERVAL_MS,
+          ((!metadataAtStart.last_version_at || timestamp - metadataAtStart.last_version_at >= VERSION_INTERVAL_MS) &&
+            metadataAtStart.version_content_hash !== versionContentHash),
         );
         const statements = [
           this.bindings.DB.prepare(
@@ -2327,7 +2367,7 @@ export class Document extends YServer {
               WHERE id = ? AND content_epoch = ?`,
           ).bind(
             projection.plainText,
-            projectDocumentHeadings(json),
+            headingsText,
             maximum,
             readOnly ? 1 : 0,
             timestamp,
@@ -2356,16 +2396,9 @@ export class Document extends YServer {
               byte_size = excluded.byte_size,
               updated_at = excluded.updated_at`,
           ).bind(epoch, maximum, structuredKey, structuredHash, structuredBytes.byteLength, timestamp, pageId, epoch),
-          this.bindings.DB.prepare(
-            `DELETE FROM page_search WHERE page_id = ?
-              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
-          ).bind(pageId, pageId, epoch),
-          this.bindings.DB.prepare(
-            `INSERT INTO page_search (page_id, workspace_id, title, body)
-              SELECT id, workspace_id, title, ? FROM pages
-               WHERE id = ? AND content_epoch = ? AND archived_at IS NULL AND import_job_id IS NULL`,
-          ).bind(projection.plainText, pageId, epoch),
-          ...refreshPageSearchV2Statements(this.bindings.DB, pageId, epoch),
+          // `page_id` is UNINDEXED in the FTS table, so each refresh scans it whole.
+          // Tags, comments and attachments refresh the row when they change.
+          ...(searchCurrent ? [] : refreshPageSearchV2Statements(this.bindings.DB, pageId, epoch)),
           this.bindings.DB.prepare(
             `UPDATE page_references SET projection_seq = -1 WHERE source_page_id = ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
@@ -2721,19 +2754,7 @@ export class Document extends YServer {
 
       // R2 was durable before the log is acknowledged. Replaying duplicate Yjs
       // updates after a crash between these two steps is safe.
-      this.state.storage.transactionSync(() => {
-        this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
-        this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
-        if (versionSaved) this.state.storage.sql.exec("DELETE FROM version_authors WHERE seq<=?", maximum);
-        this.state.storage.sql.exec(`DELETE FROM mention_introductions WHERE seq <= ?`, maximum);
-        this.state.storage.sql.exec(
-          `UPDATE document_meta SET snapshot_seq = ?, last_version_at = ? WHERE id = 1`,
-          maximum,
-          versionAt,
-        );
-      });
-      this.metadata.snapshot_seq = maximum;
-      this.metadata.last_version_at = versionAt;
+      this.acknowledgeCompaction(maximum, versionAt, versionSaved, pageProjected, searchKey, versionContentHash);
 
       if (pageProjected && !effectsSuppressed)
         await reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
@@ -2784,6 +2805,47 @@ export class Document extends YServer {
       }
       throw error;
     }
+  }
+
+  /**
+   * Acknowledge the compacted update log and record what the D1 batch committed.
+   *
+   * The search fingerprint is stored only for a committed projection, so a failed
+   * or skipped batch leaves the next compaction to refresh the search row.
+   */
+  private acknowledgeCompaction(
+    maximum: number,
+    versionAt: number,
+    versionSaved: boolean,
+    pageProjected: boolean,
+    searchKey: string | null,
+    versionContentHash: string | null,
+  ) {
+    const indexKey = pageProjected ? searchKey : null;
+    const indexSeq = pageProjected ? maximum : -1;
+    const versionHash = versionSaved ? versionContentHash : this.metadata.version_content_hash;
+    this.state.storage.transactionSync(() => {
+      this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
+      this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
+      if (versionSaved) this.state.storage.sql.exec("DELETE FROM version_authors WHERE seq<=?", maximum);
+      this.state.storage.sql.exec(`DELETE FROM mention_introductions WHERE seq <= ?`, maximum);
+      this.state.storage.sql.exec(
+        `UPDATE document_meta
+            SET snapshot_seq = ?, last_version_at = ?, search_index_key = ?, search_index_seq = ?,
+                version_content_hash = ?
+          WHERE id = 1`,
+        maximum,
+        versionAt,
+        indexKey,
+        indexSeq,
+        versionHash,
+      );
+    });
+    this.metadata.snapshot_seq = maximum;
+    this.metadata.last_version_at = versionAt;
+    this.metadata.search_index_key = indexKey;
+    this.metadata.search_index_seq = indexSeq;
+    this.metadata.version_content_hash = versionHash;
   }
 
   private async compactDiagram(maximum: number, forceVersion: boolean) {
@@ -2843,8 +2905,7 @@ export class Document extends YServer {
       ]);
 
       const page = await this.bindings.DB.prepare(
-        `SELECT workspace_id, space_id, title, archived_at, import_job_id
-           FROM pages WHERE id = ? AND content_epoch = ?`,
+        `SELECT ${PAGE_PROJECTION_COLUMNS} FROM pages WHERE id = ? AND content_epoch = ?`,
       )
         .bind(pageId, epoch)
         .first<PageProjectionRow>();
@@ -2858,6 +2919,8 @@ export class Document extends YServer {
       let versionStatementIndex = -1;
       let versionSaved = false;
       let pageProjected = false;
+      let searchKey: string | null = null;
+      let versionContentHash: string | null = null;
 
       if (page) {
         const [oldPageTargets, oldUserTargets, watcherRows] = await Promise.all([
@@ -2898,10 +2961,13 @@ export class Document extends YServer {
         const watcherIds = watcherRows.results
           .map((row) => row.id)
           .filter((id) => !newMentionIds.includes(id) && !contributorIds.includes(id));
+        searchKey = await searchIndexKey(projection.plainText, "", page);
+        const searchCurrent = searchIndexCurrent(metadataAtStart, searchKey, page);
+        versionContentHash = await sha256Hex(canonicalJson([{ ...envelope, sequence: 0 }, page.title]));
         const makeVersion = Boolean(
           forceVersion ||
-          !metadataAtStart.last_version_at ||
-          timestamp - metadataAtStart.last_version_at >= VERSION_INTERVAL_MS,
+          ((!metadataAtStart.last_version_at || timestamp - metadataAtStart.last_version_at >= VERSION_INTERVAL_MS) &&
+            metadataAtStart.version_content_hash !== versionContentHash),
         );
         const statements = [
           this.bindings.DB.prepare(
@@ -2947,16 +3013,7 @@ export class Document extends YServer {
             pageId,
             epoch,
           ),
-          this.bindings.DB.prepare(
-            `DELETE FROM page_search WHERE page_id = ?
-              AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
-          ).bind(pageId, pageId, epoch),
-          this.bindings.DB.prepare(
-            `INSERT INTO page_search (page_id, workspace_id, title, body)
-              SELECT id, workspace_id, title, ? FROM pages
-               WHERE id = ? AND content_epoch = ? AND archived_at IS NULL AND import_job_id IS NULL`,
-          ).bind(projection.plainText, pageId, epoch),
-          ...refreshPageSearchV2Statements(this.bindings.DB, pageId, epoch),
+          ...(searchCurrent ? [] : refreshPageSearchV2Statements(this.bindings.DB, pageId, epoch)),
           this.bindings.DB.prepare(
             `UPDATE page_references SET projection_seq = -1 WHERE source_page_id = ?
               AND EXISTS (SELECT 1 FROM pages WHERE id = ? AND content_epoch = ?)`,
@@ -3218,19 +3275,7 @@ export class Document extends YServer {
         }
       }
 
-      this.state.storage.transactionSync(() => {
-        this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
-        this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
-        if (versionSaved) this.state.storage.sql.exec("DELETE FROM version_authors WHERE seq<=?", maximum);
-        this.state.storage.sql.exec(`DELETE FROM mention_introductions WHERE seq <= ?`, maximum);
-        this.state.storage.sql.exec(
-          `UPDATE document_meta SET snapshot_seq = ?, last_version_at = ? WHERE id = 1`,
-          maximum,
-          versionAt,
-        );
-      });
-      this.metadata.snapshot_seq = maximum;
-      this.metadata.last_version_at = versionAt;
+      this.acknowledgeCompaction(maximum, versionAt, versionSaved, pageProjected, searchKey, versionContentHash);
       if (pageProjected && versionKey) {
         backgroundUsage(
           this.state,

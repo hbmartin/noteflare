@@ -86,4 +86,58 @@ describe("visible read-only diagram rooms", () => {
     expect(states.at(-1)?.records).toBeNull();
     unsubscribe();
   });
+  it("keeps a newer room when an old subscription unsubscribes twice", async () => {
+    mocks.api.mockResolvedValue({
+      page: { id: "diagram", kind: "diagram", contentEpoch: 1, archivedAt: null } as Page,
+    });
+    const one = room(),
+      two = room();
+    mocks.network.mockReturnValueOnce(one.bundle).mockReturnValueOnce(two.bundle);
+    const stale = subscribeDiagramEmbed("account", "diagram", () => {});
+    await waitFor(() => expect(mocks.network).toHaveBeenCalledOnce());
+    stale();
+    const latest: DiagramEmbedState[] = [];
+    const live = subscribeDiagramEmbed("account", "diagram", (state) => latest.push(state));
+    await waitFor(() => expect(mocks.network).toHaveBeenCalledTimes(2));
+    stale();
+    expect(one.bundle.destroy).toHaveBeenCalledOnce();
+    expect(two.bundle.destroy).not.toHaveBeenCalled();
+    // A third subscriber joins the surviving room instead of opening another one.
+    const joined = subscribeDiagramEmbed("account", "diagram", () => {});
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledTimes(3));
+    expect(mocks.network).toHaveBeenCalledTimes(2);
+    live();
+    expect(two.bundle.destroy).not.toHaveBeenCalled();
+    joined();
+    expect(two.bundle.destroy).toHaveBeenCalledOnce();
+  });
+  it("keeps two subscribers that pass the same function", async () => {
+    mocks.api.mockResolvedValue({
+      page: { id: "diagram", kind: "diagram", contentEpoch: 1, archivedAt: null } as Page,
+    });
+    const { bundle } = room();
+    mocks.network.mockReturnValue(bundle);
+    const shared = vi.fn();
+    const first = subscribeDiagramEmbed("account", "diagram", shared);
+    const second = subscribeDiagramEmbed("account", "diagram", shared);
+    await waitFor(() => expect(mocks.network).toHaveBeenCalledOnce());
+    first();
+    expect(bundle.destroy).not.toHaveBeenCalled();
+    second();
+    expect(bundle.destroy).toHaveBeenCalledOnce();
+  });
+  it("rechecks access after a workspace catch-up", async () => {
+    mocks.api.mockResolvedValue({
+      page: { id: "diagram", kind: "diagram", contentEpoch: 1, archivedAt: null } as Page,
+    });
+    const { bundle } = room();
+    mocks.network.mockReturnValue(bundle);
+    const states: DiagramEmbedState[] = [];
+    const unsubscribe = subscribeDiagramEmbed("account", "diagram", (state) => states.push(state));
+    await waitFor(() => expect(mocks.network).toHaveBeenCalledOnce());
+    mocks.api.mockRejectedValue(new ApiClientError(404, "page_not_found", "Gone"));
+    window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type: "workspace-invalidated" } }));
+    await waitFor(() => expect(states.at(-1)?.status).toBe("unavailable"));
+    unsubscribe();
+  });
 });
