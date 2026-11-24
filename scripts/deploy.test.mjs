@@ -53,6 +53,23 @@ it.each([
   }
 });
 
+it("reports a credential output-drain failure without including stdout", async () => {
+  const runner = vi.spyOn(wranglerProcess, "runWrangler").mockResolvedValueOnce({
+    status: 1,
+    failure: "output-drain",
+    stdout: "private credential fixture",
+  });
+  const request = vi.fn();
+  try {
+    await expect(cloudflare("0".repeat(32), { request })).rejects.toThrow(
+      /^Wrangler auth output did not close after exit\.$/,
+    );
+    expect(request).not.toHaveBeenCalled();
+  } finally {
+    runner.mockRestore();
+  }
+});
+
 it.each(["initial credentials", "OAuth renewal", "settings request"])(
   "cancels Cloudflare %s without retrying",
   async (step) => {

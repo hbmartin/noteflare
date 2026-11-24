@@ -4,6 +4,7 @@ import type { Env, MemberContext } from "./env";
 import { USAGE_COUNTERS } from "../shared/platform-costs";
 import { auditStatement, archiveAudit, setAuditActor, withAuditRequest } from "./audit";
 import {
+  consumePlatformQueue,
   enqueuePlatformJob,
   platformJobId,
   recoverPlatformJobs,
@@ -147,6 +148,9 @@ describe("durable platform release", () => {
     await env.DB.prepare("UPDATE platform_jobs SET created_at=?,available_at=?,lease_until=?,lease_token='expired'")
       .bind(Date.now() - 2 * 86400_000, 0, Date.now() - 1)
       .run();
+    await env.DB.prepare("UPDATE platform_jobs SET queue_redispatch_at=?")
+      .bind(Date.now() + 300_000)
+      .run();
     await recoverPlatformJobs(
       bindings(),
       {
@@ -161,6 +165,71 @@ describe("durable platform release", () => {
     await env.DB.prepare("UPDATE platform_jobs SET available_at=0").run();
     await recoverPlatformJobs(bindings(), { fixture: async () => {} }, 1);
     expect(await env.DB.prepare("SELECT 1 FROM platform_jobs").first()).toBeNull();
+  });
+  it("defers redispatch without delaying an accepted Queue message", async () => {
+    const intent = { workspaceId: "workspace", kind: "fixture", key: "page", generation: "1", payload: {} };
+    const id = platformJobId(intent);
+    await enqueuePlatformJob(bindings(), intent);
+    const due = (await env.DB.prepare("SELECT available_at FROM platform_jobs").first<number>("available_at"))!;
+    const send = vi.fn().mockResolvedValue({});
+    const configured = { ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } };
+    const handler = vi.fn(async () => {});
+    const clock = vi.spyOn(Date, "now").mockReturnValue(due);
+    try {
+      await recoverPlatformJobs(configured, { fixture: handler });
+      expect(await env.DB.prepare("SELECT available_at,queue_redispatch_at FROM platform_jobs").first()).toEqual({
+        available_at: due,
+        queue_redispatch_at: due + 300_000,
+      });
+      clock.mockReturnValue(due + 299_999);
+      await recoverPlatformJobs(configured, { fixture: handler });
+      expect(send).toHaveBeenCalledExactlyOnceWith({ platformJobId: id });
+
+      const ack = vi.fn();
+      await consumePlatformQueue(
+        configured,
+        { messages: [{ body: { platformJobId: id }, ack }] } as unknown as MessageBatch<unknown>,
+        { fixture: handler },
+      );
+      expect(handler).toHaveBeenCalledOnce();
+      expect(ack).toHaveBeenCalledOnce();
+      expect(await env.DB.prepare("SELECT 1 FROM platform_jobs").first()).toBeNull();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  it.each([
+    { name: "replacement generation", set: "generation='2'", generation: "2", token: null },
+    {
+      name: "consumer lease",
+      set: "lease_token='consumer',lease_until=9999999999999",
+      generation: "1",
+      token: "consumer",
+    },
+  ])("discards a recovery send result after a $name changes the row", async ({ set, generation, token }) => {
+    await enqueuePlatformJob(bindings(), {
+      workspaceId: "workspace",
+      kind: "fixture",
+      key: "page",
+      generation: "1",
+      payload: {},
+    });
+    const send = vi.fn(async () => {
+      await env.DB.prepare(`UPDATE platform_jobs SET ${set}`).run();
+      return { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
+    });
+    await recoverPlatformJobs({ ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } }, {});
+    expect(send).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare(`SELECT generation,lease_token,queue_redispatch_at,queue_send_failures,queue_dispatch_revision
+        FROM platform_jobs`).first(),
+    ).toEqual({
+      generation,
+      lease_token: token,
+      queue_redispatch_at: 0,
+      queue_send_failures: 0,
+      queue_dispatch_revision: 1,
+    });
   });
   it("reserves application quotas atomically", async () => {
     const results = await Promise.all(

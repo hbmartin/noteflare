@@ -201,17 +201,14 @@ it.each([
   },
 );
 
-it.each([
-  { name: "all sends fail and the final scan succeeds", partial: false, failScan: false },
-  { name: "one send fails and the final scan fails", partial: true, failScan: true },
-])("backs off Queue recovery when $name", async ({ partial, failScan }) => {
+it.each([false, true])("backs off Queue recovery during a total outage (failed scan: %s)", async (failScan) => {
   const now = Date.now();
   const due = now - 1;
   await env.DB.batch([recoveryJob("first", due), recoveryJob("second", due)]);
   const clock = vi.spyOn(Date, "now").mockReturnValue(now);
   let queueUnavailable = true;
   const send = vi.fn(async ({ platformJobId }: { platformJobId: string }) => {
-    if (queueUnavailable && (!partial || platformJobId === "first")) throw new Error("Queue unavailable");
+    if (queueUnavailable) throw new Error("Queue unavailable");
     // Simulate the consumer finishing an accepted job before the next scan.
     await env.DB.prepare("DELETE FROM platform_jobs WHERE id=?").bind(platformJobId).run();
     return queueSendResponse;
@@ -253,7 +250,7 @@ it.each([
         await alarmPhase(0, 0);
         await alarmPhase(2, 5000);
         expect(send.mock.calls).toEqual([[{ platformJobId: "first" }], [{ platformJobId: "second" }]]);
-        expect((await pending()).results).toEqual(partial ? [{ id: "first" }] : [{ id: "first" }, { id: "second" }]);
+        expect((await pending()).results).toEqual([{ id: "first" }, { id: "second" }]);
         expect(await retry()).toEqual({ attempts: 1, at: now + 65_000 });
         await alarmPhase(10, 10_000);
         expect(await state.storage.getAlarm()).toBe(now + 65_000);
@@ -268,14 +265,14 @@ it.each([
         expect(await state.storage.getAlarm()).toBe(now + 65_000);
 
         await alarmPhase(2, 65_000);
-        expect(send).toHaveBeenCalledTimes(partial ? 3 : 4);
+        expect(send).toHaveBeenCalledTimes(4);
         expect(await retry()).toEqual({ attempts: 2, at: now + 185_000 });
         await alarmPhase(10, 70_000);
         expect(await state.storage.getAlarm()).toBe(now + 185_000);
 
         queueUnavailable = false;
         await alarmPhase(2, 185_000);
-        expect(send).toHaveBeenCalledTimes(partial ? 4 : 6);
+        expect(send).toHaveBeenCalledTimes(6);
         expect(await retry()).toBeUndefined();
         expect((await pending()).results).toEqual([]);
         await alarmPhase(10, 190_000);
@@ -289,6 +286,84 @@ it.each([
     clock.mockRestore();
   }
 });
+
+it.each([false, true])(
+  "schedules Queue redispatch per job after a partial failure (failed scan: %s)",
+  async (failScan) => {
+    const now = Date.now();
+    await env.DB.batch([recoveryJob("failed", now - 1), recoveryJob("sent", now - 1)]);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    let rejectFirst = true;
+    let rejectScan = failScan;
+    const send = vi.fn(async ({ platformJobId }: { platformJobId: string }) => {
+      if (rejectFirst && platformJobId === "failed") throw new Error("Queue unavailable");
+      return queueSendResponse;
+    });
+    const sentIds = () => send.mock.calls.map(([message]) => message.platformJobId);
+    try {
+      await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
+        const mutable = instance as unknown as { env: Env };
+        const original = mutable.env;
+        const DB = new Proxy(env.DB, {
+          get(target, property) {
+            if (property === "prepare")
+              return (sql: string) => {
+                if (rejectScan && sql.includes("SELECT min(job_due)")) throw new Error("Final scan unavailable");
+                return target.prepare(sql);
+              };
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        mutable.env = {
+          ...original,
+          DB,
+          SEMANTIC_SEARCH_ENABLED: "false",
+          PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
+        };
+        const alarmPhase = async (phase: number, offset: number) => {
+          clock.mockReturnValue(now + offset);
+          await state.storage.put("phase", phase);
+          await instance.alarm();
+        };
+        const schedule = () => state.storage.get<{ jobRetryAt: number; retries?: Record<number, unknown> }>("schedule");
+        try {
+          await alarmPhase(2, 0);
+          expect(sentIds()).toEqual(["failed", "sent"]);
+          expect((await schedule())?.jobRetryAt).toBe(now + 60_000);
+          expect((await schedule())?.retries?.[2]).toBeUndefined();
+          await alarmPhase(10, 5000);
+          expect(await state.storage.getAlarm()).toBe(now + 60_000);
+
+          clock.mockReturnValue(now + 10_000);
+          await recoveryJob("fresh", now + 10_000).run();
+          await instance.wake();
+          expect(await state.storage.getAlarm()).toBe(now + 11_000);
+          await alarmPhase(0, 11_000);
+          await alarmPhase(2, 16_000);
+          expect(sentIds()).toEqual(["failed", "sent", "fresh"]);
+          await alarmPhase(10, 21_000);
+          expect(await state.storage.getAlarm()).toBe(now + 60_000);
+
+          rejectFirst = false;
+          rejectScan = false;
+          await alarmPhase(2, 60_000);
+          expect(sentIds()).toEqual(["failed", "sent", "fresh", "failed"]);
+          expect((await schedule())?.jobRetryAt).toBe(now + 300_000);
+          await alarmPhase(10, 65_000);
+          expect(await state.storage.getAlarm()).toBe(now + 300_000);
+          await alarmPhase(2, 300_000);
+          expect(sentIds()).toEqual(["failed", "sent", "fresh", "failed", "sent"]);
+        } finally {
+          await state.storage.deleteAlarm();
+          mutable.env = original;
+        }
+      });
+    } finally {
+      clock.mockRestore();
+    }
+  },
+);
 
 it("retains a wake recorded after the phase 2 deadline read and clears it after recovery drains", async () => {
   const now = Date.now();
@@ -396,7 +471,7 @@ it.each([false, true])(
           await state.storage.put("phase", 2);
           await instance.alarm();
           expect(sent).toHaveBeenCalledOnce();
-          expect((await state.storage.get<{ jobRetryAt: number }>("schedule"))?.jobRetryAt).toBe(now - 1);
+          expect((await state.storage.get<{ jobRetryAt: number }>("schedule"))?.jobRetryAt).toBe(now + 300_000);
           await env.DB.prepare("DELETE FROM platform_jobs WHERE id='queued'").run();
           clock.mockReturnValue(now + 5000);
           await state.storage.put("phase", 10);

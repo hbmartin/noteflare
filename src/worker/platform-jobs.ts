@@ -39,6 +39,11 @@ type JobRow = {
   attempts: number;
 };
 const LEASE_MS = 5 * 60_000;
+const QUEUE_REDISPATCH_GRACE_MS = 5 * 60_000;
+
+export function platformJobDeadlineSql(queueEnabled: boolean) {
+  return `max(available_at,coalesce(lease_until,0)${queueEnabled ? ",queue_redispatch_at" : ""})`;
+}
 
 export function platformJobId(intent: Pick<PlatformJobIntent, "workspaceId" | "kind" | "key">) {
   return JSON.stringify([intent.workspaceId, intent.kind, intent.key]);
@@ -198,22 +203,42 @@ async function runPlatformJobObserved(env: Env, id: string, handlers: PlatformHa
 }
 
 export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, limit = 25) {
-  const rows = await env.DB.prepare(`SELECT id FROM platform_jobs WHERE available_at<=?
-    AND (lease_until IS NULL OR lease_until<=?) ORDER BY available_at,id LIMIT ?`)
-    .bind(Date.now(), Date.now(), Math.max(1, Math.min(25, limit)))
-    .all<{ id: string }>();
+  const queue = env.PLATFORM_QUEUE;
+  const now = Date.now();
+  const rows = await env.DB.prepare(`SELECT id,generation,created_at,queue_dispatch_revision,queue_send_failures
+    FROM platform_jobs WHERE available_at<=? AND (lease_until IS NULL OR lease_until<=?)
+    AND (?=0 OR queue_redispatch_at<=?) ORDER BY available_at,id LIMIT ?`)
+    .bind(now, now, queue ? 1 : 0, now, Math.max(1, Math.min(25, limit)))
+    .all<{
+      id: string;
+      generation: string;
+      created_at: number;
+      queue_dispatch_revision: number;
+      queue_send_failures: number;
+    }>();
   let queueSendFailures = 0;
   for (const row of rows.results) {
-    if (env.PLATFORM_QUEUE) {
-      try {
-        await env.PLATFORM_QUEUE.send({ platformJobId: row.id });
-      } catch {
-        queueSendFailures++;
-        recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
-      }
-    } else await runPlatformJob(env, row.id, handlers);
+    if (!queue) {
+      await runPlatformJob(env, row.id, handlers);
+      continue;
+    }
+    let failures = 0;
+    try {
+      await queue.send({ platformJobId: row.id });
+    } catch {
+      queueSendFailures++;
+      failures = Math.min(row.queue_send_failures + 1, 7);
+      recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
+    }
+    const delay = failures ? Math.min(3_600_000, 60_000 * 2 ** (failures - 1)) : QUEUE_REDISPATCH_GRACE_MS;
+    // A consumer or a new generation can advance the row while the send is in flight.
+    await env.DB.prepare(`UPDATE platform_jobs SET queue_redispatch_at=?,queue_send_failures=?,
+      queue_dispatch_revision=queue_dispatch_revision+1
+      WHERE id=? AND generation=? AND created_at=? AND queue_dispatch_revision=?`)
+      .bind(Date.now() + delay, failures, row.id, row.generation, row.created_at, row.queue_dispatch_revision)
+      .run();
   }
-  return { queueSendFailures };
+  return { queueAttempts: queue ? rows.results.length : 0, queueSendFailures };
 }
 
 export async function consumePlatformQueue(

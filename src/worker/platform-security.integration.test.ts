@@ -635,6 +635,74 @@ describe("Secrets Store encryption", () => {
   });
 });
 
+it("clears Queue redispatch on owner retry for unleased jobs in that workspace", async () => {
+  await seed();
+  const signup = await createAuth(testEnv, true).handler(
+    post("http://example.test/api/auth/sign-up/email", {
+      email: "retry-owner@example.test",
+      name: "Retry owner",
+      password: "password123",
+    }),
+  );
+  const cookie = await enrollAccount(signup);
+  const user = await env.DB.prepare("SELECT id FROM user WHERE email='retry-owner@example.test'").first("id");
+  await env.DB.prepare(
+    "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
+  )
+    .bind(user)
+    .run();
+
+  const now = Date.now();
+  const redispatchAt = now + 300_000;
+  const job = (id: string, workspace: string, token: string | null, lease: number | null) =>
+    env.DB.prepare(`INSERT INTO platform_jobs
+      (id,workspace_id,kind,job_key,generation,payload_json,available_at,lease_token,lease_until,
+        queue_redispatch_at,queue_send_failures,queue_dispatch_revision,created_at,updated_at)
+      VALUES(?,?,'fixture',?,'1','{}',?,?,?,?,2,3,1,1)`).bind(id, workspace, id, now, token, lease, redispatchAt);
+  await env.DB.batch([
+    job("due", "workspace", null, null),
+    job("leased", "workspace", "worker", now + 60_000),
+    job("other", "other-workspace", null, null),
+  ]);
+  const configured = { ...testEnv };
+  delete configured.PLATFORM;
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  try {
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      new Request("http://example.test/api/platform/retry", {
+        method: "POST",
+        headers: { origin: "http://example.test", cookie },
+      }),
+      configured,
+      context,
+    );
+    expect(response.status).toBe(200);
+    await waitOnExecutionContext(context);
+    const rows = await env.DB.prepare(`SELECT id,available_at,queue_redispatch_at,queue_send_failures,
+      queue_dispatch_revision FROM platform_jobs ORDER BY id`).all();
+    expect(rows.results).toEqual([
+      { id: "due", available_at: now, queue_redispatch_at: 0, queue_send_failures: 0, queue_dispatch_revision: 4 },
+      {
+        id: "leased",
+        available_at: now,
+        queue_redispatch_at: redispatchAt,
+        queue_send_failures: 2,
+        queue_dispatch_revision: 3,
+      },
+      {
+        id: "other",
+        available_at: now,
+        queue_redispatch_at: redispatchAt,
+        queue_send_failures: 2,
+        queue_dispatch_revision: 3,
+      },
+    ]);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
 it("keeps an expired audit archive hidden from the owner while its partial deletion is deferred", async () => {
   await seed();
   const signup = await createAuth(testEnv, true).handler(
