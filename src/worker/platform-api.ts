@@ -167,7 +167,8 @@ platformApi.post("/platform/retry", async (c) => {
   requireOwner(member);
   assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
   await c.env.DB.prepare(
-    "UPDATE platform_jobs SET available_at=? WHERE workspace_id=? AND (lease_until IS NULL OR lease_until<?)",
+    `UPDATE platform_jobs SET available_at=?,queue_redispatch_at=0,queue_send_failures=0,
+     queue_dispatch_revision=queue_dispatch_revision+1 WHERE workspace_id=? AND (lease_until IS NULL OR lease_until<?)`,
   )
     .bind(Date.now(), member.workspace.id, Date.now())
     .run();

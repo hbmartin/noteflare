@@ -48,6 +48,7 @@ async function wranglerJSON(args, signal) {
   signal?.throwIfAborted();
   if (result.failure === "output-limit") throw new Error(`Wrangler ${args[0]} exceeded the 1 MiB output limit.`);
   if (result.failure === "timeout") throw new Error(`Wrangler ${args[0]} timed out.`);
+  if (result.failure === "output-drain") throw new Error(`Wrangler ${args[0]} output did not close after exit.`);
   if (result.status !== 0) throw new Error(`Wrangler ${args[0]} failed. Check authentication and permissions.`);
   try {
     return JSON.parse(result.stdout);

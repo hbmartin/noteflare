@@ -2,7 +2,7 @@ import { retiredPublicationSnapshots } from "./publication-snapshots";
 import { restartablePublicationFailure, publicationNeedsJob } from "./publication-failure";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
-import { recoverPlatformJobs, type PlatformHandlers } from "./platform-jobs";
+import { platformJobDeadlineSql, recoverPlatformJobs, type PlatformHandlers } from "./platform-jobs";
 import { handleSemanticJob, sweepSemanticJobs, semanticEnabled, unclaimedSemanticWork } from "./semantic";
 import { processPublicationBuildJob } from "./publication-builder";
 import { enqueuePendingPublications, processHostnameSyncJob } from "./publications";
@@ -152,7 +152,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
     let due: number | null | undefined;
     try {
       due = await this.env.DB.prepare(
-        "SELECT min(max(available_at,coalesce(lease_until,0))) due FROM platform_jobs",
+        `SELECT min(${platformJobDeadlineSql(Boolean(this.env.PLATFORM_QUEUE))}) due FROM platform_jobs`,
       ).first<number>("due");
     } catch {
       logger.warn(
@@ -204,12 +204,13 @@ export class PlatformCoordinator extends DurableObject<Env> {
             await enqueuePendingPublications(alarmEnv);
             break;
           case 2: {
-            const { queueSendFailures } = await recoverPlatformJobs(
+            const { queueAttempts, queueSendFailures } = await recoverPlatformJobs(
               alarmEnv,
               platformHandlers,
               alarmEnv.PLATFORM_QUEUE ? 10 : 1,
             );
-            if (queueSendFailures > 0) throw new Error("platform_queue_recovery_failed");
+            if (queueAttempts > 0 && queueSendFailures === queueAttempts)
+              throw new Error("platform_queue_recovery_failed");
             break;
           }
           case 3:
@@ -263,7 +264,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
       const phaseDue = (operation: number) => Math.max(now, retries?.[operation]?.at ?? 0);
       // D1 permits at most five compound SELECT terms. Combine each phase's work.
       scanned = await this.env.DB.prepare(`SELECT min(job_due) job_due,min(maintenance_due) maintenance_due FROM (
-      SELECT max(available_at,coalesce(lease_until,0)) job_due,NULL maintenance_due FROM platform_jobs
+      SELECT ${platformJobDeadlineSql(Boolean(this.env.PLATFORM_QUEUE))} job_due,NULL maintenance_due FROM platform_jobs
       UNION ALL SELECT NULL,max(s.next_attempt_at,?) ${retiredPublicationSnapshots}
       UNION ALL SELECT NULL,? FROM publications p WHERE ?=1 AND ((${publicationNeedsJob}) OR (${restartablePublicationFailure}))
       UNION ALL SELECT NULL,? WHERE ?=1 AND EXISTS(SELECT 1 FROM semantic_dirty d WHERE ${unclaimedSemanticWork} LIMIT 1)

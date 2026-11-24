@@ -7,6 +7,23 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("0116 adds redispatch state without moving existing execution or lease deadlines", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0116"),
+    );
+    await env.DB.prepare(`INSERT INTO platform_jobs
+      (id,workspace_id,kind,job_key,generation,payload_json,available_at,attempts,lease_token,lease_until,created_at,updated_at)
+      VALUES ('ready','workspace','fixture','ready','1','{}',100,0,NULL,NULL,1,2),
+      ('leased','workspace','fixture','leased','1','{}',100,2,'worker',200,1,2)`).run();
+    const jobs = () => env.DB.prepare("SELECT * FROM platform_jobs ORDER BY id").all();
+    const before = (await jobs()).results;
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect((await jobs()).results).toEqual(
+      before.map((job) => ({ ...job, queue_redispatch_at: 0, queue_send_failures: 0, queue_dispatch_revision: 0 })),
+    );
+  });
+
   it("0091 preserves existing cleanup jobs and their completed target progress", async () => {
     await applyD1Migrations(
       env.DB,

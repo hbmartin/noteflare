@@ -51,6 +51,38 @@ it("preserves a timeout recorded before the child exits", async () => {
   await expect(result).resolves.toMatchObject({ status: 1, failure: "timeout" });
 });
 
+it("closes stuck output pipes five seconds after exit", async () => {
+  vi.useFakeTimers();
+  const child = mockChild();
+  child.stderr = new PassThrough();
+  const result = runWrangler("wrangler", [], { stdio: ["ignore", "pipe", "pipe"] });
+  child.emit("exit", 0, null);
+
+  vi.advanceTimersByTime(4999);
+  expect(child.stdout.destroyed).toBe(false);
+  expect(child.stderr.destroyed).toBe(false);
+  vi.advanceTimersByTime(1);
+
+  await expect(result).resolves.toMatchObject({ status: 1, failure: "output-drain" });
+  expect(child.stdout.destroyed).toBe(true);
+  expect(child.stderr.destroyed).toBe(true);
+  expect(child.kill).not.toHaveBeenCalled();
+});
+
+it.each(["timeout", "output-limit"])("preserves an earlier %s when output does not close", async (failure) => {
+  vi.useFakeTimers();
+  const child = mockChild();
+  const result = runWrangler("wrangler", [], { stdio, timeoutMs: 100 });
+  if (failure === "timeout") vi.advanceTimersByTime(100);
+  else child.stdout.write(Buffer.alloc(1_048_577));
+  child.emit("exit", null, "SIGTERM");
+  vi.advanceTimersByTime(5000);
+
+  await expect(result).resolves.toMatchObject({ status: 1, failure });
+  expect(child.stdout.destroyed).toBe(true);
+  expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
+});
+
 it.each([null, Infinity, NaN, 0, -1, 1.5, "100", 2_147_483_648])(
   "rejects timeout %s before spawning",
   async (timeoutMs) => {
