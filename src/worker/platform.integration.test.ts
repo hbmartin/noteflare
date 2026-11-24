@@ -338,15 +338,26 @@ describe("durable platform release", () => {
       await env.DB.prepare("SELECT expires_at,cleanup_not_before FROM audit_archives WHERE id='legacy'").first(),
     ).toEqual({ expires_at: 1, cleanup_not_before: uploaded + 730 * 86400_000 });
   });
+  const bindingFailure = (code: number) => new Error(`delete: private provider detail (${code})`);
   it.each([
-    [10001, "transient", 600_000],
-    [10043, "transient", 600_000],
-    [10058, "transient", 600_000],
-    [10069, "lock", 86_400_000],
-    [10012, "unknown", 86_400_000],
+    ["binding internal error", bindingFailure(10001), "transient"],
+    ["binding service unavailable", bindingFailure(10043), "transient"],
+    ["binding rate limit", bindingFailure(10058), "transient"],
+    ["binding lock", bindingFailure(10069), "lock"],
+    ["unknown binding code", bindingFailure(10012), "unknown"],
+    ["structured status", { status: 503 }, "transient"],
+    ["structured statusCode", { statusCode: 502 }, "transient"],
+    ["structured lock with transient status", { code: "ObjectLockedByBucketPolicy", status: 503 }, "lock"],
+    ["binding lock with transient status", Object.assign(bindingFailure(10069), { status: 503 }), "lock"],
+    [
+      "binding transient error with structured lock",
+      Object.assign(bindingFailure(10043), { code: "ObjectLockedByBucketPolicy" }),
+      "transient",
+    ],
   ] as const)(
-    "classifies Workers R2 error %i as %s and keeps the archive pointer until cleanup",
-    async (code, reason, waitMs) => {
+    "classifies %s and keeps the archive pointer until its scheduled cleanup retry succeeds",
+    async (_name, error, reason) => {
+      const waitMs = reason === "transient" ? 600_000 : 86_400_000;
       const started = Date.now();
       const clock = vi.spyOn(Date, "now").mockReturnValue(started);
       const warn = vi.spyOn(logger, "warn");
@@ -359,7 +370,7 @@ describe("durable platform release", () => {
         .bind(key)
         .run();
       const remove = vi.fn(async (keys: string[]) => {
-        if (Date.now() === started) throw new Error(`delete: private provider detail (${code})`);
+        if (Date.now() === started) throw error;
         for (const objectKey of keys) objects.delete(objectKey);
       });
       const bucket = {
