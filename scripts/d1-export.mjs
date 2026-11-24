@@ -2,11 +2,11 @@
 //
 //   D1 Export error: cannot export databases with Virtual Tables (fts5)
 //
-// `page_search` is an FTS5 index, so a plain `wrangler d1 export` of this
-// schema exits 1 and writes nothing. Every authoritative table is ordinary,
-// and the index is derived from `pages`, so this exports the real tables by
-// name and leaves the index to be rebuilt on import. See
-// docs/BACKUP_AND_RECOVERY.md for the reindex statement.
+// `page_search_v2` and `page_title_trigrams` are FTS5 indexes, so a plain
+// `wrangler d1 export` of this schema exits 1 and writes nothing. Every
+// authoritative table is ordinary, and the indexes are derived from `pages`,
+// so this exports the real tables by name and leaves the indexes to be rebuilt
+// on import. See docs/BACKUP_AND_RECOVERY.md for the reindex statement.
 import { spawnSync } from "node:child_process";
 
 const BINDING = "DB";

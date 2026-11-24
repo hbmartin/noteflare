@@ -1342,10 +1342,6 @@ app.post("/api/install/bootstrap", async (c) => {
        VALUES (?, ?, ?, 'page', ?, ?, ?)
        ON CONFLICT(user_id, resource_type, resource_id) DO UPDATE SET muted_at = NULL`,
     ).bind(`page:${pageId}:${signup.user.id}`, workspaceId, signup.user.id, pageId, signup.user.id, timestamp),
-    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, 'Welcome', '')`).bind(
-      pageId,
-      workspaceId,
-    ),
     c.env.DB.prepare(
       `INSERT INTO page_search_v2
         (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
@@ -2045,17 +2041,22 @@ app.patch("/api/tags/:id", async (c) => {
     .bind(member.workspace.id, name, current.id)
     .first();
   if (duplicate) throw new HttpError(409, "tag_exists", "A tag with that name already exists.");
-  await c.env.DB.prepare(`UPDATE tags SET name = ?, color = ?, updated_at = ? WHERE id = ?`)
-    .bind(name, body.color === undefined ? current.color : tagColor(body.color), now(), current.id)
-    .run();
-  await c.env.DB.prepare(
-    `UPDATE page_search_v2 SET tags = COALESCE(
-       (SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
-         WHERE pt.page_id = page_search_v2.page_id), '')
-      WHERE page_id IN (SELECT page_id FROM page_tags WHERE tag_id = ?)`,
-  )
-    .bind(current.id)
-    .run();
+  // Compaction no longer rewrites unchanged search rows, so the tag text must
+  // change in the same batch as the tag itself.
+  await c.env.DB.batch([
+    c.env.DB.prepare(`UPDATE tags SET name = ?, color = ?, updated_at = ? WHERE id = ?`).bind(
+      name,
+      body.color === undefined ? current.color : tagColor(body.color),
+      now(),
+      current.id,
+    ),
+    c.env.DB.prepare(
+      `UPDATE page_search_v2 SET tags = COALESCE(
+         (SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
+           WHERE pt.page_id = page_search_v2.page_id), '')
+        WHERE page_id IN (SELECT page_id FROM page_tags WHERE tag_id = ?)`,
+    ).bind(current.id),
+  ]);
   sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   return c.json({
     tag: tagJson((await c.env.DB.prepare(`SELECT * FROM tags WHERE id = ?`).bind(current.id).first<TagRow>())!),
@@ -3415,11 +3416,6 @@ app.post("/api/pages", async (c) => {
         timestamp,
         Number(taskList),
       ),
-      c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
-        id,
-        member.workspace.id,
-        title,
-      ),
       c.env.DB.prepare(
         `INSERT INTO page_search_v2
           (page_id, workspace_id, space_id, title, tags, body, comments, attachments)
@@ -3558,11 +3554,6 @@ app.post("/api/pages/batch", async (c) => {
         member.user.id,
         timestamp,
         timestamp,
-      ),
-      c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, '')`).bind(
-        page.id,
-        member.workspace.id,
-        page.title,
       ),
       c.env.DB.prepare(
         `INSERT INTO page_search_v2
@@ -4255,24 +4246,18 @@ app.patch("/api/pages/:id", async (c) => {
   if (body.fullWidth !== undefined && typeof body.fullWidth !== "boolean")
     throw new HttpError(422, "invalid_input", "fullWidth must be a boolean.");
   const fullWidth = body.fullWidth === undefined ? (page.full_width ?? 0) : Number(body.fullWidth);
-  const result = await c.env.DB.prepare(
-    `UPDATE pages SET title = ?, icon = ?, full_width = ?, revision = revision + 1, updated_by = ?, updated_at = ?
-      WHERE id = ? AND workspace_id = ? AND revision = ?`,
-  )
-    .bind(titleValue, iconValue, fullWidth, member.user.id, now(), page.id, member.workspace.id, revision)
-    .run();
-  if (!result.meta.changes)
-    throw new HttpError(409, "stale_revision", "The page metadata changed. Reload and try again.");
-  await c.env.DB.batch([
-    c.env.DB.prepare(`DELETE FROM page_search WHERE page_id = ?`).bind(page.id),
-    c.env.DB.prepare(`INSERT INTO page_search (page_id, workspace_id, title, body) VALUES (?, ?, ?, ?)`).bind(
-      page.id,
-      member.workspace.id,
-      titleValue,
-      await currentPlainText(c.env, page.id),
-    ),
+  // The search row is rebuilt from `pages` in the same batch, so a title change
+  // is searchable even when no later compaction rewrites the row. When the
+  // revision is stale the refresh only re-derives the unchanged row.
+  const [result] = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE pages SET title = ?, icon = ?, full_width = ?, revision = revision + 1, updated_by = ?, updated_at = ?
+        WHERE id = ? AND workspace_id = ? AND revision = ?`,
+    ).bind(titleValue, iconValue, fullWidth, member.user.id, now(), page.id, member.workspace.id, revision),
     ...refreshPageSearchV2Statements(c.env.DB, page.id),
   ]);
+  if (!result?.meta.changes)
+    throw new HttpError(409, "stale_revision", "The page metadata changed. Reload and try again.");
   const updated = pageJson(await pageForMember(c.env, member, page.id));
   sendMutationEvent(c, member.workspace.id, { type: "pages-upserted", pages: [updated] });
   return c.json({ page: updated });
@@ -4769,10 +4754,6 @@ app.delete("/api/pages/:id", async (c) => {
         member.user.id,
         timestamp,
       ),
-      c.env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (
-      WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
-      SELECT id FROM subtree
-    )`).bind(page.id),
       activityMutationEnd(c.env.DB, effectiveOperationId),
     ],
     c.env.DB.prepare(
@@ -4900,21 +4881,6 @@ app.post("/api/pages/:id/restore", async (c) => {
                revision = revision + 1, updated_by = ?, updated_at = ?
          WHERE id IN subtree AND ${archiveOwnershipSql} AND ${deletionGuard}`,
       ).bind(page.id, member.workspace.id, member.user.id, now(), archiveOwnership, page.id),
-      c.env.DB.prepare(
-        `DELETE FROM page_search WHERE page_id IN (
-         WITH RECURSIVE subtree(id) AS (
-           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-         ) SELECT id FROM subtree
-       )`,
-      ).bind(page.id),
-      c.env.DB.prepare(
-        `INSERT INTO page_search (page_id, workspace_id, title, body)
-       SELECT id, workspace_id, title, COALESCE(plain_text, '') FROM pages WHERE id IN (
-         WITH RECURSIVE subtree(id) AS (
-           SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-         ) SELECT id FROM subtree
-       ) AND archived_at IS NULL AND import_job_id IS NULL`,
-      ).bind(page.id),
       ...refreshPageSearchV2SubtreeStatements(c.env.DB, page.id),
     ],
     // Read the restored snapshot in the same transaction as the update.
@@ -5548,13 +5514,16 @@ app.post("/api/pages/:id/attachments", async (c) => {
     customMetadata: { attachmentId: id },
   });
   try {
-    await c.env.DB.prepare(
-      `INSERT INTO attachments
-         (id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(id, member.workspace.id, page.id, key, name, mime, file.size, contentSha256, member.user.id, now())
-      .run();
+    // Attachment names are searchable, and compaction no longer rewrites an
+    // unchanged search row, so the name is indexed with the attachment row.
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO attachments
+           (id, workspace_id, page_id, r2_key, name, mime, size, content_sha256, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(id, member.workspace.id, page.id, key, name, mime, file.size, contentSha256, member.user.id, now()),
+      ...refreshPageSearchV2Statements(c.env.DB, page.id),
+    ]);
   } catch (error) {
     const replay = await attachmentById(c.env, member.workspace.id, id);
     if (replay && sameAttachment(replay, expected)) {
@@ -5628,7 +5597,10 @@ app.delete("/api/attachments/:id", async (c) => {
   if (!attachment) throw new HttpError(404, "attachment_not_found", "Attachment not found.");
   const page = await pageForMember(c.env, member, attachment.page_id);
   requirePageEditor(page);
-  await c.env.DB.prepare(`DELETE FROM attachments WHERE id = ?`).bind(c.req.param("id")).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`DELETE FROM attachments WHERE id = ?`).bind(c.req.param("id")),
+    ...refreshPageSearchV2Statements(c.env.DB, attachment.page_id),
+  ]);
   await c.env.BUCKET.delete(attachment.r2_key);
   return c.json({ ok: true });
 });
@@ -6008,6 +5980,7 @@ app.post("/api/uploads/:uploadId/complete", async (c) => {
       `UPDATE attachment_uploads SET state = 'committed', updated_at = ? WHERE id = ? AND state = 'r2_complete'`,
     ).bind(timestamp, session.id),
     c.env.DB.prepare(`DELETE FROM attachment_uploads WHERE id = ? AND state = 'committed'`).bind(session.id),
+    ...refreshPageSearchV2Statements(c.env.DB, session.page_id),
   ]);
   const attachment = await attachmentById(c.env, member.workspace.id, session.id);
   if (!attachment)
@@ -7218,13 +7191,6 @@ async function assertAnotherOwner(env: Env, workspaceId: string, excludedId: str
     .first();
   if (!other)
     throw new HttpError(409, "final_owner", "Promote another owner before removing or demoting the final owner.");
-}
-
-async function currentPlainText(env: Env, pageId: string) {
-  return (
-    (await env.DB.prepare(`SELECT plain_text FROM pages WHERE id = ?`).bind(pageId).first<{ plain_text: string }>())
-      ?.plain_text ?? ""
-  );
 }
 
 function escapeLike(value: string) {

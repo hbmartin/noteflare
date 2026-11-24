@@ -1361,7 +1361,7 @@ describe("OAuth MCP foundation", () => {
       .all<{ id: string }>();
     expect(createdRows.results).toHaveLength(1);
     const createdPageId = createdRows.results[0]!.id;
-    const indexed = await env.DB.prepare("SELECT body FROM page_search WHERE page_id=?")
+    const indexed = await env.DB.prepare("SELECT body FROM page_search_v2 WHERE page_id=?")
       .bind(createdPageId)
       .first<{ body: string }>();
     expect(indexed?.body).toContain("created");

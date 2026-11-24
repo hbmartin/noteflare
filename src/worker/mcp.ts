@@ -357,10 +357,6 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
           AND EXISTS (SELECT 1 FROM oauth_operation_receipts
             WHERE grant_id=? AND operation_id=? AND input_hash=? AND result_json=?) RETURNING id`,
       ).bind(staged.pageId, stageId, access.grantId, input.operation_id, inputHash, JSON.stringify(value)),
-      env.DB.prepare(
-        `INSERT INTO page_search(page_id,workspace_id,title,body)
-         SELECT id,workspace_id,title,plain_text FROM pages WHERE id=? AND import_job_id IS NULL`,
-      ).bind(staged.pageId),
       ...refreshPageSearchV2Statements(env.DB, staged.pageId),
       env.DB.prepare(
         `INSERT INTO subscriptions(id,workspace_id,user_id,resource_type,resource_id,created_by,created_at)

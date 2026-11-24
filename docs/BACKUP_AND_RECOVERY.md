@@ -86,20 +86,37 @@ retain local Yjs state in IndexedDB and resynchronize it; diagrams intentionally
    pnpm wrangler d1 execute DB --env production --remote --file backup.sql
    ```
 
-3. Rebuild the search index. The export omits `page_search` because D1 cannot export a virtual table,
-   and nothing else reconstructs it:
+3. Rebuild the search indexes. The export omits `page_search_v2` and `page_title_trigrams` because D1
+   cannot export a virtual table, and nothing else reconstructs them. Compaction refreshes a page's
+   search row only when its indexed inputs change, so a restored page can stay missing from search
+   indefinitely unless this runs:
 
    ```sh
    pnpm wrangler d1 execute DB --env production --remote --command \
-     "CREATE VIRTUAL TABLE IF NOT EXISTS page_search USING fts5(
-        page_id UNINDEXED, workspace_id UNINDEXED, title, body, tokenize = 'unicode61');
-      DELETE FROM page_search;
-      INSERT INTO page_search (page_id, workspace_id, title, body)
-      SELECT id, workspace_id, title, plain_text FROM pages WHERE archived_at IS NULL;"
+     "CREATE VIRTUAL TABLE IF NOT EXISTS page_search_v2 USING fts5(
+        page_id UNINDEXED, workspace_id UNINDEXED, space_id UNINDEXED,
+        title, tags, body, comments, attachments, headings, tokenize = 'unicode61');
+      DELETE FROM page_search_v2;
+      INSERT INTO page_search_v2
+        (page_id, workspace_id, space_id, title, tags, body, comments, attachments, headings)
+      SELECT p.id, p.workspace_id, p.space_id, p.title,
+        COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
+          WHERE pt.page_id = p.id), ''),
+        COALESCE(p.plain_text, ''),
+        COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct
+          JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
+        COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), ''),
+        p.headings_text
+      FROM pages p WHERE p.import_job_id IS NULL AND p.is_template = 0;
+      CREATE VIRTUAL TABLE IF NOT EXISTS page_title_trigrams USING fts5(
+        page_id UNINDEXED, normalized_title, content = 'page_title_titles', content_rowid = 'id',
+        tokenize = 'trigram');
+      INSERT INTO page_title_trigrams(page_title_trigrams) VALUES('rebuild');"
    ```
 
-   Archived pages are deliberately excluded, matching what compaction maintains. Search returns nothing
-   until this runs; every other feature works without it.
+   Archived pages stay indexed so the archive search filter can find them. The statement mirrors the
+   projection in `src/worker/search-index.ts`; keep the two in step. Search returns nothing until this
+   runs; every other feature works without it. The retired `page_search` view needs no rebuild.
 
 4. Restore R2 keys without changing them.
 5. Point bindings at the restored resources.

@@ -944,7 +944,12 @@ async function removeDeletionMetadata(env: Env, job: DeletionJobRow, leaseUntil:
       job.id,
       leaseUntil,
     ),
-    env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (${ids}) AND ${guard}`).bind(job.id, job.id, leaseUntil),
+    // Purged text must leave the search index with the page.
+    env.DB.prepare(`DELETE FROM page_search_v2 WHERE page_id IN (${ids}) AND ${guard}`).bind(
+      job.id,
+      job.id,
+      leaseUntil,
+    ),
     env.DB.prepare(
       `DELETE FROM attachment_uploads WHERE state IN ('r2_complete','committed') AND page_id IN (${ids}) AND ${guard}`,
     ).bind(job.id, job.id, leaseUntil),
