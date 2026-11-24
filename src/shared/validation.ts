@@ -1,5 +1,5 @@
 import { PAGE_KINDS, type PageKind } from "./page-kind.ts";
-import type { ColumnType, Page, Role, WorkspaceEvent } from "./types";
+import type { ColumnType, Page, Role, WorkspaceEvent, WorkspaceStreamMessage } from "./types";
 import { readTableCoverage } from "./table-coverage.ts";
 
 export class ValidationError extends Error {}
@@ -115,6 +115,26 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function stringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function streamSeq(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+/** Parse workspace event socket bookkeeping; events and unknown messages return null. */
+export function parseWorkspaceStreamMessage(value: unknown): WorkspaceStreamMessage | null {
+  const message = record(value);
+  if (!message || !streamSeq(message.seq)) return null;
+  if (message.type === "stream-seq") return { type: "stream-seq", seq: message.seq };
+  if (message.type === "stream-hello" && typeof message.streamId === "string" && ID_PATTERN.test(message.streamId))
+    return { type: "stream-hello", streamId: message.streamId, seq: message.seq };
+  return null;
+}
+
+/** The stream position stamped on a workspace event, if the server sent one. */
+export function workspaceEventSeq(value: unknown): number | null {
+  const seq = record(value)?.seq;
+  return streamSeq(seq) ? seq : null;
 }
 
 export function parseWorkspaceEvent(value: unknown): WorkspaceEvent | null {

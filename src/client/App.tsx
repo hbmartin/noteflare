@@ -41,6 +41,7 @@ import type {
   Space,
   Tag,
   TagColor,
+  WorkspaceConnectKind,
   WorkspaceEvent,
 } from "../shared/types";
 import { isPage } from "../shared/validation";
@@ -2971,10 +2972,17 @@ function Workspace({
   const handleWorkspaceEvent = useCallback(
     (event: WorkspaceEvent) => {
       if (event.type === "workspace-invalidated") {
+        // Also the reconnect catch-up: refresh everything another event could have changed.
         invalidateAllPagePreviews();
         setBacklinksRevision((current) => current + 1);
+        setCommentsRevision((current) => current + 1);
+        setNotificationsRevision((current) => current + 1);
+        setTaskRefresh((current) => ({ ...current, globalForceVersion: current.globalForceVersion + 1 }));
         refreshTrash();
         void loadUnreadMentions();
+        void loadUnreadNotifications();
+        void loadOrganization();
+        if (activitiesOpen) void loadJobs();
         void refreshInvalidatedWorkspace();
         return;
       }
@@ -3105,7 +3113,18 @@ function Workspace({
         window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: event }));
         handleWorkspaceEventRef.current(event);
       },
-      () => {
+      (kind?: WorkspaceConnectKind) => {
+        // Some notification writers do not broadcast, so unread counts reload on every connection.
+        void loadUnreadMentions();
+        void loadUnreadNotifications();
+        if (kind === "current") return;
+        if (kind === "catch-up") {
+          // Events were missed: replay the server's own catch-all invalidation for every subscriber.
+          const event: WorkspaceEvent = { type: "workspace-invalidated" };
+          window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: event }));
+          handleWorkspaceEventRef.current(event);
+          return;
+        }
         void loadPages().catch((error) => {
           if (signal.aborted) return;
           reportWorkspaceError(
@@ -3113,8 +3132,6 @@ function Workspace({
             apiErrorMessage(error, "The page tree could not be refreshed."),
           );
         });
-        void loadUnreadMentions();
-        void loadUnreadNotifications();
       },
     );
     return () => bundle.destroy();

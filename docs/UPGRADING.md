@@ -293,6 +293,15 @@ each room refreshes the row as before. Permanent deletion now also removes the p
 No feature activation, Durable Object class migration, or quiescence confirmation is needed. Keep relations
 disabled.
 
+## Workspace event stream positions
+
+This release adds no D1 migration. `WorkspaceEvents` objects create a one-row `workspace_event_stream` table in
+their own SQLite storage on first start, send a position when each connection opens, and stamp every event
+with it. Browsers from before this release ignore the new message and the extra field, and keep reloading the
+page tree on every reconnect. Updated browsers connected to an object still running the previous code receive
+no position and fall back to that same behavior, so the Worker and assets can deploy in either order and roll
+back without data changes.
+
 ## Automated deployment guards
 
 The production workflow stops when `0011_page_move_receipt_envelopes.sql` or a guarded Slack migration is pending. Complete the relevant quiescence procedure, then use manual workflow dispatch with `confirm_page_move_receipt_migration_safe` or `confirm_slack_review_migration_safe`. A confirmation records maintenance already completed; it does not pause live consumers. Later releases need no confirmation after these migrations are applied.

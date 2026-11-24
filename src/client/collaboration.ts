@@ -1,8 +1,8 @@
 import { IndexeddbPersistence } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
-import type { WorkspaceEvent } from "../shared/types";
-import { parseWorkspaceEvent } from "../shared/validation";
+import type { WorkspaceConnectKind, WorkspaceEvent } from "../shared/types";
+import { parseWorkspaceEvent, parseWorkspaceStreamMessage, workspaceEventSeq } from "../shared/validation";
 import { CollaborationDurability } from "./collaboration-durability";
 import { connectionRetryDelay } from "./retry";
 import { reportClientError } from "./telemetry";
@@ -498,33 +498,132 @@ export async function waitForOfflinePersistence(persistence: IndexeddbPersistenc
   }
 }
 
+/** How long a connection waits for the server's stream hello before reloading everything. */
+const WORKSPACE_HELLO_TIMEOUT_MS = 10_000;
+/**
+ * Event delivery from Workers and Durable Objects is fire-and-forget, so a
+ * broadcast that never reaches the stream cannot advance it. Reconnecting does
+ * a full reload at least this often, as it did on every reconnect before
+ * streams existed.
+ */
+const WORKSPACE_AUTHORITATIVE_RELOAD_MS = 15 * 60_000;
+/**
+ * Grant renewals reconnect within seconds. A longer outage (offline, or the
+ * Worker or Durable Object unavailable) may have dropped broadcasts before they
+ * were numbered, so it always catches up.
+ */
+const WORKSPACE_OUTAGE_MS = 15_000;
+
+/**
+ * Subscribe to workspace events.
+ *
+ * `onConnected` reports what each connection must reload once the server's
+ * position is known. It also reports `catch-up` mid-connection when a skipped
+ * position shows that this connection missed an event.
+ */
 export function createWorkspaceEvents(
   workspaceId: string,
   onEvent: (event: WorkspaceEvent) => void,
-  onConnected: () => void,
+  onConnected: (kind: WorkspaceConnectKind) => void,
 ): WorkspaceEventsBundle {
   const doc = new Y.Doc();
   const provider = new YProvider(window.location.host, workspaceId, doc, {
     party: "workspace-events",
   });
+  let stream: { id: string; seq: number } | null = null;
+  let gap = false;
+  let authoritativeAt = 0;
+  let connectionReported = true;
+  let disconnectedAt: number | null = null;
+  let helloTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const report = (kind: WorkspaceConnectKind) => {
+    clearTimeout(helloTimer);
+    helloTimer = undefined;
+    connectionReported = true;
+    if (kind !== "current") {
+      gap = false;
+      authoritativeAt = Date.now();
+    }
+    onConnected(kind);
+  };
+  const legacy = () => {
+    // Without a hello there is no position to compare, so every reconnect reloads.
+    stream = null;
+    disconnectedAt = null;
+    report("legacy");
+  };
+  const advance = (seq: number) => {
+    if (!stream || seq <= stream.seq) return;
+    if (seq > stream.seq + 1) gap = true;
+    stream = { id: stream.id, seq };
+    if (gap && connectionReported) report("catch-up");
+  };
+  const hello = (streamId: string, seq: number) => {
+    const now = Date.now();
+    const kind: WorkspaceConnectKind = !stream
+      ? "initial"
+      : stream.id === streamId &&
+          stream.seq === seq &&
+          !gap &&
+          (disconnectedAt === null || now - disconnectedAt < WORKSPACE_OUTAGE_MS) &&
+          now - authoritativeAt < WORKSPACE_AUTHORITATIVE_RELOAD_MS
+        ? "current"
+        : "catch-up";
+    stream = { id: streamId, seq };
+    disconnectedAt = null;
+    report(kind);
+  };
   const customMessage = (message: string) => {
+    let value: unknown;
     try {
-      const event = parseWorkspaceEvent(JSON.parse(message));
-      if (event) onEvent(event);
+      value = JSON.parse(message);
     } catch {
       // Ignore messages from future server versions.
+      return;
     }
+    const bookkeeping = parseWorkspaceStreamMessage(value);
+    if (bookkeeping?.type === "stream-hello") {
+      if (!connectionReported) hello(bookkeeping.streamId, bookkeeping.seq);
+      return;
+    }
+    if (bookkeeping) {
+      advance(bookkeeping.seq);
+      return;
+    }
+    const event = parseWorkspaceEvent(value);
+    if (event) onEvent(event);
+    const seq = workspaceEventSeq(value);
+    if (seq !== null) advance(seq);
   };
   const status = ({ status: next }: { status: string }) => {
-    if (next === "connected") onConnected();
+    if (next === "disconnected") {
+      // Keep the first disconnect of an outage; failed reconnects report it again.
+      disconnectedAt ??= Date.now();
+      return;
+    }
+    if (next !== "connected") return;
+    connectionReported = false;
+    clearTimeout(helloTimer);
+    helloTimer = setTimeout(() => {
+      if (!connectionReported) legacy();
+    }, WORKSPACE_HELLO_TIMEOUT_MS);
+  };
+  const sync = (synced: boolean) => {
+    // The server sends its hello before its sync reply, so a sync without one
+    // means an older Durable Object that does not number its events.
+    if (synced && !connectionReported) legacy();
   };
   provider.on("custom-message", customMessage);
   provider.on("status", status);
+  provider.on("sync", sync);
   return {
     provider,
     destroy() {
+      clearTimeout(helloTimer);
       provider.off("custom-message", customMessage);
       provider.off("status", status);
+      provider.off("sync", sync);
       provider.awareness.setLocalState(null);
       provider.destroy();
       doc.destroy();

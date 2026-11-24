@@ -3,7 +3,7 @@
 import { act, cleanup, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { startTransition, StrictMode, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import type { ClientMemberContext, Job, Page, Space, Tag, WorkspaceEvent } from "../shared/types";
+import type { ClientMemberContext, Job, Page, Space, Tag, WorkspaceConnectKind, WorkspaceEvent } from "../shared/types";
 import type { Task } from "../shared/tasks";
 import type { EditorPageProps } from "./EditorPage";
 import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, UnreadableApiResponseError } from "./api";
@@ -16,7 +16,7 @@ import { sha256Hex } from "../shared/import-integrity";
 configure({ asyncUtilTimeout: 3000 });
 
 const mocks = vi.hoisted(() => ({
-  createWorkspaceEvents: vi.fn((_workspaceId: string, _onEvent: unknown, _onReconnect: () => void) => ({
+  createWorkspaceEvents: vi.fn((_workspaceId: string, _onEvent: unknown, _onReconnect: (kind?: unknown) => void) => ({
     destroy: vi.fn(),
     provider: {},
   })),
@@ -193,10 +193,11 @@ function mockTreeEffects() {
   return animate;
 }
 
-function reconnectWorkspace() {
+/** Report a workspace event connection; no kind is a server without stream positions. */
+function reconnectWorkspace(kind?: WorkspaceConnectKind) {
   const reconnect = mocks.createWorkspaceEvents.mock.calls.at(-1)?.[2];
   if (!reconnect) throw new Error("Workspace reconnect handler was not registered.");
-  reconnect();
+  reconnect(kind);
 }
 
 function dispatchWorkspaceEvent(event: WorkspaceEvent) {
@@ -283,6 +284,44 @@ describe("App error handling", () => {
     cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("resumes a current workspace connection without reloading the tree", async () => {
+    mockShellApi();
+    render(<App />);
+    await screen.findByRole("button", { name: "Actions for Roadmap" });
+    const calls = () => vi.mocked(api).mock.calls.map(([path]) => path);
+    await waitFor(() => expect(calls()).toContain("/api/spaces"));
+    vi.mocked(api).mockClear();
+
+    await act(async () => reconnectWorkspace("current"));
+
+    await waitFor(() => expect(calls()).toContain("/api/mentions/unread-count"));
+    expect(calls()).toContain("/api/notifications?limit=1&unread=true");
+    expect(calls()).not.toContain("/api/pages/tree");
+    expect(calls()).not.toContain("/api/spaces");
+  });
+
+  it("catches up every workspace subscriber after missed events", async () => {
+    mockShellApi();
+    render(<App />);
+    await screen.findByRole("button", { name: "Actions for Roadmap" });
+    const calls = () => vi.mocked(api).mock.calls.map(([path]) => path);
+    await waitFor(() => expect(calls()).toContain("/api/spaces"));
+    vi.mocked(api).mockClear();
+    const received: unknown[] = [];
+    const listener = (event: Event) => received.push((event as CustomEvent<WorkspaceEvent>).detail);
+    window.addEventListener("notes:workspace-event", listener);
+    onTestFinished(() => window.removeEventListener("notes:workspace-event", listener));
+
+    await act(async () => reconnectWorkspace("catch-up"));
+
+    expect(received).toEqual([{ type: "workspace-invalidated" }]);
+    await waitFor(() => expect(calls()).toContain("/api/pages/tree"));
+    expect(calls()).toContain("/api/spaces");
+    expect(calls()).toContain("/api/tags");
+    expect(calls()).toContain("/api/notifications?limit=1&unread=true");
+    expect(mocks.invalidateAllPagePreviews).toHaveBeenCalled();
   });
 
   it.each([

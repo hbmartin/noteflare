@@ -1,7 +1,7 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { REALTIME_GRANT_MS, REALTIME_ROOM_MARGIN_MS, REALTIME_CLOCK_SKEW_MS } from "../shared/realtime-limits";
 import { YServer } from "y-partyserver";
-import type { Page, WorkspaceEvent } from "../shared/types";
+import type { Page, WorkspaceEvent, WorkspaceStreamMessage } from "../shared/types";
 import { ID_PATTERN, parseWorkspaceEvent } from "../shared/validation";
 import type { Env } from "./env";
 import { correlationHeaders, logger, withDurableObjectContext } from "./observability";
@@ -88,8 +88,51 @@ export class WorkspaceEvents extends YServer {
       CREATE TABLE IF NOT EXISTS realtime_rooms(room TEXT PRIMARY KEY,expires_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS realtime_fanout(room TEXT PRIMARY KEY,generation INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS realtime_room_fences(room TEXT PRIMARY KEY,generation INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS realtime_legacy_scan(id INTEGER PRIMARY KEY,deadline INTEGER NOT NULL,cursor TEXT NOT NULL,complete INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS realtime_legacy_scan(id INTEGER PRIMARY KEY,deadline INTEGER NOT NULL,cursor TEXT NOT NULL,complete INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS workspace_event_stream(id INTEGER PRIMARY KEY CHECK(id=1),stream_id TEXT NOT NULL,seq INTEGER NOT NULL);`);
     this.state.storage.sql.exec("INSERT OR IGNORE INTO realtime_legacy_scan VALUES(1,?,'',0)", Date.now() + 5 * 60_000);
+    this.state.storage.sql.exec("INSERT OR IGNORE INTO workspace_event_stream VALUES(1,?,0)", crypto.randomUUID());
+  }
+
+  /**
+   * Every event a connection could have received advances one durable sequence.
+   * A reconnecting client compares the position in its hello with the last one it
+   * saw, so it reloads only when something happened while it was away. The
+   * stream id changes only if this object's storage is recreated.
+   */
+  private streamPosition() {
+    return this.state.storage.sql
+      .exec<{ stream_id: string; seq: number }>("SELECT stream_id, seq FROM workspace_event_stream WHERE id=1")
+      .one();
+  }
+
+  /** Allocate the next position. Call it immediately before the sends it stamps. */
+  private nextSeq() {
+    return this.state.storage.sql
+      .exec<{ seq: number }>("UPDATE workspace_event_stream SET seq=seq+1 WHERE id=1 RETURNING seq")
+      .one().seq;
+  }
+
+  /**
+   * Record that connected clients may have missed something without sending a
+   * message: the next hello or event reveals the gap and the client catches up.
+   */
+  private markStreamGap() {
+    try {
+      this.nextSeq();
+    } catch (error) {
+      logger.error(
+        "workspace_events.stream_gap.failed",
+        "workspace-events",
+        "The event stream position could not record a missed delivery.",
+        { workspaceId: this.state.id.name },
+        error,
+      );
+    }
+  }
+
+  private stamped(event: WorkspaceEvent, seq: number) {
+    return JSON.stringify({ ...event, seq });
   }
 
   private authGeneration() {
@@ -151,6 +194,17 @@ export class WorkspaceEvents extends YServer {
       return;
     }
     connection.setState({ userId, expiresAt, authGeneration });
+    // Send the position before any await: nothing can be broadcast to this
+    // connection until it returns, so no event can precede the hello.
+    const position = this.streamPosition();
+    this.sendCustomMessage(
+      connection,
+      JSON.stringify({
+        type: "stream-hello",
+        streamId: position.stream_id,
+        seq: position.seq,
+      } satisfies WorkspaceStreamMessage),
+    );
     await this.scheduleAlarm(expiresAt);
     await super.onConnect(connection, context);
   }
@@ -253,7 +307,12 @@ export class WorkspaceEvents extends YServer {
         }
         return Response.json({ generation });
       }
+      const previousGeneration = this.authGeneration();
       this.state.storage.sql.exec("UPDATE realtime_control SET generation=max(generation,?) WHERE id=1", generation);
+      // Revoked members reconnect into a fresh load; anyone else reloads on their
+      // next connection. Alarm retries repeat this request for the same
+      // generation, and those must not make every connected browser reload.
+      if (this.authGeneration() > previousGeneration) this.markStreamGap();
       await this.scheduleAlarm(Date.now() + 2_000);
       for (const connection of this.getConnections<EventConnectionAuth>()) {
         if ((connection.state?.authGeneration ?? 0) < this.authGeneration())
@@ -323,7 +382,12 @@ export class WorkspaceEvents extends YServer {
       event.type === "notifications-invalidated" ||
       event.type === "jobs-invalidated"
     ) {
-      await this.broadcastEvent(event, workspaceId);
+      try {
+        await this.broadcastEvent(event, workspaceId);
+      } catch (error) {
+        this.markStreamGap();
+        throw error;
+      }
       return Response.json({ delivered: true });
     }
     if (this.queuedDeliveries >= WORKSPACE_EVENT_DELIVERY_QUEUE_LIMIT) {
@@ -342,6 +406,7 @@ export class WorkspaceEvents extends YServer {
         );
       }
       this.resyncRequired = true;
+      this.markStreamGap();
       return Response.json({ delivered: false, resyncScheduled: true }, { status: 202 });
     }
     this.queuedDeliveries += 1;
@@ -375,6 +440,7 @@ export class WorkspaceEvents extends YServer {
         error,
       );
       this.resyncRequired = true;
+      this.markStreamGap();
       return Response.json({ delivered: false, resyncScheduled: true }, { status: 202 });
     }
   }
@@ -387,7 +453,7 @@ export class WorkspaceEvents extends YServer {
       event.type === "notifications-invalidated" ||
       event.type === "jobs-invalidated"
     ) {
-      this.broadcastCustomMessage(JSON.stringify(event));
+      this.broadcastCustomMessage(this.stamped(event, this.nextSeq()));
     } else {
       const pageIds =
         event.type === "pages-upserted"
@@ -407,7 +473,7 @@ export class WorkspaceEvents extends YServer {
       // Any unresolved id takes this path: filtering it out of a mixed batch would
       // leave clients showing a page that no longer exists.
       if (pages.results.length !== new Set(pageIds).size) {
-        this.broadcastCustomMessage(JSON.stringify({ type: "workspace-invalidated" } satisfies WorkspaceEvent));
+        this.broadcastCustomMessage(this.stamped({ type: "workspace-invalidated" }, this.nextSeq()));
         return;
       }
 
@@ -457,8 +523,12 @@ export class WorkspaceEvents extends YServer {
 
       // Workspace-visible spaces share one safe audience, so keep the fast
       // broadcast path. Private-space events are partitioned per connection.
+      // Every connection sees this position: the event, its private version, or a
+      // tick when it is outside the audience. Allocated after the reads above so
+      // concurrently delivered events reach clients in sequence order.
+      const seq = this.nextSeq();
       const workspaceEvent = eventForAudience((pageId) => byId.get(pageId)?.visibility === "workspace");
-      if (workspaceEvent) this.broadcastCustomMessage(JSON.stringify(workspaceEvent));
+      if (workspaceEvent) this.broadcastCustomMessage(this.stamped(workspaceEvent, seq));
       for (const connection of this.getConnections<EventConnectionAuth>()) {
         const userId = connection.state?.userId;
         if (!userId) continue;
@@ -466,7 +536,12 @@ export class WorkspaceEvents extends YServer {
           const page = byId.get(pageId);
           return Boolean(page?.visibility === "private" && allowed.get(page.space_id)?.has(userId));
         });
-        if (visible) this.sendCustomMessage(connection, JSON.stringify(visible));
+        if (visible) this.sendCustomMessage(connection, this.stamped(visible, seq));
+        else if (!workspaceEvent)
+          this.sendCustomMessage(
+            connection,
+            JSON.stringify({ type: "stream-seq", seq } satisfies WorkspaceStreamMessage),
+          );
       }
     }
     if (event.type !== "workspace-invalidated") return;

@@ -109,31 +109,44 @@ export function subscribeDiagramEmbed(account: string, pageId: string, listener:
     const workspace = (event: Event) => {
       const change = (event as CustomEvent<WorkspaceEvent>).detail;
       if (change?.type === "pages-removed" && change.pageIds.includes(pageId)) unavailable();
-      else if (change?.type === "pages-upserted" && change.pages.some((page) => page.id === pageId)) void refresh();
+      else if (
+        // A missed-event catch-up arrives as a workspace invalidation; recheck access and the epoch.
+        change?.type === "workspace-invalidated" ||
+        (change?.type === "pages-upserted" && change.pages.some((page) => page.id === pageId))
+      )
+        void refresh();
     };
     const online = () => {
       void refresh();
     };
     window.addEventListener("notes:workspace-event", workspace);
     window.addEventListener("online", online);
-    pool = {
-      subscribe(receive) {
+    const current = {
+      subscribe(receiveState: (state: DiagramEmbedState) => void) {
+        // Wrap each subscription so two embeds passing the same function stay distinct.
+        const receive = (next: DiagramEmbedState) => receiveState(next);
         listeners.add(receive);
         receive(state);
         void refresh();
+        let subscribed = true;
         return () => {
+          if (!subscribed) return;
+          subscribed = false;
           listeners.delete(receive);
           if (listeners.size) return;
           active = false;
           if (retryTimer) clearTimeout(retryTimer);
           generation++;
           disposeRoom();
+          disposeRoom = noop;
           window.removeEventListener("notes:workspace-event", workspace);
           window.removeEventListener("online", online);
-          pools.delete(key);
+          // A newer pool may already serve this key; never evict it.
+          if (pools.get(key) === current) pools.delete(key);
         };
       },
     };
+    pool = current;
     pools.set(key, pool);
   }
   return pool.subscribe(listener);
