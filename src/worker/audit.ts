@@ -228,15 +228,16 @@ const auditCleanupBindingReasons = new Map<string, "lock" | "transient">([
 const transientAuditCleanupStatuses = new Set([429, 502, 503, 504]);
 
 function auditCleanupFailure(error: unknown) {
+  if (!error || typeof error !== "object") return "unknown";
   // The Workers binding exposes the R2 code in a plain Error's message.
   const bindingCode =
     error instanceof Error ? /^(?:R2 )?(?:head|delete): [\s\S]* \((\d+)\)$/.exec(error.message)?.[1] : undefined;
   const bindingReason = auditCleanupBindingReasons.get(bindingCode ?? "");
-  if (bindingReason) return bindingReason;
-  if (!error || typeof error !== "object") return "unknown";
-  if ("code" in error && error.code === "ObjectLockedByBucketPolicy") return "lock";
-  const status = "status" in error ? error.status : "statusCode" in error ? error.statusCode : undefined;
-  return typeof status === "number" && transientAuditCleanupStatuses.has(status) ? "transient" : "unknown";
+  if (bindingReason === "lock" || ("code" in error && error.code === "ObjectLockedByBucketPolicy")) return "lock";
+  if (bindingReason === "transient") return "transient";
+  const status = "status" in error ? error.status : undefined;
+  const statusCode = typeof status === "number" ? status : "statusCode" in error ? error.statusCode : undefined;
+  return typeof statusCode === "number" && transientAuditCleanupStatuses.has(statusCode) ? "transient" : "unknown";
 }
 /** Reconcile ambiguous PUTs and bucket-lock races without overwriting verified bytes. */
 export async function immutableAuditObject(
