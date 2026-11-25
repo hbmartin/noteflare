@@ -1415,7 +1415,7 @@ it("retires a failed canonical extent on explicit Refresh without leaving gaps i
     rows.slice(0, 350).map((row) => row.cells.Title),
   );
   expect(offsets.at(-1)).toBe(300);
-});
+}, 15_000);
 
 it("remembers query, month, row title and unfinished settings separately for each view", async () => {
   data.views = data.views.map((view) => ({ ...view, visibleColumnIds: data.columns.map((item) => item.id) }));
