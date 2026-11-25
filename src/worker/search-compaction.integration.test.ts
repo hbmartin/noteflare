@@ -9,7 +9,7 @@ type TestDocument = {
   document: Y.Doc;
   compact(forceVersion?: boolean): Promise<void>;
   bindings: Env;
-  metadata: { last_version_at: number; search_index_key: string | null; search_index_seq: number };
+  metadata: { search_index_key: string | null; search_index_seq: number };
 };
 
 const ACTOR = "search-actor";
@@ -98,10 +98,10 @@ async function compactCounting(room: TestDocument, forceVersion = false) {
   return { refreshedSearch: counted.statements.some((sql) => sql.includes("page_search_v2")) };
 }
 
-function versionIntervalElapsed(room: TestDocument, state: DurableObjectState) {
-  const earlier = Date.now() - VERSION_INTERVAL_MS - 1;
-  room.metadata.last_version_at = earlier;
-  state.storage.sql.exec("UPDATE document_meta SET last_version_at = ? WHERE id = 1", earlier);
+async function versionIntervalElapsed(pageId: string) {
+  await env.DB.prepare("UPDATE page_versions SET created_at = created_at - ? WHERE page_id = ?")
+    .bind(VERSION_INTERVAL_MS + 1, pageId)
+    .run();
 }
 
 beforeEach(async () => {
@@ -218,7 +218,7 @@ describe("compaction search and version writes", () => {
       expect(await versionCount(pageId)).toBe(1);
 
       // Typing and then undoing leaves the visible document unchanged.
-      versionIntervalElapsed(room, state);
+      await versionIntervalElapsed(pageId);
       const text = () => paragraphNode(room.document, "alpha").get(0) as Y.XmlText;
       edit(room.document, () => text().insert(5, " draft"));
       edit(room.document, () => text().delete(5, 6));
@@ -242,9 +242,62 @@ describe("compaction search and version writes", () => {
     });
   });
 
+  it("uses the latest D1 version after an older Worker writes a version without a hash", async () => {
+    const { pageId, stub } = await fixture();
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as TestDocument;
+      paragraph(room.document, "alpha", "Alpha");
+      await room.compact(true);
+      await versionIntervalElapsed(pageId);
+      await env.DB.prepare(`INSERT INTO page_versions
+        (id,page_id,epoch,sequence,title,r2_key,byte_size,created_at)
+        VALUES('older-worker',?,1,2,'Searchable','old-snapshot',1,?)`)
+        .bind(pageId, Date.now() - VERSION_INTERVAL_MS - 1)
+        .run();
+      await env.DB.prepare("UPDATE page_versions SET created_at=created_at-1000 WHERE id<>'older-worker'").run();
+      align(room.document, "alpha", "center");
+      align(room.document, "alpha", "left");
+      await room.compact();
+      expect(await versionCount(pageId)).toBe(3);
+      expect(
+        (
+          await env.DB.prepare(
+            "SELECT content_fingerprint FROM page_versions WHERE page_id=? ORDER BY created_at DESC LIMIT 1",
+          )
+            .bind(pageId)
+            .first<{ content_fingerprint: string }>()
+        )?.content_fingerprint,
+      ).toMatch(/^[a-f0-9]{64}$/);
+    });
+  });
+
+  it("prunes expired history even when a compaction deduplicates its version", async () => {
+    const { pageId, stub } = await fixture();
+    await runInDurableObject(stub, async (instance, state) => {
+      const room = instance as unknown as TestDocument & { metadata: { last_version_prune_at: number } };
+      paragraph(room.document, "alpha", "Alpha");
+      await room.compact(true);
+      await versionIntervalElapsed(pageId);
+      await env.BUCKET.put("expired-snapshot", "expired");
+      await env.DB.prepare(`INSERT INTO page_versions
+        (id,page_id,epoch,sequence,title,r2_key,byte_size,created_at)
+        VALUES('expired',?,1,0,'Searchable','expired-snapshot',1,?)`)
+        .bind(pageId, Date.now() - 31 * 24 * 60 * 60_000)
+        .run();
+      state.storage.sql.exec("UPDATE document_meta SET last_version_prune_at=0 WHERE id=1");
+      room.metadata.last_version_prune_at = 0;
+      const text = paragraphNode(room.document, "alpha").get(0) as Y.XmlText;
+      edit(room.document, () => text.insert(5, "!"));
+      edit(room.document, () => text.delete(5, 1));
+      await room.compact();
+      expect(await versionCount(pageId)).toBe(1);
+      expect(await env.BUCKET.head("expired-snapshot")).toBeNull();
+    });
+  });
+
   it("skips diagram search refreshes for layout changes and versions only new layouts", async () => {
     const { pageId, stub } = await fixture("diagram");
-    await runInDurableObject(stub, async (instance, state) => {
+    await runInDurableObject(stub, async (instance) => {
       const room = instance as unknown as TestDocument;
       const node = new Y.Map<unknown>();
       edit(room.document, () => {
@@ -259,12 +312,12 @@ describe("compaction search and version writes", () => {
       expect(await compactCounting(room, true)).toEqual({ refreshedSearch: true });
       expect((await searchRow(pageId))?.body).toContain("Roadmap");
 
-      versionIntervalElapsed(room, state);
+      await versionIntervalElapsed(pageId);
       edit(room.document, () => node.set("x", 120));
       expect(await compactCounting(room)).toEqual({ refreshedSearch: false });
       expect(await versionCount(pageId)).toBe(2);
 
-      versionIntervalElapsed(room, state);
+      await versionIntervalElapsed(pageId);
       edit(room.document, () => node.set("x", 240));
       edit(room.document, () => node.set("x", 120));
       expect(await compactCounting(room)).toEqual({ refreshedSearch: false });
