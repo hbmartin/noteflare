@@ -1177,11 +1177,10 @@ export function DiagramPage({
     };
   }, [onAccessDenied, onPageUnavailable, onPageChanged, notices, page.contentEpoch, page.id]);
   useEffect(() => {
-    void prefetchedOrFetch<{ threads: CommentThread[] }>(pagePrefetchPaths(page.id).comments)
+    const path = pagePrefetchPaths(page.id).comments;
+    void prefetchedOrFetch<{ threads: CommentThread[] }>(path, `${path}?revision=${commentsRevision}`)
       .then((data) => setThreads(data.threads))
       .catch(() => setThreads([]));
-    // The revision invalidates this read even when the page stays selected.
-    // eslint-disable-next-line react/exhaustive-deps
   }, [commentsRevision, page.id]);
 
   const connected = status === "connected" && Boolean(bundle?.synced) && ready;

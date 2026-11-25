@@ -170,13 +170,13 @@ export function takePrefetched<T>(path: string): Promise<T> | null {
 }
 
 /** If the pending speculative fetch fails or is invalidated, issue the foreground read. */
-export function prefetchedOrFetch<T>(path: string): Promise<T> {
+export function prefetchedOrFetch<T>(path: string, requestPath = path): Promise<T> {
   if (queued) queued.paths = queued.paths.filter((candidate) => candidate !== path);
   const entry = attemptPrefetch(path);
-  if (!entry) return api<T>(path);
+  if (!entry) return api<T>(requestPath);
   const fetchAgain = () => {
     if (!currentPagePrefetchOwner(entry.owner)) throw new DOMException("Page prefetch session changed.", "AbortError");
-    return api<T>(path);
+    return api<T>(requestPath);
   };
   return entry.promise.then(
     (data) => (entry.invalidated || !currentPagePrefetchOwner(entry.owner) ? fetchAgain() : (data as T)),
