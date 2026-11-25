@@ -15,6 +15,7 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
     failure,
     failed = false,
     exited = false,
+    finishDrain,
     drainTimer,
     killTimer;
   function stopChild() {
@@ -22,6 +23,13 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
     child.kill("SIGTERM");
     killTimer = setTimeout(() => child.kill("SIGKILL"), maxShutdownMs);
     killTimer.unref();
+  }
+  function abortChild() {
+    if (!exited) stopChild();
+    else if (finishDrain) {
+      failure ??= "aborted";
+      finishDrain();
+    }
   }
   child.stdout?.on("data", (chunk) => {
     bytes += chunk.length;
@@ -31,17 +39,19 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
     } else output.push(chunk);
   });
   const { promise: finished, resolve: resolveExit } = Promise.withResolvers();
-  const finish = (status) =>
+  const finish = (status) => {
+    finishDrain = undefined;
     resolveExit({
       status: failed || failure ? 1 : status,
       stdout: Buffer.concat(output).toString("utf8"),
       failure,
     });
+  };
   child.on("error", () => {
     failed = true;
   });
   child.once("close", finish);
-  signal?.addEventListener("abort", stopChild, { once: true });
+  signal?.addEventListener("abort", abortChild, { once: true });
   const timeout =
     timeoutMs === undefined
       ? undefined
@@ -55,14 +65,20 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
     clearTimeout(timeout);
     clearTimeout(killTimer);
     if (!child.stdout && !child.stderr) return;
-    drainTimer = setTimeout(() => {
-      failure ??= "output-drain";
+    finishDrain = () => {
       child.removeListener("close", finish);
       child.stdout?.destroy();
       child.stderr?.destroy();
       finish(status);
-    }, maxOutputDrainMs);
-    drainTimer.unref();
+    };
+    if (signal?.aborted) abortChild();
+    else {
+      drainTimer = setTimeout(() => {
+        failure ??= "output-drain";
+        finishDrain?.();
+      }, maxOutputDrainMs);
+      drainTimer.unref();
+    }
   });
   try {
     if (child.pid) onChild?.(child.pid);
@@ -75,6 +91,6 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
     clearTimeout(timeout);
     clearTimeout(drainTimer);
     clearTimeout(killTimer);
-    signal?.removeEventListener("abort", stopChild);
+    signal?.removeEventListener("abort", abortChild);
   }
 }
