@@ -2,7 +2,13 @@ import { retiredPublicationSnapshots } from "./publication-snapshots";
 import { restartablePublicationFailure, publicationNeedsJob } from "./publication-failure";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
-import { platformJobDeadlineSql, recoverPlatformJobs, type PlatformHandlers } from "./platform-jobs";
+import {
+  platformJobDeadlineSql,
+  recoverPlatformJobs,
+  type PlatformHandlers,
+  type QueueDispatchCooldown,
+  type QueueDispatchRow,
+} from "./platform-jobs";
 import { handleSemanticJob, sweepSemanticJobs, semanticEnabled, unclaimedSemanticWork } from "./semantic";
 import { processPublicationBuildJob } from "./publication-builder";
 import { enqueuePendingPublications, processHostnameSyncJob } from "./publications";
@@ -36,6 +42,21 @@ type MaintenanceSchedule = {
   jobDeadlineRefreshed?: true;
   retries?: Record<string, { attempts: number; at: number }>;
 };
+
+const dispatchCooldownKey = "queueDispatchCooldowns";
+const dispatchCooldownMaxMs = 3_600_000;
+const maxDispatchCooldowns = 100;
+
+function matchesDispatch(
+  row: QueueDispatchRow,
+  entry: QueueDispatchCooldown | undefined,
+): entry is QueueDispatchCooldown {
+  return (
+    entry?.generation === row.generation &&
+    entry.created_at === row.created_at &&
+    entry.queue_dispatch_revision === row.queue_dispatch_revision
+  );
+}
 
 export const platformHandlers: PlatformHandlers = {
   semantic: handleSemanticJob,
@@ -147,12 +168,44 @@ export class PlatformCoordinator extends DurableObject<Env> {
     }
     delete state.jobDeadlineRead;
   }
+  private async dispatchCooldowns() {
+    return (await this.ctx.storage.get<QueueDispatchCooldown[]>(dispatchCooldownKey)) ?? [];
+  }
+  private async recordDispatchCooldowns(
+    cooldowns: QueueDispatchCooldown[],
+    failed: QueueDispatchRow[],
+    recorded: QueueDispatchRow[],
+  ) {
+    if (!cooldowns.length && !failed.length) return;
+    const now = Date.now();
+    const entries = new Map(
+      cooldowns.filter((entry) => entry.at + dispatchCooldownMaxMs > now).map((entry) => [entry.id, entry]),
+    );
+    for (const row of recorded) {
+      if (matchesDispatch(row, entries.get(row.id))) entries.delete(row.id);
+    }
+    for (const row of failed) {
+      const prior = entries.get(row.id);
+      const attempts = Math.min(matchesDispatch(row, prior) ? prior.attempts + 1 : 1, 7);
+      const at = now + Math.min(dispatchCooldownMaxMs, 60_000 * 2 ** (attempts - 1));
+      entries.delete(row.id);
+      entries.set(row.id, { ...row, attempts, at });
+    }
+    const next = [...entries.values()].slice(-maxDispatchCooldowns);
+    if (next.length === cooldowns.length && next.every((entry, index) => entry === cooldowns[index])) return;
+    if (next.length) await this.ctx.storage.put(dispatchCooldownKey, next);
+    else await this.ctx.storage.delete(dispatchCooldownKey);
+  }
   private async refreshJobDeadline() {
     const id = await this.beginJobDeadlineRead();
     let due: number | null | undefined;
     try {
-      due = await this.env.DB.prepare(
-        `SELECT min(${platformJobDeadlineSql(Boolean(this.env.PLATFORM_QUEUE))}) due FROM platform_jobs`,
+      const queueEnabled = Boolean(this.env.PLATFORM_QUEUE);
+      const statement = this.env.DB.prepare(
+        `SELECT min(${platformJobDeadlineSql(queueEnabled)}) due FROM platform_jobs`,
+      );
+      due = await (
+        queueEnabled ? statement.bind(JSON.stringify(await this.dispatchCooldowns())) : statement
       ).first<number>("due");
     } catch {
       logger.warn(
@@ -204,12 +257,11 @@ export class PlatformCoordinator extends DurableObject<Env> {
             await enqueuePendingPublications(alarmEnv);
             break;
           case 2: {
-            const { queueAttempts, queueSendFailures, dispatchStateFailures } = await recoverPlatformJobs(
-              alarmEnv,
-              platformHandlers,
-              alarmEnv.PLATFORM_QUEUE ? 10 : 1,
-            );
-            if (queueAttempts > 0 && dispatchStateFailures === queueAttempts) {
+            const cooldowns = alarmEnv.PLATFORM_QUEUE ? await this.dispatchCooldowns() : [];
+            const { queueAttempts, queueSendFailures, dispatchStateFailures, dispatchStateRecorded } =
+              await recoverPlatformJobs(alarmEnv, platformHandlers, alarmEnv.PLATFORM_QUEUE ? 10 : 1, cooldowns);
+            await this.recordDispatchCooldowns(cooldowns, dispatchStateFailures, dispatchStateRecorded);
+            if (queueAttempts > 0 && dispatchStateFailures.length === queueAttempts) {
               logger.warn(
                 "platform.maintenance.dispatch_state_unavailable",
                 "platform",
@@ -270,9 +322,11 @@ export class PlatformCoordinator extends DurableObject<Env> {
       const now = Date.now(),
         retries = (await this.scheduleState()).retries;
       const phaseDue = (operation: number) => Math.max(now, retries?.[operation]?.at ?? 0);
+      const queueEnabled = Boolean(this.env.PLATFORM_QUEUE);
+      const queueBindings = queueEnabled ? [JSON.stringify(await this.dispatchCooldowns())] : [];
       // D1 permits at most five compound SELECT terms. Combine each phase's work.
       scanned = await this.env.DB.prepare(`SELECT min(job_due) job_due,min(maintenance_due) maintenance_due FROM (
-      SELECT ${platformJobDeadlineSql(Boolean(this.env.PLATFORM_QUEUE))} job_due,NULL maintenance_due FROM platform_jobs
+      SELECT ${platformJobDeadlineSql(queueEnabled)} job_due,NULL maintenance_due FROM platform_jobs
       UNION ALL SELECT NULL,max(s.next_attempt_at,?) ${retiredPublicationSnapshots}
       UNION ALL SELECT NULL,? FROM publications p WHERE ?=1 AND ((${publicationNeedsJob}) OR (${restartablePublicationFailure}))
       UNION ALL SELECT NULL,? WHERE ?=1 AND EXISTS(SELECT 1 FROM semantic_dirty d WHERE ${unclaimedSemanticWork} LIMIT 1)
@@ -280,6 +334,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
         SELECT (SELECT ? FROM audit_events WHERE ?=1 AND archive_id IS NULL LIMIT 1) archive_due,
           (SELECT ? FROM audit_events WHERE ?=1 AND basin_exported_at IS NULL LIMIT 1) basin_due))`)
         .bind(
+          ...queueBindings,
           phaseDue(8),
           phaseDue(1),
           this.env.PUBLIC_PUBLISHING_ENABLED === "true" ? 1 : 0,

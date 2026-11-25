@@ -701,11 +701,12 @@ it("wakes the coordinator for an encoded key rotation route without Queue or opt
 });
 
 it.each([
-  { semanticEnabled: "false", retryPath: "/api/platform/retry" },
-  { semanticEnabled: "true", retryPath: "/api/platform/%72etry" },
+  { semanticEnabled: "false", retryPath: "/api/platform/retry", failEarly: false },
+  { semanticEnabled: "true", retryPath: "/api/platform/%72etry", failEarly: false },
+  { semanticEnabled: "false", retryPath: "/api/platform/retry", failEarly: true },
 ] as const)(
-  "owner Retry at $retryPath wakes once and preserves outage backoff",
-  async ({ semanticEnabled, retryPath }) => {
+  "owner Retry at $retryPath wakes once and preserves outage backoff (early failure: $failEarly)",
+  async ({ semanticEnabled, retryPath, failEarly }) => {
     const cookie = await enrollPlatformOwner("retry-owner@example.test");
 
     const now = Date.now();
@@ -757,9 +758,10 @@ it.each([
       AUDIT_ENABLED: "false",
       HEATMAPS_ENABLED: "false",
     };
+    const requests: { context: ReturnType<typeof createExecutionContext>; response: Promise<Response> }[] = [];
     const requestRetry = async () => {
       const context = createExecutionContext();
-      const response = await worker.fetch(
+      const response = worker.fetch(
         new Request(`http://example.test${retryPath}`, {
           method: "POST",
           headers: { origin: "http://example.test", cookie },
@@ -767,49 +769,65 @@ it.each([
         configured,
         context,
       );
-      expect(response.status).toBe(200);
+      requests.push({ context, response });
+      expect((await response).status).toBe(200);
       return context;
     };
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-    try {
-      const context = await requestRetry();
-      expect(wake).toHaveBeenCalledExactlyOnceWith(undefined, now);
-      expect(await env.DB.prepare("SELECT available_at FROM platform_jobs WHERE id='due'").first("available_at")).toBe(
-        now,
-      );
-      releaseWake();
-      await waitOnExecutionContext(context);
-      await runInDurableObject(stub, async (_instance, state) => {
-        expect(await state.storage.get("schedule")).toMatchObject({ jobRetryAt: now, retries: { 2: outage } });
-        expect(await state.storage.getAlarm()).toBe(now + 60_000);
-        await state.storage.deleteAlarm();
-      });
-      const rows = await env.DB.prepare(`SELECT id,available_at,queue_redispatch_at,queue_send_failures,
+    const exercise = async () => {
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      try {
+        const context = await requestRetry();
+        expect(wake).toHaveBeenCalledExactlyOnceWith(undefined, now);
+        expect(
+          await env.DB.prepare("SELECT available_at FROM platform_jobs WHERE id='due'").first("available_at"),
+        ).toBe(now);
+        if (failEarly) throw new Error("fixture_before_drain");
+        releaseWake();
+        await waitOnExecutionContext(context);
+        await runInDurableObject(stub, async (_instance, state) => {
+          expect(await state.storage.get("schedule")).toMatchObject({ jobRetryAt: now, retries: { 2: outage } });
+          expect(await state.storage.getAlarm()).toBe(now + 60_000);
+        });
+        const rows = await env.DB.prepare(`SELECT id,available_at,queue_redispatch_at,queue_send_failures,
       queue_dispatch_revision FROM platform_jobs ORDER BY id`).all();
-      expect(rows.results).toEqual([
-        { id: "due", available_at: now, queue_redispatch_at: 0, queue_send_failures: 0, queue_dispatch_revision: 4 },
-        {
-          id: "leased",
-          available_at: redispatchAt,
-          queue_redispatch_at: redispatchAt,
-          queue_send_failures: 2,
-          queue_dispatch_revision: 3,
-        },
-        {
-          id: "other",
-          available_at: redispatchAt,
-          queue_redispatch_at: redispatchAt,
-          queue_send_failures: 2,
-          queue_dispatch_revision: 3,
-        },
-      ]);
-      await env.DB.prepare("DELETE FROM platform_jobs WHERE id='due'").run();
-      await waitOnExecutionContext(await requestRetry());
-      expect(wake).toHaveBeenCalledTimes(1);
-    } finally {
-      releaseWake();
-      clock.mockRestore();
-    }
+        expect(rows.results).toEqual([
+          { id: "due", available_at: now, queue_redispatch_at: 0, queue_send_failures: 0, queue_dispatch_revision: 4 },
+          {
+            id: "leased",
+            available_at: redispatchAt,
+            queue_redispatch_at: redispatchAt,
+            queue_send_failures: 2,
+            queue_dispatch_revision: 3,
+          },
+          {
+            id: "other",
+            available_at: redispatchAt,
+            queue_redispatch_at: redispatchAt,
+            queue_send_failures: 2,
+            queue_dispatch_revision: 3,
+          },
+        ]);
+        await env.DB.prepare("DELETE FROM platform_jobs WHERE id='due'").run();
+        await waitOnExecutionContext(await requestRetry());
+        expect(wake).toHaveBeenCalledTimes(1);
+      } finally {
+        releaseWake();
+        try {
+          await Promise.allSettled(requests.map(({ response }) => response));
+          await Promise.allSettled(requests.map(({ context }) => waitOnExecutionContext(context)));
+          await runInDurableObject(stub, async (_instance, state) => state.storage.deleteAlarm());
+        } finally {
+          clock.mockRestore();
+        }
+      }
+    };
+    const result = await exercise().catch((error: Error) => error.message);
+    expect(result).toBe(failEarly ? "fixture_before_drain" : undefined);
+    expect(vi.isMockFunction(Date.now)).toBe(false);
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(await state.storage.get("schedule")).toMatchObject({ jobRetryAt: now, retries: { 2: outage } });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
   },
 );
 

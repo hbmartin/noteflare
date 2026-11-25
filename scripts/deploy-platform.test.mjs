@@ -382,6 +382,28 @@ describe("coordinated Turnstile replacement", () => {
     expect(live.get(profile.publicName)).toEqual(activeSitekey(sitekey));
   });
 
+  it("reports a confirmed upload when cancelled after Wrangler reports success", async () => {
+    const { connect, fingerprints } = fixture();
+    const cancellation = new AbortController();
+    let uploadFile;
+    const execute = vi.fn(async (_program, args) => {
+      if (args.includes("--dry-run")) return { status: 0 };
+      uploadFile = args[args.indexOf("--secrets-file") + 1];
+      expect(existsSync(uploadFile)).toBe(true);
+      cancellation.abort(new Error("Deployment interrupted."));
+      return { status: 0 };
+    });
+    await expect(
+      deployPlatform("production", execute, {
+        connect,
+        readFingerprints: fingerprints,
+        signal: cancellation.signal,
+      }),
+    ).rejects.toThrow(`Deployment interrupted. Confirmed uploads: ${profile.name}.`);
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(existsSync(uploadFile)).toBe(false);
+  });
+
   it("waits for an interrupted upload to exit before removing the private file", async () => {
     const { connect, fingerprints } = fixture();
     const cancellation = new AbortController();
