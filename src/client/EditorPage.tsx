@@ -903,7 +903,8 @@ export function EditorPage({
         window.clearTimeout(deadline);
         const closed = next;
         next = undefined;
-        storageLifetime.abort();
+        // An Error reason would retain this editor's stack through the pending observer.
+        storageLifetime.abort("The page closed.");
         closed?.destroy();
       };
       const deadline = window.setTimeout(() => {
