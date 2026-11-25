@@ -8,7 +8,7 @@ const PREFETCH_TTL_MS = 30_000;
 const MAX_ENTRIES = 20;
 const MAX_IN_FLIGHT = 2;
 
-type PrefetchOwner = { generation: number; epoch: number };
+export type PrefetchOwner = { generation: number; epoch: number };
 type Entry = {
   promise: Promise<unknown>;
   at: number;
