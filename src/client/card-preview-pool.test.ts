@@ -6,10 +6,13 @@ import { subscribeCardPreview, type CardPreviewState } from "./card-preview-pool
 
 const preview = { page: { id: "page", title: "Plan", kind: "document" }, text: "" };
 let visibility: DocumentVisibilityState = "visible";
+let online = true;
 
 beforeEach(() => {
   vi.useFakeTimers();
   visibility = "visible";
+  online = true;
+  Object.defineProperty(navigator, "onLine", { configurable: true, get: () => online });
   Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility });
   mocks.api.mockResolvedValue(preview);
 });
@@ -54,6 +57,22 @@ describe("card preview pool", () => {
     second();
   });
 
+  it("waits for connectivity after an offline tab becomes visible", async () => {
+    const unsubscribe = subscribeCardPreview("account", "offline", null, () => {});
+    await settle();
+    visibility = "hidden";
+    online = false;
+    await vi.advanceTimersByTimeAsync(30_000);
+    visibility = "visible";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await settle();
+    expect(mocks.api).toHaveBeenCalledTimes(1);
+    online = true;
+    window.dispatchEvent(new Event("online"));
+    await settle();
+    expect(mocks.api).toHaveBeenCalledTimes(2);
+    unsubscribe();
+  });
   it("skips periodic checks while hidden and makes one up when visible", async () => {
     const unsubscribe = subscribeCardPreview("account", "hidden", null, () => {});
     await settle();

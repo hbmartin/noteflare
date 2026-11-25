@@ -306,6 +306,9 @@ export function createCollaboration(
       stop();
       if (closed) return;
       closed = true;
+      // lib0's version-change listener retains the persistence through its
+      // database-open closure. The connection is closing even if IDB is blocked.
+      if (indexeddb.db) indexeddb.db.onversionchange = null;
       void indexeddb.destroy().catch((error) => {
         console.error("Failed to close offline document storage", error);
         void reportClientError("client.offline_storage_failed", error);

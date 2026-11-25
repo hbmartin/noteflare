@@ -21,6 +21,6 @@ export function followPageLink(event: MouseEvent<HTMLAnchorElement>, pageId: str
     !pageId
   )
     return;
-  event.preventDefault();
-  window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: pageId }));
+  const request = new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: pageId, cancelable: true });
+  if (!window.dispatchEvent(request)) event.preventDefault();
 }

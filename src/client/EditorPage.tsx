@@ -1,3 +1,4 @@
+import { observeUntilAborted } from "./retry";
 import { registerAuthorizationPreservation } from "./authorization-lifecycle";
 import { useOnlineStatus } from "./online-status";
 import { CommentDraftContext, DraftCommentsControllers, DraftThreadsSidebar } from "./CommentDrafts";
@@ -488,6 +489,7 @@ export function EditorPage({
       if (storageRetry > 0) setStorageLoadingSlow(false);
     });
     queueMicrotask(() => active && setStatus("connecting"));
+    const storageLifetime = new AbortController();
     let pendingWrite = Promise.resolve();
     const quarantine = (key = currentStorageKey, reason: RecoveryEntry["reason"] = "epoch") => {
       if (!active) return;
@@ -505,7 +507,7 @@ export function EditorPage({
       if (prior && JSON.stringify(prior) === JSON.stringify(combined)) return;
       replaceRecovery([...current.filter((entry) => entry.key !== key), combined]);
     };
-    let next: CollaborationBundle;
+    let next: CollaborationBundle | undefined;
     let catalogFailures = 0;
     let pendingActive = false;
     let catalogNeedsRepair = false;
@@ -544,7 +546,7 @@ export function EditorPage({
       if (readingRevision === pendingRevision) pendingActive = marker;
       const olderDrafts = pendingKeys.filter((key) => key !== currentStorageKey);
       for (const key of olderDrafts) quarantine(key);
-      const hasLocalDraft = marker || pendingActive || (!catalogPage && next.hasUnsyncedChanges);
+      const hasLocalDraft = marker || pendingActive || (!catalogPage && next?.hasUnsyncedChanges);
       const controller = new AbortController();
       const deadline = window.setTimeout(() => controller.abort(), 10_000);
       try {
@@ -711,7 +713,7 @@ export function EditorPage({
             if (clearRetryTimer !== undefined) window.clearTimeout(clearRetryTimer);
             clearRetryTimer = window.setTimeout(() => {
               clearRetryTimer = undefined;
-              if (active && revision === pendingRevision && !next.hasUnsyncedChanges) writePending(false);
+              if (active && revision === pendingRevision && next && !next.hasUnsyncedChanges) writePending(false);
             }, 5_000);
           }
         });
@@ -720,9 +722,10 @@ export function EditorPage({
     let seededUpdates = false;
     let compacting: Promise<void> | null = null;
     const failStorage = (error: unknown) => {
+      if (storageLifetime.signal.aborted) return;
       storageFailed = true;
       console.error("Unable to persist local document update", error);
-      if (active) {
+      if (active && next) {
         setStorageWriteFailed(true);
         try {
           const markdown = offlineCopyMarkdown(next.doc, offlineMetadata.current.page.title);
@@ -741,6 +744,7 @@ export function EditorPage({
       }
     };
     const documentUpdate = (_update: Uint8Array, origin: unknown) => {
+      if (!next) return;
       if (origin === next.provider) {
         next.indexeddb["_storeUpdate"](_update, origin);
         return;
@@ -757,11 +761,13 @@ export function EditorPage({
         try {
           const db = next.indexeddb.db;
           if (!db) throw new Error("Offline document storage is unavailable.");
-          const stored = persistPendingDocumentUpdate(db, _update).catch(failStorage);
+          const stored = observeUntilAborted(persistPendingDocumentUpdate(db, _update), storageLifetime.signal).catch(
+            failStorage,
+          );
           pendingWrite = pendingWrite
             .then(() => stored)
             .then(() => {
-              if (storageFailed) return;
+              if (storageFailed || !next) return;
               if (!seededUpdates) {
                 persistedUpdates = next.indexeddb["_dbsize"];
                 seededUpdates = true;
@@ -788,12 +794,12 @@ export function EditorPage({
     };
     next.doc.on("update", documentUpdate);
     const customMessage = (message: string) => {
-      if (!active) return;
+      if (!active || !next) return;
       try {
         const value = JSON.parse(message) as { type: string; bytes: number; readOnly: boolean };
         if (value.type === "document-schema-upgrade") setSchemaUpgrade(true);
         if (value.type === "document-size") setSizeWarning(value);
-        if (value.type === "document-update-ack" && !next.hasUnsyncedChanges) writePending(false);
+        if (value.type === "document-update-ack" && next && !next.hasUnsyncedChanges) writePending(false);
       } catch {
         // Ignore custom messages from future server versions.
       }
@@ -801,22 +807,22 @@ export function EditorPage({
     next.provider.on("custom-message", customMessage);
     const closeReconciler = createDocumentCloseReconciler({
       page: { id: page.id, contentEpoch: page.contentEpoch },
-      provider: { connect: () => next.resume(), disconnect: () => next.suspend() },
+      provider: { connect: () => next?.resume(), disconnect: () => next?.suspend() },
       onStateChange: (state) => {
         if (active) setAuthorizationPaused(state === "paused");
       },
-      hasUnsyncedChanges: () => next.hasUnsyncedChanges,
+      hasUnsyncedChanges: () => next?.hasUnsyncedChanges ?? false,
       quarantine,
       onPageChanged,
       onPageUnavailable,
       onAccessDenied: (id, error) => {
-        if (next.hasUnsyncedChanges) {
+        if (next?.hasUnsyncedChanges) {
           quarantine(currentStorageKey, "access");
           setAccessQuarantine(true);
         } else onAccessDenied(id, error);
       },
       onUnauthorized: () => {
-        if (next.hasUnsyncedChanges) {
+        if (next?.hasUnsyncedChanges) {
           quarantine(currentStorageKey, "access");
           setAccessQuarantine(true);
         } else {
@@ -826,7 +832,7 @@ export function EditorPage({
     });
     retryAuthorization.current = () => closeReconciler.retry();
     const stopPreserving = registerAuthorizationPreservation(() => {
-      if (!active || !next.hasUnsyncedChanges) return;
+      if (!active || !next?.hasUnsyncedChanges) return;
       quarantine(currentStorageKey, "access");
       const markdown = offlineCopyMarkdown(next.doc, offlineMetadata.current.page.title);
       liveRecoveryCopies.set(currentStorageKey, markdown);
@@ -850,8 +856,8 @@ export function EditorPage({
     next.provider.on("sync", connectionSync);
     void (async () => {
       try {
-        await next.ready;
-        if (active) {
+        await next?.ready;
+        if (active && next) {
           setConnectionSynced(next.provider.synced);
           setStorageLoadingSlow(false);
           setStorageError(null);
@@ -864,8 +870,8 @@ export function EditorPage({
         } else setStorageError(OFFLINE_INIT_ERROR);
         void (async () => {
           try {
-            await next.lateReady;
-            if (!active) return;
+            await next?.lateReady;
+            if (!active || !next) return;
             setConnectionSynced(next.provider.synced);
             setStorageLoadingSlow(false);
             setStorageError(null);
@@ -885,24 +891,22 @@ export function EditorPage({
       active = false;
       stopPreserving();
       closeReconciler.destroy();
-      next.provider.off("custom-message", customMessage);
-      next.provider.off("connection-close", connectionClose);
-      next.provider.off("sync", connectionSync);
-      next.doc.off("update", documentUpdate);
+      next?.provider.off("custom-message", customMessage);
+      next?.provider.off("connection-close", connectionClose);
+      next?.provider.off("sync", connectionSync);
+      next?.doc.off("update", documentUpdate);
       if (clearRetryTimer !== undefined) window.clearTimeout(clearRetryTimer);
-      next.stop();
-      // Destroy once local writes settle, but never let a hung IndexedDB write keep
-      // the closed page's document and storage connection alive. Closing the
-      // database still lets an in-flight transaction finish.
-      let destroyed = false;
-      let deadline: number | undefined;
+      next?.stop();
+      // Late write continuations only retain the mutable reference. Release it
+      // even when an IndexedDB request never settles.
       const destroy = () => {
-        if (destroyed) return;
-        destroyed = true;
         window.clearTimeout(deadline);
-        next.destroy();
+        const closed = next;
+        next = undefined;
+        storageLifetime.abort();
+        closed?.destroy();
       };
-      deadline = window.setTimeout(() => {
+      const deadline = window.setTimeout(() => {
         void reportClientError(
           "client.offline_storage_slow",
           new Error("Local page writes did not settle after the page closed."),
@@ -910,11 +914,11 @@ export function EditorPage({
         destroy();
       }, CLOSED_PAGE_STORAGE_TIMEOUT_MS);
       void pendingWrite
-        .catch(() => {})
-        .then(async () => {
-          if (compacting) await compacting;
-          destroy();
-        });
+        .then(
+          () => compacting,
+          () => compacting,
+        )
+        .then(destroy, destroy);
       setBundle(null);
       setStorageLoadingSlow(false);
       setStorageError(null);

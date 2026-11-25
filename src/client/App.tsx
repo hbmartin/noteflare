@@ -1645,6 +1645,23 @@ export function useCommittedRef<T>(value: T) {
   return ref;
 }
 
+const workspaceViews = [
+  "search",
+  "home",
+  "tasks",
+  "mentions",
+  "templates",
+  "trash",
+  "settings",
+  "activity",
+  "writing",
+] as const;
+type WorkspaceView = "pages" | (typeof workspaceViews)[number];
+
+function workspaceView(requested: string | null, pageId: string | null): WorkspaceView {
+  return workspaceViews.find((view) => view === requested) ?? (pageId ? "pages" : "home");
+}
+
 function Workspace({
   member,
   onSignOut,
@@ -1776,28 +1793,9 @@ function Workspace({
   const handleRevealHandled = useCallback((sequence: number) => {
     setRevealRequest((current) => (current?.sequence === sequence ? undefined : current));
   }, []);
-  const [view, setView] = useState<
-    "pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings" | "activity" | "writing"
-  >(() => {
-    const requested = startupNavigation.current!.view;
-    return requested &&
-      ["search", "home", "tasks", "mentions", "templates", "trash", "settings", "activity", "writing"].includes(
-        requested,
-      )
-      ? (requested as
-          | "search"
-          | "home"
-          | "tasks"
-          | "mentions"
-          | "templates"
-          | "trash"
-          | "settings"
-          | "activity"
-          | "writing")
-      : startupNavigation.current!.pageId
-        ? "pages"
-        : "home";
-  });
+  const [view, setView] = useState(() =>
+    workspaceView(startupNavigation.current!.view, startupNavigation.current!.pageId),
+  );
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [writingLaunch, setWritingLaunch] = useState<WritingLaunchRequest | null>(null);
   useEffect(() => {
@@ -1888,13 +1886,18 @@ function Workspace({
     () => localStorage.getItem(`notes:active-space:${member.workspace.id}`) ?? "",
   );
   const [favorites, setFavorites] = useState<Page[]>([]);
-  const [pins, setPins] = useState<Page[]>([]);
+  const [pinSnapshot, setPinSnapshot] = useState<{ spaceId: string; pages: Page[] }>();
+  const pins = pinSnapshot?.spaceId === activeSpaceId ? pinSnapshot.pages : [];
+  const [pinsRefreshVersion, refreshPins] = useReducer((version: number) => version + 1, 0);
   const [tags, setTags] = useState<Tag[]>([]);
   const [pageTags, setPageTags] = useState<{ pageId: string; tags: Tag[] }>({ pageId: "", tags: [] });
   const [templates, setTemplates] = useState<Page[]>([]);
   const [pendingTemplateId, setPendingTemplateId] = useState<string | null>(null);
   const [organizationLoading, setOrganizationLoading] = useState(true);
-  const [organizationLoadError, setOrganizationLoadError] = useState("");
+  const [metadataLoadError, setOrganizationLoadError] = useState("");
+  const [pinLoadError, setPinLoadError] = useState<{ spaceId: string; message: string }>();
+  const organizationLoadError =
+    metadataLoadError || (pinLoadError?.spaceId === activeSpaceId ? pinLoadError.message : "");
   const [pendingOrganizationAction, setPendingOrganizationAction] = useState<string | null>(null);
   const [spaceFormOpen, setSpaceFormOpen] = useState(false);
   const sidebarOpenRef = useRef(false);
@@ -2219,12 +2222,20 @@ function Workspace({
 
   useEffect(() => {
     const navigate = () => {
-      const id = new URL(window.location.href).searchParams.get("page");
-      if (id && id !== selectedIdRef.current) navigateToPage(id);
+      const params = new URL(window.location.href).searchParams;
+      const id = params.get("page");
+      if (id && (id !== selectedIdRef.current || pendingSelectionIdRef.current)) {
+        navigateToPage(id);
+      } else {
+        cancelPageAccessRequest();
+        const pending = pendingSelectionIdRef.current;
+        if (pending) dispatchPageAction({ type: "clear-pending-selection", pageId: pending });
+      }
+      setView(workspaceView(params.get("view"), id));
     };
     window.addEventListener("popstate", navigate);
     return () => window.removeEventListener("popstate", navigate);
-  }, [navigateToPage, selectedIdRef]);
+  }, [cancelPageAccessRequest, dispatchPageAction, navigateToPage, pendingSelectionIdRef, selectedIdRef]);
 
   const recordPageUpserts = useCallback((incoming: Page[]) => {
     pendingPageEvents.current.recordUpserts(incoming);
@@ -2728,15 +2739,10 @@ function Workspace({
   // Keyed on the selection rather than folded into loadOrganization: the selection
   // changes on every page click, and only the page's own tags depend on it.
   const [organizationRevision, setOrganizationRevision] = useState(0);
-  const activeSpaceIdRef = useRef(activeSpaceId);
-  const loadedPinsSpaceRef = useRef<string | null>(null);
+  const activeSpaceIdRef = useCommittedRef(activeSpaceId);
   const pinsLoadGenerationRef = useRef(0);
-  useEffect(() => {
-    activeSpaceIdRef.current = activeSpaceId;
-  }, [activeSpaceId]);
   const loadOrganization = useCallback(async () => {
     const generation = ++organizationLoadGenerationRef.current;
-    const currentSpaceId = activeSpaceIdRef.current;
     const attempt = startWorkspaceErrorAttempt({ source: "organization" });
     try {
       const [spaceData, favoriteData, tagData, templateData] = await Promise.all([
@@ -2750,6 +2756,7 @@ function Workspace({
       setFavorites(favoriteData.pages);
       setTags(tagData.tags);
       setTemplates(templateData.templates);
+      const currentSpaceId = activeSpaceIdRef.current;
       const selectedSpace = selectedSpaceIdRef.current;
       const resolvedSpaceId = spaceData.spaces.some((space) => space.id === currentSpaceId)
         ? currentSpaceId
@@ -2760,56 +2767,58 @@ function Workspace({
         setActiveSpaceId(resolvedSpaceId);
         if (resolvedSpaceId) localStorage.setItem(`notes:active-space:${member.workspace.id}`, resolvedSpaceId);
       }
-      const pinsGeneration = ++pinsLoadGenerationRef.current;
-      const [pinResult] = await Promise.allSettled([
-        resolvedSpaceId
-          ? api<{ pages: Page[] }>(`/api/spaces/${encodeURIComponent(resolvedSpaceId)}/pins`)
-          : Promise.resolve({ pages: [] }),
-      ]);
-      if (generation !== organizationLoadGenerationRef.current) return;
-      if (pinResult.status === "fulfilled" && pinsGeneration === pinsLoadGenerationRef.current) {
-        loadedPinsSpaceRef.current = resolvedSpaceId;
-        setPins(pinResult.value.pages);
-      }
-      if (pinResult.status === "rejected") throw pinResult.reason;
+      refreshPins();
       setOrganizationRevision((current) => current + 1);
       setOrganizationLoadError("");
       clearWorkspaceErrors(attempt);
     } catch (error) {
-      setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
+      if (generation === organizationLoadGenerationRef.current)
+        setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
     } finally {
       if (generation === organizationLoadGenerationRef.current) setOrganizationLoading(false);
       finishWorkspaceErrorAttempt(attempt);
     }
-  }, [clearWorkspaceErrors, finishWorkspaceErrorAttempt, member.workspace.id, startWorkspaceErrorAttempt]);
+  }, [
+    activeSpaceIdRef,
+    clearWorkspaceErrors,
+    finishWorkspaceErrorAttempt,
+    member.workspace.id,
+    startWorkspaceErrorAttempt,
+  ]);
   useEffect(() => {
     const timer = window.setTimeout(() => void loadOrganization(), 0);
     return () => window.clearTimeout(timer);
   }, [loadOrganization]);
-  // Spaces, favorites, tags and templates are workspace-wide; switching spaces only changes the pins.
+  const pinSpaceId = spaces.some((space) => space.id === activeSpaceId) ? activeSpaceId : "";
   useEffect(() => {
-    if (!activeSpaceId || loadedPinsSpaceRef.current === null || loadedPinsSpaceRef.current === activeSpaceId) return;
+    if (!pinSpaceId) return undefined;
     const generation = ++pinsLoadGenerationRef.current;
-    void api<{ pages: Page[] }>(`/api/spaces/${encodeURIComponent(activeSpaceId)}/pins`)
-      .then((data) => {
-        if (generation !== pinsLoadGenerationRef.current) return;
-        loadedPinsSpaceRef.current = activeSpaceId;
-        setPins(data.pages);
+    const controller = new AbortController();
+    const current = () =>
+      generation === pinsLoadGenerationRef.current &&
+      !controller.signal.aborted &&
+      activeSpaceIdRef.current === pinSpaceId;
+    void api<{ pages: Page[] }>(`/api/spaces/${encodeURIComponent(pinSpaceId)}/pins`, { signal: controller.signal })
+      .then(({ pages: loadedPins }) => {
+        if (!current()) return;
+        setPinSnapshot({ spaceId: pinSpaceId, pages: loadedPins });
+        setPinLoadError(undefined);
       })
       .catch((error: unknown) => {
-        if (generation !== pinsLoadGenerationRef.current) return;
-        setOrganizationLoadError(apiErrorMessage(error, "Spaces and organization could not be refreshed."));
+        if (current())
+          setPinLoadError({ spaceId: pinSpaceId, message: apiErrorMessage(error, "Pins could not be refreshed.") });
       });
-  }, [activeSpaceId]);
-  useEffect(() => {
-    // An OAuth consent hand-off leaves the workspace at once; never prefetch private pages for it.
+    return () => controller.abort();
+  }, [activeSpaceIdRef, pinSpaceId, pinsRefreshVersion]);
+  useLayoutEffect(() => {
+    // An OAuth consent hand-off leaves the workspace at once.
     configurePagePrefetch({
-      account: member.user.id,
+      account: workspaceAccountKey,
       enabled: !new URLSearchParams(window.location.search).has("oauthAuthorize"),
       preloadDiagramEditor: () => import("./DiagramPage"),
     });
     return () => configurePagePrefetch({ account: null, enabled: false });
-  }, [member.user.id]);
+  }, [workspaceAccountKey]);
   useEffect(() => {
     if (!selectedId) return;
     const generation = ++pageTagsLoadGenerationRef.current;
@@ -2831,7 +2840,7 @@ function Workspace({
     if (!selectedSpaceId || selectedSpaceId === activeSpaceIdRef.current) return;
     setActiveSpaceId(selectedSpaceId);
     localStorage.setItem(`notes:active-space:${member.workspace.id}`, selectedSpaceId);
-  }, [member.workspace.id, selectedId, selectedSpaceId]);
+  }, [activeSpaceIdRef, member.workspace.id, selectedId, selectedSpaceId]);
 
   const selectSpace = useCallback(
     (spaceId: string) => {
@@ -2890,7 +2899,15 @@ function Workspace({
       await api(`/api/spaces/${encodeURIComponent(page.spaceId)}/pins/${encodeURIComponent(page.id)}`, {
         method: pinned ? "DELETE" : "POST",
       });
-      setPins((current) => (pinned ? current.filter((candidate) => candidate.id !== page.id) : [...current, page]));
+      if (activeSpaceIdRef.current === page.spaceId) {
+        ++pinsLoadGenerationRef.current;
+        setPinSnapshot((current) => {
+          const currentPins = current?.spaceId === page.spaceId ? current.pages : [];
+          const remaining = currentPins.filter((candidate) => candidate.id !== page.id);
+          return { spaceId: page.spaceId, pages: pinned ? remaining : [...remaining, page] };
+        });
+        refreshPins();
+      }
       clearWorkspaceErrors({ source: "organization" });
     } catch (error) {
       reportWorkspaceError({ source: "organization" }, apiErrorMessage(error, "The space pin could not be updated."));
@@ -3147,10 +3164,6 @@ function Workspace({
         handleWorkspaceEventRef.current(event);
       },
       (kind?: WorkspaceConnectKind) => {
-        // Some notification writers do not broadcast, so unread counts reload on every connection.
-        void loadUnreadMentions();
-        void loadUnreadNotifications();
-        if (kind === "current") return;
         if (kind === "catch-up") {
           // Events were missed: replay the server's own catch-all invalidation for every subscriber.
           const event: WorkspaceEvent = { type: "workspace-invalidated" };
@@ -3158,6 +3171,10 @@ function Workspace({
           handleWorkspaceEventRef.current(event);
           return;
         }
+        // Some notification writers do not broadcast, so always reload the unread counts.
+        void loadUnreadMentions();
+        void loadUnreadNotifications();
+        if (kind === "current") return;
         void loadPages().catch((error) => {
           if (signal.aborted) return;
           reportWorkspaceError(
@@ -3296,6 +3313,14 @@ function Workspace({
     const navigate = (event: Event) => {
       const pageId = (event as CustomEvent<string>).detail;
       if (!pageId) return;
+      if (event.cancelable) {
+        event.preventDefault();
+        const current = new URL(window.location.href);
+        if (current.searchParams.get("page") !== pageId || current.searchParams.has("view")) {
+          const destination = new URL(`/?page=${encodeURIComponent(pageId)}`, current);
+          history.pushState(null, "", destination);
+        }
+      }
       navigateToPage(pageId);
     };
     window.addEventListener(PAGE_NAVIGATE_EVENT, navigate);
@@ -4303,7 +4328,12 @@ function Workspace({
             <span className="sidebar-section-actions">
               {activeSpace && (
                 <ActionMenu label="Space options">
-                  <WatchControl key={activeSpace.id} resourceType="space" resourceId={activeSpace.id} />
+                  <WatchControl
+                    key={activeSpace.id}
+                    account={workspaceAccountKey}
+                    resourceType="space"
+                    resourceId={activeSpace.id}
+                  />
                 </ActionMenu>
               )}
               {canEditActiveSpace && (
@@ -4559,6 +4589,7 @@ function Workspace({
                   {!activeSelected.isTemplate && (
                     <WatchControl
                       key={`watch:${activeSelected.id}`}
+                      account={workspaceAccountKey}
                       resourceType="page"
                       resourceId={activeSelected.id}
                     />
