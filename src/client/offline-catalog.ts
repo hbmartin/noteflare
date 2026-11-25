@@ -370,7 +370,12 @@ function requestResult<T>(request: IDBRequest<T>) {
 }
 
 function transactionDone(transaction: IDBTransaction) {
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((complete, fail) => {
+    resolve = complete;
+    reject = fail;
+  });
   // A stalled callback should hold only the promise, not its native
   // transaction and database. Read any error from the event target.
   transaction.addEventListener("complete", () => resolve());
