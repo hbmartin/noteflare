@@ -3,7 +3,14 @@ import { countedD1 } from "../../tests/helpers/count-d1";
 import { enrollAccount, responseCookies } from "../../tests/helpers/security";
 import { sha256Hex } from "../shared/import-integrity";
 import { requireSecurity } from "./security";
-import { applyD1Migrations, env, reset, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import {
+  applyD1Migrations,
+  env,
+  reset,
+  createExecutionContext,
+  runInDurableObject,
+  waitOnExecutionContext,
+} from "cloudflare:test";
 import worker from "./index";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
@@ -635,73 +642,126 @@ describe("Secrets Store encryption", () => {
   });
 });
 
-it("clears Queue redispatch on owner retry for unleased jobs in that workspace", async () => {
-  await seed();
-  const signup = await createAuth(testEnv, true).handler(
-    post("http://example.test/api/auth/sign-up/email", {
-      email: "retry-owner@example.test",
-      name: "Retry owner",
-      password: "password123",
-    }),
-  );
-  const cookie = await enrollAccount(signup);
-  const user = await env.DB.prepare("SELECT id FROM user WHERE email='retry-owner@example.test'").first("id");
-  await env.DB.prepare(
-    "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
-  )
-    .bind(user)
-    .run();
+it.each([
+  { semanticEnabled: "false", retryPath: "/api/platform/retry" },
+  { semanticEnabled: "true", retryPath: "/api/platform/%72etry" },
+] as const)(
+  "owner Retry at $retryPath wakes once and preserves outage backoff",
+  async ({ semanticEnabled, retryPath }) => {
+    await seed();
+    const signup = await createAuth(testEnv, true).handler(
+      post("http://example.test/api/auth/sign-up/email", {
+        email: "retry-owner@example.test",
+        name: "Retry owner",
+        password: "password123",
+      }),
+    );
+    const cookie = await enrollAccount(signup);
+    const user = await env.DB.prepare("SELECT id FROM user WHERE email='retry-owner@example.test'").first("id");
+    await env.DB.prepare(
+      "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
+    )
+      .bind(user)
+      .run();
 
-  const now = Date.now();
-  const redispatchAt = now + 300_000;
-  const job = (id: string, workspace: string, token: string | null, lease: number | null) =>
-    env.DB.prepare(`INSERT INTO platform_jobs
+    const now = Date.now();
+    const redispatchAt = now + 300_000;
+    const job = (id: string, workspace: string, token: string | null, lease: number | null) =>
+      env.DB.prepare(`INSERT INTO platform_jobs
       (id,workspace_id,kind,job_key,generation,payload_json,available_at,lease_token,lease_until,
         queue_redispatch_at,queue_send_failures,queue_dispatch_revision,created_at,updated_at)
-      VALUES(?,?,'fixture',?,'1','{}',?,?,?,?,2,3,1,1)`).bind(id, workspace, id, now, token, lease, redispatchAt);
-  await env.DB.batch([
-    job("due", "workspace", null, null),
-    job("leased", "workspace", "worker", now + 60_000),
-    job("other", "other-workspace", null, null),
-  ]);
-  const configured = { ...testEnv };
-  delete configured.PLATFORM;
-  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-  try {
-    const context = createExecutionContext();
-    const response = await worker.fetch(
-      new Request("http://example.test/api/platform/retry", {
-        method: "POST",
-        headers: { origin: "http://example.test", cookie },
-      }),
-      configured,
-      context,
-    );
-    expect(response.status).toBe(200);
-    await waitOnExecutionContext(context);
-    const rows = await env.DB.prepare(`SELECT id,available_at,queue_redispatch_at,queue_send_failures,
-      queue_dispatch_revision FROM platform_jobs ORDER BY id`).all();
-    expect(rows.results).toEqual([
-      { id: "due", available_at: now, queue_redispatch_at: 0, queue_send_failures: 0, queue_dispatch_revision: 4 },
-      {
-        id: "leased",
-        available_at: now,
-        queue_redispatch_at: redispatchAt,
-        queue_send_failures: 2,
-        queue_dispatch_revision: 3,
-      },
-      {
-        id: "other",
-        available_at: now,
-        queue_redispatch_at: redispatchAt,
-        queue_send_failures: 2,
-        queue_dispatch_revision: 3,
-      },
+      VALUES(?,?,'fixture',?,'1','{}',?,?,?,?,2,3,1,1)`).bind(
+        id,
+        workspace,
+        id,
+        redispatchAt,
+        token,
+        lease,
+        redispatchAt,
+      );
+    await env.DB.batch([
+      job("due", "workspace", null, null),
+      job("leased", "workspace", "worker", now + 60_000),
+      job("other", "other-workspace", null, null),
     ]);
-  } finally {
-    clock.mockRestore();
-  }
-});
+    const coordinator = testEnv.PLATFORM!;
+    const stub = coordinator.getByName("maintenance");
+    const wake = vi.fn((at?: number, jobRetryAt?: number) => stub.wake(at, jobRetryAt));
+    const outage = { attempts: 7, at: now + 3_600_000 };
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.put("schedule", {
+        active: false,
+        running: false,
+        scanning: false,
+        notBefore: now + 60_000,
+        wakeAt: null,
+        retries: { 2: outage },
+      });
+      await state.storage.setAlarm(outage.at);
+    });
+    const configured: Env = {
+      ...testEnv,
+      PLATFORM: new Proxy(coordinator, {
+        get(target, property) {
+          if (property === "get") return () => ({ wake });
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }),
+      SEMANTIC_SEARCH_ENABLED: semanticEnabled,
+      PUBLIC_PUBLISHING_ENABLED: "false",
+      AUDIT_ENABLED: "false",
+      HEATMAPS_ENABLED: "false",
+    };
+    const requestRetry = async () => {
+      const context = createExecutionContext();
+      const response = await worker.fetch(
+        new Request(`http://example.test${retryPath}`, {
+          method: "POST",
+          headers: { origin: "http://example.test", cookie },
+        }),
+        configured,
+        context,
+      );
+      expect(response.status).toBe(200);
+      await waitOnExecutionContext(context);
+    };
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      await requestRetry();
+      expect(wake).toHaveBeenCalledExactlyOnceWith(undefined, now);
+      await runInDurableObject(stub, async (_instance, state) => {
+        expect(await state.storage.get("schedule")).toMatchObject({ jobRetryAt: now, retries: { 2: outage } });
+        expect(await state.storage.getAlarm()).toBe(now + 60_000);
+        await state.storage.deleteAlarm();
+      });
+      const rows = await env.DB.prepare(`SELECT id,available_at,queue_redispatch_at,queue_send_failures,
+      queue_dispatch_revision FROM platform_jobs ORDER BY id`).all();
+      expect(rows.results).toEqual([
+        { id: "due", available_at: now, queue_redispatch_at: 0, queue_send_failures: 0, queue_dispatch_revision: 4 },
+        {
+          id: "leased",
+          available_at: redispatchAt,
+          queue_redispatch_at: redispatchAt,
+          queue_send_failures: 2,
+          queue_dispatch_revision: 3,
+        },
+        {
+          id: "other",
+          available_at: redispatchAt,
+          queue_redispatch_at: redispatchAt,
+          queue_send_failures: 2,
+          queue_dispatch_revision: 3,
+        },
+      ]);
+      await env.DB.prepare("DELETE FROM platform_jobs WHERE id='due'").run();
+      await requestRetry();
+      expect(wake).toHaveBeenCalledTimes(1);
+    } finally {
+      clock.mockRestore();
+    }
+  },
+);
 
 it("keeps an expired audit archive hidden from the owner while its partial deletion is deferred", async () => {
   await seed();

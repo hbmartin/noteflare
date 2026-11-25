@@ -6,6 +6,8 @@ import { auditStatement, archiveAudit, setAuditActor, withAuditRequest } from ".
 import {
   consumePlatformQueue,
   enqueuePlatformJob,
+  notifyPlatformJob,
+  PlatformJobDeferred,
   platformJobId,
   recoverPlatformJobs,
   runPlatformJob,
@@ -166,59 +168,137 @@ describe("durable platform release", () => {
     await recoverPlatformJobs(bindings(), { fixture: async () => {} }, 1);
     expect(await env.DB.prepare("SELECT 1 FROM platform_jobs").first()).toBeNull();
   });
-  it("defers redispatch without delaying an accepted Queue message", async () => {
+  it.each(["normal", "recovery"] as const)(
+    "defers redispatch after a %s send without delaying the consumer",
+    async (source) => {
+      const intent = { workspaceId: "workspace", kind: "fixture", key: "page", generation: "1", payload: {} };
+      const id = platformJobId(intent);
+      const due = Date.now();
+      const send = vi.fn().mockResolvedValue({});
+      const configured = { ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } };
+      const handler = vi.fn(async () => {});
+      const clock = vi.spyOn(Date, "now").mockReturnValue(due);
+      try {
+        await enqueuePlatformJob(source === "normal" ? configured : bindings(), intent);
+        if (source === "recovery") await recoverPlatformJobs(configured, { fixture: handler });
+        expect(await env.DB.prepare("SELECT available_at,queue_redispatch_at FROM platform_jobs").first()).toEqual({
+          available_at: due,
+          queue_redispatch_at: due + 300_000,
+        });
+        clock.mockReturnValue(due + 5000);
+        await recoverPlatformJobs(configured, { fixture: handler });
+        expect(send.mock.calls).toEqual(
+          source === "normal" ? [[{ platformJobId: id }, { delaySeconds: 0 }]] : [[{ platformJobId: id }]],
+        );
+
+        const ack = vi.fn();
+        clock.mockReturnValue(due);
+        await consumePlatformQueue(
+          configured,
+          { messages: [{ body: { platformJobId: id }, ack }] } as unknown as MessageBatch<unknown>,
+          { fixture: handler },
+        );
+        expect(handler).toHaveBeenCalledOnce();
+        expect(ack).toHaveBeenCalledOnce();
+        expect(await env.DB.prepare("SELECT 1 FROM platform_jobs").first()).toBeNull();
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it("starts a consumer retry's grace period at its scheduled delivery time", async () => {
     const intent = { workspaceId: "workspace", kind: "fixture", key: "page", generation: "1", payload: {} };
     const id = platformJobId(intent);
-    await enqueuePlatformJob(bindings(), intent);
-    const due = (await env.DB.prepare("SELECT available_at FROM platform_jobs").first<number>("available_at"))!;
+    const now = Date.now();
     const send = vi.fn().mockResolvedValue({});
     const configured = { ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } };
-    const handler = vi.fn(async () => {});
-    const clock = vi.spyOn(Date, "now").mockReturnValue(due);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     try {
-      await recoverPlatformJobs(configured, { fixture: handler });
-      expect(await env.DB.prepare("SELECT available_at,queue_redispatch_at FROM platform_jobs").first()).toEqual({
-        available_at: due,
-        queue_redispatch_at: due + 300_000,
+      await enqueuePlatformJob(bindings(), intent);
+      await runPlatformJob(configured, id, {
+        fixture: async () => {
+          throw new PlatformJobDeferred(25_750);
+        },
       });
-      clock.mockReturnValue(due + 299_999);
-      await recoverPlatformJobs(configured, { fixture: handler });
-      expect(send).toHaveBeenCalledExactlyOnceWith({ platformJobId: id });
-
-      const ack = vi.fn();
-      await consumePlatformQueue(
-        configured,
-        { messages: [{ body: { platformJobId: id }, ack }] } as unknown as MessageBatch<unknown>,
-        { fixture: handler },
-      );
-      expect(handler).toHaveBeenCalledOnce();
-      expect(ack).toHaveBeenCalledOnce();
-      expect(await env.DB.prepare("SELECT 1 FROM platform_jobs").first()).toBeNull();
+      expect(send.mock.calls).toEqual([[{ platformJobId: id }, { delaySeconds: 26 }]]);
+      expect(await env.DB.prepare("SELECT available_at,queue_redispatch_at FROM platform_jobs").first()).toEqual({
+        available_at: now + 25_750,
+        queue_redispatch_at: now + 326_000,
+      });
+      clock.mockReturnValue(now + 325_999);
+      await recoverPlatformJobs(configured, {});
+      expect(send).toHaveBeenCalledOnce();
+      clock.mockReturnValue(now + 326_000);
+      await recoverPlatformJobs(configured, {});
+      expect(send).toHaveBeenLastCalledWith({ platformJobId: id });
+      expect(send).toHaveBeenCalledTimes(2);
     } finally {
       clock.mockRestore();
     }
   });
-  it.each([
-    { name: "replacement generation", set: "generation='2'", generation: "2", token: null },
-    {
-      name: "consumer lease",
-      set: "lease_token='consumer',lease_until=9999999999999",
-      generation: "1",
-      token: "consumer",
-    },
-  ])("discards a recovery send result after a $name changes the row", async ({ set, generation, token }) => {
-    await enqueuePlatformJob(bindings(), {
-      workspaceId: "workspace",
-      kind: "fixture",
-      key: "page",
-      generation: "1",
-      payload: {},
-    });
+
+  it("sets an immediate wake's delivery time from the row's existing availability and lease", async () => {
+    const intent = { workspaceId: "workspace", kind: "fixture", key: "page", generation: "1", payload: {} };
+    const id = platformJobId(intent);
+    const now = Date.now();
+    const send = vi.fn().mockResolvedValue({});
+    const configured = { ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } };
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      await enqueuePlatformJob(bindings(), intent);
+      await env.DB.prepare("UPDATE platform_jobs SET available_at=?,lease_token='running',lease_until=?")
+        .bind(now + 8000, now + 12_000)
+        .run();
+      expect(await notifyPlatformJob(configured, intent)).toBe(true);
+      expect(send).toHaveBeenCalledExactlyOnceWith({ platformJobId: id }, { delaySeconds: 12 });
+      expect(await env.DB.prepare("SELECT queue_redispatch_at FROM platform_jobs").first("queue_redispatch_at")).toBe(
+        now + 312_000,
+      );
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each(["Queue send", "D1 deadline write"] as const)("leaves a job due after a failed %s", async (failure) => {
+    const intent = { workspaceId: "workspace", kind: "fixture", key: "page", generation: "1", payload: {} };
+    const id = platformJobId(intent);
+    const send = vi.fn().mockResolvedValue({});
+    const configured = { ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } };
+    await enqueuePlatformJob(bindings(), intent);
+    if (failure === "Queue send") send.mockRejectedValueOnce(new Error("Queue unavailable"));
+    else {
+      await env.DB.prepare(`CREATE TRIGGER reject_queue_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+        WHEN NEW.queue_redispatch_at > 0 BEGIN SELECT RAISE(ABORT,'fixture_rejected'); END`).run();
+    }
+
+    expect(await notifyPlatformJob(configured, intent)).toBe(failure === "D1 deadline write");
+    expect(await env.DB.prepare("SELECT queue_redispatch_at FROM platform_jobs").first("queue_redispatch_at")).toBe(0);
+    await env.DB.prepare("DROP TRIGGER IF EXISTS reject_queue_deadline").run();
+    await recoverPlatformJobs(configured, {});
+    expect(send).toHaveBeenLastCalledWith({ platformJobId: id });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+  it.each(
+    [
+      { name: "replacement generation", set: "generation='2'", generation: "2", token: null },
+      {
+        name: "consumer lease",
+        set: "lease_token='consumer',lease_until=9999999999999",
+        generation: "1",
+        token: "consumer",
+      },
+    ].flatMap((change) => ["normal", "recovery"].map((source) => ({ ...change, source }))),
+  )("discards a $source send result after a $name changes the row", async ({ set, generation, token, source }) => {
+    const intent = { workspaceId: "workspace", kind: "fixture", key: "page", generation: "1", payload: {} };
+    await enqueuePlatformJob(bindings(), intent);
     const send = vi.fn(async () => {
       await env.DB.prepare(`UPDATE platform_jobs SET ${set}`).run();
       return { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
     });
-    await recoverPlatformJobs({ ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } }, {});
+    const configured = { ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } };
+    if (source === "normal") await notifyPlatformJob(configured, intent);
+    else await recoverPlatformJobs(configured, {});
     expect(send).toHaveBeenCalledOnce();
     expect(
       await env.DB.prepare(`SELECT generation,lease_token,queue_redispatch_at,queue_send_failures,queue_dispatch_revision

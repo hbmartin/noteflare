@@ -9,6 +9,7 @@ import { beginKeyRotation, encryptionKeyStatus } from "./secrets";
 import { auditRetention, auditStatement, listAudit } from "./audit";
 import { heatmapContext, readHeatmap, recordHeatmap } from "./heatmaps";
 import { costOptions, platformCosts } from "./platform-costs";
+import { wakePlatformBestEffort } from "./platform-wakeup";
 
 const capability = (enabled: boolean, dependencies: Record<string, boolean>) => ({
   enabled,
@@ -166,12 +167,14 @@ platformApi.post("/platform/retry", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
-  await c.env.DB.prepare(
+  const now = Date.now();
+  const updated = await c.env.DB.prepare(
     `UPDATE platform_jobs SET available_at=?,queue_redispatch_at=0,queue_send_failures=0,
      queue_dispatch_revision=queue_dispatch_revision+1 WHERE workspace_id=? AND (lease_until IS NULL OR lease_until<?)`,
   )
-    .bind(Date.now(), member.workspace.id, Date.now())
+    .bind(now, member.workspace.id, now)
     .run();
+  if (updated.meta.changes) await wakePlatformBestEffort(c.env, undefined, now);
   return c.json({ ok: true });
 });
 platformApi.get("/platform/keys", async (c) => {

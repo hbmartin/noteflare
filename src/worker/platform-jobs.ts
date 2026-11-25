@@ -38,6 +38,14 @@ type JobRow = {
   payload_json: string;
   attempts: number;
 };
+type QueueDispatchRow = {
+  id: string;
+  generation: string;
+  created_at: number;
+  queue_dispatch_revision: number;
+};
+type QueueDispatchDeadline = QueueDispatchRow & { available_at: number; lease_until: number | null };
+
 const LEASE_MS = 5 * 60_000;
 const QUEUE_REDISPATCH_GRACE_MS = 5 * 60_000;
 
@@ -87,19 +95,54 @@ export async function notifyPlatformJob(
   intent: Pick<PlatformJobIntent, "workspaceId" | "kind" | "key">,
   at = Date.now(),
 ) {
-  // Recovery re-enqueues from D1 if this best-effort wakeup fails or expires.
-  if (env.PLATFORM_QUEUE) {
+  const queue = env.PLATFORM_QUEUE;
+  if (!queue) return false;
+  const id = platformJobId(intent);
+  let row: QueueDispatchDeadline | null | undefined;
+  try {
+    row = await env.DB.prepare(
+      "SELECT id,generation,created_at,queue_dispatch_revision,available_at,lease_until FROM platform_jobs WHERE id=?",
+    )
+      .bind(id)
+      .first<QueueDispatchDeadline>();
+  } catch {
+    logger.warn(
+      "platform.enqueue.dispatch_state_unavailable",
+      "platform",
+      "Queue wake will use the requested deadline",
+    );
+  }
+  if (row === null) return false;
+
+  const due = Math.max(at, row?.available_at ?? 0, row?.lease_until ?? 0);
+  const delaySeconds = Math.max(0, Math.ceil((due - Date.now()) / 1000));
+  try {
+    await queue.send({ platformJobId: id }, { delaySeconds });
+  } catch {
+    recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
+    return false;
+  }
+  if (row) {
     try {
-      await env.PLATFORM_QUEUE.send(
-        { platformJobId: platformJobId(intent) },
-        { delaySeconds: Math.max(0, Math.ceil((at - Date.now()) / 1000)) },
-      );
-      return true;
+      await recordQueueDispatch(env, row, Date.now() + delaySeconds * 1000 + QUEUE_REDISPATCH_GRACE_MS, 0);
     } catch {
-      recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
+      logger.warn(
+        "platform.enqueue.dispatch_state_failed",
+        "platform",
+        "Accepted Queue wake remains eligible for recovery",
+      );
     }
   }
-  return false;
+  return true;
+}
+
+async function recordQueueDispatch(env: Env, row: QueueDispatchRow, redispatchAt: number, failures: number) {
+  // The consumer, a replacement generation, or owner Retry can advance the row during the send.
+  await env.DB.prepare(`UPDATE platform_jobs SET queue_redispatch_at=?,queue_send_failures=?,
+    queue_dispatch_revision=queue_dispatch_revision+1
+    WHERE id=? AND generation=? AND created_at=? AND queue_dispatch_revision=?`)
+    .bind(redispatchAt, failures, row.id, row.generation, row.created_at, row.queue_dispatch_revision)
+    .run();
 }
 
 export function runPlatformJob(env: Env, id: string, handlers: PlatformHandlers) {
@@ -209,15 +252,10 @@ export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, 
     FROM platform_jobs WHERE available_at<=? AND (lease_until IS NULL OR lease_until<=?)
     AND (?=0 OR queue_redispatch_at<=?) ORDER BY available_at,id LIMIT ?`)
     .bind(now, now, queue ? 1 : 0, now, Math.max(1, Math.min(25, limit)))
-    .all<{
-      id: string;
-      generation: string;
-      created_at: number;
-      queue_dispatch_revision: number;
-      queue_send_failures: number;
-    }>();
+    .all<QueueDispatchRow & { queue_send_failures: number }>();
   let queueSendFailures = 0;
-  // Settle each job before starting the next so a D1 failure leaves later jobs for recovery.
+  // Record each result before sending the next job. If D1 fails after Queue accepts a message,
+  // recovery may send that job again. The consumer claims only due jobs with no active lease.
   for (const row of rows.results) {
     if (!queue) {
       await runPlatformJob(env, row.id, handlers);
@@ -232,12 +270,7 @@ export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, 
       recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
     }
     const delay = failures ? Math.min(3_600_000, 60_000 * 2 ** (failures - 1)) : QUEUE_REDISPATCH_GRACE_MS;
-    // A consumer or a new generation can advance the row while the send is in flight.
-    await env.DB.prepare(`UPDATE platform_jobs SET queue_redispatch_at=?,queue_send_failures=?,
-      queue_dispatch_revision=queue_dispatch_revision+1
-      WHERE id=? AND generation=? AND created_at=? AND queue_dispatch_revision=?`)
-      .bind(Date.now() + delay, failures, row.id, row.generation, row.created_at, row.queue_dispatch_revision)
-      .run();
+    await recordQueueDispatch(env, row, Date.now() + delay, failures);
   }
   return { queueAttempts: queue ? rows.results.length : 0, queueSendFailures };
 }

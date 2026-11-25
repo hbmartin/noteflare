@@ -69,6 +69,40 @@ it("closes stuck output pipes five seconds after exit", async () => {
   expect(child.kill).not.toHaveBeenCalled();
 });
 
+it.each(["before", "after"])("ends the drain when cancelled %s exit", async (when) => {
+  vi.useFakeTimers();
+  const child = mockChild();
+  const controller = new AbortController();
+  child.stderr = new PassThrough();
+  const result = runWrangler("wrangler", [], { stdio: ["ignore", "pipe", "pipe"], signal: controller.signal });
+  child.stdout.write("partial output");
+  if (when === "before") controller.abort();
+  expect(child.kill.mock.calls).toEqual(when === "before" ? [["SIGTERM"]] : []);
+  expect(child.stdout.destroyed).toBe(false);
+
+  child.emit("exit", when === "before" ? null : 0, null);
+  expect(child.stdout.destroyed).toBe(when === "before");
+  if (when === "after") controller.abort();
+
+  expect(child.stdout.destroyed).toBe(true);
+  expect(child.stderr.destroyed).toBe(true);
+  await expect(result).resolves.toEqual({ status: 1, stdout: "partial output", failure: "aborted" });
+});
+
+it("preserves the previous failure when aborting the drain", async () => {
+  vi.useFakeTimers();
+  const child = mockChild();
+  const controller = new AbortController();
+  const result = runWrangler("wrangler", [], { stdio, signal: controller.signal, timeoutMs: 100 });
+  vi.advanceTimersByTime(100);
+  child.emit("exit", null, "SIGTERM");
+  controller.abort();
+
+  expect(child.stdout.destroyed).toBe(true);
+  expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGTERM");
+  await expect(result).resolves.toMatchObject({ status: 1, failure: "timeout" });
+});
+
 it.each(["timeout", "output-limit"])("preserves an earlier %s when output does not close", async (failure) => {
   vi.useFakeTimers();
   const child = mockChild();
