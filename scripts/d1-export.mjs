@@ -1,11 +1,13 @@
 // Dump ordinary rows and capture the schema separately because D1 cannot
 // export FTS virtual tables. Restore triggers only after loading the data.
 import { spawnSync } from "node:child_process";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createWriteStream } from "node:fs";
 import { mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { pipeline } from "node:stream/promises";
+import { planRestoreData, replayD1Data, restoreColumnSql, restoreForeignKeySql } from "./d1-restore-data.mjs";
 
 const BINDING = "DB";
 const cli = createRequire(import.meta.url).resolve("wrangler");
@@ -91,6 +93,20 @@ if (
 )
   throw new Error("The database contains a table or virtual index without a supported restore path.");
 
+// Remote D1 restricts table-valued PRAGMAs. Inspect the captured schema in
+// memory, without copying user rows into a second database.
+const metadata = new DatabaseSync(":memory:", { enableForeignKeyConstraints: false });
+let order;
+try {
+  metadata.exec(ddl(tables));
+  order = planRestoreData(
+    tables.map(({ name }) => name),
+    metadata.prepare(restoreColumnSql).all(),
+    metadata.prepare(restoreForeignKeySql).all(),
+  );
+} finally {
+  metadata.close();
+}
 const cwdFlag = passthrough.indexOf("--cwd");
 const cwd = cwdFlag === -1 ? passthrough.find((arg) => arg.startsWith("--cwd="))?.slice(6) : passthrough[cwdFlag + 1];
 const destination = resolve(cwd ?? ".", output);
@@ -99,16 +115,19 @@ const data = join(directory, "data.sql");
 const backup = join(directory, "backup.sql");
 try {
   console.log(`Exporting ${tables.length} tables and their schema.`);
-  wrangler([
-    "d1",
-    "export",
-    BINDING,
-    ...passthrough,
-    "--output",
-    data,
-    "--no-schema",
-    ...tables.flatMap(({ name }) => ["--table", name]),
-  ]);
+  wrangler(
+    [
+      "d1",
+      "export",
+      BINDING,
+      ...passthrough,
+      "--output",
+      data,
+      "--no-schema",
+      ...tables.flatMap(({ name }) => ["--table", name]),
+    ],
+    { capture: true },
+  );
   if ((await stat(data)).size === 0) throw new Error("Wrangler returned an empty data export.");
 
   async function* restoreSql() {
@@ -116,7 +135,7 @@ try {
     yield ddl(tables);
     // Some parent keys for foreign keys are declared by explicit indexes.
     yield ddl(schema.filter((row) => row.type === "index"));
-    yield* createReadStream(data);
+    yield* replayD1Data(data, order);
     yield "\n";
     yield ddl(virtual);
     yield virtual.map(({ name }) => rebuild[name]).join("\n") + "\n";
