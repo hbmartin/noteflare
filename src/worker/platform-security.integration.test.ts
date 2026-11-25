@@ -642,27 +642,71 @@ describe("Secrets Store encryption", () => {
   });
 });
 
+async function enrollPlatformOwner(email: string) {
+  await seed();
+  const signup = await createAuth(testEnv, true).handler(
+    post("http://example.test/api/auth/sign-up/email", { email, name: "Platform owner", password: "password123" }),
+  );
+  const cookie = await enrollAccount(signup);
+  const user = await env.DB.prepare("SELECT id FROM user WHERE email=?").bind(email).first("id");
+  await env.DB.prepare(
+    "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
+  )
+    .bind(user)
+    .run();
+  return cookie;
+}
+
+function coordinatorWithWake(wake: (at?: number, jobRetryAt?: number) => Promise<void>) {
+  return new Proxy(testEnv.PLATFORM!, {
+    get(target, property) {
+      if (property === "get") return () => ({ wake });
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+it("wakes the coordinator for an encoded key rotation route without Queue or optional features", async () => {
+  const cookie = await enrollPlatformOwner("key-owner@example.test");
+  const wake = vi.fn(async () => {});
+  const configured: Env = {
+    ...testEnv,
+    PLATFORM: coordinatorWithWake(wake),
+    SEMANTIC_SEARCH_ENABLED: "false",
+    PUBLIC_PUBLISHING_ENABLED: "false",
+    AUDIT_ENABLED: "false",
+    HEATMAPS_ENABLED: "false",
+    AI_ENCRYPTION_KEYS: {
+      get: async () => JSON.stringify({ active: "next", keys: { next: "test-encryption-key-at-least-32-characters" } }),
+    },
+  };
+  delete configured.PLATFORM_QUEUE;
+  const context = createExecutionContext();
+  const response = await worker.fetch(
+    new Request("http://example.test/api/platform/%6Beys/ai/rotate", {
+      method: "POST",
+      headers: { origin: "http://example.test", cookie },
+    }),
+    configured,
+    context,
+  );
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ targetKeyId: "next" });
+  await waitOnExecutionContext(context);
+  expect(wake).toHaveBeenCalledOnce();
+  expect(
+    await env.DB.prepare("SELECT workspace_id,job_key FROM platform_jobs WHERE kind='key-rotation'").first(),
+  ).toEqual({ workspace_id: "workspace", job_key: "ai" });
+});
+
 it.each([
   { semanticEnabled: "false", retryPath: "/api/platform/retry" },
   { semanticEnabled: "true", retryPath: "/api/platform/%72etry" },
 ] as const)(
   "owner Retry at $retryPath wakes once and preserves outage backoff",
   async ({ semanticEnabled, retryPath }) => {
-    await seed();
-    const signup = await createAuth(testEnv, true).handler(
-      post("http://example.test/api/auth/sign-up/email", {
-        email: "retry-owner@example.test",
-        name: "Retry owner",
-        password: "password123",
-      }),
-    );
-    const cookie = await enrollAccount(signup);
-    const user = await env.DB.prepare("SELECT id FROM user WHERE email='retry-owner@example.test'").first("id");
-    await env.DB.prepare(
-      "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace',?,'owner',1)",
-    )
-      .bind(user)
-      .run();
+    const cookie = await enrollPlatformOwner("retry-owner@example.test");
 
     const now = Date.now();
     const redispatchAt = now + 300_000;
@@ -684,9 +728,15 @@ it.each([
       job("leased", "workspace", "worker", now + 60_000),
       job("other", "other-workspace", null, null),
     ]);
-    const coordinator = testEnv.PLATFORM!;
-    const stub = coordinator.getByName("maintenance");
-    const wake = vi.fn((at?: number, jobRetryAt?: number) => stub.wake(at, jobRetryAt));
+    const stub = testEnv.PLATFORM!.getByName("maintenance");
+    let releaseWake!: () => void;
+    const pendingWake = new Promise<void>((resolve) => {
+      releaseWake = resolve;
+    });
+    const wake = vi.fn(async (at?: number, jobRetryAt?: number) => {
+      await pendingWake;
+      await stub.wake(at, jobRetryAt);
+    });
     const outage = { attempts: 7, at: now + 3_600_000 };
     await runInDurableObject(stub, async (_instance, state) => {
       await state.storage.put("schedule", {
@@ -701,13 +751,7 @@ it.each([
     });
     const configured: Env = {
       ...testEnv,
-      PLATFORM: new Proxy(coordinator, {
-        get(target, property) {
-          if (property === "get") return () => ({ wake });
-          const value = Reflect.get(target, property, target);
-          return typeof value === "function" ? value.bind(target) : value;
-        },
-      }),
+      PLATFORM: coordinatorWithWake(wake),
       SEMANTIC_SEARCH_ENABLED: semanticEnabled,
       PUBLIC_PUBLISHING_ENABLED: "false",
       AUDIT_ENABLED: "false",
@@ -724,12 +768,17 @@ it.each([
         context,
       );
       expect(response.status).toBe(200);
-      await waitOnExecutionContext(context);
+      return context;
     };
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     try {
-      await requestRetry();
+      const context = await requestRetry();
       expect(wake).toHaveBeenCalledExactlyOnceWith(undefined, now);
+      expect(await env.DB.prepare("SELECT available_at FROM platform_jobs WHERE id='due'").first("available_at")).toBe(
+        now,
+      );
+      releaseWake();
+      await waitOnExecutionContext(context);
       await runInDurableObject(stub, async (_instance, state) => {
         expect(await state.storage.get("schedule")).toMatchObject({ jobRetryAt: now, retries: { 2: outage } });
         expect(await state.storage.getAlarm()).toBe(now + 60_000);
@@ -755,9 +804,10 @@ it.each([
         },
       ]);
       await env.DB.prepare("DELETE FROM platform_jobs WHERE id='due'").run();
-      await requestRetry();
+      await waitOnExecutionContext(await requestRetry());
       expect(wake).toHaveBeenCalledTimes(1);
     } finally {
+      releaseWake();
       clock.mockRestore();
     }
   },

@@ -10,6 +10,7 @@ import { auditRetention, auditStatement, listAudit } from "./audit";
 import { heatmapContext, readHeatmap, recordHeatmap } from "./heatmaps";
 import { costOptions, platformCosts } from "./platform-costs";
 import { wakePlatformBestEffort } from "./platform-wakeup";
+import { backgroundUsage } from "./usage";
 
 const capability = (enabled: boolean, dependencies: Record<string, boolean>) => ({
   enabled,
@@ -174,7 +175,8 @@ platformApi.post("/platform/retry", async (c) => {
   )
     .bind(now, member.workspace.id, now)
     .run();
-  if (updated.meta.changes) await wakePlatformBestEffort(c.env, undefined, now);
+  if (updated.meta.changes)
+    backgroundUsage(c.executionCtx, c.env, "platform.wake", {}, (env) => wakePlatformBestEffort(env, undefined, now));
   return c.json({ ok: true });
 });
 platformApi.get("/platform/keys", async (c) => {

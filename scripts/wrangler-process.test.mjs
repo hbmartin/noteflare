@@ -89,6 +89,37 @@ it.each(["before", "after"])("ends the drain when cancelled %s exit", async (whe
   await expect(result).resolves.toEqual({ status: 1, stdout: "partial output", failure: "aborted" });
 });
 
+it.each(["before", "after"])(
+  "reports an inherited-stdio cancellation %s exit even when the child exits zero",
+  async (when) => {
+    vi.useFakeTimers();
+    const child = mockChild();
+    child.stdout = undefined;
+    const controller = new AbortController();
+    const result = runWrangler("wrangler", [], { stdio: "inherit", signal: controller.signal });
+    if (when === "before") controller.abort();
+    child.emit("exit", 0, null);
+    if (when === "after") controller.abort();
+    child.emit("close", 0, null);
+
+    expect(child.kill.mock.calls).toEqual(when === "before" ? [["SIGTERM"]] : []);
+    await expect(result).resolves.toEqual({ status: 1, stdout: "", failure: "aborted" });
+  },
+);
+
+it("preserves a completed child's success if cancellation arrives after close", async () => {
+  const child = mockChild();
+  child.stdout = undefined;
+  const controller = new AbortController();
+  const result = runWrangler("wrangler", [], { stdio: "inherit", signal: controller.signal });
+  child.emit("exit", 0, null);
+  child.emit("close", 0, null);
+  controller.abort();
+
+  expect(child.kill).not.toHaveBeenCalled();
+  await expect(result).resolves.toMatchObject({ status: 0, failure: undefined });
+});
+
 it("preserves the previous failure when aborting the drain", async () => {
   vi.useFakeTimers();
   const child = mockChild();

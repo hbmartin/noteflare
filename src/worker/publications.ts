@@ -13,7 +13,7 @@ import { publicJson } from "./public-utils";
 import { tableInternal } from "./table-service";
 import { restartablePublicationFailure, publicationNeedsJob } from "./publication-failure";
 import { retirePublicationBuild } from "./publication-jobs";
-import { enqueuePlatformJob } from "./platform-jobs";
+import { enqueuePlatformJob, notifyPlatformJobs, persistPlatformJob, platformJobId } from "./platform-jobs";
 export type Publication = {
   id: string;
   workspace_id: string;
@@ -381,29 +381,41 @@ export async function publicationSettingsResponse(request: Request, env: Env, sp
     url: `${env.PUBLIC_BASE_URL ?? new URL(request.url).origin}/sites/${key}`,
   });
 }
-async function queuePublication(env: Env, pub: Publication) {
-  if (pub.active)
-    await enqueuePlatformJob(env, {
-      workspaceId: pub.workspace_id,
-      kind: "publication",
-      key: pub.id,
-      generation: String(pub.generation),
-      payload: {
-        publicationId: pub.id,
-        generation: pub.generation,
-      },
-    });
+function publicationJobIntent(pub: Publication) {
+  return {
+    workspaceId: pub.workspace_id,
+    kind: "publication",
+    key: pub.id,
+    generation: String(pub.generation),
+    payload: { publicationId: pub.id, generation: pub.generation },
+  };
 }
+
+async function queuePublication(env: Env, pub: Publication) {
+  if (pub.active) await enqueuePlatformJob(env, publicationJobIntent(pub));
+}
+
 export async function enqueuePendingPublications(env: Env) {
   if (env.PUBLIC_PUBLISHING_ENABLED !== "true") return;
+  const jobIds: string[] = [];
   const failures = await env.DB.prepare(`SELECT * FROM publications p WHERE ${restartablePublicationFailure}
     ORDER BY p.updated_at LIMIT 20`).all<Publication>();
-  for (const pub of failures.results)
-    await retirePublicationBuild(env, pub, JSON.parse(pub.build_failure_json!).kind === "state" ? "state" : "content");
+  for (const pub of failures.results) {
+    const reason = JSON.parse(pub.build_failure_json!).kind === "state" ? "state" : "content";
+    // The generation update triggers a durable job insert in the same transaction.
+    if (await retirePublicationBuild(env, pub, reason, { notify: false })) {
+      jobIds.push(platformJobId(publicationJobIntent(pub)));
+    }
+  }
   const rows = await env.DB.prepare(
     `SELECT * FROM publications p WHERE ${publicationNeedsJob} ORDER BY updated_at LIMIT 20`,
   ).all<Publication>();
-  for (const pub of rows.results) await queuePublication(env, pub);
+  for (const pub of rows.results) {
+    const intent = publicationJobIntent(pub);
+    await persistPlatformJob(env, intent);
+    jobIds.push(platformJobId(intent));
+  }
+  await notifyPlatformJobs(env, jobIds);
 }
 export async function hostnameSettingsResponse(request: Request, env: Env, publicationId: string): Promise<Response> {
   const member = await requireMember(request, env);

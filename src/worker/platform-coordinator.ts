@@ -204,11 +204,19 @@ export class PlatformCoordinator extends DurableObject<Env> {
             await enqueuePendingPublications(alarmEnv);
             break;
           case 2: {
-            const { queueAttempts, queueSendFailures } = await recoverPlatformJobs(
+            const { queueAttempts, queueSendFailures, dispatchStateFailures } = await recoverPlatformJobs(
               alarmEnv,
               platformHandlers,
               alarmEnv.PLATFORM_QUEUE ? 10 : 1,
             );
+            if (queueAttempts > 0 && dispatchStateFailures === queueAttempts) {
+              logger.warn(
+                "platform.maintenance.dispatch_state_unavailable",
+                "platform",
+                "Backing off Queue recovery because no dispatch deadline could be recorded",
+              );
+              throw new Error("platform_queue_dispatch_state_unavailable");
+            }
             if (queueAttempts > 0 && queueSendFailures === queueAttempts)
               throw new Error("platform_queue_recovery_failed");
             break;
