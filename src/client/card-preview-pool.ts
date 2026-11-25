@@ -81,13 +81,18 @@ export function subscribeCardPreview(
         void refresh();
       }
     };
+    let missedTick = false;
     const online = () => {
+      if (document.visibilityState === "hidden") {
+        missedTick = true;
+        return;
+      }
+      missedTick = false;
       generation++;
       publish({ status: "loading", preview: null });
       void refresh();
     };
     // A hidden or offline tab skips the periodic check and makes it up once visible.
-    let missedTick = false;
     const tick = () => {
       if (document.visibilityState === "hidden" || !navigator.onLine) {
         missedTick = true;
@@ -96,7 +101,7 @@ export function subscribeCardPreview(
       void refresh();
     };
     const visibility = () => {
-      if (document.visibilityState === "hidden" || !missedTick) return;
+      if (document.visibilityState === "hidden" || !navigator.onLine || !missedTick) return;
       missedTick = false;
       void refresh();
     };

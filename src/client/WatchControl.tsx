@@ -1,40 +1,62 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import type { WatchState } from "../shared/types";
 import { api, apiErrorMessage, json } from "./api";
-import { forgetValues, prefetchedOrFetch, recentValue, rememberValue } from "./page-prefetch";
+import {
+  currentPagePrefetchOwner,
+  currentPageWatchRevision,
+  invalidatePageWatchValues,
+  pagePrefetchOwner,
+  prefetchedOrFetch,
+  recentValue,
+  rememberValue,
+  subscribePageWatchInvalidation,
+} from "./page-prefetch";
 
 export function WatchControl({
   resourceType,
   resourceId,
   compact = false,
+  account,
 }: {
   resourceType: "page" | "space";
   resourceId: string;
   compact?: boolean;
+  account?: string;
 }) {
   const path = `/api/${resourceType === "page" ? "pages" : "spaces"}/${encodeURIComponent(resourceId)}/watch`;
   // Menus remount their contents when they open and close; reuse a state read moments ago.
-  const [watch, setWatch] = useState(() => recentValue(path) as WatchState | null);
+  const watchRevision = useSyncExternalStore(subscribePageWatchInvalidation, currentPageWatchRevision);
+  const revision = resourceType === "page" ? watchRevision : 0;
+  const identity = `${account ?? ""}|${path}|${revision}`;
+  const [loaded, setLoaded] = useState<{ identity: string; watch: WatchState }>();
+  const watch = loaded?.identity === identity ? loaded.watch : (recentValue(path, account) as WatchState | null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [updateError, setUpdateError] = useState("");
   const label = resourceType === "page" ? "page" : "space";
 
   useEffect(() => {
-    if (recentValue(path)) return undefined;
+    if (recentValue(path, account)) return undefined;
     let active = true;
+    const owner = pagePrefetchOwner();
+    const current = () =>
+      currentPagePrefetchOwner(owner) && (resourceType !== "page" || currentPageWatchRevision() === revision);
     void prefetchedOrFetch<{ watch: WatchState }>(path)
-      .then((data) => {
-        rememberValue(path, data.watch);
-        if (active) setWatch(data.watch);
+      .then(({ watch: nextWatch }) => {
+        if (!current()) return;
+        rememberValue(path, nextWatch, owner);
+        if (active) {
+          setError("");
+          setLoaded({ identity, watch: nextWatch });
+        }
       })
       .catch((cause) => {
-        if (active) setError(apiErrorMessage(cause, `Watch status for this ${label} is unavailable.`));
+        if (active && current()) setError(apiErrorMessage(cause, `Watch status for this ${label} is unavailable.`));
       });
     return () => {
       active = false;
     };
-  }, [label, path]);
+  }, [account, identity, label, path, resourceType, revision]);
 
   // Only an initial load failure leaves nothing to render. Replacing a loaded button
   // with this span would strip the control mid-click, taking focus and retry with it.
@@ -63,12 +85,14 @@ export function WatchControl({
       title={updateError || (inherited ? "Watching through this space" : action)}
       onClick={async () => {
         setBusy(true);
+        const owner = pagePrefetchOwner();
         try {
           const data = await api<{ watch: WatchState }>(path, { method: "PUT", body: json({ state: next }) });
-          // A space watch is inherited by its pages, so their remembered states are stale now.
-          if (resourceType === "space") forgetValues((cached) => cached.startsWith("/api/pages/"));
-          rememberValue(path, data.watch);
-          setWatch(data.watch);
+          if (!currentPagePrefetchOwner(owner)) return;
+          if (resourceType === "space") invalidatePageWatchValues();
+          if (resourceType === "page" && currentPageWatchRevision() !== revision) return;
+          rememberValue(path, data.watch, owner);
+          setLoaded({ identity, watch: data.watch });
           setError("");
           setUpdateError("");
         } catch (cause) {

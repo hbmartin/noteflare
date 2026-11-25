@@ -86,6 +86,28 @@ describe("visible read-only diagram rooms", () => {
     expect(states.at(-1)?.records).toBeNull();
     unsubscribe();
   });
+  it("discards a catch-up response that predates removal", async () => {
+    let resolve!: (data: { page: Page }) => void;
+    mocks.api.mockImplementationOnce(
+      () =>
+        new Promise((complete) => {
+          resolve = complete;
+        }),
+    );
+    const states: DiagramEmbedState[] = [];
+    const unsubscribe = subscribeDiagramEmbed("account", "diagram", (state) => states.push(state));
+    window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: { type: "workspace-invalidated" } }));
+    window.dispatchEvent(
+      new CustomEvent("notes:workspace-event", {
+        detail: { type: "pages-removed", pageIds: ["diagram"] },
+      }),
+    );
+    resolve({ page: { id: "diagram", kind: "diagram", contentEpoch: 1, archivedAt: null } as Page });
+    await Promise.resolve();
+    expect(mocks.network).not.toHaveBeenCalled();
+    expect(states.at(-1)?.status).toBe("unavailable");
+    unsubscribe();
+  });
   it("keeps a newer room when an old subscription unsubscribes twice", async () => {
     mocks.api.mockResolvedValue({
       page: { id: "diagram", kind: "diagram", contentEpoch: 1, archivedAt: null } as Page,

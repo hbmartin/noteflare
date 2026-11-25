@@ -306,7 +306,7 @@ before they reach it. Pages accumulate size from embedded images and long edit h
 | Table rows    | 20000 per table, enforced on write | Rejected with `table_row_limit`  |
 | Attachments   | 10 MiB single-shot, 10 GiB chunked | Rejected with `upload_too_large` |
 | Connections   | 30 per document epoch              | Excess closed with `4429`        |
-| Versions      | 30 days, 200 per page              | Pruned during compaction         |
+| Versions      | 30 days, 200 per page              | Checked during compaction        |
 
 Table reads are paged, so a table that grows past the write limit through an out-of-band
 write still reads back correctly. Inserting table rows directly in D1 is still unwise: it
@@ -463,9 +463,10 @@ compaction, not keystrokes, so they lag edits by up to the 30-second compaction 
 `WorkspaceEvents` Durable Objects hold no authoritative state. They only fan out page-tree and
 projection-invalidation events; losing one costs freshness, not data.
 
-Each object numbers the events it sends with one durable stream position, and every connection starts with
-that position. A browser that reconnects, for example on the five-minute grant renewal, reloads only when the
-position moved while it was away, the disconnect lasted more than 15 seconds, or 15 minutes have passed since
+Each object tracks a durable position for workspace-visible events and one for
+each recipient of private events. A connection starts with both positions that
+apply to its user. A browser that reconnects, for example on the five-minute grant renewal, reloads only when the
+applicable position moved while it was away, the disconnect lasted more than 15 seconds, or 15 minutes have passed since
 its last full reload. A failed delivery inside the object also advances the position, so connected browsers
 catch up as soon as they see the gap.
 

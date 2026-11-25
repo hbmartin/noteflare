@@ -1,7 +1,7 @@
 import { purgeCommentDrafts } from "./comment-drafts";
 import { purgeCellDrafts } from "./cell-drafts";
 import type { ClientMemberContext, Page, PageKind } from "../shared/types";
-import { fetchUpdates, type IndexeddbPersistence } from "y-indexeddb";
+import type { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
 
 const DATABASE_NAME = "noteflare-offline-catalog";
@@ -157,19 +157,45 @@ export function persistPendingDocumentUpdate(db: IDBDatabase, update: Uint8Array
   return transactionDone(transaction);
 }
 
-/** Compact only updates already loaded into the Y.Doc; concurrent later rows survive. */
-export async function compactDocumentUpdates(persistence: IndexeddbPersistence): Promise<void> {
-  await fetchUpdates(persistence);
-  const db = persistence.db;
-  if (!db) throw new Error("Offline document storage is unavailable.");
-  const lastLoaded = persistence["_dbref"];
+/** Merge and replace the update log in one transaction. A closed document can
+ * be collected even if the transaction never completes. */
+export function compactDocumentUpdates(persistence: IndexeddbPersistence): Promise<void> {
+  if (!persistence.db) return Promise.reject(new Error("Offline document storage is unavailable."));
+  return compactStoredUpdates(persistence.db, new WeakRef(persistence));
+}
+
+function compactStoredUpdates(db: IDBDatabase, owner: WeakRef<IndexeddbPersistence>): Promise<void> {
   const transaction = db.transaction("updates", "readwrite");
   const store = transaction.objectStore("updates");
-  store.add(Y.encodeStateAsUpdate(persistence.doc));
-  store.delete(IDBKeyRange.upperBound(lastLoaded, true));
-  const count = store.count();
-  await transactionDone(transaction);
-  persistence["_dbsize"] = count.result;
+  const updates = store.getAll();
+  let newKey: IDBValidKey | undefined;
+  updates.addEventListener("success", () => {
+    const persistence = owner.deref();
+    if (!persistence || persistence["_destroyed"] || !updates.result.length) return;
+    try {
+      Y.transact(
+        persistence.doc,
+        () => {
+          for (const update of updates.result as Uint8Array[]) Y.applyUpdate(persistence.doc, update);
+        },
+        persistence,
+      );
+      const snapshot = Y.encodeStateAsUpdate(persistence.doc);
+      store.clear();
+      const added = store.add(snapshot);
+      added.addEventListener("success", () => {
+        newKey = added.result;
+      });
+    } catch {
+      transaction.abort();
+    }
+  });
+  return transactionDone(transaction).then(() => {
+    const persistence = owner.deref();
+    if (!persistence || persistence["_destroyed"] || typeof newKey !== "number") return;
+    persistence["_dbref"] = newKey + 1;
+    persistence["_dbsize"] = 1;
+  });
 }
 
 export function pendingKeysOf(page: OfflinePage): string[] {
@@ -344,15 +370,24 @@ function requestResult<T>(request: IDBRequest<T>) {
 }
 
 function transactionDone(transaction: IDBTransaction) {
-  return new Promise<void>((resolve, reject) => {
-    transaction.addEventListener("complete", () => resolve());
-    transaction.addEventListener("abort", () =>
-      reject(transaction.error ?? new Error("Offline catalog transaction was aborted.")),
-    );
-    transaction.addEventListener("error", () =>
-      reject(transaction.error ?? new Error("Offline catalog transaction failed.")),
-    );
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((complete, fail) => {
+    resolve = complete;
+    reject = fail;
   });
+  // A stalled callback should hold only the promise, not its native
+  // transaction and database. Read any error from the event target.
+  transaction.addEventListener("complete", () => resolve());
+  transaction.addEventListener("abort", (event) =>
+    reject(
+      (event.currentTarget as IDBTransaction | null)?.error ?? new Error("Offline catalog transaction was aborted."),
+    ),
+  );
+  transaction.addEventListener("error", (event) =>
+    reject((event.currentTarget as IDBTransaction | null)?.error ?? new Error("Offline catalog transaction failed.")),
+  );
+  return promise;
 }
 
 export async function rememberOfflineAccount(member: ClientMemberContext) {

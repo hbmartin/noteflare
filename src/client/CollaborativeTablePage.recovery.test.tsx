@@ -169,63 +169,67 @@ async function bufferedRows() {
   expect(titleInputs()).toHaveLength(300);
 }
 
-it.each(["read", "mutation"] as const)("retires buffered and late rows after confirmed %s denial", async (kind) => {
-  vi.useFakeTimers();
-  fixture(false, 800);
-  await bufferedRows();
-  const input = titleInputs()[0]!;
-  fireEvent.focus(input);
-  fireEvent.change(input, { target: { value: "Locally authored recovery" } });
-  const read = vi.mocked(api).getMockImplementation()!;
-  const held = heldFixtureRead();
-  let started = false,
-    restored = false;
-  vi.mocked(api).mockImplementation(async (path, init) => {
-    if (init?.method === "POST" && path.endsWith("/commands"))
-      throw new ApiClientError(403, "forbidden", "Access removed");
-    if (!init?.method) {
-      if (!started) {
-        started = true;
-        await held.promise;
-        if (kind === "mutation") return read(path, init);
+it.each(["read", "mutation"] as const)(
+  "retires buffered and late rows after confirmed %s denial",
+  async (kind) => {
+    vi.useFakeTimers();
+    fixture(false, 800);
+    await bufferedRows();
+    const input = titleInputs()[0]!;
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "Locally authored recovery" } });
+    const read = vi.mocked(api).getMockImplementation()!;
+    const held = heldFixtureRead();
+    let started = false,
+      restored = false;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (init?.method === "POST" && path.endsWith("/commands"))
+        throw new ApiClientError(403, "forbidden", "Access removed");
+      if (!init?.method) {
+        if (!started) {
+          started = true;
+          await held.promise;
+          if (kind === "mutation") return read(path, init);
+        }
+        if (!restored) throw new ApiClientError(403, "forbidden", "Access removed");
       }
-      if (!restored) throw new ApiClientError(403, "forbidden", "Access removed");
-    }
-    return read(path, init);
-  });
-  await act(async () => {
-    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-  });
-  expect(started).toBe(true);
-  await act(async () => {
-    fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
-    if (kind === "mutation") fireEvent.blur(input);
-    else held.release();
-  });
-  expect(screen.getByText("Access removed")).toBeVisible();
-  await act(async () => held.release());
-  expect(titleInputs()).toHaveLength(0);
-  expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
-  expect(screen.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue("Locally authored recovery");
-  expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(
-    kind === "mutation" ? 1 : 0,
-  );
-  restored = true;
-  const before = vi.mocked(api).mock.calls.length;
-  await act(async () => {
-    const verification = nextFixtureRead((params) => !params.has("cursor"));
-    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
-    await verification;
-  });
-  expect(titleInputs()).toHaveLength(100);
-  expect(
-    vi
-      .mocked(api)
-      .mock.calls.slice(before)
-      .some(([path, init]) => !init?.method && !new URL(path, "http://localhost").searchParams.has("cursor")),
-  ).toBe(true);
-  expect(titleInputs()[0]).toBeEnabled();
-});
+      return read(path, init);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    });
+    expect(started).toBe(true);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Load more rows" }));
+      if (kind === "mutation") fireEvent.blur(input);
+      else held.release();
+    });
+    expect(screen.getByText("Access removed")).toBeVisible();
+    await act(async () => held.release());
+    expect(titleInputs()).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Load more rows" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Recovered cell draft" })).toHaveValue("Locally authored recovery");
+    expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(
+      kind === "mutation" ? 1 : 0,
+    );
+    restored = true;
+    const before = vi.mocked(api).mock.calls.length;
+    await act(async () => {
+      const verification = nextFixtureRead((params) => !params.has("cursor"));
+      fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+      await verification;
+    });
+    expect(titleInputs()).toHaveLength(100);
+    expect(
+      vi
+        .mocked(api)
+        .mock.calls.slice(before)
+        .some(([path, init]) => !init?.method && !new URL(path, "http://localhost").searchParams.has("cursor")),
+    ).toBe(true);
+    expect(titleInputs()[0]).toBeEnabled();
+  },
+  15_000,
+);
 
 it("disables continuation controls while draft text waits to become the applied query", async () => {
   vi.useFakeTimers();
@@ -302,6 +306,7 @@ it.each(["success", "failure"] as const)(
     expect(accountCellDrafts(account)[0]!.text).toBe("Preserved task draft");
     expect(vi.mocked(api).mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(1);
   },
+  15_000,
 );
 it("independent task drag preserves a same-cell draft and its uncertain Retry", async () => {
   const { data, ids, month, container } = fixture(true);

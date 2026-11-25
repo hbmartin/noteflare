@@ -35,17 +35,9 @@ At minimum, before an upgrade:
 pnpm db:export --remote --output backup.sql
 ```
 
-Use `pnpm db:export`, not `wrangler d1 export` directly. D1 refuses to export a database containing a
-virtual table:
-
-```
-D1 Export error: cannot export databases with Virtual Tables (fts5)
-```
-
-`page_search` is an FTS5 index, so a plain export exits 1 and writes nothing. Every authoritative table
-is ordinary, and the index is derived from `pages`, so the script exports the real tables by name and
-leaves the index to be rebuilt on import. It discovers the table list from `sqlite_master` on each run,
-so a migration that adds a table needs no change here.
+Use `pnpm db:export` to capture D1 rows and schema in one SQL file. The script exports
+ordinary tables and the migration ledger, and includes the SQL to rebuild FTS data
+and restore indexes, views, and triggers after loading rows.
 
 Use Cloudflare R2 tooling or an S3-compatible client to copy `assets/`, `documents/`, and `diagrams/`. Preserve
 object metadata.
@@ -77,50 +69,29 @@ retain local Yjs state in IndexedDB and resynchronize it; diagrams intentionally
 
 ### Restore metadata and objects
 
-1. Deploy the same application revision and migrations.
-2. Import the D1 export into an **empty** replacement D1 database. The export carries its own
-   `CREATE TABLE` statements and the `d1_migrations` rows, so do not apply migrations first — the import
-   would collide with the tables they create.
+1. Prepare an **empty** replacement D1 database and use the application revision that
+   matches the backup's migration history. Applying migrations before importing
+   would collide with the schema included in the backup.
 
    ```sh
    pnpm wrangler d1 execute DB --env production --remote --file backup.sql
    ```
 
-3. Rebuild the search indexes. The export omits `page_search_v2` and `page_title_trigrams` because D1
-   cannot export a virtual table, and nothing else reconstructs them. Compaction refreshes a page's
-   search row only when its indexed inputs change, so a restored page can stay missing from search
-   indefinitely unless this runs:
+2. Restore R2 keys without changing them.
+3. Point bindings at the restored resources.
+4. Before enabling edits, verify full-text search and fuzzy title search for an
+   existing page and after creating or renaming a page. Check attachment
+   authorization and current and historical snapshot reads. If you need Worker
+   rollback, verify the restored `page_search` compatibility view accepts the
+   previous Worker's writes.
 
-   ```sh
-   pnpm wrangler d1 execute DB --env production --remote --command \
-     "CREATE VIRTUAL TABLE IF NOT EXISTS page_search_v2 USING fts5(
-        page_id UNINDEXED, workspace_id UNINDEXED, space_id UNINDEXED,
-        title, tags, body, comments, attachments, headings, tokenize = 'unicode61');
-      DELETE FROM page_search_v2;
-      INSERT INTO page_search_v2
-        (page_id, workspace_id, space_id, title, tags, body, comments, attachments, headings)
-      SELECT p.id, p.workspace_id, p.space_id, p.title,
-        COALESCE((SELECT group_concat(t.name, ' ') FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
-          WHERE pt.page_id = p.id), ''),
-        COALESCE(p.plain_text, ''),
-        COALESCE((SELECT group_concat(c.plain_text, ' ') FROM comment_threads ct
-          JOIN comments c ON c.thread_id = ct.id WHERE ct.page_id = p.id AND c.deleted_at IS NULL), ''),
-        COALESCE((SELECT group_concat(a.name, ' ') FROM attachments a WHERE a.page_id = p.id), ''),
-        p.headings_text
-      FROM pages p WHERE p.import_job_id IS NULL AND p.is_template = 0;
-      CREATE VIRTUAL TABLE IF NOT EXISTS page_title_trigrams USING fts5(
-        page_id UNINDEXED, normalized_title, content = 'page_title_titles', content_rowid = 'id',
-        tokenize = 'trigram');
-      INSERT INTO page_title_trigrams(page_title_trigrams) VALUES('rebuild');"
-   ```
-
-   Archived pages stay indexed so the archive search filter can find them. The statement mirrors the
-   projection in `src/worker/search-index.ts`; keep the two in step. Search returns nothing until this
-   runs; every other feature works without it. The retired `page_search` view needs no rebuild.
-
-4. Restore R2 keys without changing them.
-5. Point bindings at the restored resources.
-6. Verify search, attachment authorization, and current/history snapshot reads before enabling edits.
+Earlier table-only backups require the schema from the matching application
+revision. Create a scratch database at that revision using its migrations. After
+loading the backup into a separate empty database, restore the missing FTS tables,
+explicit indexes, views, and triggers from the scratch schema. Rebuild the FTS
+tables using the projections in `scripts/d1-export.mjs` before enabling edits.
+The dump already records its applied migrations, so normal migration application
+cannot supply the missing objects.
 
 ### Restore one document to a prior version
 

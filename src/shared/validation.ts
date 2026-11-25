@@ -1,5 +1,5 @@
 import { PAGE_KINDS, type PageKind } from "./page-kind.ts";
-import type { ColumnType, Page, Role, WorkspaceEvent, WorkspaceStreamMessage } from "./types";
+import type { ColumnType, Page, Role, WorkspaceEvent, WorkspaceStreamHello, WorkspaceStreamPosition } from "./types";
 import { readTableCoverage } from "./table-coverage.ts";
 
 export class ValidationError extends Error {}
@@ -121,20 +121,32 @@ function streamSeq(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
-/** Parse workspace event socket bookkeeping; events and unknown messages return null. */
-export function parseWorkspaceStreamMessage(value: unknown): WorkspaceStreamMessage | null {
+/** Recognize the scoped hello. Older Workers fall back through the sync handshake. */
+export function parseWorkspaceStreamHello(value: unknown): WorkspaceStreamHello | null {
   const message = record(value);
-  if (!message || !streamSeq(message.seq)) return null;
-  if (message.type === "stream-seq") return { type: "stream-seq", seq: message.seq };
-  if (message.type === "stream-hello" && typeof message.streamId === "string" && ID_PATTERN.test(message.streamId))
-    return { type: "stream-hello", streamId: message.streamId, seq: message.seq };
-  return null;
+  if (
+    message?.type !== "stream-hello" ||
+    message.protocol !== 2 ||
+    typeof message.streamId !== "string" ||
+    !ID_PATTERN.test(message.streamId) ||
+    !streamSeq(message.publicSeq) ||
+    !streamSeq(message.privateSeq)
+  )
+    return null;
+  return {
+    type: "stream-hello",
+    protocol: 2,
+    streamId: message.streamId,
+    publicSeq: message.publicSeq,
+    privateSeq: message.privateSeq,
+  };
 }
 
-/** The stream position stamped on a workspace event, if the server sent one. */
-export function workspaceEventSeq(value: unknown): number | null {
-  const seq = record(value)?.seq;
-  return streamSeq(seq) ? seq : null;
+/** Stream position stamped on a workspace event. */
+export function workspaceEventPosition(value: unknown): WorkspaceStreamPosition | null {
+  const position = record(record(value)?.position);
+  if ((position?.scope !== "publicSeq" && position?.scope !== "privateSeq") || !streamSeq(position.seq)) return null;
+  return { scope: position.scope, seq: position.seq };
 }
 
 export function parseWorkspaceEvent(value: unknown): WorkspaceEvent | null {

@@ -7,7 +7,10 @@ afterEach(() => cleanup());
 
 function renderLink() {
   const navigate = vi.fn();
-  const listener = (event: Event) => navigate((event as CustomEvent<string>).detail);
+  const listener = (event: Event) => {
+    event.preventDefault();
+    navigate((event as CustomEvent<string>).detail);
+  };
   window.addEventListener(PAGE_NAVIGATE_EVENT, listener);
   render(
     <a href="/?page=target" onClick={(event) => followPageLink(event, "target")}>
@@ -28,6 +31,15 @@ describe("internal page links", () => {
     expect(allowed).toBe(false);
     expect(navigate).toHaveBeenCalledWith("target");
     dispose();
+  });
+
+  it("keeps the href when no workspace handles navigation", () => {
+    render(
+      <a href="/?page=target" onClick={(event) => followPageLink(event, "target")}>
+        Offline link
+      </a>,
+    );
+    expect(fireEvent.click(screen.getByRole("link", { name: "Offline link" }))).toBe(true);
   });
 
   it.each([{ metaKey: true }, { ctrlKey: true }, { shiftKey: true }, { altKey: true }, { button: 1 }])(

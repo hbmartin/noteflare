@@ -958,3 +958,46 @@ test("removes a clean cached copy when live page access is revoked", async ({ pa
     )
     .toBe(false);
 });
+
+test("a document card preserves online history and opens its locally saved target offline", async ({
+  page,
+  context,
+}) => {
+  await signInOwner(page);
+  await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
+  const created = await page.request.post("/api/pages", { data: { kind: "document", title: "Offline card source" } });
+  expect(created.ok()).toBe(true);
+  const { page: source } = (await created.json()) as { page: { id: string } };
+  const sourceUrl = `/?page=${source.id}`;
+  await page.goto(sourceUrl);
+  const editor = page.locator(".bn-editor");
+  await expect(editor).toHaveAttribute("contenteditable", "true");
+  await editor.click();
+  await page.keyboard.type("/Sub-page");
+  await page.getByRole("option", { name: /Sub-page/ }).click();
+  const card = page.locator(".editor-page-link");
+  await expect(card).toBeVisible();
+  const target = (await card.getAttribute("href"))!;
+  await card.click();
+  await expect(page).toHaveURL(target);
+  await expect(editor).toHaveAttribute("contenteditable", "true");
+  await editor.click();
+  await page.keyboard.insertText("Offline card destination");
+  await expect(editor).toContainText("Offline card destination");
+
+  await page.goBack();
+  await expect(page).toHaveURL(sourceUrl);
+  await expect(card).toBeVisible();
+  await page.goForward();
+  await expect(page).toHaveURL(target);
+  await expect(editor).toContainText("Offline card destination");
+  await page.goBack();
+  await expect(card).toBeVisible();
+
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
+  await card.click();
+  await expect(page).toHaveURL(target);
+  await expect(page.locator(".offline-document .bn-editor")).toContainText("Offline card destination");
+});

@@ -286,6 +286,53 @@ describe("App error handling", () => {
     vi.unstubAllGlobals();
   });
 
+  it("pushes browser history for a handled page link and restores it on Back and Forward", async () => {
+    const linkedPage: Page = { ...page, id: "linked-page", title: "Linked page", position: "a1" };
+    window.history.replaceState(null, "", `/?page=${page.id}`);
+    mockShellApi({ pages: [page, linkedPage] });
+    render(<App />);
+    await screen.findByRole("button", { name: "Actions for Roadmap" });
+    const before = window.history.length;
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent("notes:navigate-page", { detail: linkedPage.id, cancelable: true }));
+    });
+    expect(new URL(location.href).searchParams.get("page")).toBe(linkedPage.id);
+    expect(window.history.length).toBe(before + 1);
+    window.history.back();
+    await waitFor(() => expect(new URL(location.href).searchParams.get("page")).toBe(page.id));
+    window.history.forward();
+    await waitFor(() => expect(new URL(location.href).searchParams.get("page")).toBe(linkedPage.id));
+    expect(window.history.length).toBe(before + 1);
+  });
+
+  it("discards delayed pins when the user returns to an already loaded space", async () => {
+    const otherSpace: Space = { ...shellGeneralSpace, id: "other-space", name: "Other", slug: "other", position: "a1" };
+    const generalPin = { ...page, id: "general-pin", title: "General pin" };
+    const otherPin = { ...page, id: "other-pin", spaceId: otherSpace.id, title: "Other pin" };
+    const pendingPins = deferred<{ pages: Page[] }>();
+    mockShellApi();
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/spaces") return { spaces: [shellGeneralSpace, otherSpace] };
+      if (path === `/api/spaces/${shellGeneralSpace.id}/pins`) return { pages: [generalPin] };
+      if (path === "/api/spaces/other-space/pins") return pendingPins.promise;
+      return shellApi(path, init);
+    });
+    render(<App />);
+    const pinned = await screen.findByLabelText("Pinned in this space");
+    expect(within(pinned).getByRole("button", { name: "General pin" })).toBeVisible();
+    const space = await screen.findByRole("combobox", { name: "Current space" });
+    fireEvent.change(space, { target: { value: otherSpace.id } });
+    await waitFor(() =>
+      expect(vi.mocked(api).mock.calls.some(([path]) => path === "/api/spaces/other-space/pins")).toBe(true),
+    );
+    fireEvent.change(space, { target: { value: shellGeneralSpace.id } });
+    await act(async () => pendingPins.resolve({ pages: [otherPin] }));
+    expect(space).toHaveValue(shellGeneralSpace.id);
+    expect(screen.getByRole("button", { name: "General pin" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Other pin" })).toBeNull();
+  });
+
   it("resumes a current workspace connection without reloading the tree", async () => {
     mockShellApi();
     render(<App />);

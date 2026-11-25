@@ -55,6 +55,7 @@ const ALARM_RETRY_DELAY_MS = 5_000;
 // behind a recovered dependency; a cold wake still reconciles in onStart.
 const RESTORE_RECONCILIATION_MAX_DELAY_MS = 5 * 60_000;
 const VERSION_INTERVAL_MS = 15 * 60_000;
+const VERSION_PRUNE_INTERVAL_MS = 60 * 60_000;
 const VERSION_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const WARN_BYTES = 16 * 1024 * 1024;
 const READ_ONLY_BYTES = 24 * 1024 * 1024;
@@ -92,8 +93,7 @@ interface MetaRow extends Record<string, SqlStorageValue> {
   // match before a compaction may skip the full-table FTS refresh.
   search_index_key: string | null;
   search_index_seq: number;
-  // Content fingerprint of the most recent automatic or forced version.
-  version_content_hash: string | null;
+  last_version_prune_at: number;
 }
 
 interface PageProjectionRow {
@@ -104,9 +104,22 @@ interface PageProjectionRow {
   import_job_id: string | null;
   is_template: number;
   indexed_seq: number;
+  latest_version_at: number | null;
+  latest_version_fingerprint: string | null;
 }
 
-const PAGE_PROJECTION_COLUMNS = "workspace_id, space_id, title, archived_at, import_job_id, is_template, indexed_seq";
+const PAGE_PROJECTION_SQL = `SELECT p.workspace_id, p.space_id, p.title, p.archived_at, p.import_job_id,
+    p.is_template, p.indexed_seq, v.created_at latest_version_at, v.content_fingerprint latest_version_fingerprint
+  FROM pages p
+  LEFT JOIN page_versions v ON v.id = (
+    SELECT id FROM page_versions WHERE page_id=p.id AND epoch=p.content_epoch
+    ORDER BY created_at DESC, sequence DESC, id DESC LIMIT 1
+  )
+  WHERE p.id=? AND p.content_epoch=?`;
+
+function versionDue(page: PageProjectionRow, timestamp: number) {
+  return page.latest_version_at === null || timestamp - page.latest_version_at >= VERSION_INTERVAL_MS;
+}
 
 /** Fingerprint every `pages` input of the page's `page_search_v2` row that compaction owns. */
 function searchIndexKey(plainText: string, headings: string, page: PageProjectionRow) {
@@ -773,8 +786,8 @@ export class Document extends YServer {
     if (!metaColumns.some((column) => column.name === "search_index_seq")) {
       sql.exec(`ALTER TABLE document_meta ADD COLUMN search_index_seq INTEGER NOT NULL DEFAULT -1`);
     }
-    if (!metaColumns.some((column) => column.name === "version_content_hash")) {
-      sql.exec(`ALTER TABLE document_meta ADD COLUMN version_content_hash TEXT`);
+    if (!metaColumns.some((column) => column.name === "last_version_prune_at")) {
+      sql.exec("ALTER TABLE document_meta ADD COLUMN last_version_prune_at INTEGER NOT NULL DEFAULT 0");
     }
     const hadMetadata = Boolean(
       sql.exec<{ present: number }>(`SELECT EXISTS(SELECT 1 FROM document_meta WHERE id = 1) present`).one().present,
@@ -2285,11 +2298,7 @@ export class Document extends YServer {
         },
       });
 
-      const page = await this.bindings.DB.prepare(
-        `SELECT ${PAGE_PROJECTION_COLUMNS} FROM pages WHERE id = ? AND content_epoch = ?`,
-      )
-        .bind(pageId, epoch)
-        .first<PageProjectionRow>();
+      const page = await this.bindings.DB.prepare(PAGE_PROJECTION_SQL).bind(pageId, epoch).first<PageProjectionRow>();
       // Every compaction writes a new projection object; without this the superseded
       // ones accumulate in R2 for the life of the page.
       const supersededProjection = await this.bindings.DB.prepare(
@@ -2303,7 +2312,6 @@ export class Document extends YServer {
       let versionSaved = false;
       let pageProjected = false;
       let searchKey: string | null = null;
-      let versionContentHash: string | null = null;
       const effectsSuppressed =
         suppressExternalEffects &&
         (page?.import_job_id?.startsWith("notion-create:") === true ||
@@ -2351,15 +2359,14 @@ export class Document extends YServer {
         const headingsText = projectDocumentHeadings(json);
         searchKey = await searchIndexKey(projection.plainText, headingsText, page);
         const searchCurrent = searchIndexCurrent(metadataAtStart, searchKey, page);
-        versionContentHash = await sha256Hex(canonicalJson([json, page.title]));
-        // Forced versions (archive, restore, API mutations) are unconditional. An
-        // automatic version is skipped when it would duplicate the previous one,
-        // e.g. after edits that were undone or only touched collaborator state.
-        const makeVersion = Boolean(
-          forceVersion ||
-          ((!metadataAtStart.last_version_at || timestamp - metadataAtStart.last_version_at >= VERSION_INTERVAL_MS) &&
-            metadataAtStart.version_content_hash !== versionContentHash),
-        );
+        const versionFingerprint =
+          forceVersion || versionDue(page, timestamp) ? await sha256Hex(canonicalJson([json, page.title])) : null;
+        const makeVersion =
+          versionFingerprint !== null &&
+          (forceVersion ||
+            page.latest_version_at === null ||
+            page.latest_version_at < timestamp - VERSION_RETENTION_MS ||
+            page.latest_version_fingerprint !== versionFingerprint);
         const statements = [
           this.bindings.DB.prepare(
             `UPDATE pages SET plain_text = ?, headings_text = ?, indexed_seq = ?, oversized = ?, updated_at = ?
@@ -2613,8 +2620,8 @@ export class Document extends YServer {
           statements.push(
             this.bindings.DB.prepare(
               `INSERT INTO page_versions
-              (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
-              SELECT ?, id, ?, ?, ?, ?, ?, ?, ? FROM pages WHERE id = ? AND content_epoch = ?`,
+              (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at, content_fingerprint)
+              SELECT ?, id, ?, ?, ?, ?, ?, ?, ?, ? FROM pages WHERE id = ? AND content_epoch = ?`,
             ).bind(
               versionId,
               epoch,
@@ -2624,6 +2631,7 @@ export class Document extends YServer {
               snapshot.byteLength,
               metadataAtStart.last_editor_id,
               versionAt,
+              versionFingerprint,
               pageId,
               epoch,
             ),
@@ -2754,7 +2762,7 @@ export class Document extends YServer {
 
       // R2 was durable before the log is acknowledged. Replaying duplicate Yjs
       // updates after a crash between these two steps is safe.
-      this.acknowledgeCompaction(maximum, versionAt, versionSaved, pageProjected, searchKey, versionContentHash);
+      this.acknowledgeCompaction(maximum, versionAt, versionSaved, pageProjected, searchKey);
 
       if (pageProjected && !effectsSuppressed)
         await reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
@@ -2767,24 +2775,7 @@ export class Document extends YServer {
           ),
         );
 
-      if (pageProjected && versionKey) {
-        backgroundUsage(
-          this.state,
-          this.bindings,
-          "document.version_cleanup",
-          { workspaceId: page?.workspace_id, pageId },
-          () =>
-            this.pruneVersions(pageId).catch((error) => {
-              logger.error(
-                "document.version_prune.failed",
-                "document",
-                "Document version pruning failed.",
-                { pageId },
-                error,
-              );
-            }),
-        );
-      }
+      if (pageProjected && page) await this.pruneVersionsIfDue(pageId, page.workspace_id, versionSaved);
     } catch (error) {
       this.metadata.dirty = 1;
       if (metadataAtStart.notify_edit) this.metadata.notify_edit = 1;
@@ -2819,11 +2810,9 @@ export class Document extends YServer {
     versionSaved: boolean,
     pageProjected: boolean,
     searchKey: string | null,
-    versionContentHash: string | null,
   ) {
     const indexKey = pageProjected ? searchKey : null;
     const indexSeq = pageProjected ? maximum : -1;
-    const versionHash = versionSaved ? versionContentHash : this.metadata.version_content_hash;
     this.state.storage.transactionSync(() => {
       this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
       this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
@@ -2831,21 +2820,18 @@ export class Document extends YServer {
       this.state.storage.sql.exec(`DELETE FROM mention_introductions WHERE seq <= ?`, maximum);
       this.state.storage.sql.exec(
         `UPDATE document_meta
-            SET snapshot_seq = ?, last_version_at = ?, search_index_key = ?, search_index_seq = ?,
-                version_content_hash = ?
+            SET snapshot_seq = ?, last_version_at = ?, search_index_key = ?, search_index_seq = ?
           WHERE id = 1`,
         maximum,
         versionAt,
         indexKey,
         indexSeq,
-        versionHash,
       );
     });
     this.metadata.snapshot_seq = maximum;
     this.metadata.last_version_at = versionAt;
     this.metadata.search_index_key = indexKey;
     this.metadata.search_index_seq = indexSeq;
-    this.metadata.version_content_hash = versionHash;
   }
 
   private async compactDiagram(maximum: number, forceVersion: boolean) {
@@ -2904,11 +2890,7 @@ export class Document extends YServer {
         }),
       ]);
 
-      const page = await this.bindings.DB.prepare(
-        `SELECT ${PAGE_PROJECTION_COLUMNS} FROM pages WHERE id = ? AND content_epoch = ?`,
-      )
-        .bind(pageId, epoch)
-        .first<PageProjectionRow>();
+      const page = await this.bindings.DB.prepare(PAGE_PROJECTION_SQL).bind(pageId, epoch).first<PageProjectionRow>();
       const supersededProjection = await this.bindings.DB.prepare(
         `SELECT r2_key, thumbnail_r2_key FROM diagram_projections WHERE page_id = ?`,
       )
@@ -2920,7 +2902,6 @@ export class Document extends YServer {
       let versionSaved = false;
       let pageProjected = false;
       let searchKey: string | null = null;
-      let versionContentHash: string | null = null;
 
       if (page) {
         const [oldPageTargets, oldUserTargets, watcherRows] = await Promise.all([
@@ -2963,12 +2944,16 @@ export class Document extends YServer {
           .filter((id) => !newMentionIds.includes(id) && !contributorIds.includes(id));
         searchKey = await searchIndexKey(projection.plainText, "", page);
         const searchCurrent = searchIndexCurrent(metadataAtStart, searchKey, page);
-        versionContentHash = await sha256Hex(canonicalJson([{ ...envelope, sequence: 0 }, page.title]));
-        const makeVersion = Boolean(
-          forceVersion ||
-          ((!metadataAtStart.last_version_at || timestamp - metadataAtStart.last_version_at >= VERSION_INTERVAL_MS) &&
-            metadataAtStart.version_content_hash !== versionContentHash),
-        );
+        const versionFingerprint =
+          forceVersion || versionDue(page, timestamp)
+            ? await sha256Hex(canonicalJson([{ ...envelope, sequence: 0 }, page.title]))
+            : null;
+        const makeVersion =
+          versionFingerprint !== null &&
+          (forceVersion ||
+            page.latest_version_at === null ||
+            page.latest_version_at < timestamp - VERSION_RETENTION_MS ||
+            page.latest_version_fingerprint !== versionFingerprint);
         const statements = [
           this.bindings.DB.prepare(
             `UPDATE pages SET plain_text = ?, indexed_seq = ?, oversized = ?, updated_at = ?,
@@ -3157,8 +3142,8 @@ export class Document extends YServer {
           statements.push(
             this.bindings.DB.prepare(
               `INSERT INTO page_versions
-                (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at)
-               SELECT ?, id, ?, ?, ?, ?, ?, ?, ? FROM pages WHERE id = ? AND content_epoch = ?`,
+                (id, page_id, epoch, sequence, title, r2_key, byte_size, last_editor_id, created_at, content_fingerprint)
+               SELECT ?, id, ?, ?, ?, ?, ?, ?, ?, ? FROM pages WHERE id = ? AND content_epoch = ?`,
             ).bind(
               versionId,
               epoch,
@@ -3168,6 +3153,7 @@ export class Document extends YServer {
               snapshot.byteLength,
               metadataAtStart.last_editor_id,
               versionAt,
+              versionFingerprint,
               pageId,
               epoch,
             ),
@@ -3275,25 +3261,8 @@ export class Document extends YServer {
         }
       }
 
-      this.acknowledgeCompaction(maximum, versionAt, versionSaved, pageProjected, searchKey, versionContentHash);
-      if (pageProjected && versionKey) {
-        backgroundUsage(
-          this.state,
-          this.bindings,
-          "document.version_cleanup",
-          { workspaceId: page?.workspace_id, pageId },
-          () =>
-            this.pruneVersions(pageId).catch((error) =>
-              logger.error(
-                "diagram.version_prune.failed",
-                "document",
-                "Diagram version pruning failed.",
-                { pageId },
-                error,
-              ),
-            ),
-        );
-      }
+      this.acknowledgeCompaction(maximum, versionAt, versionSaved, pageProjected, searchKey);
+      if (pageProjected && page) await this.pruneVersionsIfDue(pageId, page.workspace_id, versionSaved);
     } catch (error) {
       this.metadata.dirty = 1;
       if (metadataAtStart.notify_edit) this.metadata.notify_edit = 1;
@@ -3316,17 +3285,36 @@ export class Document extends YServer {
     }
   }
 
+  private async pruneVersionsIfDue(pageId: string, workspaceId: string, versionSaved: boolean) {
+    const now = Date.now();
+    const lastPrunedAt = this.metadata.last_version_prune_at;
+    if (!versionSaved && lastPrunedAt && now - lastPrunedAt < VERSION_PRUNE_INTERVAL_MS) return;
+    try {
+      await this.pruneVersions(pageId);
+      this.state.storage.sql.exec("UPDATE document_meta SET last_version_prune_at=? WHERE id=1", now);
+      this.metadata.last_version_prune_at = now;
+    } catch (error) {
+      logger.error(
+        "document.version_prune.failed",
+        "document",
+        "Version pruning failed.",
+        { pageId, workspaceId },
+        error,
+      );
+    }
+  }
+
   private async pruneVersions(pageId: string) {
     const cutoff = Date.now() - VERSION_RETENTION_MS;
     const versions = await this.bindings.DB.prepare(
-      `SELECT id, r2_key, created_at FROM page_versions WHERE page_id = ? ORDER BY created_at DESC`,
+      `SELECT id, r2_key, created_at FROM page_versions WHERE page_id = ? ORDER BY created_at DESC, sequence DESC, id DESC`,
     )
       .bind(pageId)
       .all<{ id: string; r2_key: string; created_at: number }>();
     const expired = versions.results.filter((version, index) => index >= 200 || version.created_at < cutoff);
     for (const version of expired) {
-      await this.bindings.DB.prepare(`DELETE FROM page_versions WHERE id = ?`).bind(version.id).run();
       await this.bindings.BUCKET.delete(version.r2_key);
+      await this.bindings.DB.prepare(`DELETE FROM page_versions WHERE id = ?`).bind(version.id).run();
     }
   }
 

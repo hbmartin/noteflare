@@ -6,6 +6,8 @@ import {
   cancelPagePrefetch,
   configurePagePrefetch,
   forgetValues,
+  invalidatePageWatchValues,
+  pagePrefetchOwner,
   invalidatePrefetchedForEvent,
   pageIntentProps,
   pagePrefetchPaths,
@@ -41,10 +43,9 @@ const requested = () => mocks.api.mock.calls.map(([path]) => path as string);
 describe("page prefetch", () => {
   it("requests a document's tags, watch state and comments once, for one later use", async () => {
     prefetchPage("page", "document");
-    // At most two requests run at once; the third waits for the next intent.
+    // At most two requests run at once; the third starts when one settles.
     expect(requested()).toEqual([pagePrefetchPaths("page").tags, pagePrefetchPaths("page").watch]);
     await vi.advanceTimersByTimeAsync(0);
-    prefetchPage("page", "document");
     expect(requested()).toContain(pagePrefetchPaths("page").comments);
     expect(requested()).toHaveLength(3);
 
@@ -95,6 +96,35 @@ describe("page prefetch", () => {
     prefetchPage("page", "document");
     await vi.advanceTimersByTimeAsync(0);
     expect(takePrefetched(pagePrefetchPaths("page").tags)).toBeNull();
+  });
+
+  it("retries a transient failure when page opening joined a pending prefetch", async () => {
+    let reject!: (error: Error) => void;
+    mocks.api.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, fail) => {
+          reject = fail;
+        }),
+    );
+    prefetchPage("page", "document");
+    const result = prefetchedOrFetch(pagePrefetchPaths("page").tags);
+    reject(new Error("network"));
+    await expect(result).resolves.toEqual({ path: pagePrefetchPaths("page").tags });
+  });
+
+  it("discards remembered and prefetched inherited watch data and rejects writes from the previous account", async () => {
+    const { watch } = pagePrefetchPaths("page");
+    prefetchPage("page", "document");
+    await vi.advanceTimersByTimeAsync(0);
+    rememberValue(watch, { state: "watching" });
+    invalidatePageWatchValues();
+    expect(recentValue(watch)).toBeNull();
+    expect(takePrefetched(watch)).toBeNull();
+
+    const previous = pagePrefetchOwner();
+    configurePagePrefetch({ account: "account-b", enabled: true });
+    rememberValue(watch, { state: "watching" }, previous);
+    expect(recentValue(watch)).toBeNull();
   });
 
   it("waits for a resting pointer or focus before prefetching", async () => {

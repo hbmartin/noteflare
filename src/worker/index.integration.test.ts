@@ -85,7 +85,7 @@ function authenticatedRequest(cookie: string, path: string, init: RequestInit = 
 
 /** A broadcast workspace event without its stream position, which the stream tests cover. */
 function unsequenced(message: string): WorkspaceEvent {
-  const { seq: _seq, ...event } = JSON.parse(message) as WorkspaceEvent & { seq?: number };
+  const { position: _position, ...event } = JSON.parse(message) as WorkspaceEvent & { position?: unknown };
   return event as WorkspaceEvent;
 }
 
@@ -9826,7 +9826,7 @@ describe("workspace event stream", () => {
   async function streamSeq(installed: InstalledWorkspace) {
     let seq = -1;
     await runInDurableObject(env.WORKSPACE_EVENTS.getByName(installed.workspaceId), async (_instance, state) => {
-      seq = state.storage.sql.exec<{ seq: number }>("SELECT seq FROM workspace_event_stream WHERE id=1").one().seq;
+      seq = state.storage.sql.exec<{ seq: number }>("SELECT seq FROM workspace_event_stream_v2 WHERE id=1").one().seq;
     });
     return seq;
   }
@@ -9835,45 +9835,85 @@ describe("workspace event stream", () => {
     const installed = await bootstrap();
     const first = await openWorkspaceEvents(installed);
     const hello = await first.message(0);
-    expect(hello).toEqual({ type: "stream-hello", streamId: expect.any(String), seq: expect.any(Number) });
-    const start = hello.seq as number;
+    expect(hello).toEqual({
+      type: "stream-hello",
+      protocol: 2,
+      streamId: expect.any(String),
+      publicSeq: expect.any(Number),
+      privateSeq: 0,
+    });
+    const start = hello.publicSeq as number;
 
     expect((await broadcast(installed, { type: "organization-invalidated" })).status).toBe(200);
-    expect(await first.message(1)).toEqual({ type: "organization-invalidated", seq: start + 1 });
+    expect(await first.message(1)).toEqual({
+      type: "organization-invalidated",
+      position: { scope: "publicSeq", seq: start + 1 },
+    });
     first.socket.close(1000, "done");
 
     const second = await openWorkspaceEvents(installed);
-    expect(await second.message(0)).toEqual({ type: "stream-hello", streamId: hello.streamId, seq: start + 1 });
+    expect(await second.message(0)).toEqual({ ...hello, publicSeq: start + 1 });
     second.socket.close(1000, "done");
 
     await abortAllDurableObjects();
     const restarted = await openWorkspaceEvents(installed);
-    expect(await restarted.message(0)).toEqual({ type: "stream-hello", streamId: hello.streamId, seq: start + 1 });
+    expect(await restarted.message(0)).toEqual({ ...hello, publicSeq: start + 1 });
     restarted.socket.close(1000, "done");
   });
 
-  it("advances connections outside a private event's audience with a tick", async () => {
+  it("keeps private events and cursor changes within the authorized audience", async () => {
     const installed = await bootstrap();
     const { space_id: spaceId } = (await env.DB.prepare("SELECT space_id FROM pages WHERE id=?")
       .bind(installed.pageId)
       .first<{ space_id: string }>())!;
-    const events = await openWorkspaceEvents(installed);
-    const start = (await events.message(0)).seq as number;
-    // The connected member loses sight of the space without the socket being revoked.
-    await env.DB.batch([
-      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
-        VALUES('stream-owner','Other owner','stream-owner@example.test',1,1)`),
-      env.DB.prepare(
-        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES(?,'stream-owner','owner',1)",
-      ).bind(installed.workspaceId),
-      env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE user_id=?").bind(installed.userId),
-      env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(spaceId),
-      env.DB.prepare("DELETE FROM space_members WHERE space_id=? AND user_id=?").bind(spaceId, installed.userId),
-    ]);
+    const inviteRes = await SELF.fetch(
+      authenticatedRequest(installed.cookie, "/api/invites", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role: "viewer" }),
+      }),
+    );
+    const { invite } = await inviteRes.json<{ invite: { token: string } }>();
+    const accepted = await SELF.fetch("http://example.test/api/invites/accept", {
+      method: "POST",
+      headers: { origin: "http://example.test", "content-type": "application/json" },
+      body: JSON.stringify({
+        token: invite.token,
+        email: "stream-viewer@example.test",
+        name: "Stream viewer",
+        password: "password123",
+      }),
+    });
+    expect(accepted.status).toBe(200);
+    const viewerCookie = await enrollAccount(accepted, invite.token);
+    const viewer = { ...installed, cookie: viewerCookie };
+    await env.DB.prepare("UPDATE spaces SET visibility='private' WHERE id=?").bind(spaceId).run();
 
-    expect((await broadcast(installed, { type: "comments-invalidated", pageId: installed.pageId })).status).toBe(200);
-    expect(await events.message(1)).toEqual({ type: "stream-seq", seq: start + 1 });
-    events.socket.close(1000, "done");
+    const publicSocket = await openWorkspaceEvents(viewer);
+    const publicHello = await publicSocket.message(0);
+    const owner = await openWorkspaceEvents(installed);
+    const ownerHello = await owner.message(0);
+    const privateEvent = { type: "comments-invalidated", pageId: installed.pageId };
+
+    expect((await broadcast(installed, privateEvent)).status).toBe(200);
+    expect(await owner.message(1)).toEqual({ ...privateEvent, position: { scope: "privateSeq", seq: 1 } });
+    owner.socket.close(1000, "done");
+
+    expect((await broadcast(installed, privateEvent)).status).toBe(200);
+    const uncaughtOwner = await openWorkspaceEvents(installed);
+    expect(await uncaughtOwner.message(0)).toEqual({ ...ownerHello, privateSeq: 2 });
+
+    const reconnected = await openWorkspaceEvents(viewer);
+    expect(await reconnected.message(0)).toEqual(publicHello);
+    await broadcast(installed, { type: "organization-invalidated" });
+    expect(await publicSocket.message(1)).toEqual({
+      type: "organization-invalidated",
+      position: { scope: "publicSeq", seq: Number(publicHello.publicSeq) + 1 },
+    });
+    expect(publicSocket.messages).toHaveLength(2);
+    publicSocket.socket.close(1000, "done");
+    reconnected.socket.close(1000, "done");
+    uncaughtOwner.socket.close(1000, "done");
   });
 
   it("records missed deliveries without sending anything", async () => {

@@ -1,8 +1,13 @@
 import { IndexeddbPersistence } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
-import type { WorkspaceConnectKind, WorkspaceEvent } from "../shared/types";
-import { parseWorkspaceEvent, parseWorkspaceStreamMessage, workspaceEventSeq } from "../shared/validation";
+import type {
+  WorkspaceConnectKind,
+  WorkspaceEvent,
+  WorkspaceStreamHello,
+  WorkspaceStreamPosition,
+} from "../shared/types";
+import { parseWorkspaceEvent, parseWorkspaceStreamHello, workspaceEventPosition } from "../shared/validation";
 import { CollaborationDurability } from "./collaboration-durability";
 import { connectionRetryDelay } from "./retry";
 import { reportClientError } from "./telemetry";
@@ -301,6 +306,9 @@ export function createCollaboration(
       stop();
       if (closed) return;
       closed = true;
+      // lib0's version-change listener retains the persistence through its
+      // database-open closure. The connection is closing even if IDB is blocked.
+      if (indexeddb.db) indexeddb.db.onversionchange = null;
       void indexeddb.destroy().catch((error) => {
         console.error("Failed to close offline document storage", error);
         void reportClientError("client.offline_storage_failed", error);
@@ -541,47 +549,48 @@ export function createWorkspaceEvents(
   const provider = new YProvider(window.location.host, workspaceId, doc, {
     party: "workspace-events",
   });
-  let stream: { id: string; seq: number } | null = null;
-  let gap = false;
+  let stream: WorkspaceStreamHello | null = null;
+  let previouslyConnected = false;
   let authoritativeAt = 0;
-  let connectionReported = true;
   let disconnectedAt: number | null = null;
+  let socketAttempt = 0;
+  let awaitingHello = false;
   let helloTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const report = (kind: WorkspaceConnectKind) => {
+  const stopWaiting = () => {
+    awaitingHello = false;
     clearTimeout(helloTimer);
     helloTimer = undefined;
-    connectionReported = true;
-    if (kind !== "current") {
-      gap = false;
-      authoritativeAt = Date.now();
-    }
+  };
+  const report = (kind: WorkspaceConnectKind) => {
+    stopWaiting();
+    if (kind !== "current") authoritativeAt = Date.now();
+    previouslyConnected = true;
     onConnected(kind);
   };
   const legacy = () => {
-    // Without a hello there is no position to compare, so every reconnect reloads.
     stream = null;
     disconnectedAt = null;
-    report("legacy");
+    report(previouslyConnected ? "catch-up" : "legacy");
   };
-  const advance = (seq: number) => {
-    if (!stream || seq <= stream.seq) return;
-    if (seq > stream.seq + 1) gap = true;
-    stream = { id: stream.id, seq };
-    if (gap && connectionReported) report("catch-up");
+  const advance = ({ scope, seq }: WorkspaceStreamPosition) => {
+    if (!stream || awaitingHello || disconnectedAt !== null || seq <= stream[scope]) return false;
+    const missed = seq > stream[scope] + 1;
+    stream[scope] = seq;
+    return missed;
   };
-  const hello = (streamId: string, seq: number) => {
+  const hello = (position: WorkspaceStreamHello) => {
     const now = Date.now();
-    const kind: WorkspaceConnectKind = !stream
+    const kind: WorkspaceConnectKind = !previouslyConnected
       ? "initial"
-      : stream.id === streamId &&
-          stream.seq === seq &&
-          !gap &&
+      : stream?.streamId === position.streamId &&
+          stream.publicSeq === position.publicSeq &&
+          stream.privateSeq === position.privateSeq &&
           (disconnectedAt === null || now - disconnectedAt < WORKSPACE_OUTAGE_MS) &&
           now - authoritativeAt < WORKSPACE_AUTHORITATIVE_RELOAD_MS
         ? "current"
         : "catch-up";
-    stream = { id: streamId, seq };
+    stream = position;
     disconnectedAt = null;
     report(kind);
   };
@@ -590,40 +599,39 @@ export function createWorkspaceEvents(
     try {
       value = JSON.parse(message);
     } catch {
-      // Ignore messages from future server versions.
       return;
     }
-    const bookkeeping = parseWorkspaceStreamMessage(value);
-    if (bookkeeping?.type === "stream-hello") {
-      if (!connectionReported) hello(bookkeeping.streamId, bookkeeping.seq);
-      return;
-    }
-    if (bookkeeping) {
-      advance(bookkeeping.seq);
+    const position = parseWorkspaceStreamHello(value);
+    if (position) {
+      if (awaitingHello) hello(position);
       return;
     }
     const event = parseWorkspaceEvent(value);
     if (event) onEvent(event);
-    const seq = workspaceEventSeq(value);
-    if (seq !== null) advance(seq);
+    const stamp = workspaceEventPosition(value);
+    if (stamp && advance(stamp)) {
+      // The authoritative event already requests the same refresh.
+      if (event?.type === "workspace-invalidated") authoritativeAt = Date.now();
+      else report("catch-up");
+    }
   };
   const status = ({ status: next }: { status: string }) => {
     if (next === "disconnected") {
-      // Keep the first disconnect of an outage; failed reconnects report it again.
       disconnectedAt ??= Date.now();
+      stopWaiting();
       return;
     }
     if (next !== "connected") return;
-    connectionReported = false;
-    clearTimeout(helloTimer);
+    stopWaiting();
+    const attempt = ++socketAttempt;
+    awaitingHello = true;
     helloTimer = setTimeout(() => {
-      if (!connectionReported) legacy();
+      if (awaitingHello && socketAttempt === attempt) legacy();
     }, WORKSPACE_HELLO_TIMEOUT_MS);
   };
   const sync = (synced: boolean) => {
-    // The server sends its hello before its sync reply, so a sync without one
-    // means an older Durable Object that does not number its events.
-    if (synced && !connectionReported) legacy();
+    // The server sends its hello before its sync reply.
+    if (synced && awaitingHello) legacy();
   };
   provider.on("custom-message", customMessage);
   provider.on("status", status);
@@ -631,7 +639,7 @@ export function createWorkspaceEvents(
   return {
     provider,
     destroy() {
-      clearTimeout(helloTimer);
+      stopWaiting();
       provider.off("custom-message", customMessage);
       provider.off("status", status);
       provider.off("sync", sync);

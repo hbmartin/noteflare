@@ -32,7 +32,10 @@ export function subscribeDiagramEmbed(account: string, pageId: string, listener:
     };
     const unavailable = () => {
       generation++;
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = undefined;
       disposeRoom();
+      disposeRoom = noop;
       bundle = null;
       publish({ page: null, records: null, status: "unavailable" });
     };
@@ -45,9 +48,10 @@ export function subscribeDiagramEmbed(account: string, pageId: string, listener:
       refreshing = true;
       if (retryTimer) clearTimeout(retryTimer);
       retryTimer = undefined;
+      const readGeneration = generation;
       try {
         const { page } = await api<{ page: Page }>(`/api/pages/${encodeURIComponent(pageId)}`);
-        if (!active) return;
+        if (!active || generation !== readGeneration) return;
         if (page.kind !== "diagram" || page.archivedAt !== null) {
           unavailable();
           return;
@@ -90,7 +94,7 @@ export function subscribeDiagramEmbed(account: string, pageId: string, listener:
         };
         void next.ready.then(read);
       } catch (error) {
-        if (!active) return;
+        if (!active || generation !== readGeneration) return;
         if (error instanceof ApiClientError && [401, 403, 404, 410].includes(error.status)) unavailable();
         else {
           publish({ ...state, status: "offline" });
@@ -108,8 +112,10 @@ export function subscribeDiagramEmbed(account: string, pageId: string, listener:
     };
     const workspace = (event: Event) => {
       const change = (event as CustomEvent<WorkspaceEvent>).detail;
-      if (change?.type === "pages-removed" && change.pageIds.includes(pageId)) unavailable();
-      else if (
+      if (change?.type === "pages-removed" && change.pageIds.includes(pageId)) {
+        pendingRefresh = false;
+        unavailable();
+      } else if (
         // A missed-event catch-up arrives as a workspace invalidation; recheck access and the epoch.
         change?.type === "workspace-invalidated" ||
         (change?.type === "pages-upserted" && change.pages.some((page) => page.id === pageId))

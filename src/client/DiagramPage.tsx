@@ -1,3 +1,4 @@
+import { pagePrefetchPaths, prefetchedOrFetch } from "./page-prefetch";
 import { DiagramRestoreOwner } from "./diagram-restore-owner";
 import { createDocumentCloseReconciler } from "./document-connection";
 import { useOnlineStatus } from "./online-status";
@@ -1176,7 +1177,8 @@ export function DiagramPage({
     };
   }, [onAccessDenied, onPageUnavailable, onPageChanged, notices, page.contentEpoch, page.id]);
   useEffect(() => {
-    void api<{ threads: CommentThread[] }>(`/api/pages/${page.id}/comments?revision=${commentsRevision}`)
+    const path = pagePrefetchPaths(page.id).comments;
+    void prefetchedOrFetch<{ threads: CommentThread[] }>(path, `${path}?revision=${commentsRevision}`)
       .then((data) => setThreads(data.threads))
       .catch(() => setThreads([]));
   }, [commentsRevision, page.id]);
