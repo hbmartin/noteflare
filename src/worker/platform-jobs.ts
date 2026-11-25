@@ -84,10 +84,14 @@ function platformIntentStatement(database: Pick<D1Database, "prepare">, intent: 
     );
 }
 
-export async function enqueuePlatformJob(env: Env, intent: PlatformJobIntent, before: D1PreparedStatement[] = []) {
+export async function persistPlatformJob(env: Env, intent: PlatformJobIntent, before: D1PreparedStatement[] = []) {
   const statement = platformIntentStatement(env.DB, intent);
   if (before.length) await env.DB.batch([...before, statement]);
   else await statement.run();
+}
+
+export async function enqueuePlatformJob(env: Env, intent: PlatformJobIntent, before: D1PreparedStatement[] = []) {
+  await persistPlatformJob(env, intent, before);
   await notifyPlatformJob(env, intent);
 }
 export async function notifyPlatformJob(
@@ -114,35 +118,88 @@ export async function notifyPlatformJob(
   }
   if (row === null) return false;
 
-  const due = Math.max(at, row?.available_at ?? 0, row?.lease_until ?? 0);
-  const delaySeconds = Math.max(0, Math.ceil((due - Date.now()) / 1000));
-  try {
-    await queue.send({ platformJobId: id }, { delaySeconds });
-  } catch {
-    recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
-    return false;
-  }
+  const redispatchAt = await sendDelayedPlatformJob(
+    env,
+    queue,
+    id,
+    Math.max(at, row?.available_at ?? 0, row?.lease_until ?? 0),
+  );
+  if (redispatchAt === null) return false;
   if (row) {
     try {
-      await recordQueueDispatch(env, row, Date.now() + delaySeconds * 1000 + QUEUE_REDISPATCH_GRACE_MS, 0);
+      await queueDispatchStatement(env.DB, row, redispatchAt, 0).run();
     } catch {
       logger.warn(
         "platform.enqueue.dispatch_state_failed",
         "platform",
-        "Accepted Queue wake remains eligible for recovery",
+        "Could not record an accepted Queue wake's recovery deadline",
       );
     }
   }
   return true;
 }
 
-async function recordQueueDispatch(env: Env, row: QueueDispatchRow, redispatchAt: number, failures: number) {
+/** Publication maintenance gathers intents before notifying Queue to keep D1 calls bounded per alarm. */
+export async function notifyPlatformJobs(env: Env, ids: readonly string[]) {
+  const queue = env.PLATFORM_QUEUE;
+  if (!queue || !ids.length) return;
+  const jobIds = [...new Set(ids)];
+  let rows: QueueDispatchDeadline[];
+  try {
+    ({ results: rows } = await env.DB.prepare(
+      `SELECT id,generation,created_at,queue_dispatch_revision,available_at,lease_until
+       FROM platform_jobs WHERE id IN (SELECT value FROM json_each(?))`,
+    )
+      .bind(JSON.stringify(jobIds))
+      .all<QueueDispatchDeadline>());
+  } catch {
+    logger.warn(
+      "platform.enqueue.dispatch_state_unavailable",
+      "platform",
+      "Publication Queue wakes remain pending for recovery",
+    );
+    return;
+  }
+
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const accepted: { row: QueueDispatchDeadline; redispatchAt: number }[] = [];
+  for (const id of jobIds) {
+    const row = byId.get(id);
+    if (!row) continue;
+    const redispatchAt = await sendDelayedPlatformJob(env, queue, id, Math.max(row.available_at, row.lease_until ?? 0));
+    if (redispatchAt !== null) accepted.push({ row, redispatchAt });
+  }
+  if (!accepted.length) return;
+  try {
+    await env.DB.batch(accepted.map(({ row, redispatchAt }) => queueDispatchStatement(env.DB, row, redispatchAt, 0)));
+  } catch {
+    logger.warn(
+      "platform.enqueue.dispatch_state_failed",
+      "platform",
+      "Could not record accepted publication Queue wakes' recovery deadlines",
+      { accepted: accepted.length },
+    );
+  }
+}
+
+async function sendDelayedPlatformJob(env: Env, queue: Queue, id: string, due: number) {
+  const delaySeconds = Math.max(0, Math.ceil((due - Date.now()) / 1000));
+  try {
+    await queue.send({ platformJobId: id }, { delaySeconds });
+    return Date.now() + delaySeconds * 1000 + QUEUE_REDISPATCH_GRACE_MS;
+  } catch {
+    recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
+    return null;
+  }
+}
+
+function queueDispatchStatement(database: D1Database, row: QueueDispatchRow, redispatchAt: number, failures: number) {
   // The consumer, a replacement generation, or owner Retry can advance the row during the send.
-  await env.DB.prepare(`UPDATE platform_jobs SET queue_redispatch_at=?,queue_send_failures=?,
+  return database
+    .prepare(`UPDATE platform_jobs SET queue_redispatch_at=?,queue_send_failures=?,
     queue_dispatch_revision=queue_dispatch_revision+1
     WHERE id=? AND generation=? AND created_at=? AND queue_dispatch_revision=?`)
-    .bind(redispatchAt, failures, row.id, row.generation, row.created_at, row.queue_dispatch_revision)
-    .run();
+    .bind(redispatchAt, failures, row.id, row.generation, row.created_at, row.queue_dispatch_revision);
 }
 
 export function runPlatformJob(env: Env, id: string, handlers: PlatformHandlers) {
@@ -254,8 +311,9 @@ export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, 
     .bind(now, now, queue ? 1 : 0, now, Math.max(1, Math.min(25, limit)))
     .all<QueueDispatchRow & { queue_send_failures: number }>();
   let queueSendFailures = 0;
-  // Record each result before sending the next job. If D1 fails after Queue accepts a message,
-  // recovery may send that job again. The consumer claims only due jobs with no active lease.
+  let dispatchStateFailures = 0;
+  // An accepted message may be sent again if D1 cannot record its deadline.
+  // The consumer claims only due jobs with no active lease, and the rest of the batch still runs.
   for (const row of rows.results) {
     if (!queue) {
       await runPlatformJob(env, row.id, handlers);
@@ -270,9 +328,18 @@ export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, 
       recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
     }
     const delay = failures ? Math.min(3_600_000, 60_000 * 2 ** (failures - 1)) : QUEUE_REDISPATCH_GRACE_MS;
-    await recordQueueDispatch(env, row, Date.now() + delay, failures);
+    try {
+      await queueDispatchStatement(env.DB, row, Date.now() + delay, failures).run();
+    } catch {
+      dispatchStateFailures++;
+      logger.warn(
+        "platform.recovery.dispatch_state_failed",
+        "platform",
+        "Queue recovery could not record a job’s dispatch deadline",
+      );
+    }
   }
-  return { queueAttempts: queue ? rows.results.length : 0, queueSendFailures };
+  return { queueAttempts: queue ? rows.results.length : 0, queueSendFailures, dispatchStateFailures };
 }
 
 export async function consumePlatformQueue(

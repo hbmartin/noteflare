@@ -2,6 +2,7 @@ import { applyD1Migrations, env, reset, runInDurableObject } from "cloudflare:te
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "./env";
 import { enqueuePendingPublications, type Publication } from "./publications";
+import { countedD1 } from "../../tests/helpers/count-d1";
 
 beforeEach(async () => {
   await reset();
@@ -290,6 +291,56 @@ it.each([false, true])("backs off Queue recovery during a total outage (failed s
   }
 });
 
+it.each(["first", "all"] as const)("isolates dispatch state write failures for %s jobs", async (failure) => {
+  const now = Date.now();
+  await env.DB.batch([recoveryJob("first", now - 1), recoveryJob("second", now - 1)]);
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+  const condition = failure === "first" ? "AND OLD.id='first'" : "";
+  await env.DB.prepare(`CREATE TRIGGER reject_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+      WHEN NEW.queue_redispatch_at>0 ${condition} BEGIN SELECT RAISE(ABORT,'fixture_d1_write_failed'); END`).run();
+  try {
+    await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
+      const mutable = instance as unknown as { env: Env };
+      const original = mutable.env;
+      mutable.env = queueRecoveryEnv(original, send, () => false);
+      const runPhase = async (time: number) => {
+        clock.mockReturnValue(time);
+        await state.storage.put("phase", 2);
+        await instance.alarm();
+      };
+      const retry = async () =>
+        (await state.storage.get<{ retries?: Record<number, unknown> }>("schedule"))?.retries?.[2];
+      try {
+        await runPhase(now);
+        expect(send.mock.calls).toEqual([[{ platformJobId: "first" }], [{ platformJobId: "second" }]]);
+        expect(
+          (await env.DB.prepare("SELECT id,queue_redispatch_at FROM platform_jobs ORDER BY id").all()).results,
+        ).toEqual([
+          { id: "first", queue_redispatch_at: 0 },
+          {
+            id: "second",
+            queue_redispatch_at: failure === "all" ? 0 : now + 300_000,
+          },
+        ]);
+        const deadline = now + 60_000;
+        expect(await retry()).toEqual(failure === "all" ? { attempts: 1, at: deadline } : undefined);
+        await env.DB.prepare("DROP TRIGGER reject_deadline").run();
+        await runPhase(now + 5000);
+        expect(send).toHaveBeenCalledTimes(failure === "all" ? 2 : 3);
+        await runPhase(deadline);
+        expect(await retry()).toBeUndefined();
+        expect(send).toHaveBeenCalledTimes(failure === "all" ? 4 : 3);
+      } finally {
+        await state.storage.deleteAlarm();
+        mutable.env = original;
+      }
+    });
+  } finally {
+    clock.mockRestore();
+  }
+});
+
 it.each([false, true])(
   "schedules Queue redispatch per job after a partial failure (failed scan: %s)",
   async (failScan) => {
@@ -477,6 +528,102 @@ it.each([false, true])(
     }
   },
 );
+
+describe("publication Queue dispatch in phase 1", () => {
+  async function seedPublications(perGroup: number) {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@phase.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Workspace',1)"),
+      ...["restart", "missing"].flatMap((group) =>
+        Array.from({ length: perGroup }, (_, index) => {
+          const id = `${group}-${index}`;
+          return env.DB.prepare(`INSERT INTO publications
+            (id,workspace_id,space_id,url_key,config_json,active,generation,access_generation,needs_build,created_by,created_at,updated_at)
+            VALUES(?,'workspace','workspace-general',?,'{}',1,1,1,1,'owner',1,?)`).bind(id, id, index + 1);
+        }),
+      ),
+      env.DB.prepare(`UPDATE publications SET build_failure_json='{"kind":"state"}' WHERE id LIKE 'restart-%'`),
+      env.DB.prepare("DELETE FROM platform_jobs WHERE job_key LIKE 'missing-%'"),
+    ]);
+  }
+
+  it("dispatches both full batches within the D1 call budget, with audit enabled", async () => {
+    await seedPublications(20);
+    const now = Date.now() + 10_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+    const d1 = countedD1(env.DB);
+    try {
+      expect(
+        await alarmAt(1, {
+          DB: d1.database,
+          AUDIT_ENABLED: "true",
+          PUBLIC_PUBLISHING_ENABLED: "true",
+          PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
+        }),
+      ).toEqual({ phase: 2, alarm: now + 5000 });
+      expect(d1.calls).toBe(44);
+      expect(send).toHaveBeenCalledTimes(40);
+      const dispatched = await env.DB.prepare("SELECT count(*) FROM platform_jobs WHERE queue_redispatch_at=?")
+        .bind(now + 300_000)
+        .first("count(*)");
+      expect(dispatched).toBe(40);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it.each(["partial", "write", "read"] as const)(
+    "preserves durable jobs after a %s dispatch failure",
+    async (failure) => {
+      await seedPublications(2);
+      if (failure === "write") {
+        await env.DB.prepare(`CREATE TRIGGER reject_publication_deadline BEFORE UPDATE OF queue_redispatch_at
+        ON platform_jobs WHEN NEW.queue_redispatch_at>0 AND OLD.job_key='missing-1'
+        BEGIN SELECT RAISE(ABORT,'fixture_d1_write_failed'); END`).run();
+      }
+      const send = vi.fn(async ({ platformJobId }: { platformJobId: string }) => {
+        if (failure === "partial") {
+          if (platformJobId.endsWith('"missing-0"]')) throw new Error("fixture_queue_send_failed");
+          if (platformJobId.endsWith('"restart-0"]')) {
+            await env.DB.prepare("UPDATE platform_jobs SET generation='3' WHERE id=?").bind(platformJobId).run();
+          }
+        }
+        return queueSendResponse;
+      });
+      const configured = queueRecoveryEnv(env as Env, send, () => false);
+      const DB = new Proxy(configured.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              if (failure === "read" && sql.includes("json_each(?)")) throw new Error("fixture_dispatch_read_failed");
+              return target.prepare(sql);
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      await alarmAt(1, { ...configured, DB, PUBLIC_PUBLISHING_ENABLED: "true" });
+      expect(send).toHaveBeenCalledTimes(failure === "read" ? 0 : 4);
+
+      if (failure === "write") await env.DB.prepare("DROP TRIGGER reject_publication_deadline").run();
+      const pending = await env.DB.prepare(
+        "SELECT job_key,generation,queue_redispatch_at>0 AS dispatched FROM platform_jobs ORDER BY job_key",
+      ).all();
+      expect(pending.results).toEqual([
+        { job_key: "missing-0", generation: "1", dispatched: 0 },
+        { job_key: "missing-1", generation: "1", dispatched: Number(failure === "partial") },
+        { job_key: "restart-0", generation: failure === "partial" ? "3" : "2", dispatched: 0 },
+        { job_key: "restart-1", generation: "2", dispatched: Number(failure === "partial") },
+      ]);
+      send.mockClear();
+      await alarmAt(2, configured);
+      expect(send).toHaveBeenCalledTimes(failure === "partial" ? 2 : 4);
+    },
+  );
+});
 
 describe("publication recovery deadlines", () => {
   async function pendingPublication(now: number) {

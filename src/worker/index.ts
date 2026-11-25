@@ -7678,25 +7678,25 @@ export default {
             throw error;
           }
           const headers = new Headers(response.headers);
-          const requestPath = new URL(request.url).pathname;
+          const routePath = app.getPath(request);
           if (
             response.status < 400 &&
             ["POST", "PATCH", "PUT", "DELETE"].includes(request.method) &&
             !readOnlyPostRequests.has(request) &&
-            app.getPath(request) !== "/api/platform/retry" &&
+            routePath !== "/api/platform/retry" &&
             usageEnv.PLATFORM &&
             (usageEnv.SEMANTIC_SEARCH_ENABLED === "true" ||
               usageEnv.PUBLIC_PUBLISHING_ENABLED === "true" ||
               usageEnv.AUDIT_ENABLED === "true" ||
               usageEnv.HEATMAPS_ENABLED === "true" ||
-              requestPath.startsWith("/api/platform/keys"))
+              routePath.startsWith("/api/platform/keys"))
           )
             backgroundUsage(context, usageEnv, "platform.wake", {}, (bindings) =>
               wakePlatform(bindings).catch(() =>
                 logger.warn("platform.wake.failed", "platform", "Scheduled recovery will retry platform work"),
               ),
             );
-          if (!requestPath.startsWith("/share/")) headers.set("X-Robots-Tag", "noindex, nofollow");
+          if (!new URL(request.url).pathname.startsWith("/share/")) headers.set("X-Robots-Tag", "noindex, nofollow");
           headers.set("x-request-id", requestId);
           headers.set("x-worker-version", usageEnv.CF_VERSION_METADATA?.id ?? "local");
           const contentLengthHeader = headers.get("content-length");

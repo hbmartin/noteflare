@@ -3,7 +3,12 @@ import type { Publication } from "./publications";
 import { recordMetric } from "./observability";
 import { notifyPlatformJob } from "./platform-jobs";
 import { wakePlatformBestEffort } from "./platform-wakeup";
-export async function retirePublicationBuild(env: Env, pub: Publication, reason: "content" | "authority" | "state") {
+export async function retirePublicationBuild(
+  env: Env,
+  pub: Publication,
+  reason: "content" | "authority" | "state",
+  { notify = true } = {},
+) {
   const changed =
     await env.DB.prepare(`UPDATE publications SET generation=generation+1,needs_build=1,build_state_recovery_count=build_state_recovery_count+?,
     build_content_version=NULL,build_checkpoint_json=NULL,build_error=NULL,build_failure_checkpoint_json=NULL,build_failure_json=NULL
@@ -18,10 +23,10 @@ export async function retirePublicationBuild(env: Env, pub: Publication, reason:
         Number(reason === "state"),
       )
       .run();
-  if (changed.meta.changes) {
-    await wakePublicationBuild(env, pub);
-    recordMetric(env, { event: `publication.restart.${reason}`, component: "platform", attempts: 1 });
-  }
+  if (!changed.meta.changes) return false;
+  if (notify) await wakePublicationBuild(env, pub);
+  recordMetric(env, { event: `publication.restart.${reason}`, component: "platform", attempts: 1 });
+  return true;
 }
 export async function wakePublicationBuild(env: Env, pub: Pick<Publication, "id" | "workspace_id">) {
   await notifyPlatformJob(env, { workspaceId: pub.workspace_id, kind: "publication", key: pub.id });

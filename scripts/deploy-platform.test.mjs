@@ -398,6 +398,7 @@ describe("coordinated Turnstile replacement", () => {
         },
       });
       exited = true;
+      expect(result).toMatchObject({ status: 1, failure: "aborted" });
       expect(existsSync(uploadFile)).toBe(true);
       return result;
     });

@@ -15,6 +15,7 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
     failure,
     failed = false,
     exited = false,
+    settled = false,
     finishDrain,
     drainTimer,
     killTimer;
@@ -25,11 +26,10 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
     killTimer.unref();
   }
   function abortChild() {
-    if (!exited) stopChild();
-    else if (finishDrain) {
-      failure ??= "aborted";
-      finishDrain();
-    }
+    if (settled) return;
+    failure ??= "aborted";
+    if (exited) finishDrain?.();
+    else stopChild();
   }
   child.stdout?.on("data", (chunk) => {
     bytes += chunk.length;
@@ -40,6 +40,7 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
   });
   const { promise: finished, resolve: resolveExit } = Promise.withResolvers();
   const finish = (status) => {
+    settled = true;
     finishDrain = undefined;
     resolveExit({
       status: failed || failure ? 1 : status,
