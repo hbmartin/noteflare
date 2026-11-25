@@ -426,8 +426,10 @@ describe("collaboration durability barriers", () => {
   });
 
   describe("workspace event stream positions", () => {
-    const hello = (seq: number, streamId = "stream-a") => JSON.stringify({ type: "stream-hello", streamId, seq });
-    const event = (seq: number) => JSON.stringify({ type: "organization-invalidated", seq });
+    const hello = (publicSeq: number, streamId = "stream-a", privateSeq = 0) =>
+      JSON.stringify({ type: "stream-hello", protocol: 2, streamId, publicSeq, privateSeq });
+    const event = (seq: number) =>
+      JSON.stringify({ type: "organization-invalidated", position: { scope: "publicSeq", seq } });
 
     function connect() {
       const onEvent = vi.fn();
@@ -452,11 +454,18 @@ describe("collaboration durability barriers", () => {
       provider.emit("custom-message", event(5));
       // The position is stripped before subscribers see the event.
       expect(onEvent).toHaveBeenLastCalledWith({ type: "organization-invalidated" });
-      provider.emit("custom-message", JSON.stringify({ type: "stream-seq", seq: 6 }));
-      expect(onEvent).toHaveBeenCalledTimes(1);
+      provider.emit(
+        "custom-message",
+        JSON.stringify({
+          type: "comments-invalidated",
+          pageId: "page",
+          position: { scope: "privateSeq", seq: 1 },
+        }),
+      );
+      expect(onEvent).toHaveBeenCalledTimes(2);
 
       open();
-      provider.emit("custom-message", hello(6));
+      provider.emit("custom-message", hello(5, "stream-a", 1));
       expect(onConnected).toHaveBeenLastCalledWith("current");
       expect(onConnected).toHaveBeenCalledTimes(2);
       bundle.destroy();
@@ -492,15 +501,32 @@ describe("collaboration durability barriers", () => {
       expect(onConnected).toHaveBeenLastCalledWith("legacy");
 
       open();
+      provider.emit("custom-message", JSON.stringify({ type: "stream-hello", streamId: "unscoped", seq: 4 }));
       vi.advanceTimersByTime(10_000);
-      expect(onConnected).toHaveBeenLastCalledWith("legacy");
+      expect(onConnected).toHaveBeenLastCalledWith("catch-up");
 
       open();
       provider.emit("custom-message", hello(2));
-      expect(onConnected).toHaveBeenLastCalledWith("initial");
+      expect(onConnected).toHaveBeenLastCalledWith("catch-up");
       vi.advanceTimersByTime(15 * 60_000);
       open();
       provider.emit("custom-message", hello(2));
+      expect(onConnected).toHaveBeenLastCalledWith("catch-up");
+      bundle.destroy();
+    });
+
+    it("preserves the last hello when a retry disconnects before classification", () => {
+      vi.useFakeTimers();
+      const { onConnected, bundle, provider, open } = connect();
+      open();
+      provider.emit("custom-message", hello(2));
+      provider.emit("status", { status: "disconnected" });
+      open();
+      provider.emit("status", { status: "disconnected" });
+      vi.advanceTimersByTime(11_000);
+      expect(onConnected).toHaveBeenCalledTimes(1);
+      open();
+      provider.emit("custom-message", hello(2, "stream-a", 1));
       expect(onConnected).toHaveBeenLastCalledWith("catch-up");
       bundle.destroy();
     });

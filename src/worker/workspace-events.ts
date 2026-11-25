@@ -1,7 +1,7 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { REALTIME_GRANT_MS, REALTIME_ROOM_MARGIN_MS, REALTIME_CLOCK_SKEW_MS } from "../shared/realtime-limits";
 import { YServer } from "y-partyserver";
-import type { Page, WorkspaceEvent, WorkspaceStreamMessage } from "../shared/types";
+import type { Page, WorkspaceEvent, WorkspaceStreamHello, WorkspaceStreamPosition } from "../shared/types";
 import { ID_PATTERN, parseWorkspaceEvent } from "../shared/validation";
 import type { Env } from "./env";
 import { correlationHeaders, logger, withDurableObjectContext } from "./observability";
@@ -89,37 +89,40 @@ export class WorkspaceEvents extends YServer {
       CREATE TABLE IF NOT EXISTS realtime_fanout(room TEXT PRIMARY KEY,generation INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS realtime_room_fences(room TEXT PRIMARY KEY,generation INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS realtime_legacy_scan(id INTEGER PRIMARY KEY,deadline INTEGER NOT NULL,cursor TEXT NOT NULL,complete INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS workspace_event_stream(id INTEGER PRIMARY KEY CHECK(id=1),stream_id TEXT NOT NULL,seq INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS workspace_event_stream_v2(id INTEGER PRIMARY KEY CHECK(id=1),stream_id TEXT NOT NULL,seq INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS workspace_private_event_positions(user_id TEXT PRIMARY KEY,seq INTEGER NOT NULL);`);
     this.state.storage.sql.exec("INSERT OR IGNORE INTO realtime_legacy_scan VALUES(1,?,'',0)", Date.now() + 5 * 60_000);
-    this.state.storage.sql.exec("INSERT OR IGNORE INTO workspace_event_stream VALUES(1,?,0)", crypto.randomUUID());
+    this.state.storage.sql.exec("INSERT OR IGNORE INTO workspace_event_stream_v2 VALUES(1,?,0)", crypto.randomUUID());
   }
 
-  /**
-   * Every event a connection could have received advances one durable sequence.
-   * A reconnecting client compares the position in its hello with the last one it
-   * saw, so it reloads only when something happened while it was away. The
-   * stream id changes only if this object's storage is recreated.
-   */
-  private streamPosition() {
-    return this.state.storage.sql
-      .exec<{ stream_id: string; seq: number }>("SELECT stream_id, seq FROM workspace_event_stream WHERE id=1")
+  private streamHello(userId: string): WorkspaceStreamHello {
+    const position = this.state.storage.sql
+      .exec<{ stream_id: string; seq: number; private_seq: number }>(
+        `SELECT stream_id, seq,
+           COALESCE((SELECT seq FROM workspace_private_event_positions WHERE user_id=?),0) AS private_seq
+         FROM workspace_event_stream_v2 WHERE id=1`,
+        userId,
+      )
       .one();
+    return {
+      type: "stream-hello",
+      protocol: 2,
+      streamId: position.stream_id,
+      publicSeq: position.seq,
+      privateSeq: position.private_seq,
+    };
   }
 
-  /** Allocate the next position. Call it immediately before the sends it stamps. */
-  private nextSeq() {
+  private nextPublicSeq() {
     return this.state.storage.sql
-      .exec<{ seq: number }>("UPDATE workspace_event_stream SET seq=seq+1 WHERE id=1 RETURNING seq")
+      .exec<{ seq: number }>("UPDATE workspace_event_stream_v2 SET seq=seq+1 WHERE id=1 RETURNING seq")
       .one().seq;
   }
 
-  /**
-   * Record that connected clients may have missed something without sending a
-   * message: the next hello or event reveals the gap and the client catches up.
-   */
+  /** When the audience is unknown, a later public event or hello requests an authoritative refresh. */
   private markStreamGap() {
     try {
-      this.nextSeq();
+      this.nextPublicSeq();
     } catch (error) {
       logger.error(
         "workspace_events.stream_gap.failed",
@@ -131,8 +134,8 @@ export class WorkspaceEvents extends YServer {
     }
   }
 
-  private stamped(event: WorkspaceEvent, seq: number) {
-    return JSON.stringify({ ...event, seq });
+  private stamped(event: WorkspaceEvent, scope: WorkspaceStreamPosition["scope"], seq: number) {
+    return JSON.stringify({ ...event, position: { scope, seq } satisfies WorkspaceStreamPosition });
   }
 
   private authGeneration() {
@@ -196,15 +199,7 @@ export class WorkspaceEvents extends YServer {
     connection.setState({ userId, expiresAt, authGeneration });
     // Send the position before any await: nothing can be broadcast to this
     // connection until it returns, so no event can precede the hello.
-    const position = this.streamPosition();
-    this.sendCustomMessage(
-      connection,
-      JSON.stringify({
-        type: "stream-hello",
-        streamId: position.stream_id,
-        seq: position.seq,
-      } satisfies WorkspaceStreamMessage),
-    );
+    this.sendCustomMessage(connection, JSON.stringify(this.streamHello(userId)));
     await this.scheduleAlarm(expiresAt);
     await super.onConnect(connection, context);
   }
@@ -453,7 +448,7 @@ export class WorkspaceEvents extends YServer {
       event.type === "notifications-invalidated" ||
       event.type === "jobs-invalidated"
     ) {
-      this.broadcastCustomMessage(this.stamped(event, this.nextSeq()));
+      this.broadcastCustomMessage(this.stamped(event, "publicSeq", this.nextPublicSeq()));
     } else {
       const pageIds =
         event.type === "pages-upserted"
@@ -473,7 +468,7 @@ export class WorkspaceEvents extends YServer {
       // Any unresolved id takes this path: filtering it out of a mixed batch would
       // leave clients showing a page that no longer exists.
       if (pages.results.length !== new Set(pageIds).size) {
-        this.broadcastCustomMessage(this.stamped({ type: "workspace-invalidated" }, this.nextSeq()));
+        this.broadcastCustomMessage(this.stamped({ type: "workspace-invalidated" }, "publicSeq", this.nextPublicSeq()));
         return;
       }
 
@@ -521,27 +516,45 @@ export class WorkspaceEvents extends YServer {
         return canRead(event.pageId) ? event : null;
       };
 
-      // Workspace-visible spaces share one safe audience, so keep the fast
-      // broadcast path. Private-space events are partitioned per connection.
-      // Every connection sees this position: the event, its private version, or a
-      // tick when it is outside the audience. Allocated after the reads above so
-      // concurrently delivered events reach clients in sequence order.
-      const seq = this.nextSeq();
+      // Allocate after audience reads and before sending. Each recipient's private
+      // cursor advances even when they are disconnected. Unrelated users see no change.
       const workspaceEvent = eventForAudience((pageId) => byId.get(pageId)?.visibility === "workspace");
-      if (workspaceEvent) this.broadcastCustomMessage(this.stamped(workspaceEvent, seq));
-      for (const connection of this.getConnections<EventConnectionAuth>()) {
-        const userId = connection.state?.userId;
-        if (!userId) continue;
-        const visible = eventForAudience((pageId) => {
-          const page = byId.get(pageId);
-          return Boolean(page?.visibility === "private" && allowed.get(page.space_id)?.has(userId));
-        });
-        if (visible) this.sendCustomMessage(connection, this.stamped(visible, seq));
-        else if (!workspaceEvent)
-          this.sendCustomMessage(
-            connection,
-            JSON.stringify({ type: "stream-seq", seq } satisfies WorkspaceStreamMessage),
-          );
+      const users = [...new Set(grants.results.map((grant) => grant.user_id))];
+      const { publicSeq, privatePositions } = this.state.storage.transactionSync(() => ({
+        publicSeq: workspaceEvent ? this.nextPublicSeq() : null,
+        privatePositions: users.length
+          ? this.state.storage.sql
+              .exec<{ user_id: string; seq: number }>(
+                `INSERT INTO workspace_private_event_positions
+                   SELECT value,1 FROM json_each(?) WHERE true
+                   ON CONFLICT(user_id) DO UPDATE SET seq=seq+1 RETURNING user_id,seq`,
+                JSON.stringify(users),
+              )
+              .toArray()
+          : [],
+      }));
+      if (workspaceEvent && publicSeq !== null)
+        this.broadcastCustomMessage(this.stamped(workspaceEvent, "publicSeq", publicSeq));
+      if (privatePositions.length) {
+        const positions = new Map(privatePositions.map(({ user_id, seq }) => [user_id, seq]));
+        const messages = new Map<string, string>();
+        for (const connection of this.getConnections<EventConnectionAuth>()) {
+          const userId = connection.state?.userId;
+          if (!userId) continue;
+          const seq = positions.get(userId);
+          if (seq === undefined) continue;
+          let message = messages.get(userId);
+          if (!message) {
+            const visible = eventForAudience((pageId) => {
+              const page = byId.get(pageId);
+              return Boolean(page?.visibility === "private" && allowed.get(page.space_id)?.has(userId));
+            });
+            if (!visible) continue;
+            message = this.stamped(visible, "privateSeq", seq);
+            messages.set(userId, message);
+          }
+          this.sendCustomMessage(connection, message);
+        }
       }
     }
     if (event.type !== "workspace-invalidated") return;
