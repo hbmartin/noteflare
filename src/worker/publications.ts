@@ -14,7 +14,13 @@ import { tableInternal } from "./table-service";
 import { restartablePublicationFailure, publicationNeedsJob } from "./publication-failure";
 import { retirePublicationBuild } from "./publication-jobs";
 import { logger } from "./observability";
-import { enqueuePlatformJob, notifyPlatformJobs, persistPlatformJob, platformJobId } from "./platform-jobs";
+import {
+  enqueuePlatformJob,
+  notifyPlatformJobs,
+  persistPlatformJob,
+  platformJobId,
+  type QueueDispatchOutcomes,
+} from "./platform-jobs";
 export type Publication = {
   id: string;
   workspace_id: string;
@@ -396,7 +402,10 @@ async function queuePublication(env: Env, pub: Publication) {
   if (pub.active) await enqueuePlatformJob(env, publicationJobIntent(pub));
 }
 
-export async function enqueuePendingPublications(env: Env) {
+export async function enqueuePendingPublications(
+  env: Env,
+  recordDispatchState?: (dispatchState: QueueDispatchOutcomes) => Promise<void>,
+) {
   if (env.PUBLIC_PUBLISHING_ENABLED !== "true") return;
   const jobIds: string[] = [];
   try {
@@ -418,9 +427,11 @@ export async function enqueuePendingPublications(env: Env) {
       jobIds.push(platformJobId(intent));
     }
   } finally {
-    await notifyPlatformJobs(env, jobIds).catch(() =>
-      logger.warn("publication.wake.failed", "platform", "Saved publication jobs remain pending for recovery"),
-    );
+    await notifyPlatformJobs(env, jobIds)
+      .then((dispatchState) => recordDispatchState?.(dispatchState))
+      .catch(() =>
+        logger.warn("publication.wake.failed", "platform", "Saved publication jobs remain pending for recovery"),
+      );
   }
 }
 export async function hostnameSettingsResponse(request: Request, env: Env, publicationId: string): Promise<Response> {

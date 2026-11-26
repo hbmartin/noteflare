@@ -47,21 +47,47 @@ export type QueueDispatchRow = {
 };
 type QueueDispatchDeadline = QueueDispatchRow & { available_at: number; lease_until: number | null };
 export type QueueDispatchCooldown = QueueDispatchRow & { attempts: number; at: number };
+type QueueDispatchDeadlineWrite = { row: QueueDispatchRow; redispatchAt: number };
+export type QueueDispatchOutcomes = {
+  failed: QueueDispatchDeadlineWrite[];
+  recordedIds: string[];
+};
 
 const LEASE_MS = 5 * 60_000;
 const QUEUE_REDISPATCH_GRACE_MS = 5 * 60_000;
 const QUEUE_DEADLINE_BATCH_SIZE = 10;
 
-// The Queue clock also includes matching coordinator cooldowns passed as a JSON binding.
-const queueCooldownSql = `coalesce((SELECT CAST(json_extract(value,'$.at') AS INTEGER) FROM json_each(?)
-  WHERE json_extract(value,'$.id')=platform_jobs.id
-    AND json_extract(value,'$.generation')=platform_jobs.generation
-    AND json_extract(value,'$.created_at')=platform_jobs.created_at
-    AND json_extract(value,'$.queue_dispatch_revision')=platform_jobs.queue_dispatch_revision),0)`;
+// Materialize the small list first and look up each entry by the indexed job ID.
+const queueCooldownsCte = `WITH dispatch_cooldowns AS MATERIALIZED (
+  SELECT j.rowid AS job_rowid,CAST(json_extract(c.value,'$.at') AS INTEGER) AS at
+  FROM json_each(?) c CROSS JOIN platform_jobs j
+  WHERE j.id=json_extract(c.value,'$.id')
+    AND j.generation=json_extract(c.value,'$.generation')
+    AND j.created_at=json_extract(c.value,'$.created_at')
+    AND j.queue_dispatch_revision=json_extract(c.value,'$.queue_dispatch_revision')
+)`;
 
-export function platformJobDeadlineSql(queueEnabled: boolean) {
-  const queueDeadline = queueEnabled ? `,queue_redispatch_at,${queueCooldownSql}` : "";
-  return `max(available_at,coalesce(lease_until,0)${queueDeadline})`;
+function activeCooldownsJson(cooldowns: readonly QueueDispatchCooldown[], now: number) {
+  const active = cooldowns.filter(({ at }) => at > now);
+  return active.length ? JSON.stringify(active) : null;
+}
+
+export function platformJobDeadlineSql(
+  queueEnabled: boolean,
+  cooldowns: readonly QueueDispatchCooldown[],
+  now = Date.now(),
+) {
+  const active = queueEnabled ? activeCooldownsJson(cooldowns, now) : null;
+  const queueDeadline = queueEnabled ? ",queue_redispatch_at" : "";
+  const cooldownDeadline = active ? ",coalesce(cooldown.at,0)" : "";
+  return {
+    deadline: `max(available_at,coalesce(lease_until,0)${queueDeadline}${cooldownDeadline})`,
+    from: active
+      ? `platform_jobs LEFT JOIN (${queueCooldownsCte} SELECT job_rowid,at FROM dispatch_cooldowns) cooldown
+        ON cooldown.job_rowid=platform_jobs.rowid`
+      : "platform_jobs",
+    bindings: active ? [active] : [],
+  };
 }
 
 export function platformJobId(intent: Pick<PlatformJobIntent, "workspaceId" | "kind" | "key">) {
@@ -161,8 +187,9 @@ export async function notifyPlatformJob(
 
 /** Publication maintenance gathers intents before notifying Queue to keep D1 calls bounded per alarm. */
 export async function notifyPlatformJobs(env: Env, ids: readonly string[]) {
+  const dispatchState: QueueDispatchOutcomes = { failed: [], recordedIds: [] };
   const queue = env.PLATFORM_QUEUE;
-  if (!queue || !ids.length) return;
+  if (!queue || !ids.length) return dispatchState;
   const jobIds = [...new Set(ids)];
   let rows: QueueDispatchDeadline[];
   try {
@@ -178,22 +205,29 @@ export async function notifyPlatformJobs(env: Env, ids: readonly string[]) {
       "platform",
       "Publication Queue wakes remain pending for recovery",
     );
-    return;
+    return dispatchState;
   }
 
   const byId = new Map(rows.map((row) => [row.id, row]));
-  const accepted: { row: QueueDispatchDeadline; redispatchAt: number }[] = [];
+  const accepted: QueueDispatchDeadlineWrite[] = [];
   for (const id of jobIds) {
-    const row = byId.get(id);
-    if (!row) continue;
-    const redispatchAt = await sendDelayedPlatformJob(env, queue, id, Math.max(row.available_at, row.lease_until ?? 0));
+    const snapshot = byId.get(id);
+    if (!snapshot) continue;
+    const { available_at, lease_until, ...row } = snapshot;
+    const redispatchAt = await sendDelayedPlatformJob(env, queue, id, Math.max(available_at, lease_until ?? 0));
     if (redispatchAt !== null) accepted.push({ row, redispatchAt });
   }
   for (let index = 0; index < accepted.length; index += QUEUE_DEADLINE_BATCH_SIZE) {
     const group = accepted.slice(index, index + QUEUE_DEADLINE_BATCH_SIZE);
     try {
-      await env.DB.batch(group.map(({ row, redispatchAt }) => queueDispatchStatement(env.DB, row, redispatchAt, 0)));
+      const results = await env.DB.batch(
+        group.map(({ row, redispatchAt }) => queueDispatchStatement(env.DB, row, redispatchAt, 0)),
+      );
+      for (const [offset, result] of results.entries()) {
+        if (result.meta.changes > 0) dispatchState.recordedIds.push(group[offset]!.row.id);
+      }
     } catch {
+      dispatchState.failed.push(...group);
       logger.warn(
         "platform.enqueue.dispatch_state_failed",
         "platform",
@@ -202,6 +236,7 @@ export async function notifyPlatformJobs(env: Env, ids: readonly string[]) {
       );
     }
   }
+  return dispatchState;
 }
 
 async function sendDelayedPlatformJob(env: Env, queue: Queue, id: string, due: number) {
@@ -332,15 +367,17 @@ export async function recoverPlatformJobs(
 ) {
   const queue = env.PLATFORM_QUEUE;
   const now = Date.now();
-  const dispatchDue = queue ? `AND queue_redispatch_at<=? AND ${queueCooldownSql}<=?` : "";
+  const active = queue ? activeCooldownsJson(cooldowns, now) : null;
+  const dispatchDue = queue ? "AND queue_redispatch_at<=?" : "";
+  // Keep SELECT first so the audit wrapper treats the recovery read as read-only.
+  const cooldownDue = active ? `AND rowid NOT IN (${queueCooldownsCte} SELECT job_rowid FROM dispatch_cooldowns)` : "";
   const rows = await env.DB.prepare(`SELECT id,generation,created_at,queue_dispatch_revision,queue_send_failures
     FROM platform_jobs WHERE available_at<=? AND (lease_until IS NULL OR lease_until<=?)
-    ${dispatchDue} ORDER BY available_at,id LIMIT ?`)
-    .bind(now, now, ...(queue ? [now, JSON.stringify(cooldowns), now] : []), Math.max(1, Math.min(25, limit)))
+    ${dispatchDue} ${cooldownDue} ORDER BY available_at,id LIMIT ?`)
+    .bind(now, now, ...(queue ? [now] : []), ...(active ? [active] : []), Math.max(1, Math.min(25, limit)))
     .all<QueueDispatchRow & { queue_send_failures: number }>();
   let queueSendFailures = 0;
-  const dispatchStateFailures: QueueDispatchRow[] = [];
-  const dispatchStateRecorded: QueueDispatchRow[] = [];
+  const dispatchState: QueueDispatchOutcomes = { failed: [], recordedIds: [] };
   // An accepted message may be sent again if D1 cannot record its deadline.
   // The consumer claims only due jobs with no active lease, and the rest of the batch still runs.
   for (const { queue_send_failures, ...row } of rows.results) {
@@ -357,11 +394,12 @@ export async function recoverPlatformJobs(
       recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
     }
     const delay = failures ? Math.min(3_600_000, 60_000 * 2 ** (failures - 1)) : QUEUE_REDISPATCH_GRACE_MS;
+    const redispatchAt = Date.now() + delay;
     try {
-      await queueDispatchStatement(env.DB, row, Date.now() + delay, failures).run();
-      dispatchStateRecorded.push(row);
+      const result = await queueDispatchStatement(env.DB, row, redispatchAt, failures).run();
+      if (result.meta.changes > 0) dispatchState.recordedIds.push(row.id);
     } catch {
-      dispatchStateFailures.push(row);
+      dispatchState.failed.push({ row, redispatchAt });
       logger.warn(
         "platform.recovery.dispatch_state_failed",
         "platform",
@@ -372,8 +410,7 @@ export async function recoverPlatformJobs(
   return {
     queueAttempts: queue ? rows.results.length : 0,
     queueSendFailures,
-    dispatchStateFailures,
-    dispatchStateRecorded,
+    dispatchState,
   };
 }
 
