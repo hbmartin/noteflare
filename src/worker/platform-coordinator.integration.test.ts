@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "./env";
 import { enqueuePendingPublications, type Publication } from "./publications";
 import { countedD1 } from "../../tests/helpers/count-d1";
-import { enqueuePlatformJob } from "./platform-jobs";
+import { enqueuePlatformJob, type QueueDispatchCooldown } from "./platform-jobs";
 
 beforeEach(async () => {
   await reset();
@@ -292,15 +292,21 @@ it.each([false, true])("backs off Queue recovery during a total outage (failed s
   }
 });
 
-it.each(["first", "all", "setup failure"] as const)(
+it.each(["first", "all", "send failure", "setup failure"] as const)(
   "isolates dispatch state write failures for %s jobs",
   async (failure) => {
     const now = Date.now();
     await env.DB.batch([recoveryJob("first", now - 1), recoveryJob("second", now - 1)]);
+    const queueRejected = failure === "send failure";
+    if (queueRejected) await env.DB.prepare("UPDATE platform_jobs SET queue_send_failures=5 WHERE id='first'").run();
     const exercise = async () => {
       const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-      const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
-      const condition = failure === "first" ? "AND OLD.id='first'" : "";
+      const send = vi.fn(async ({ platformJobId }: { platformJobId: string }) => {
+        if (queueRejected && platformJobId === "first") throw new Error("fixture_queue_rejected");
+        return queueSendResponse;
+      });
+      const firstSends = () => send.mock.calls.filter(([message]) => message.platformJobId === "first").length;
+      const condition = failure === "first" || queueRejected ? "AND OLD.id='first'" : "";
       try {
         await env.DB.prepare(`CREATE TRIGGER reject_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
       WHEN NEW.queue_redispatch_at>0 ${condition} BEGIN SELECT RAISE(ABORT,'fixture_d1_write_failed'); END`).run();
@@ -332,14 +338,21 @@ it.each(["first", "all", "setup failure"] as const)(
                 queue_redispatch_at: failure === "all" ? 0 : now + 300_000,
               },
             ]);
-            const deadline = now + 60_000;
-            expect(await retry()).toEqual(failure === "all" ? { attempts: 1, at: deadline } : undefined);
+            expect(await retry()).toEqual(failure === "all" ? { attempts: 1, at: now + 60_000 } : undefined);
+            const deadline = now + (queueRejected ? 32 * 60_000 : 300_000);
+            expect(await state.storage.get("queueDispatchCooldowns")).toEqual(
+              expect.arrayContaining([expect.objectContaining({ id: "first", attempts: 1, at: deadline })]),
+            );
             await env.DB.prepare("DROP TRIGGER reject_deadline").run();
             await runPhase(now + 5000);
-            expect(send).toHaveBeenCalledTimes(2);
-            await runPhase(deadline);
+            await runPhase(now + 60_000);
             expect(await retry()).toBeUndefined();
-            expect(send).toHaveBeenCalledTimes(failure === "all" ? 4 : 3);
+            expect(send).toHaveBeenCalledTimes(2);
+            await runPhase(deadline - 5000);
+            expect(firstSends()).toBe(1);
+            await runPhase(deadline);
+            expect(firstSends()).toBe(2);
+            expect(await state.storage.get("queueDispatchCooldowns")).toBeUndefined();
           } finally {
             await state.storage.deleteAlarm();
             mutable.env = original;
@@ -367,7 +380,11 @@ it.each(["owner retry", "replacement"] as const)("cools down a failing job until
   const now = Date.now();
   await env.DB.batch([recoveryJob("failing", now - 1), recoveryJob("healthy", now - 1)]);
   const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-  const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+  let rejectFailing = true;
+  const send = vi.fn(async ({ platformJobId }: { platformJobId: string }) => {
+    if (rejectFailing && platformJobId === "failing") throw new Error("fixture_queue_rejected");
+    return queueSendResponse;
+  });
   try {
     await env.DB.prepare(`CREATE TRIGGER reject_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
       WHEN NEW.queue_redispatch_at>0 AND OLD.id='failing'
@@ -408,8 +425,10 @@ it.each(["owner retry", "replacement"] as const)("cools down a failing job until
             .run();
         else await env.DB.prepare("UPDATE platform_jobs SET generation='2' WHERE id='failing'").run();
         await env.DB.prepare("DROP TRIGGER reject_deadline").run();
+        rejectFailing = false;
         await runPhase(2, 70_000);
         expect(send).toHaveBeenCalledTimes(6);
+        expect(await state.storage.get("queueDispatchCooldowns")).toBeUndefined();
         expect(send).toHaveBeenLastCalledWith({ platformJobId: "failing" });
       } finally {
         await state.storage.deleteAlarm();
@@ -422,6 +441,67 @@ it.each(["owner retry", "replacement"] as const)("cools down a failing job until
     } finally {
       clock.mockRestore();
     }
+  }
+});
+
+it.each(["expired", "active"] as const)("preserves fenced cooldowns when trimming %s entries", async (trim) => {
+  const now = Date.now();
+  const held = Array.from({ length: 12 }, (_, index) => `held-${index}`);
+  const stale = ["stale-created", "stale-generation", "stale-no-op", "stale-revision"];
+  const failing = Array.from({ length: 4 }, (_, index) => `write-failure-${index}`);
+  await env.DB.batch([...held, ...stale, ...failing].map((id) => recoveryJob(id, now - 1)));
+  await env.DB.prepare(`CREATE TRIGGER reject_trim_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+      WHEN NEW.queue_redispatch_at>0 AND OLD.id LIKE 'write-failure-%'
+      BEGIN SELECT RAISE(ABORT,'fixture_d1_write_failed'); END`).run();
+
+  const entry = (id: string, at = now + 900_000): QueueDispatchCooldown => ({
+    id,
+    generation: "1",
+    created_at: 0,
+    queue_dispatch_revision: 0,
+    attempts: 1,
+    at,
+  });
+  const cooldowns = [
+    ...held.map((id) => entry(id)),
+    { ...entry("stale-created"), created_at: 1 },
+    { ...entry("stale-generation"), generation: "older" },
+    { ...entry("stale-no-op"), queue_dispatch_revision: 1 },
+    { ...entry("stale-revision"), queue_dispatch_revision: 1 },
+    ...Array.from({ length: 84 }, (_, index) =>
+      entry(`filler-${index}`, trim === "expired" ? now - 1 : now + 60_000 + index),
+    ),
+  ];
+  const send = vi.fn(async ({ platformJobId }: { platformJobId: string }) => {
+    if (platformJobId === "stale-no-op")
+      await env.DB.prepare("UPDATE platform_jobs SET generation='2' WHERE id=?").bind(platformJobId).run();
+    return queueSendResponse;
+  });
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  try {
+    await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
+      const mutable = instance as unknown as { env: Env };
+      const original = mutable.env;
+      mutable.env = { ...queueRecoveryEnv(original, send, () => false), AUDIT_ENABLED: "true" };
+      try {
+        await state.storage.put({ phase: 2, queueDispatchCooldowns: cooldowns });
+        await instance.alarm();
+        expect(send.mock.calls.map(([message]) => message.platformJobId)).toEqual([...stale, ...failing]);
+        const retained = (await state.storage.get<QueueDispatchCooldown[]>("queueDispatchCooldowns"))!.map(
+          ({ id }) => id,
+        );
+        expect(retained).toHaveLength(100);
+        expect(retained).toEqual(expect.arrayContaining([...held, ...failing, "stale-no-op", "filler-1"]));
+        for (const id of ["filler-0", "stale-created", "stale-generation", "stale-revision"])
+          expect(retained).not.toContain(id);
+      } finally {
+        await state.storage.deleteAlarm();
+        mutable.env = original;
+      }
+    });
+  } finally {
+    clock.mockRestore();
+    await env.DB.prepare("DROP TRIGGER IF EXISTS reject_trim_deadline").run();
   }
 });
 
@@ -646,20 +726,22 @@ describe("publication Queue dispatch in phase 1", () => {
       const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
       const d1 = countedD1(env.DB);
       try {
-        expect(
-          await alarmAt(1, {
-            DB: d1.database,
-            AUDIT_ENABLED: "true",
-            PUBLIC_PUBLISHING_ENABLED: "true",
-            PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
-          }),
-        ).toEqual({ phase: 2, alarm: now + 5000 });
+        const configured = {
+          DB: d1.database,
+          AUDIT_ENABLED: "true",
+          PUBLIC_PUBLISHING_ENABLED: "true",
+          PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
+        } as const;
+        expect(await alarmAt(1, configured)).toEqual({ phase: 2, alarm: now + 5000 });
         expect(d1.calls).toBe(47);
         expect(send).toHaveBeenCalledTimes(40);
         const dispatched = await env.DB.prepare("SELECT count(*) FROM platform_jobs WHERE queue_redispatch_at=?")
           .bind(now + 300_000)
           .first("count(*)");
         expect(dispatched).toBe(failGroup ? 30 : 40);
+        clock.mockReturnValue(now + 5000);
+        await alarmAt(2, configured);
+        expect(send).toHaveBeenCalledTimes(40);
       } finally {
         clock.mockRestore();
       }
@@ -687,6 +769,52 @@ describe("publication Queue dispatch in phase 1", () => {
       ).toBe(3);
     } finally {
       await env.DB.prepare("DROP TRIGGER IF EXISTS reject_intent").run();
+    }
+  });
+
+  it("preserves delayed delivery grace when a failed sweep flushes its accepted wakes", async () => {
+    const now = Date.now() + 10_000;
+    await seedPublications(2);
+    await env.DB.prepare(`CREATE TRIGGER delay_fixture_publication AFTER INSERT ON platform_jobs
+      WHEN NEW.job_key='missing-0' BEGIN
+        UPDATE platform_jobs SET available_at=${now + 120_000} WHERE id=NEW.id;
+      END`).run();
+    await env.DB.prepare(`CREATE TRIGGER reject_intent BEFORE INSERT ON platform_jobs
+      WHEN NEW.job_key='missing-1' BEGIN SELECT RAISE(ABORT,'fixture_intent_failed'); END`).run();
+    await env.DB.prepare(`CREATE TRIGGER reject_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+      WHEN NEW.queue_redispatch_at>0 AND OLD.job_key='missing-0'
+      BEGIN SELECT RAISE(ABORT,'fixture_d1_write_failed'); END`).run();
+
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+    const configured: Env = { ...queueRecoveryEnv(env as Env, send, () => false), PUBLIC_PUBLISHING_ENABLED: "true" };
+    const delayed = { platformJobId: '["workspace","publication","missing-0"]' };
+    try {
+      await alarmAt(1, configured);
+      expect(send).toHaveBeenCalledTimes(3);
+      expect(send).toHaveBeenCalledWith(delayed, { delaySeconds: 120 });
+      await env.DB.prepare("DROP TRIGGER reject_deadline").run();
+
+      for (const offset of [5000, 120_000]) {
+        clock.mockReturnValue(now + offset);
+        await alarmAt(2, configured);
+        expect(send).toHaveBeenCalledTimes(3);
+      }
+      clock.mockReturnValue(now + 300_000);
+      await alarmAt(2, configured);
+      expect(send.mock.calls.slice(3).map(([message]) => message)).toEqual([
+        { platformJobId: '["workspace","publication","restart-0"]' },
+        { platformJobId: '["workspace","publication","restart-1"]' },
+      ]);
+      clock.mockReturnValue(now + 305_000);
+      const finalScan = await alarmAt(10, { ...configured, PUBLIC_PUBLISHING_ENABLED: "false" });
+      expect(finalScan.alarm).toBe(now + 420_000);
+      clock.mockReturnValue(now + 420_000);
+      await alarmAt(2, configured);
+      expect(send).toHaveBeenCalledTimes(6);
+      expect(send).toHaveBeenLastCalledWith(delayed);
+    } finally {
+      clock.mockRestore();
     }
   });
 
@@ -790,7 +918,7 @@ describe("publication Queue dispatch in phase 1", () => {
       ]);
       send.mockClear();
       await alarmAt(2, configured);
-      expect(send).toHaveBeenCalledTimes(failure === "partial" ? 2 : 4);
+      expect(send).toHaveBeenCalledTimes({ partial: 2, write: 0, read: 4 }[failure]);
     },
   );
 });
