@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "./env";
 import { enqueuePendingPublications, type Publication } from "./publications";
 import { countedD1 } from "../../tests/helpers/count-d1";
+import { enqueuePlatformJob } from "./platform-jobs";
 
 beforeEach(async () => {
   await reset();
@@ -291,53 +292,136 @@ it.each([false, true])("backs off Queue recovery during a total outage (failed s
   }
 });
 
-it.each(["first", "all"] as const)("isolates dispatch state write failures for %s jobs", async (failure) => {
+it.each(["first", "all", "setup failure"] as const)(
+  "isolates dispatch state write failures for %s jobs",
+  async (failure) => {
+    const now = Date.now();
+    await env.DB.batch([recoveryJob("first", now - 1), recoveryJob("second", now - 1)]);
+    const exercise = async () => {
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+      const condition = failure === "first" ? "AND OLD.id='first'" : "";
+      try {
+        await env.DB.prepare(`CREATE TRIGGER reject_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+      WHEN NEW.queue_redispatch_at>0 ${condition} BEGIN SELECT RAISE(ABORT,'fixture_d1_write_failed'); END`).run();
+        if (failure === "setup failure") {
+          // A second creation fails during setup after the real trigger already exists.
+          await env.DB.prepare(`CREATE TRIGGER reject_deadline BEFORE UPDATE ON platform_jobs
+        BEGIN SELECT 1; END`).run();
+        }
+        await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
+          const mutable = instance as unknown as { env: Env };
+          const original = mutable.env;
+          mutable.env = queueRecoveryEnv(original, send, () => false);
+          const runPhase = async (time: number) => {
+            clock.mockReturnValue(time);
+            await state.storage.put("phase", 2);
+            await instance.alarm();
+          };
+          const retry = async () =>
+            (await state.storage.get<{ retries?: Record<number, unknown> }>("schedule"))?.retries?.[2];
+          try {
+            await runPhase(now);
+            expect(send.mock.calls).toEqual([[{ platformJobId: "first" }], [{ platformJobId: "second" }]]);
+            expect(
+              (await env.DB.prepare("SELECT id,queue_redispatch_at FROM platform_jobs ORDER BY id").all()).results,
+            ).toEqual([
+              { id: "first", queue_redispatch_at: 0 },
+              {
+                id: "second",
+                queue_redispatch_at: failure === "all" ? 0 : now + 300_000,
+              },
+            ]);
+            const deadline = now + 60_000;
+            expect(await retry()).toEqual(failure === "all" ? { attempts: 1, at: deadline } : undefined);
+            await env.DB.prepare("DROP TRIGGER reject_deadline").run();
+            await runPhase(now + 5000);
+            expect(send).toHaveBeenCalledTimes(2);
+            await runPhase(deadline);
+            expect(await retry()).toBeUndefined();
+            expect(send).toHaveBeenCalledTimes(failure === "all" ? 4 : 3);
+          } finally {
+            await state.storage.deleteAlarm();
+            mutable.env = original;
+          }
+        });
+      } finally {
+        try {
+          await env.DB.prepare("DROP TRIGGER IF EXISTS reject_deadline").run();
+        } finally {
+          clock.mockRestore();
+        }
+      }
+    };
+    const result = await exercise().catch((error: Error) => error.message);
+    const setupError = expect.stringContaining("already exists");
+    expect(result).toEqual(failure === "setup failure" ? setupError : undefined);
+    expect(vi.isMockFunction(Date.now)).toBe(false);
+    expect(
+      await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name='reject_deadline'").first(),
+    ).toBeNull();
+  },
+);
+
+it.each(["owner retry", "replacement"] as const)("cools down a failing job until an intervening %s", async (change) => {
   const now = Date.now();
-  await env.DB.batch([recoveryJob("first", now - 1), recoveryJob("second", now - 1)]);
+  await env.DB.batch([recoveryJob("failing", now - 1), recoveryJob("healthy", now - 1)]);
   const clock = vi.spyOn(Date, "now").mockReturnValue(now);
   const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
-  const condition = failure === "first" ? "AND OLD.id='first'" : "";
-  await env.DB.prepare(`CREATE TRIGGER reject_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
-      WHEN NEW.queue_redispatch_at>0 ${condition} BEGIN SELECT RAISE(ABORT,'fixture_d1_write_failed'); END`).run();
   try {
+    await env.DB.prepare(`CREATE TRIGGER reject_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+      WHEN NEW.queue_redispatch_at>0 AND OLD.id='failing'
+      BEGIN SELECT RAISE(ABORT,'fixture_d1_write_failed'); END`).run();
     await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
       const mutable = instance as unknown as { env: Env };
       const original = mutable.env;
       mutable.env = queueRecoveryEnv(original, send, () => false);
-      const runPhase = async (time: number) => {
-        clock.mockReturnValue(time);
-        await state.storage.put("phase", 2);
+      const runPhase = async (phase: number, offset: number) => {
+        clock.mockReturnValue(now + offset);
+        await state.storage.put("phase", phase);
         await instance.alarm();
       };
-      const retry = async () =>
-        (await state.storage.get<{ retries?: Record<number, unknown> }>("schedule"))?.retries?.[2];
       try {
-        await runPhase(now);
-        expect(send.mock.calls).toEqual([[{ platformJobId: "first" }], [{ platformJobId: "second" }]]);
-        expect(
-          (await env.DB.prepare("SELECT id,queue_redispatch_at FROM platform_jobs ORDER BY id").all()).results,
-        ).toEqual([
-          { id: "first", queue_redispatch_at: 0 },
-          {
-            id: "second",
-            queue_redispatch_at: failure === "all" ? 0 : now + 300_000,
-          },
+        await runPhase(2, 0);
+        expect(await state.storage.get("schedule")).toMatchObject({ jobRetryAt: now + 60_000 });
+        await runPhase(10, 5000);
+        expect(await state.storage.getAlarm()).toBe(now + 60_000);
+        await recoveryJob("fresh", now + 5000).run();
+        await runPhase(2, 10_000);
+        expect(send.mock.calls.map(([message]) => message)).toEqual([
+          { platformJobId: "failing" },
+          { platformJobId: "healthy" },
+          { platformJobId: "fresh" },
         ]);
-        const deadline = now + 60_000;
-        expect(await retry()).toEqual(failure === "all" ? { attempts: 1, at: deadline } : undefined);
+
+        await recoveryJob("healthy-again", now + 60_000).run();
+        await runPhase(2, 60_000);
+        expect(send).toHaveBeenCalledTimes(5);
+        expect(await state.storage.get("schedule")).toMatchObject({ jobRetryAt: now + 180_000 });
+        await runPhase(2, 65_000);
+        expect(send).toHaveBeenCalledTimes(5);
+
+        if (change === "owner retry")
+          await env.DB.prepare(`UPDATE platform_jobs SET available_at=?,queue_redispatch_at=0,queue_send_failures=0,
+            queue_dispatch_revision=queue_dispatch_revision+1 WHERE id='failing'`)
+            .bind(now + 65_000)
+            .run();
+        else await env.DB.prepare("UPDATE platform_jobs SET generation='2' WHERE id='failing'").run();
         await env.DB.prepare("DROP TRIGGER reject_deadline").run();
-        await runPhase(now + 5000);
-        expect(send).toHaveBeenCalledTimes(failure === "all" ? 2 : 3);
-        await runPhase(deadline);
-        expect(await retry()).toBeUndefined();
-        expect(send).toHaveBeenCalledTimes(failure === "all" ? 4 : 3);
+        await runPhase(2, 70_000);
+        expect(send).toHaveBeenCalledTimes(6);
+        expect(send).toHaveBeenLastCalledWith({ platformJobId: "failing" });
       } finally {
         await state.storage.deleteAlarm();
         mutable.env = original;
       }
     });
   } finally {
-    clock.mockRestore();
+    try {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS reject_deadline").run();
+    } finally {
+      clock.mockRestore();
+    }
   }
 });
 
@@ -549,31 +633,117 @@ describe("publication Queue dispatch in phase 1", () => {
     ]);
   }
 
-  it("dispatches both full batches within the D1 call budget, with audit enabled", async () => {
-    await seedPublications(20);
-    const now = Date.now() + 10_000;
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  it.each([false, true])(
+    "dispatches both full batches within the D1 call budget, failed group: %s",
+    async (failGroup) => {
+      await seedPublications(20);
+      if (failGroup)
+        await env.DB.prepare(`CREATE TRIGGER reject_group BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+        WHEN NEW.queue_redispatch_at>0 AND OLD.job_key='restart-0'
+        BEGIN SELECT RAISE(ABORT,'fixture_deadline_group_failed'); END`).run();
+      const now = Date.now() + 10_000;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+      const d1 = countedD1(env.DB);
+      try {
+        expect(
+          await alarmAt(1, {
+            DB: d1.database,
+            AUDIT_ENABLED: "true",
+            PUBLIC_PUBLISHING_ENABLED: "true",
+            PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
+          }),
+        ).toEqual({ phase: 2, alarm: now + 5000 });
+        expect(d1.calls).toBe(47);
+        expect(send).toHaveBeenCalledTimes(40);
+        const dispatched = await env.DB.prepare("SELECT count(*) FROM platform_jobs WHERE queue_redispatch_at=?")
+          .bind(now + 300_000)
+          .first("count(*)");
+        expect(dispatched).toBe(failGroup ? 30 : 40);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it("sends already saved jobs when a later intent fails and preserves the sweep error", async () => {
+    await seedPublications(2);
+    await env.DB.prepare(`CREATE TRIGGER reject_intent BEFORE INSERT ON platform_jobs
+        WHEN NEW.job_key='missing-1' BEGIN SELECT RAISE(ABORT,'fixture_intent_failed'); END`).run();
     const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
-    const d1 = countedD1(env.DB);
+    const configured = {
+      ...queueRecoveryEnv(env as Env, send, () => false),
+      PUBLIC_PUBLISHING_ENABLED: "true",
+    } as const;
     try {
+      await expect(enqueuePendingPublications(configured)).rejects.toThrow("fixture_intent_failed");
+      expect(send.mock.calls.map(([message]) => message)).toEqual([
+        { platformJobId: '["workspace","publication","restart-0"]' },
+        { platformJobId: '["workspace","publication","restart-1"]' },
+        { platformJobId: '["workspace","publication","missing-0"]' },
+      ]);
       expect(
-        await alarmAt(1, {
-          DB: d1.database,
-          AUDIT_ENABLED: "true",
-          PUBLIC_PUBLISHING_ENABLED: "true",
-          PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() },
-        }),
-      ).toEqual({ phase: 2, alarm: now + 5000 });
-      expect(d1.calls).toBe(44);
-      expect(send).toHaveBeenCalledTimes(40);
-      const dispatched = await env.DB.prepare("SELECT count(*) FROM platform_jobs WHERE queue_redispatch_at=?")
-        .bind(now + 300_000)
-        .first("count(*)");
-      expect(dispatched).toBe(40);
+        await env.DB.prepare("SELECT count(*) FROM platform_jobs WHERE queue_redispatch_at>0").first("count(*)"),
+      ).toBe(3);
     } finally {
-      clock.mockRestore();
+      await env.DB.prepare("DROP TRIGGER IF EXISTS reject_intent").run();
     }
   });
+
+  it.each([false, true])(
+    "protects the publication snapshot when a new generation has completed: %s",
+    async (completed) => {
+      await seedPublications(1);
+      const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+      const configured = {
+        ...queueRecoveryEnv(env as Env, send, () => false),
+        PUBLIC_PUBLISHING_ENABLED: "true",
+      } as const;
+      const DB = new Proxy(configured.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              const statement = target.prepare(sql);
+              if (
+                !sql.startsWith("SELECT * FROM publications") ||
+                !sql.includes("NOT EXISTS(SELECT 1 FROM platform_jobs")
+              )
+                return statement;
+              return {
+                async all() {
+                  const snapshot = await statement.all();
+                  await env.DB.prepare("UPDATE publications SET generation=2 WHERE id='missing-0'").run();
+                  if (completed) {
+                    await env.DB.batch([
+                      env.DB.prepare("UPDATE publications SET needs_build=0 WHERE id='missing-0'"),
+                      env.DB.prepare("DELETE FROM platform_jobs WHERE job_key='missing-0'"),
+                    ]);
+                  }
+                  return snapshot;
+                },
+              };
+            };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      await enqueuePendingPublications({ ...configured, DB });
+
+      // Settings saves use the base key, while checkpoint continuations append the checkpoint position.
+      for (const key of ["missing-0", "missing-0:1:1:"])
+        await enqueuePlatformJob(configured, {
+          workspaceId: "workspace",
+          key,
+          kind: "publication",
+          generation: "1",
+          payload: { publicationId: "missing-0", generation: 1 },
+        });
+      const jobs = await env.DB.prepare(
+        "SELECT job_key,generation FROM platform_jobs WHERE job_key LIKE 'missing-%'",
+      ).all();
+      expect(jobs.results).toEqual(completed ? [] : [{ job_key: "missing-0", generation: "2" }]);
+    },
+  );
 
   it.each(["partial", "write", "read"] as const)(
     "preserves durable jobs after a %s dispatch failure",

@@ -90,7 +90,7 @@ it.each(["before", "after"])("ends the drain when cancelled %s exit", async (whe
 });
 
 it.each(["before", "after"])(
-  "reports an inherited-stdio cancellation %s exit even when the child exits zero",
+  "uses the observed event order when cancelling %s a successful inherited-stdio exit",
   async (when) => {
     vi.useFakeTimers();
     const child = mockChild();
@@ -103,7 +103,9 @@ it.each(["before", "after"])(
     child.emit("close", 0, null);
 
     expect(child.kill.mock.calls).toEqual(when === "before" ? [["SIGTERM"]] : []);
-    await expect(result).resolves.toEqual({ status: 1, stdout: "", failure: "aborted" });
+    await expect(result).resolves.toEqual(
+      when === "before" ? { status: 1, stdout: "", failure: "aborted" } : { status: 0, stdout: "", failure: undefined },
+    );
   },
 );
 

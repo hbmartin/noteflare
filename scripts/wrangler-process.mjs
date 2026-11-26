@@ -26,7 +26,7 @@ export async function runWrangler(program, args, { stdio, signal, onChild, timeo
     killTimer.unref();
   }
   function abortChild() {
-    if (settled) return;
+    if (settled || (exited && !finishDrain)) return;
     failure ??= "aborted";
     if (exited) finishDrain?.();
     else stopChild();

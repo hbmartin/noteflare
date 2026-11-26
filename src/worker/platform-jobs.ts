@@ -3,6 +3,7 @@ import { setAuditActor, withAuditRequest } from "./audit";
 import type { Env } from "./env";
 import { logger, recordMetric } from "./observability";
 import { wakePlatformBestEffort } from "./platform-wakeup";
+import { blockedPublicationBuild } from "./publication-failure";
 
 export type PlatformJobIntent = {
   workspaceId: string;
@@ -38,19 +39,29 @@ type JobRow = {
   payload_json: string;
   attempts: number;
 };
-type QueueDispatchRow = {
+export type QueueDispatchRow = {
   id: string;
   generation: string;
   created_at: number;
   queue_dispatch_revision: number;
 };
 type QueueDispatchDeadline = QueueDispatchRow & { available_at: number; lease_until: number | null };
+export type QueueDispatchCooldown = QueueDispatchRow & { attempts: number; at: number };
 
 const LEASE_MS = 5 * 60_000;
 const QUEUE_REDISPATCH_GRACE_MS = 5 * 60_000;
+const QUEUE_DEADLINE_BATCH_SIZE = 10;
+
+// The Queue clock also includes matching coordinator cooldowns passed as a JSON binding.
+const queueCooldownSql = `coalesce((SELECT CAST(json_extract(value,'$.at') AS INTEGER) FROM json_each(?)
+  WHERE json_extract(value,'$.id')=platform_jobs.id
+    AND json_extract(value,'$.generation')=platform_jobs.generation
+    AND json_extract(value,'$.created_at')=platform_jobs.created_at
+    AND json_extract(value,'$.queue_dispatch_revision')=platform_jobs.queue_dispatch_revision),0)`;
 
 export function platformJobDeadlineSql(queueEnabled: boolean) {
-  return `max(available_at,coalesce(lease_until,0)${queueEnabled ? ",queue_redispatch_at" : ""})`;
+  const queueDeadline = queueEnabled ? `,queue_redispatch_at,${queueCooldownSql}` : "";
+  return `max(available_at,coalesce(lease_until,0)${queueDeadline})`;
 }
 
 export function platformJobId(intent: Pick<PlatformJobIntent, "workspaceId" | "kind" | "key">) {
@@ -61,10 +72,18 @@ export function platformJobId(intent: Pick<PlatformJobIntent, "workspaceId" | "k
  * A new generation preserves an active predecessor's lease; consumers also fence their outputs. */
 function platformIntentStatement(database: Pick<D1Database, "prepare">, intent: PlatformJobIntent) {
   const now = Date.now();
+  const payload = JSON.stringify(intent.payload);
+  const publication = intent.kind === "publication";
+  // A maintenance or continuation caller may hold a snapshot from before a settings save.
+  const values = publication
+    ? `SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM publications p
+        WHERE p.id=json_extract(?,'$.publicationId') AND p.workspace_id=? AND CAST(p.generation AS TEXT)=?
+          AND p.active=1 AND p.needs_build=1 AND NOT (${blockedPublicationBuild}))`
+    : "VALUES(?,?,?,?,?,?,?,?,?)";
   return database
     .prepare(`INSERT INTO platform_jobs
     (id,workspace_id,kind,job_key,generation,payload_json,available_at,created_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,kind,job_key) DO UPDATE SET
+    ${values} ON CONFLICT(workspace_id,kind,job_key) DO UPDATE SET
     generation=excluded.generation,payload_json=excluded.payload_json,available_at=excluded.available_at,
     attempts=0,
     lease_token=CASE WHEN platform_jobs.lease_until>excluded.updated_at THEN platform_jobs.lease_token ELSE NULL END,
@@ -77,10 +96,11 @@ function platformIntentStatement(database: Pick<D1Database, "prepare">, intent: 
       intent.kind,
       intent.key,
       intent.generation,
-      JSON.stringify(intent.payload),
+      payload,
       now,
       now,
       now,
+      ...(publication ? [payload, intent.workspaceId, intent.generation] : []),
     );
 }
 
@@ -169,16 +189,18 @@ export async function notifyPlatformJobs(env: Env, ids: readonly string[]) {
     const redispatchAt = await sendDelayedPlatformJob(env, queue, id, Math.max(row.available_at, row.lease_until ?? 0));
     if (redispatchAt !== null) accepted.push({ row, redispatchAt });
   }
-  if (!accepted.length) return;
-  try {
-    await env.DB.batch(accepted.map(({ row, redispatchAt }) => queueDispatchStatement(env.DB, row, redispatchAt, 0)));
-  } catch {
-    logger.warn(
-      "platform.enqueue.dispatch_state_failed",
-      "platform",
-      "Could not record accepted publication Queue wakes' recovery deadlines",
-      { accepted: accepted.length },
-    );
+  for (let index = 0; index < accepted.length; index += QUEUE_DEADLINE_BATCH_SIZE) {
+    const group = accepted.slice(index, index + QUEUE_DEADLINE_BATCH_SIZE);
+    try {
+      await env.DB.batch(group.map(({ row, redispatchAt }) => queueDispatchStatement(env.DB, row, redispatchAt, 0)));
+    } catch {
+      logger.warn(
+        "platform.enqueue.dispatch_state_failed",
+        "platform",
+        "Could not record a group of accepted publication Queue wakes",
+        { accepted: group.length },
+      );
+    }
   }
 }
 
@@ -302,19 +324,26 @@ async function runPlatformJobObserved(env: Env, id: string, handlers: PlatformHa
   }
 }
 
-export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, limit = 25) {
+export async function recoverPlatformJobs(
+  env: Env,
+  handlers: PlatformHandlers,
+  limit = 25,
+  cooldowns: readonly QueueDispatchCooldown[] = [],
+) {
   const queue = env.PLATFORM_QUEUE;
   const now = Date.now();
+  const dispatchDue = queue ? `AND queue_redispatch_at<=? AND ${queueCooldownSql}<=?` : "";
   const rows = await env.DB.prepare(`SELECT id,generation,created_at,queue_dispatch_revision,queue_send_failures
     FROM platform_jobs WHERE available_at<=? AND (lease_until IS NULL OR lease_until<=?)
-    AND (?=0 OR queue_redispatch_at<=?) ORDER BY available_at,id LIMIT ?`)
-    .bind(now, now, queue ? 1 : 0, now, Math.max(1, Math.min(25, limit)))
+    ${dispatchDue} ORDER BY available_at,id LIMIT ?`)
+    .bind(now, now, ...(queue ? [now, JSON.stringify(cooldowns), now] : []), Math.max(1, Math.min(25, limit)))
     .all<QueueDispatchRow & { queue_send_failures: number }>();
   let queueSendFailures = 0;
-  let dispatchStateFailures = 0;
+  const dispatchStateFailures: QueueDispatchRow[] = [];
+  const dispatchStateRecorded: QueueDispatchRow[] = [];
   // An accepted message may be sent again if D1 cannot record its deadline.
   // The consumer claims only due jobs with no active lease, and the rest of the batch still runs.
-  for (const row of rows.results) {
+  for (const { queue_send_failures, ...row } of rows.results) {
     if (!queue) {
       await runPlatformJob(env, row.id, handlers);
       continue;
@@ -324,14 +353,15 @@ export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, 
       await queue.send({ platformJobId: row.id });
     } catch {
       queueSendFailures++;
-      failures = Math.min(row.queue_send_failures + 1, 7);
+      failures = Math.min(queue_send_failures + 1, 7);
       recordMetric(env, { event: "platform.enqueue.failed", component: "platform" });
     }
     const delay = failures ? Math.min(3_600_000, 60_000 * 2 ** (failures - 1)) : QUEUE_REDISPATCH_GRACE_MS;
     try {
       await queueDispatchStatement(env.DB, row, Date.now() + delay, failures).run();
+      dispatchStateRecorded.push(row);
     } catch {
-      dispatchStateFailures++;
+      dispatchStateFailures.push(row);
       logger.warn(
         "platform.recovery.dispatch_state_failed",
         "platform",
@@ -339,7 +369,12 @@ export async function recoverPlatformJobs(env: Env, handlers: PlatformHandlers, 
       );
     }
   }
-  return { queueAttempts: queue ? rows.results.length : 0, queueSendFailures, dispatchStateFailures };
+  return {
+    queueAttempts: queue ? rows.results.length : 0,
+    queueSendFailures,
+    dispatchStateFailures,
+    dispatchStateRecorded,
+  };
 }
 
 export async function consumePlatformQueue(
