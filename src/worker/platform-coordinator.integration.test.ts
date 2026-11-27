@@ -531,17 +531,20 @@ describe("Queue dispatch cooldown trimming", () => {
     return { sent: send.mock.calls.map(([message]) => (message as { platformJobId: string }).platformJobId), retained };
   }
 
-  it("only removes cooldowns for the exact snapshot whose deadline was recorded", async () => {
+  it("clears cooldowns through the recorded revision of the same incarnation", async () => {
     const now = Date.now();
     const held = ids("held", 12);
-    const due = ["confirmed", "stale-generation", "stale-no-op", "stale-revision"];
+    const due = ["confirmed", "stale-created", "stale-generation", "stale-no-op", "stale-revision"];
     const failing = ids("write-failure", 4);
     await env.DB.batch([...held, ...due, ...failing].map((id) => recoveryJob(id, now - 1)));
+    await env.DB.prepare("UPDATE platform_jobs SET queue_dispatch_revision=1 WHERE id='confirmed'").run();
     const { sent, retained } = await recoverWithCooldowns(
       now,
       [
         ...held.map((id) => cooldownEntry(id, now + 900_000)),
-        cooldownEntry("confirmed", now - 1),
+        cooldownEntry("confirmed", now + 900_000),
+        cooldownEntry("confirmed", now - 1, { queue_dispatch_revision: 1 }),
+        cooldownEntry("stale-created", now + 900_000, { created_at: 1 }),
         cooldownEntry("stale-generation", now + 900_000, { generation: "older" }),
         cooldownEntry("stale-no-op", now - 1),
         cooldownEntry("stale-revision", now + 900_000, { queue_dispatch_revision: 1 }),
@@ -556,8 +559,9 @@ describe("Queue dispatch cooldown trimming", () => {
       },
     );
     expect(sent).toEqual([...due, ...failing]);
-    expect(retained[0]).toHaveLength(19);
-    expect(retained[0]).toEqual(expect.arrayContaining([...held, ...failing, ...due.slice(1)]));
+    const expected = [...held, ...failing, "stale-created", "stale-no-op", "stale-revision"];
+    expect(retained[0]).toHaveLength(expected.length);
+    expect(retained[0]).toEqual(expect.arrayContaining(expected));
   });
 
   it.each([
@@ -606,14 +610,20 @@ describe("Queue dispatch cooldown trimming", () => {
     expect(retained[0]).toEqual(expect.arrayContaining([...held, ...failing]));
   });
 
-  it.each(["finished job", "older snapshot", "older snapshot during D1 outage"])(
+  it.each(["finished job", "older snapshot", "older snapshot during D1 outage", "different creation timestamp"])(
     "keeps the live entries when a full list receives a report for a %s",
     async (reason) => {
       const now = Date.now();
       const held = ids("held", 100);
       await env.DB.batch(held.map((id) => recoveryJob(id, now - 1)));
       const stored = held.map((id, index) => cooldownEntry(id, now + 300_000 + index));
-      const row = reason === "finished job" ? dispatchRow("finished") : { ...dispatchRow("held-0"), generation: "old" };
+      const row =
+        reason === "finished job"
+          ? dispatchRow("finished")
+          : {
+              ...dispatchRow("held-0"),
+              ...(reason === "different creation timestamp" ? { created_at: 1 } : { generation: "old" }),
+            };
       await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
         const mutable = instance as unknown as { env: Env };
         const original = mutable.env;
@@ -638,6 +648,57 @@ describe("Queue dispatch cooldown trimming", () => {
       });
     },
   );
+
+  it.each(["older", "newer"])("keeps the higher revision on overflow after storing the %s one first", async (first) => {
+    const now = Date.now();
+    const held = ids("held", 99);
+    await env.DB.batch([...held, "job", "incoming"].map((id) => recoveryJob(id, now - 1)));
+    await env.DB.prepare("UPDATE platform_jobs SET generation='2' WHERE id='job'").run();
+    const older = { row: dispatchRow("job"), redispatchAt: now + 600_000 };
+    const newer = {
+      row: { ...older.row, generation: "2", queue_dispatch_revision: 1 },
+      redispatchAt: now + 300_000,
+    };
+    const [stored, incoming] = first === "older" ? [older, newer] : [newer, older];
+    await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
+      const mutable = instance as unknown as { env: Env };
+      const original = mutable.env;
+      let probes = 0;
+      const DB = new Proxy(original.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              if (sql.startsWith(cooldownProbe)) {
+                probes++;
+                throw new Error("fixture_probe_failed");
+              }
+              return target.prepare(sql);
+            };
+          return Reflect.get(target, property, target);
+        },
+      });
+      mutable.env = { ...original, DB };
+      try {
+        await state.storage.put("queueDispatchCooldowns", [
+          ...held.map((id, index) => cooldownEntry(id, now + 120_000 + index)),
+          { ...stored.row, at: stored.redispatchAt, attempts: 1 },
+        ]);
+        await instance.recordQueueDispatchFailures([
+          incoming,
+          { row: dispatchRow("incoming"), redispatchAt: now + 300_000 },
+        ]);
+        const cooldowns = await state.storage.get<QueueDispatchCooldown[]>("queueDispatchCooldowns");
+        expect(probes).toBe(1);
+        expect(cooldowns).toHaveLength(100);
+        expect(cooldowns?.filter(({ id }) => id === "job")).toEqual([
+          { ...newer.row, at: newer.redispatchAt, attempts: 1 },
+        ]);
+        expect(cooldowns).toContainEqual(cooldownEntry("incoming", now + 300_000));
+      } finally {
+        mutable.env = original;
+      }
+    });
+  });
 
   it("merges a report saved while an overflow probe is in flight", async () => {
     const now = Date.now();
@@ -690,6 +751,63 @@ describe("Queue dispatch cooldown trimming", () => {
 
 describe("Queue dispatch cooldown ordering", () => {
   const maintenance = () => env.PLATFORM!.getByName("maintenance");
+
+  it("saves partial batch outcomes when a later cooldown read fails", async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+    const sent = () => send.mock.calls.map(([message]) => message);
+    try {
+      await env.DB.batch(["first", "second", "third"].map((id) => recoveryJob(id, now - 1)));
+      await env.DB.prepare(`CREATE TRIGGER reject_first_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+        WHEN NEW.queue_redispatch_at>0 AND OLD.id='first'
+        BEGIN SELECT RAISE(ABORT,'fixture_first_deadline_failed'); END`).run();
+      await runInDurableObject(maintenance(), async (instance, state) => {
+        const mutable = instance as unknown as { env: Env };
+        const original = mutable.env;
+        mutable.env = queueRecoveryEnv(original, send, () => false);
+        const get = state.storage.get.bind(state.storage);
+        let cooldownReads = 0;
+        const storageGet = vi.spyOn(state.storage, "get").mockImplementation(((
+          key: string | string[],
+          options?: DurableObjectGetOptions,
+        ) => {
+          if (key === "queueDispatchCooldowns" && ++cooldownReads === 4)
+            return Promise.reject(new Error("fixture_later_cooldown_read_failed"));
+          return typeof key === "string" ? get(key, options) : get(key, options);
+        }) as typeof state.storage.get);
+        const runPhase = async (offset: number) => {
+          clock.mockReturnValue(now + offset);
+          await state.storage.put("phase", 2);
+          await instance.alarm();
+        };
+        try {
+          await state.storage.put("queueDispatchCooldowns", [cooldownEntry("second", now - 1)]);
+          await runPhase(0);
+          expect(sent()).toEqual([{ platformJobId: "first" }, { platformJobId: "second" }]);
+          expect(await get("queueDispatchCooldowns")).toEqual([cooldownEntry("first", now + 300_000)]);
+          expect(await get("schedule")).toMatchObject({ retries: { 2: { attempts: 1, at: now + 60_000 } } });
+
+          await env.DB.prepare("DROP TRIGGER reject_first_deadline").run();
+          await runPhase(60_000);
+          expect(send).toHaveBeenCalledTimes(3);
+          expect(send).toHaveBeenLastCalledWith({ platformJobId: "third" });
+          expect(await get("schedule")).not.toHaveProperty("retries.2");
+          await runPhase(295_000);
+          expect(send).toHaveBeenCalledTimes(3);
+          await runPhase(300_000);
+          expect(sent().slice(3)).toEqual([{ platformJobId: "first" }, { platformJobId: "second" }]);
+        } finally {
+          storageGet.mockRestore();
+          await state.storage.deleteAlarm();
+          mutable.env = original;
+        }
+      });
+    } finally {
+      clock.mockRestore();
+      await env.DB.prepare("DROP TRIGGER IF EXISTS reject_first_deadline").run();
+    }
+  });
 
   it("keeps a consumer retry cooldown when an earlier recovery batch finishes", async () => {
     const now = Date.now();
@@ -771,18 +889,20 @@ describe("Queue dispatch cooldown ordering", () => {
     }
   });
 
-  it.each([false, true])(
-    "rechecks cooldowns before later sends in a recovery batch (revision changes: %s)",
-    async (change) => {
+  it.each(["same", "newer", "older"])(
+    "rechecks a report for the %s revision before a later send in the same batch",
+    async (revision) => {
       const now = Date.now();
       const clock = vi.spyOn(Date, "now").mockReturnValue(now);
       const send = vi.fn<Queue["send"]>(async (message) => {
         const { platformJobId: id } = message as { platformJobId: string };
         if (id === "first") {
-          if (change) await env.DB.prepare("UPDATE platform_jobs SET generation='2' WHERE id='second'").run();
-          const row = change
-            ? { ...dispatchRow("second"), generation: "2", queue_dispatch_revision: 1 }
-            : dispatchRow("second");
+          if (revision === "newer")
+            await env.DB.prepare("UPDATE platform_jobs SET generation='2' WHERE id='second'").run();
+          const row =
+            revision === "newer"
+              ? { ...dispatchRow("second"), generation: "2", queue_dispatch_revision: 1 }
+              : dispatchRow("second");
           await maintenance().recordQueueDispatchFailures([{ row, redispatchAt: now + 300_000 }]);
           throw new Error("fixture_queue_unavailable");
         }
@@ -791,19 +911,26 @@ describe("Queue dispatch cooldown ordering", () => {
       const configured = queueRecoveryEnv(env as Env, send, () => false);
       try {
         await env.DB.batch([recoveryJob("first", now - 1), recoveryJob("second", now - 1)]);
+        if (revision === "older")
+          await env.DB.prepare("UPDATE platform_jobs SET generation='2' WHERE id='second'").run();
         await alarmAt(2, configured);
-        expect(send).toHaveBeenCalledExactlyOnceWith({ platformJobId: "first" });
-        const schedule = await runInDurableObject(maintenance(), (_instance, state) => state.storage.get("schedule"));
-        expect(schedule).toMatchObject({ retries: { 2: { attempts: 1, at: now + 60_000 } } });
+        const skipsSecond = revision !== "older";
+        expect(send.mock.calls.map(([message]) => message)).toEqual(
+          skipsSecond ? [{ platformJobId: "first" }] : [{ platformJobId: "first" }, { platformJobId: "second" }],
+        );
+        const schedule = await runInDurableObject(maintenance(), (_instance, state) =>
+          state.storage.get<{ retries?: Record<number, unknown> }>("schedule"),
+        );
+        expect(schedule?.retries?.[2]).toEqual(skipsSecond ? { attempts: 1, at: now + 60_000 } : undefined);
 
         await env.DB.prepare("DELETE FROM platform_jobs WHERE id='first'").run();
         clock.mockReturnValue(now + 299_000);
         await alarmAt(2, configured);
-        expect(send).toHaveBeenCalledTimes(1);
+        expect(send).toHaveBeenCalledTimes(skipsSecond ? 1 : 2);
         clock.mockReturnValue(now + 300_000);
         await alarmAt(2, configured);
         expect(send).toHaveBeenLastCalledWith({ platformJobId: "second" });
-        expect(send).toHaveBeenCalledTimes(2);
+        expect(send).toHaveBeenCalledTimes(skipsSecond ? 2 : 3);
       } finally {
         clock.mockRestore();
       }

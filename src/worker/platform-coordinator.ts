@@ -54,6 +54,10 @@ const maxReportedDispatchFailures = 10;
 
 const isSafeInteger = (value: unknown): value is number => Number.isSafeInteger(value);
 
+function dispatchIncarnationKey({ id, created_at }: QueueDispatchRow) {
+  return JSON.stringify([id, created_at]);
+}
+
 function reportedDispatchFailure(input: unknown): QueueDispatchDeadlineWrite | null {
   if (!input || typeof input !== "object") return null;
   const { row, redispatchAt } = input as { row?: Partial<QueueDispatchRow>; redispatchAt?: unknown };
@@ -195,11 +199,12 @@ export class PlatformCoordinator extends DurableObject<Env> {
   // Callers pass outcomes rather than a snapshot: Queue wakes can report failures while a phase runs.
   private async recordDispatchCooldowns(outcomes: QueueDispatchOutcomes) {
     let saved = await this.mergeDispatchCooldowns(outcomes);
-    if (Array.isArray(saved)) {
+    if (typeof saved !== "boolean") {
+      const { candidates, minimumRevisions } = saved;
       // The probe checks both stored and incoming snapshots without holding the storage lock.
       let stale = new Set<string>();
       try {
-        stale = await staleDispatchCooldownKeys(this.env.DB, saved);
+        stale = await staleDispatchCooldownKeys(this.env.DB, candidates);
       } catch {
         logger.warn(
           "platform.maintenance.dispatch_cooldown_check_failed",
@@ -207,7 +212,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
           "Trimming Queue dispatch cooldowns without confirming which jobs have changed",
         );
       }
-      saved = await this.mergeDispatchCooldowns(outcomes, stale);
+      saved = await this.mergeDispatchCooldowns(outcomes, { stale, minimumRevisions });
     }
     if (saved === true) return;
     logger.warn(
@@ -220,26 +225,39 @@ export class PlatformCoordinator extends DurableObject<Env> {
   }
   private mergeDispatchCooldowns(
     { failed, recorded }: QueueDispatchOutcomes,
-    stale?: ReadonlySet<string>,
-  ): Promise<boolean | QueueDispatchCooldown[]> {
+    checked?: { stale: ReadonlySet<string>; minimumRevisions: ReadonlyMap<string, number> },
+  ): Promise<boolean | { candidates: QueueDispatchCooldown[]; minimumRevisions: ReadonlyMap<string, number> }> {
     return this.ctx.blockConcurrencyWhile(async () => {
       // Catch storage errors here so a rejected operation does not escape the lock callback.
       try {
         const stored = await this.dispatchCooldowns();
         const now = Date.now();
+        // Keep the revision bounds learned before the probe even if another merge removed those entries.
+        const minimumRevisions = new Map(checked?.minimumRevisions);
+        const rememberRevision = (row: QueueDispatchRow, revision = row.queue_dispatch_revision) => {
+          const key = dispatchIncarnationKey(row);
+          minimumRevisions.set(key, Math.max(minimumRevisions.get(key) ?? revision, revision));
+        };
+        for (const entry of stored) rememberRevision(entry);
+        for (const { row } of failed) rememberRevision(row);
+        // A successful write advances the revision of the snapshot it wrote.
+        for (const row of recorded) rememberRevision(row, row.queue_dispatch_revision + 1);
+        const superseded = (row: QueueDispatchRow) =>
+          row.queue_dispatch_revision <
+          (minimumRevisions.get(dispatchIncarnationKey(row)) ?? row.queue_dispatch_revision);
+
         const entries = new Map<string, QueueDispatchCooldown>();
         for (const entry of stored) {
+          if (entry.at + dispatchCooldownMaxMs <= now || superseded(entry)) continue;
           const key = queueDispatchSnapshotKey(entry);
-          if (entry.at + dispatchCooldownMaxMs > now && !stale?.has(key)) entries.set(key, entry);
+          if (!checked?.stale.has(key)) entries.set(key, entry);
         }
-        // A successful write advances this snapshot's revision. Later snapshots have their own cooldowns.
-        for (const row of recorded) entries.delete(queueDispatchSnapshotKey(row));
         const activeIds = new Set([...entries.values()].filter(({ at }) => at > now).map(({ id }) => id));
         const added = new Set<string>();
         const conflicts = new Set<string>();
         for (const { row, redispatchAt } of failed) {
           const key = queueDispatchSnapshotKey(row);
-          if (stale?.has(key)) continue;
+          if (superseded(row) || checked?.stale.has(key)) continue;
           const prior = entries.get(key);
           const attempts = Math.min((prior?.attempts ?? 0) + 1, 7);
           const backoff = Math.min(dispatchCooldownMaxMs, 60_000 * 2 ** (attempts - 1));
@@ -249,7 +267,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
         }
         const overflow = entries.size - maxDispatchCooldowns;
         if (overflow > 0) {
-          if (!stale) return [...entries.values()];
+          if (!checked) return { candidates: [...entries.values()], minimumRevisions };
           // When D1 cannot resolve a conflict, keep the active stored snapshot ahead of the incoming one.
           const rank = ([key, entry]: [string, QueueDispatchCooldown]) =>
             entry.at <= now ? 0 : conflicts.has(key) ? 1 : 2;
@@ -339,7 +357,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
           }
           case 2: {
             const cooldowns = alarmEnv.PLATFORM_QUEUE ? await this.dispatchCooldowns() : [];
-            const { queueAttempts, queueSendFailures, dispatchState } = await recoverPlatformJobs(
+            const { queueAttempts, queueSendFailures, cooldownReadFailed, dispatchState } = await recoverPlatformJobs(
               alarmEnv,
               platformHandlers,
               alarmEnv.PLATFORM_QUEUE ? 10 : 1,
@@ -347,6 +365,14 @@ export class PlatformCoordinator extends DurableObject<Env> {
               () => this.dispatchCooldowns(),
             );
             await this.recordDispatchCooldowns(dispatchState);
+            if (cooldownReadFailed) {
+              logger.warn(
+                "platform.maintenance.dispatch_cooldown_read_failed",
+                "platform",
+                "Queue recovery stopped before the next send because it could not read dispatch cooldowns",
+              );
+              throw new Error("platform_queue_cooldown_read_failed");
+            }
             if (queueAttempts > 0 && dispatchState.failed.length === queueAttempts) {
               logger.warn(
                 "platform.maintenance.dispatch_state_unavailable",
