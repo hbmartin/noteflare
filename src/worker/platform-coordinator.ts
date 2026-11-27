@@ -3,10 +3,12 @@ import { restartablePublicationFailure, publicationNeedsJob } from "./publicatio
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import {
+  liveDispatchCooldownIds,
   platformJobDeadlineSql,
   recoverPlatformJobs,
   type PlatformHandlers,
   type QueueDispatchCooldown,
+  type QueueDispatchDeadlineWrite,
   type QueueDispatchOutcomes,
   type QueueDispatchRow,
 } from "./platform-jobs";
@@ -47,6 +49,7 @@ type MaintenanceSchedule = {
 const dispatchCooldownKey = "queueDispatchCooldowns";
 const dispatchCooldownMaxMs = 3_600_000;
 const maxDispatchCooldowns = 100;
+const maxReportedDispatchFailures = 10;
 
 function matchesDispatch(
   row: QueueDispatchRow,
@@ -57,6 +60,26 @@ function matchesDispatch(
     entry.created_at === row.created_at &&
     entry.queue_dispatch_revision === row.queue_dispatch_revision
   );
+}
+
+const isSafeInteger = (value: unknown): value is number => Number.isSafeInteger(value);
+
+function reportedDispatchFailure(input: unknown): QueueDispatchDeadlineWrite | null {
+  if (!input || typeof input !== "object") return null;
+  const { row, redispatchAt } = input as { row?: Partial<QueueDispatchRow>; redispatchAt?: unknown };
+  if (
+    !row ||
+    typeof row !== "object" ||
+    typeof row.id !== "string" ||
+    !row.id ||
+    typeof row.generation !== "string" ||
+    !isSafeInteger(row.created_at) ||
+    !isSafeInteger(row.queue_dispatch_revision) ||
+    !isSafeInteger(redispatchAt)
+  )
+    return null;
+  const { id, generation, created_at, queue_dispatch_revision } = row;
+  return { row: { id, generation, created_at, queue_dispatch_revision }, redispatchAt };
 }
 
 export const platformHandlers: PlatformHandlers = {
@@ -82,6 +105,13 @@ export class PlatformCoordinator extends DurableObject<Env> {
     )
       return { allowed: false, status: 403, code: "conversation_locked" };
     return authorizeAiGeneration(this.env, input);
+  }
+  // Internal binding RPC only. Single-job wakes report an accepted Queue send whose deadline write failed.
+  async recordQueueDispatchFailures(input: QueueDispatchDeadlineWrite[]) {
+    if (!this.env.PLATFORM || !this.ctx.id.equals(this.env.PLATFORM.idFromName("maintenance"))) return;
+    if (!Array.isArray(input) || input.length > maxReportedDispatchFailures) return;
+    const failed = input.map(reportedDispatchFailure).filter((failure) => failure !== null);
+    if (failed.length) await this.recordDispatchCooldowns({ failed, recordedIds: [] });
   }
   private async scheduleState(): Promise<MaintenanceSchedule> {
     return (
@@ -172,36 +202,74 @@ export class PlatformCoordinator extends DurableObject<Env> {
   private async dispatchCooldowns() {
     return (await this.ctx.storage.get<QueueDispatchCooldown[]>(dispatchCooldownKey)) ?? [];
   }
-  private async recordDispatchCooldowns(
-    cooldowns: QueueDispatchCooldown[],
-    { failed, recordedIds }: QueueDispatchOutcomes,
-  ) {
-    if (!cooldowns.length && !failed.length) return;
-    const now = Date.now();
-    const entries = new Map(
-      cooldowns.filter((entry) => entry.at + dispatchCooldownMaxMs > now).map((entry) => [entry.id, entry]),
+  // Callers pass outcomes rather than a snapshot: Queue wakes can report failures while a phase runs.
+  private async recordDispatchCooldowns({ failed, recordedIds }: QueueDispatchOutcomes) {
+    const stored = await this.dispatchCooldowns();
+    if (!stored.length && !failed.length) return;
+    // Only an overflowing list needs the D1 read, which runs outside the lock.
+    const stale = new Map<string, QueueDispatchCooldown>();
+    if (stored.length + failed.length > maxDispatchCooldowns) {
+      try {
+        const live = await liveDispatchCooldownIds(this.env.DB, stored);
+        for (const entry of stored) if (!live.has(entry.id)) stale.set(entry.id, entry);
+      } catch {
+        logger.warn(
+          "platform.maintenance.dispatch_cooldown_check_failed",
+          "platform",
+          "Trimming Queue dispatch cooldowns by deadline alone",
+        );
+      }
+    }
+    const saved = await this.ctx.blockConcurrencyWhile(async () => {
+      const cooldowns = await this.dispatchCooldowns();
+      const now = Date.now();
+      const entries = new Map(
+        cooldowns.filter((entry) => entry.at + dispatchCooldownMaxMs > now).map((entry) => [entry.id, entry]),
+      );
+      // A confirmed write advances the row's revision and supersedes its previous cooldown.
+      for (const id of recordedIds) entries.delete(id);
+      const added = new Set<QueueDispatchCooldown>();
+      for (const { row, redispatchAt } of failed) {
+        const prior = entries.get(row.id);
+        const attempts = Math.min(matchesDispatch(row, prior) ? prior.attempts + 1 : 1, 7);
+        const backoff = Math.min(dispatchCooldownMaxMs, 60_000 * 2 ** (attempts - 1));
+        const entry = { ...row, attempts, at: Math.max(redispatchAt, now + backoff) };
+        entries.delete(row.id);
+        entries.set(row.id, entry);
+        added.add(entry);
+      }
+      let next = [...entries.values()];
+      const overflow = next.length - maxDispatchCooldowns;
+      if (overflow > 0) {
+        // New entries fence sends Queue has just accepted. Evict stale entries, which can never match
+        // again, then expired ones, then the active fences that end soonest. Entries written after
+        // the D1 read count as live.
+        const isStale = (entry: QueueDispatchCooldown) => matchesDispatch(entry, stale.get(entry.id));
+        const rank = (entry: QueueDispatchCooldown) => (isStale(entry) ? 0 : entry.at <= now ? 1 : 2);
+        const candidates = next
+          .filter((entry) => !added.has(entry))
+          .sort((left, right) => rank(left) - rank(right) || left.at - right.at);
+        const evicted = new Set(candidates.slice(0, Math.max(overflow, candidates.filter(isStale).length)));
+        next = next.filter((entry) => !evicted.has(entry));
+      }
+      if (next.length === cooldowns.length && next.every((entry, index) => entry === cooldowns[index])) return true;
+      // A throw here would reset the object, so the failure is reported after the lock.
+      try {
+        if (next.length) await this.ctx.storage.put(dispatchCooldownKey, next);
+        else await this.ctx.storage.delete(dispatchCooldownKey);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (saved) return;
+    logger.warn(
+      "platform.maintenance.dispatch_cooldowns_failed",
+      "platform",
+      "Could not save Queue dispatch cooldowns; recovery may send accepted wakes again",
+      { failed: failed.length },
     );
-    // A confirmed write advances the row's revision and supersedes its previous cooldown.
-    for (const id of recordedIds) entries.delete(id);
-    for (const { row, redispatchAt } of failed) {
-      const prior = entries.get(row.id);
-      const attempts = Math.min(matchesDispatch(row, prior) ? prior.attempts + 1 : 1, 7);
-      const backoff = Math.min(dispatchCooldownMaxMs, 60_000 * 2 ** (attempts - 1));
-      const at = Math.max(redispatchAt, now + backoff);
-      entries.delete(row.id);
-      entries.set(row.id, { ...row, attempts, at });
-    }
-    let next = [...entries.values()];
-    const overflow = next.length - maxDispatchCooldowns;
-    if (overflow > 0) {
-      const expired = next.filter((entry) => entry.at <= now);
-      const active = next.filter((entry) => entry.at > now).sort((left, right) => left.at - right.at);
-      const evicted = new Set([...expired, ...active].slice(0, overflow));
-      next = next.filter((entry) => !evicted.has(entry));
-    }
-    if (next.length === cooldowns.length && next.every((entry, index) => entry === cooldowns[index])) return;
-    if (next.length) await this.ctx.storage.put(dispatchCooldownKey, next);
-    else await this.ctx.storage.delete(dispatchCooldownKey);
+    throw new Error("platform_dispatch_cooldowns_unavailable");
   }
   private async refreshJobDeadline() {
     const id = await this.beginJobDeadlineRead();
@@ -260,12 +328,18 @@ export class PlatformCoordinator extends DurableObject<Env> {
           case 0:
             await sweepSemanticJobs(alarmEnv, 10);
             break;
-          case 1:
+          case 1: {
+            // A failed cooldown save fails the phase, but a sweep error keeps precedence.
+            let cooldownFailure: Error | undefined;
             await enqueuePendingPublications(alarmEnv, async (dispatchState) => {
               if (dispatchState.failed.length || dispatchState.recordedIds.length)
-                await this.recordDispatchCooldowns(await this.dispatchCooldowns(), dispatchState);
+                await this.recordDispatchCooldowns(dispatchState).catch((error: Error) => {
+                  cooldownFailure = error;
+                });
             });
+            if (cooldownFailure) throw cooldownFailure;
             break;
+          }
           case 2: {
             const cooldowns = alarmEnv.PLATFORM_QUEUE ? await this.dispatchCooldowns() : [];
             const { queueAttempts, queueSendFailures, dispatchState } = await recoverPlatformJobs(
@@ -274,7 +348,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
               alarmEnv.PLATFORM_QUEUE ? 10 : 1,
               cooldowns,
             );
-            await this.recordDispatchCooldowns(cooldowns, dispatchState);
+            await this.recordDispatchCooldowns(dispatchState);
             if (queueAttempts > 0 && dispatchState.failed.length === queueAttempts) {
               logger.warn(
                 "platform.maintenance.dispatch_state_unavailable",

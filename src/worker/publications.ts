@@ -427,11 +427,12 @@ export async function enqueuePendingPublications(
       jobIds.push(platformJobId(intent));
     }
   } finally {
-    await notifyPlatformJobs(env, jobIds)
-      .then((dispatchState) => recordDispatchState?.(dispatchState))
-      .catch(() =>
-        logger.warn("publication.wake.failed", "platform", "Saved publication jobs remain pending for recovery"),
-      );
+    const dispatchState = await notifyPlatformJobs(env, jobIds).catch(() => {
+      logger.warn("publication.wake.failed", "platform", "Saved publication jobs remain pending for recovery");
+      return null;
+    });
+    // Recording errors are the caller's: they are not failed wakes.
+    if (dispatchState) await recordDispatchState?.(dispatchState);
   }
 }
 export async function hostnameSettingsResponse(request: Request, env: Env, publicationId: string): Promise<Response> {
