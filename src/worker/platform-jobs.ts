@@ -50,7 +50,7 @@ export type QueueDispatchCooldown = QueueDispatchRow & { attempts: number; at: n
 export type QueueDispatchDeadlineWrite = { row: QueueDispatchRow; redispatchAt: number };
 export type QueueDispatchOutcomes = {
   failed: QueueDispatchDeadlineWrite[];
-  recordedIds: string[];
+  recorded: QueueDispatchRow[];
 };
 
 const LEASE_MS = 5 * 60_000;
@@ -74,14 +74,18 @@ function dispatchRow({ id, generation, created_at, queue_dispatch_revision }: Qu
   return { id, generation, created_at, queue_dispatch_revision };
 }
 
-/** The IDs of cooldowns whose job row is still at the fenced snapshot. Other entries can never match again. */
-export async function liveDispatchCooldownIds(database: D1Database, cooldowns: readonly QueueDispatchRow[]) {
-  if (!cooldowns.length) return new Set<string>();
+export function queueDispatchSnapshotKey({ id, generation, created_at, queue_dispatch_revision }: QueueDispatchRow) {
+  return JSON.stringify([id, generation, created_at, queue_dispatch_revision]);
+}
+
+/** Identify stale snapshots even when multiple cooldowns refer to the same job ID. */
+export async function staleDispatchCooldownKeys(database: D1Database, cooldowns: readonly QueueDispatchRow[]) {
   const { results } = await database
-    .prepare(`SELECT j.id FROM json_each(?) c CROSS JOIN platform_jobs j WHERE ${cooldownMatchesJobSql}`)
+    .prepare(`SELECT c.key AS position FROM json_each(?) c CROSS JOIN platform_jobs j WHERE ${cooldownMatchesJobSql}`)
     .bind(JSON.stringify(cooldowns.map(dispatchRow)))
-    .all<{ id: string }>();
-  return new Set(results.map(({ id }) => id));
+    .all<{ position: number }>();
+  const live = new Set(results.map(({ position }) => position));
+  return new Set(cooldowns.flatMap((row, position) => (live.has(position) ? [] : [queueDispatchSnapshotKey(row)])));
 }
 
 function activeCooldownsJson(cooldowns: readonly QueueDispatchCooldown[], now: number) {
@@ -206,7 +210,7 @@ export async function notifyPlatformJob(
 
 /** Publication maintenance gathers intents before notifying Queue to keep D1 calls bounded per alarm. */
 export async function notifyPlatformJobs(env: Env, ids: readonly string[]) {
-  const dispatchState: QueueDispatchOutcomes = { failed: [], recordedIds: [] };
+  const dispatchState: QueueDispatchOutcomes = { failed: [], recorded: [] };
   const queue = env.PLATFORM_QUEUE;
   if (!queue || !ids.length) return dispatchState;
   const jobIds = [...new Set(ids)];
@@ -243,7 +247,7 @@ export async function notifyPlatformJobs(env: Env, ids: readonly string[]) {
         group.map(({ row, redispatchAt }) => queueDispatchStatement(env.DB, row, redispatchAt, 0)),
       );
       for (const [offset, result] of results.entries()) {
-        if (result.meta.changes > 0) dispatchState.recordedIds.push(group[offset]!.row.id);
+        if (result.meta.changes > 0) dispatchState.recorded.push(group[offset]!.row);
       }
     } catch {
       dispatchState.failed.push(...group);
@@ -383,6 +387,7 @@ export async function recoverPlatformJobs(
   handlers: PlatformHandlers,
   limit = 25,
   cooldowns: readonly QueueDispatchCooldown[] = [],
+  readLatestCooldowns?: () => Promise<readonly QueueDispatchCooldown[]>,
 ) {
   const queue = env.PLATFORM_QUEUE;
   const now = Date.now();
@@ -395,8 +400,12 @@ export async function recoverPlatformJobs(
     ${dispatchDue} ${cooldownDue} ORDER BY available_at,id LIMIT ?`)
     .bind(now, now, ...(queue ? [now] : []), ...(active ? [active] : []), Math.max(1, Math.min(25, limit)))
     .all<QueueDispatchRow & { queue_send_failures: number }>();
+  const initialCooldowns = new Map(
+    cooldowns.filter(({ at }) => at > now).map((entry) => [queueDispatchSnapshotKey(entry), entry]),
+  );
+  let queueAttempts = 0;
   let queueSendFailures = 0;
-  const dispatchState: QueueDispatchOutcomes = { failed: [], recordedIds: [] };
+  const dispatchState: QueueDispatchOutcomes = { failed: [], recorded: [] };
   // An accepted message may be sent again if D1 cannot record its deadline.
   // The consumer claims only due jobs with no active lease, and the rest of the batch still runs.
   for (const { queue_send_failures, ...row } of rows.results) {
@@ -404,7 +413,21 @@ export async function recoverPlatformJobs(
       await runPlatformJob(env, row.id, handlers);
       continue;
     }
+    if (readLatestCooldowns) {
+      const latest = await readLatestCooldowns();
+      const sendAt = Date.now();
+      const selected = queueDispatchSnapshotKey(row);
+      const fenced = latest.some((entry) => {
+        if (entry.id !== row.id || entry.at <= sendAt) return false;
+        const key = queueDispatchSnapshotKey(entry);
+        const initial = initialCooldowns.get(key);
+        // A new report may describe a newer revision than the selected row. Let the next scan check it.
+        return key === selected || entry.at !== initial?.at || entry.attempts !== initial?.attempts;
+      });
+      if (fenced) continue;
+    }
     let failures = 0;
+    queueAttempts++;
     try {
       await queue.send({ platformJobId: row.id });
     } catch {
@@ -416,7 +439,7 @@ export async function recoverPlatformJobs(
     const redispatchAt = Date.now() + delay;
     try {
       const result = await queueDispatchStatement(env.DB, row, redispatchAt, failures).run();
-      if (result.meta.changes > 0) dispatchState.recordedIds.push(row.id);
+      if (result.meta.changes > 0) dispatchState.recorded.push(row);
     } catch {
       dispatchState.failed.push({ row, redispatchAt });
       logger.warn(
@@ -427,7 +450,7 @@ export async function recoverPlatformJobs(
     }
   }
   return {
-    queueAttempts: queue ? rows.results.length : 0,
+    queueAttempts,
     queueSendFailures,
     dispatchState,
   };
