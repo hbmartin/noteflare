@@ -2,7 +2,7 @@ import { withUsage, setUsageIdentity } from "./usage";
 import { setAuditActor, withAuditRequest } from "./audit";
 import type { Env } from "./env";
 import { logger, recordMetric } from "./observability";
-import { wakePlatformBestEffort } from "./platform-wakeup";
+import { recordQueueDispatchFailureBestEffort, wakePlatformBestEffort } from "./platform-wakeup";
 import { blockedPublicationBuild } from "./publication-failure";
 
 export type PlatformJobIntent = {
@@ -47,7 +47,7 @@ export type QueueDispatchRow = {
 };
 type QueueDispatchDeadline = QueueDispatchRow & { available_at: number; lease_until: number | null };
 export type QueueDispatchCooldown = QueueDispatchRow & { attempts: number; at: number };
-type QueueDispatchDeadlineWrite = { row: QueueDispatchRow; redispatchAt: number };
+export type QueueDispatchDeadlineWrite = { row: QueueDispatchRow; redispatchAt: number };
 export type QueueDispatchOutcomes = {
   failed: QueueDispatchDeadlineWrite[];
   recordedIds: string[];
@@ -57,15 +57,32 @@ const LEASE_MS = 5 * 60_000;
 const QUEUE_REDISPATCH_GRACE_MS = 5 * 60_000;
 const QUEUE_DEADLINE_BATCH_SIZE = 10;
 
+// A cooldown fences only the row snapshot whose deadline write failed.
+const cooldownMatchesJobSql = `j.id=json_extract(c.value,'$.id')
+    AND j.generation=json_extract(c.value,'$.generation')
+    AND j.created_at=json_extract(c.value,'$.created_at')
+    AND j.queue_dispatch_revision=json_extract(c.value,'$.queue_dispatch_revision')`;
+
 // Materialize the small list first and look up each entry by the indexed job ID.
 const queueCooldownsCte = `WITH dispatch_cooldowns AS MATERIALIZED (
   SELECT j.rowid AS job_rowid,CAST(json_extract(c.value,'$.at') AS INTEGER) AS at
   FROM json_each(?) c CROSS JOIN platform_jobs j
-  WHERE j.id=json_extract(c.value,'$.id')
-    AND j.generation=json_extract(c.value,'$.generation')
-    AND j.created_at=json_extract(c.value,'$.created_at')
-    AND j.queue_dispatch_revision=json_extract(c.value,'$.queue_dispatch_revision')
+  WHERE ${cooldownMatchesJobSql}
 )`;
+
+function dispatchRow({ id, generation, created_at, queue_dispatch_revision }: QueueDispatchRow): QueueDispatchRow {
+  return { id, generation, created_at, queue_dispatch_revision };
+}
+
+/** The IDs of cooldowns whose job row is still at the fenced snapshot. Other entries can never match again. */
+export async function liveDispatchCooldownIds(database: D1Database, cooldowns: readonly QueueDispatchRow[]) {
+  if (!cooldowns.length) return new Set<string>();
+  const { results } = await database
+    .prepare(`SELECT j.id FROM json_each(?) c CROSS JOIN platform_jobs j WHERE ${cooldownMatchesJobSql}`)
+    .bind(JSON.stringify(cooldowns.map(dispatchRow)))
+    .all<{ id: string }>();
+  return new Set(results.map(({ id }) => id));
+}
 
 function activeCooldownsJson(cooldowns: readonly QueueDispatchCooldown[], now: number) {
   const active = cooldowns.filter(({ at }) => at > now);
@@ -180,6 +197,8 @@ export async function notifyPlatformJob(
         "platform",
         "Could not record an accepted Queue wake's recovery deadline",
       );
+      // The coordinator's cooldown keeps recovery from sending again during the accepted message's grace period.
+      await recordQueueDispatchFailureBestEffort(env, { row: dispatchRow(row), redispatchAt });
     }
   }
   return true;

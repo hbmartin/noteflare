@@ -1,4 +1,4 @@
-import { applyD1Migrations, env, reset } from "cloudflare:test";
+import { applyD1Migrations, env, reset, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env, MemberContext } from "./env";
 import { USAGE_COUNTERS } from "../shared/platform-costs";
@@ -12,6 +12,7 @@ import {
   recoverPlatformJobs,
   runPlatformJob,
   reservePlatformUsage,
+  type QueueDispatchCooldown,
 } from "./platform-jobs";
 import { finalizeHeatmaps, heatmapWeek, readHeatmap } from "./heatmaps";
 import { backgroundUsage, withUsage } from "./usage";
@@ -260,24 +261,114 @@ describe("durable platform release", () => {
     }
   });
 
-  it.each(["Queue send", "D1 deadline write"] as const)("leaves a job due after a failed %s", async (failure) => {
+  it("leaves a job due after a failed Queue send", async () => {
     const intent = { workspaceId: "workspace", kind: "fixture", key: "page", generation: "1", payload: {} };
     const id = platformJobId(intent);
     const send = vi.fn().mockResolvedValue({});
     const configured = { ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } };
     await enqueuePlatformJob(bindings(), intent);
-    if (failure === "Queue send") send.mockRejectedValueOnce(new Error("Queue unavailable"));
-    else {
-      await env.DB.prepare(`CREATE TRIGGER reject_queue_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
-        WHEN NEW.queue_redispatch_at > 0 BEGIN SELECT RAISE(ABORT,'fixture_rejected'); END`).run();
-    }
+    send.mockRejectedValueOnce(new Error("Queue unavailable"));
 
-    expect(await notifyPlatformJob(configured, intent)).toBe(failure === "D1 deadline write");
+    expect(await notifyPlatformJob(configured, intent)).toBe(false);
     expect(await env.DB.prepare("SELECT queue_redispatch_at FROM platform_jobs").first("queue_redispatch_at")).toBe(0);
-    await env.DB.prepare("DROP TRIGGER IF EXISTS reject_queue_deadline").run();
     await recoverPlatformJobs(configured, {});
     expect(send).toHaveBeenLastCalledWith({ platformJobId: id });
     expect(send).toHaveBeenCalledTimes(2);
+  });
+  describe("single-job wakes whose deadline write fails", () => {
+    const maintenance = () => env.PLATFORM!.getByName("maintenance");
+    const storedCooldowns = () =>
+      runInDurableObject(maintenance(), (_instance, state) =>
+        state.storage.get<QueueDispatchCooldown[]>("queueDispatchCooldowns"),
+      );
+    async function recoveryPhase(configured: Env) {
+      await runInDurableObject(maintenance(), async (instance, state) => {
+        const mutable = instance as unknown as { env: Env };
+        const original = mutable.env;
+        mutable.env = configured;
+        try {
+          await state.storage.put("phase", 2);
+          await instance.alarm();
+        } finally {
+          await state.storage.deleteAlarm();
+          mutable.env = original;
+        }
+      });
+    }
+
+    it.each([
+      { source: "request", delay: 0 },
+      // The first failed attempt backs off two seconds.
+      { source: "consumer", delay: 2_000 },
+    ] as const)("keeps a $source wake's grace period with a coordinator cooldown", async ({ source, delay }) => {
+      const intent = { workspaceId: "workspace", kind: "fixture", key: "page", generation: "1", payload: {} };
+      const id = platformJobId(intent);
+      const send = vi.fn().mockResolvedValue({});
+      const configured = { ...bindings(), PLATFORM_QUEUE: { send, sendBatch: vi.fn(), metrics: vi.fn() } };
+      const now = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      try {
+        await enqueuePlatformJob(bindings(), intent);
+        await env.DB.prepare(`CREATE TRIGGER reject_queue_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+          WHEN NEW.queue_redispatch_at > 0 BEGIN SELECT RAISE(ABORT,'fixture_rejected'); END`).run();
+        const woke =
+          source === "request"
+            ? await notifyPlatformJob(configured, intent)
+            : await runPlatformJob(configured, id, {
+                fixture: async () => {
+                  throw new Error("provider failed");
+                },
+              }).then(() => true);
+        expect(woke).toBe(true);
+        expect(send).toHaveBeenCalledExactlyOnceWith({ platformJobId: id }, { delaySeconds: delay / 1000 });
+        const row = await env.DB.prepare(
+          "SELECT generation,created_at,queue_dispatch_revision,queue_redispatch_at FROM platform_jobs",
+        ).first<{ generation: string; created_at: number; queue_dispatch_revision: number }>();
+        expect(row).toMatchObject({ queue_redispatch_at: 0 });
+        const at = now + delay + 300_000;
+        expect(await storedCooldowns()).toEqual([
+          {
+            id,
+            generation: row!.generation,
+            created_at: row!.created_at,
+            queue_dispatch_revision: row!.queue_dispatch_revision,
+            attempts: 1,
+            at,
+          },
+        ]);
+
+        await env.DB.prepare("DROP TRIGGER reject_queue_deadline").run();
+        clock.mockReturnValue(now + 60_000);
+        await recoveryPhase(configured);
+        expect(send).toHaveBeenCalledOnce();
+        clock.mockReturnValue(at);
+        await recoveryPhase(configured);
+        expect(send).toHaveBeenLastCalledWith({ platformJobId: id });
+        expect(send).toHaveBeenCalledTimes(2);
+      } finally {
+        clock.mockRestore();
+        await env.DB.prepare("DROP TRIGGER IF EXISTS reject_queue_deadline").run();
+      }
+    });
+
+    it("ignores reports sent to another coordinator instance or with malformed rows", async () => {
+      const row = { id: "job", generation: "1", created_at: 0, queue_dispatch_revision: 0 };
+      const other = env.PLATFORM!.getByName("other");
+      await other.recordQueueDispatchFailures([{ row, redispatchAt: Date.now() + 300_000 }]);
+      expect(
+        await runInDurableObject(other, (_instance, state) => state.storage.get("queueDispatchCooldowns")),
+      ).toBeUndefined();
+      await maintenance().recordQueueDispatchFailures([
+        { row: { ...row, created_at: "0" }, redispatchAt: Date.now() + 300_000 },
+        { row, redispatchAt: Number.NaN },
+        { row: { ...row, id: "" }, redispatchAt: Date.now() + 300_000 },
+      ] as never);
+      expect(await storedCooldowns()).toBeUndefined();
+      await maintenance().recordQueueDispatchFailures(
+        Array.from({ length: 11 }, () => ({ row, redispatchAt: Date.now() + 300_000 })),
+      );
+      expect(await storedCooldowns()).toBeUndefined();
+    });
   });
   it.each(
     [
