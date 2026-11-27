@@ -43,6 +43,7 @@ export type QueueDispatchRow = {
   id: string;
   generation: string;
   created_at: number;
+  dispatch_incarnation?: string | null;
   queue_dispatch_revision: number;
 };
 type QueueDispatchDeadline = QueueDispatchRow & { available_at: number; lease_until: number | null };
@@ -56,11 +57,13 @@ export type QueueDispatchOutcomes = {
 const LEASE_MS = 5 * 60_000;
 const QUEUE_REDISPATCH_GRACE_MS = 5 * 60_000;
 const QUEUE_DEADLINE_BATCH_SIZE = 10;
+const queueDispatchColumns = "id,generation,created_at,dispatch_incarnation,queue_dispatch_revision";
 
 // A cooldown fences only the row snapshot whose deadline write failed.
 const cooldownMatchesJobSql = `j.id=json_extract(c.value,'$.id')
     AND j.generation=json_extract(c.value,'$.generation')
     AND j.created_at=json_extract(c.value,'$.created_at')
+    AND j.dispatch_incarnation IS json_extract(c.value,'$.dispatch_incarnation')
     AND j.queue_dispatch_revision=json_extract(c.value,'$.queue_dispatch_revision')`;
 
 // Materialize the small list first and look up each entry by the indexed job ID.
@@ -70,12 +73,14 @@ const queueCooldownsCte = `WITH dispatch_cooldowns AS MATERIALIZED (
   WHERE ${cooldownMatchesJobSql}
 )`;
 
-function dispatchRow({ id, generation, created_at, queue_dispatch_revision }: QueueDispatchRow): QueueDispatchRow {
-  return { id, generation, created_at, queue_dispatch_revision };
+function dispatchRow(row: QueueDispatchRow): QueueDispatchRow {
+  const { id, generation, created_at, dispatch_incarnation, queue_dispatch_revision } = row;
+  return { id, generation, created_at, dispatch_incarnation: dispatch_incarnation ?? null, queue_dispatch_revision };
 }
 
-export function queueDispatchSnapshotKey({ id, generation, created_at, queue_dispatch_revision }: QueueDispatchRow) {
-  return JSON.stringify([id, generation, created_at, queue_dispatch_revision]);
+export function queueDispatchSnapshotKey(row: QueueDispatchRow) {
+  const { id, generation, created_at, dispatch_incarnation, queue_dispatch_revision } = row;
+  return JSON.stringify([id, generation, created_at, dispatch_incarnation ?? null, queue_dispatch_revision]);
 }
 
 /** Identify stale snapshots even when multiple cooldowns refer to the same job ID. */
@@ -171,9 +176,7 @@ export async function notifyPlatformJob(
   const id = platformJobId(intent);
   let row: QueueDispatchDeadline | null | undefined;
   try {
-    row = await env.DB.prepare(
-      "SELECT id,generation,created_at,queue_dispatch_revision,available_at,lease_until FROM platform_jobs WHERE id=?",
-    )
+    row = await env.DB.prepare(`SELECT ${queueDispatchColumns},available_at,lease_until FROM platform_jobs WHERE id=?`)
       .bind(id)
       .first<QueueDispatchDeadline>();
   } catch {
@@ -217,7 +220,7 @@ export async function notifyPlatformJobs(env: Env, ids: readonly string[]) {
   let rows: QueueDispatchDeadline[];
   try {
     ({ results: rows } = await env.DB.prepare(
-      `SELECT id,generation,created_at,queue_dispatch_revision,available_at,lease_until
+      `SELECT ${queueDispatchColumns},available_at,lease_until
        FROM platform_jobs WHERE id IN (SELECT value FROM json_each(?))`,
     )
       .bind(JSON.stringify(jobIds))
@@ -274,12 +277,20 @@ async function sendDelayedPlatformJob(env: Env, queue: Queue, id: string, due: n
 }
 
 function queueDispatchStatement(database: D1Database, row: QueueDispatchRow, redispatchAt: number, failures: number) {
-  // The consumer, a replacement generation, or owner Retry can advance the row during the send.
+  // The row may advance or be replaced during the send.
   return database
     .prepare(`UPDATE platform_jobs SET queue_redispatch_at=?,queue_send_failures=?,
     queue_dispatch_revision=queue_dispatch_revision+1
-    WHERE id=? AND generation=? AND created_at=? AND queue_dispatch_revision=?`)
-    .bind(redispatchAt, failures, row.id, row.generation, row.created_at, row.queue_dispatch_revision);
+    WHERE id=? AND generation=? AND created_at=? AND dispatch_incarnation IS ? AND queue_dispatch_revision=?`)
+    .bind(
+      redispatchAt,
+      failures,
+      row.id,
+      row.generation,
+      row.created_at,
+      row.dispatch_incarnation ?? null,
+      row.queue_dispatch_revision,
+    );
 }
 
 export function runPlatformJob(env: Env, id: string, handlers: PlatformHandlers) {
@@ -395,7 +406,7 @@ export async function recoverPlatformJobs(
   const dispatchDue = queue ? "AND queue_redispatch_at<=?" : "";
   // Keep SELECT first so the audit wrapper treats the recovery read as read-only.
   const cooldownDue = active ? `AND rowid NOT IN (${queueCooldownsCte} SELECT job_rowid FROM dispatch_cooldowns)` : "";
-  const rows = await env.DB.prepare(`SELECT id,generation,created_at,queue_dispatch_revision,queue_send_failures
+  const rows = await env.DB.prepare(`SELECT ${queueDispatchColumns},queue_send_failures
     FROM platform_jobs WHERE available_at<=? AND (lease_until IS NULL OR lease_until<=?)
     ${dispatchDue} ${cooldownDue} ORDER BY available_at,id LIMIT ?`)
     .bind(now, now, ...(queue ? [now] : []), ...(active ? [active] : []), Math.max(1, Math.min(25, limit)))
@@ -429,7 +440,11 @@ export async function recoverPlatformJobs(
         const key = queueDispatchSnapshotKey(entry);
         if (key === selected) return true;
         // Let the next scan resolve new reports for a later revision or a different incarnation.
-        if (entry.created_at === row.created_at && entry.queue_dispatch_revision <= row.queue_dispatch_revision)
+        if (
+          typeof row.dispatch_incarnation === "string" &&
+          entry.dispatch_incarnation === row.dispatch_incarnation &&
+          entry.queue_dispatch_revision <= row.queue_dispatch_revision
+        )
           return false;
         const initial = initialCooldowns.get(key);
         return entry.at !== initial?.at || entry.attempts !== initial?.attempts;

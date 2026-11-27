@@ -51,10 +51,61 @@ describe("D1 migrations", () => {
       ('leased','workspace','fixture','leased','1','{}',100,2,'worker',200,1,2)`).run();
     const jobs = () => env.DB.prepare("SELECT * FROM platform_jobs ORDER BY id").all();
     const before = (await jobs()).results;
-    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0117"),
+    );
     expect((await jobs()).results).toEqual(
       before.map((job) => ({ ...job, queue_redispatch_at: 0, queue_send_failures: 0, queue_dispatch_revision: 0 })),
     );
+  });
+
+  it("0119 preserves existing jobs and assigns a token to every newly inserted job", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0119"),
+    );
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Workspace',1)"),
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@example.test',1,1)",
+      ),
+      env.DB.prepare(`INSERT INTO platform_jobs
+        (id,workspace_id,kind,job_key,generation,payload_json,available_at,lease_token,lease_until,created_at,updated_at,
+          queue_redispatch_at,queue_dispatch_revision)
+        VALUES('legacy','workspace','fixture','legacy','1','{}',100,'worker',200,1,2,300,4)`),
+    ]);
+    const legacy = () => env.DB.prepare("SELECT * FROM platform_jobs WHERE id='legacy'").first();
+    const before = await legacy();
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(await legacy()).toEqual({ ...before, dispatch_incarnation: null });
+
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO platform_jobs
+        (id,workspace_id,kind,job_key,generation,payload_json,available_at,created_at,updated_at)
+        VALUES('direct','workspace','fixture','direct','1','{}',0,1,1)`),
+      env.DB.prepare(`INSERT INTO publications
+        (id,workspace_id,space_id,url_key,config_json,active,created_by,created_at,updated_at)
+        VALUES('site','workspace','workspace-general','site','{}',1,'owner',1,1)`),
+    ]);
+    const token = (key: string) =>
+      env.DB.prepare("SELECT dispatch_incarnation FROM platform_jobs WHERE job_key=?")
+        .bind(key)
+        .first<string>("dispatch_incarnation");
+    const direct = await token("direct");
+    const publication = await token("site");
+    expect(direct).toMatch(/^[a-f0-9]{32}$/);
+    expect(publication).toMatch(/^[a-f0-9]{32}$/);
+    expect(direct).not.toBe(publication);
+
+    await env.DB.prepare("UPDATE publications SET generation=generation+1 WHERE id='site'").run();
+    expect(await token("site")).toBe(publication);
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM platform_jobs WHERE kind='publication'"),
+      env.DB.prepare("UPDATE publications SET generation=generation+1 WHERE id='site'"),
+    ]);
+    expect(await token("site")).toMatch(/^[a-f0-9]{32}$/);
+    expect(await token("site")).not.toBe(publication);
   });
 
   it("0091 preserves existing cleanup jobs and their completed target progress", async () => {
