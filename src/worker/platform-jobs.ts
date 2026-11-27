@@ -405,6 +405,7 @@ export async function recoverPlatformJobs(
   );
   let queueAttempts = 0;
   let queueSendFailures = 0;
+  let cooldownReadFailed = false;
   const dispatchState: QueueDispatchOutcomes = { failed: [], recorded: [] };
   // An accepted message may be sent again if D1 cannot record its deadline.
   // The consumer claims only due jobs with no active lease, and the rest of the batch still runs.
@@ -414,15 +415,24 @@ export async function recoverPlatformJobs(
       continue;
     }
     if (readLatestCooldowns) {
-      const latest = await readLatestCooldowns();
+      let latest: readonly QueueDispatchCooldown[];
+      try {
+        latest = await readLatestCooldowns();
+      } catch {
+        cooldownReadFailed = true;
+        break;
+      }
       const sendAt = Date.now();
       const selected = queueDispatchSnapshotKey(row);
       const fenced = latest.some((entry) => {
         if (entry.id !== row.id || entry.at <= sendAt) return false;
         const key = queueDispatchSnapshotKey(entry);
+        if (key === selected) return true;
+        // Let the next scan resolve new reports for a later revision or a different incarnation.
+        if (entry.created_at === row.created_at && entry.queue_dispatch_revision <= row.queue_dispatch_revision)
+          return false;
         const initial = initialCooldowns.get(key);
-        // A new report may describe a newer revision than the selected row. Let the next scan check it.
-        return key === selected || entry.at !== initial?.at || entry.attempts !== initial?.attempts;
+        return entry.at !== initial?.at || entry.attempts !== initial?.attempts;
       });
       if (fenced) continue;
     }
@@ -452,6 +462,7 @@ export async function recoverPlatformJobs(
   return {
     queueAttempts,
     queueSendFailures,
+    cooldownReadFailed,
     dispatchState,
   };
 }
