@@ -5,6 +5,7 @@ import { enqueuePendingPublications, type Publication } from "./publications";
 import { countedD1 } from "../../tests/helpers/count-d1";
 import {
   enqueuePlatformJob,
+  notifyPlatformJob,
   persistPlatformJob,
   PlatformJobDeferred,
   platformJobId as jobIdForIntent,
@@ -129,11 +130,13 @@ it("accounts for active job leases when choosing the next maintenance deadline",
   expect((await alarmAt(10, {})).alarm).toBe(lease);
 });
 
-function recoveryJob(id: string, due: number, lease: number | null = null) {
+const fixtureIncarnation = (id: string) => `fixture-${id}`;
+
+function recoveryJob(id: string, due: number, lease: number | null = null, incarnation = fixtureIncarnation(id)) {
   return env.DB.prepare(
-    `INSERT INTO platform_jobs(id,workspace_id,kind,job_key,generation,payload_json,available_at,created_at,updated_at,lease_until)
-     VALUES(?,'workspace','semantic',?,'1','{}',?,0,0,?)`,
-  ).bind(id, id, due, lease);
+    `INSERT INTO platform_jobs(id,workspace_id,kind,job_key,generation,payload_json,available_at,created_at,updated_at,lease_until,dispatch_incarnation)
+     VALUES(?,'workspace','semantic',?,'1','{}',?,0,0,?,?)`,
+  ).bind(id, id, due, lease, incarnation);
 }
 
 const queueSendResponse = { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
@@ -141,6 +144,7 @@ const dispatchRow = (id: string): QueueDispatchRow => ({
   id,
   generation: "1",
   created_at: 0,
+  dispatch_incarnation: fixtureIncarnation(id),
   queue_dispatch_revision: 0,
 });
 const cooldownEntry = (
@@ -544,7 +548,7 @@ describe("Queue dispatch cooldown trimming", () => {
         ...held.map((id) => cooldownEntry(id, now + 900_000)),
         cooldownEntry("confirmed", now + 900_000),
         cooldownEntry("confirmed", now - 1, { queue_dispatch_revision: 1 }),
-        cooldownEntry("stale-created", now + 900_000, { created_at: 1 }),
+        cooldownEntry("stale-created", now + 900_000, { created_at: 1, dispatch_incarnation: "older-incarnation" }),
         cooldownEntry("stale-generation", now + 900_000, { generation: "older" }),
         cooldownEntry("stale-no-op", now - 1),
         cooldownEntry("stale-revision", now + 900_000, { queue_dispatch_revision: 1 }),
@@ -610,20 +614,27 @@ describe("Queue dispatch cooldown trimming", () => {
     expect(retained[0]).toEqual(expect.arrayContaining([...held, ...failing]));
   });
 
-  it.each(["finished job", "older snapshot", "older snapshot during D1 outage", "different creation timestamp"])(
-    "keeps the live entries when a full list receives a report for a %s",
-    async (reason) => {
+  const obsoleteReports = [
+    { reason: "finished job", row: dispatchRow("finished") },
+    { reason: "older snapshot", row: { ...dispatchRow("held-0"), generation: "old" } },
+    {
+      reason: "older snapshot during D1 outage",
+      row: { ...dispatchRow("held-0"), generation: "old" },
+      rejectCheck: true,
+    },
+    { reason: "different creation timestamp", row: { ...dispatchRow("held-0"), created_at: 1 } },
+    {
+      reason: "different incarnation token",
+      row: { ...dispatchRow("held-0"), dispatch_incarnation: "older-incarnation" },
+    },
+  ];
+  it.each(obsoleteReports)(
+    "keeps the live entries when a full list receives a report for a $reason",
+    async ({ row, rejectCheck }) => {
       const now = Date.now();
       const held = ids("held", 100);
       await env.DB.batch(held.map((id) => recoveryJob(id, now - 1)));
       const stored = held.map((id, index) => cooldownEntry(id, now + 300_000 + index));
-      const row =
-        reason === "finished job"
-          ? dispatchRow("finished")
-          : {
-              ...dispatchRow("held-0"),
-              ...(reason === "different creation timestamp" ? { created_at: 1 } : { generation: "old" }),
-            };
       await runInDurableObject(env.PLATFORM!.getByName("maintenance"), async (instance, state) => {
         const mutable = instance as unknown as { env: Env };
         const original = mutable.env;
@@ -631,7 +642,7 @@ describe("Queue dispatch cooldown trimming", () => {
           get(target, property) {
             if (property === "prepare")
               return (sql: string) => {
-                if (reason.endsWith("outage") && sql.startsWith(cooldownProbe)) throw new Error("fixture_probe_failed");
+                if (rejectCheck && sql.startsWith(cooldownProbe)) throw new Error("fixture_probe_failed");
                 return target.prepare(sql);
               };
             return Reflect.get(target, property, target);
@@ -751,6 +762,135 @@ describe("Queue dispatch cooldown trimming", () => {
 
 describe("Queue dispatch cooldown ordering", () => {
   const maintenance = () => env.PLATFORM!.getByName("maintenance");
+  const storedCooldowns = () =>
+    runInDurableObject(maintenance(), (_instance, state) =>
+      state.storage.get<QueueDispatchCooldown[]>("queueDispatchCooldowns"),
+    );
+  const publication = { workspaceId: "workspace", kind: "publication", key: "site" };
+  const publicationJobId = jobIdForIntent(publication);
+  const readPublicationJob = () =>
+    env.DB.prepare(
+      "SELECT id,generation,created_at,dispatch_incarnation,queue_dispatch_revision FROM platform_jobs WHERE id=?",
+    )
+      .bind(publicationJobId)
+      .first<QueueDispatchRow>();
+  // Hold the legacy timestamp fixed independently of D1's wall clock.
+  const fixPublicationJobTimestamp = () =>
+    env.DB.prepare("UPDATE platform_jobs SET created_at=0 WHERE id=?").bind(publicationJobId);
+
+  async function insertPublicationJob() {
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Workspace',1)"),
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@example.test',1,1)",
+      ),
+      env.DB.prepare(`INSERT INTO publications
+        (id,workspace_id,space_id,url_key,config_json,active,created_by,created_at,updated_at)
+        VALUES('site','workspace','workspace-general','site','{}',1,'owner',1,1)`),
+      fixPublicationJobTimestamp(),
+    ]);
+  }
+
+  async function recreatePublicationJob() {
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM platform_jobs WHERE id=?").bind(publicationJobId),
+      env.DB.prepare("UPDATE publications SET needs_build=0 WHERE id='site'"),
+      env.DB.prepare("UPDATE publications SET needs_build=1 WHERE id='site'"),
+      fixPublicationJobTimestamp(),
+    ]);
+  }
+
+  it("keeps a recreated publication job's cooldown despite an older row's higher revision", async () => {
+    await insertPublicationJob();
+    await env.DB.prepare("UPDATE platform_jobs SET queue_dispatch_revision=2 WHERE id=?").bind(publicationJobId).run();
+    const older = (await readPublicationJob())!;
+    await recreatePublicationJob();
+    const recreated = (await readPublicationJob())!;
+    expect(recreated).toMatchObject({ id: older.id, created_at: older.created_at, queue_dispatch_revision: 0 });
+    expect(recreated.dispatch_incarnation).not.toBe(older.dispatch_incarnation);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+    const configured = queueRecoveryEnv(env as Env, send, () => false);
+    try {
+      await maintenance().recordQueueDispatchFailures([{ row: older, redispatchAt: now + 300_000 }]);
+      await env.DB.prepare(`CREATE TRIGGER reject_recreated_deadline BEFORE UPDATE OF queue_redispatch_at ON platform_jobs
+        WHEN NEW.queue_redispatch_at>0 BEGIN SELECT RAISE(ABORT,'fixture_recreated_deadline_failed'); END`).run();
+      expect(await notifyPlatformJob(configured, publication)).toBe(true);
+      expect(await storedCooldowns()).toContainEqual({ ...recreated, attempts: 1, at: now + 300_000 });
+      await env.DB.prepare("DROP TRIGGER reject_recreated_deadline").run();
+
+      clock.mockReturnValue(now + 299_999);
+      await alarmAt(2, configured);
+      expect(send).toHaveBeenCalledTimes(1);
+      clock.mockReturnValue(now + 300_000);
+      await alarmAt(2, configured);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send).toHaveBeenLastCalledWith({ platformJobId: publicationJobId });
+    } finally {
+      clock.mockRestore();
+      await env.DB.prepare("DROP TRIGGER IF EXISTS reject_recreated_deadline").run();
+    }
+  });
+
+  it("isolates cooldowns and delayed deadline writes when every legacy field repeats", async () => {
+    await insertPublicationJob();
+    const original = (await readPublicationJob())!;
+    await recreatePublicationJob();
+    const selected = (await readPublicationJob())!;
+    expect(selected).toEqual({ ...original, dispatch_incarnation: expect.any(String) });
+    expect(selected.dispatch_incarnation).not.toBe(original.dispatch_incarnation);
+    await maintenance().recordQueueDispatchFailures([{ row: original, redispatchAt: Date.now() + 300_000 }]);
+    const send = vi.fn<Queue["send"]>(async () => {
+      await recreatePublicationJob();
+      return queueSendResponse;
+    });
+
+    await alarmAt(
+      2,
+      queueRecoveryEnv(env as Env, send, () => false),
+    );
+    expect(send).toHaveBeenCalledExactlyOnceWith({ platformJobId: publicationJobId });
+    const recreated = await readPublicationJob();
+    expect(recreated).toEqual({ ...selected, dispatch_incarnation: expect.any(String) });
+    expect(recreated?.dispatch_incarnation).not.toBe(selected.dispatch_incarnation);
+    expect(
+      await env.DB.prepare("SELECT queue_redispatch_at FROM platform_jobs WHERE id=?")
+        .bind(publicationJobId)
+        .first("queue_redispatch_at"),
+    ).toBe(0);
+  });
+
+  it("honors legacy cooldowns only on pre-migration rows", async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+    const configured = queueRecoveryEnv(env as Env, send, () => false);
+    const legacyRow = (id: string) => ({ id, generation: "1", created_at: 0, queue_dispatch_revision: 0 });
+    try {
+      await env.DB.batch([
+        recoveryJob("legacy", now - 1),
+        recoveryJob("tokenized", now - 1),
+        env.DB.prepare("UPDATE platform_jobs SET dispatch_incarnation=NULL WHERE id='legacy'"),
+      ]);
+      await runInDurableObject(maintenance(), async (instance, state) => {
+        // Storage from the old Worker omits the field, as do its RPC reports.
+        await state.storage.put("queueDispatchCooldowns", [{ ...legacyRow("legacy"), attempts: 1, at: now + 240_000 }]);
+        await instance.recordQueueDispatchFailures([{ row: legacyRow("tokenized"), redispatchAt: now + 240_000 }]);
+      });
+      await alarmAt(2, configured);
+      expect(send).toHaveBeenCalledExactlyOnceWith({ platformJobId: "tokenized" });
+      expect(await storedCooldowns()).toEqual([{ ...legacyRow("legacy"), attempts: 1, at: now + 240_000 }]);
+
+      clock.mockReturnValue(now + 240_000);
+      await alarmAt(2, configured);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(send).toHaveBeenLastCalledWith({ platformJobId: "legacy" });
+      expect(await storedCooldowns()).toBeUndefined();
+    } finally {
+      clock.mockRestore();
+    }
+  });
 
   it("saves partial batch outcomes when a later cooldown read fails", async () => {
     const now = Date.now();
@@ -809,6 +949,49 @@ describe("Queue dispatch cooldown ordering", () => {
     }
   });
 
+  it("logs the pre-send read failure even when the cooldown save also fails", async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const warn = vi.spyOn(logger, "warn");
+    const send = vi.fn<Queue["send"]>(async () => queueSendResponse);
+    try {
+      await env.DB.batch([recoveryJob("first", now - 1), recoveryJob("second", now - 1)]);
+      await runInDurableObject(maintenance(), async (instance, state) => {
+        const mutable = instance as unknown as { env: Env };
+        const original = mutable.env;
+        mutable.env = queueRecoveryEnv(original, send, () => false);
+        const get = state.storage.get.bind(state.storage);
+        let cooldownReads = 0;
+        const storageGet = vi.spyOn(state.storage, "get").mockImplementation(((
+          key: string | string[],
+          options?: DurableObjectGetOptions,
+        ) => {
+          if (key === "queueDispatchCooldowns" && ++cooldownReads >= 3)
+            return Promise.reject(new Error("fixture_cooldown_storage_unavailable"));
+          return typeof key === "string" ? get(key, options) : get(key, options);
+        }) as typeof state.storage.get);
+        try {
+          await state.storage.put("phase", 2);
+          await instance.alarm();
+          expect(await get("schedule")).toMatchObject({ retries: { 2: { attempts: 1, at: now + 60_000 } } });
+        } finally {
+          storageGet.mockRestore();
+          await state.storage.deleteAlarm();
+          mutable.env = original;
+        }
+      });
+      expect(send).toHaveBeenCalledExactlyOnceWith({ platformJobId: "first" });
+      expect(warn.mock.calls.map(([event]) => event)).toEqual([
+        "platform.maintenance.dispatch_cooldown_read_failed",
+        "platform.maintenance.dispatch_cooldowns_failed",
+        "platform.maintenance.failed",
+      ]);
+    } finally {
+      warn.mockRestore();
+      clock.mockRestore();
+    }
+  });
+
   it("keeps a consumer retry cooldown when an earlier recovery batch finishes", async () => {
     const now = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
@@ -838,13 +1021,13 @@ describe("Queue dispatch cooldown ordering", () => {
       const stored = await runInDurableObject(maintenance(), (_instance, state) =>
         state.storage.get<QueueDispatchCooldown[]>("queueDispatchCooldowns"),
       );
-      const current = await env.DB.prepare("SELECT queue_dispatch_revision FROM platform_jobs WHERE id=?")
+      const current = await env.DB.prepare(
+        "SELECT queue_dispatch_revision,dispatch_incarnation FROM platform_jobs WHERE id=?",
+      )
         .bind(firstId)
-        .first<number>("queue_dispatch_revision");
-      expect(current).toBeGreaterThan(1);
-      expect(stored).toEqual([
-        cooldownEntry(firstId, now + 302_000, { created_at: now, queue_dispatch_revision: current! }),
-      ]);
+        .first<Pick<QueueDispatchRow, "queue_dispatch_revision" | "dispatch_incarnation">>();
+      expect(current?.queue_dispatch_revision).toBeGreaterThan(1);
+      expect(stored).toEqual([cooldownEntry(firstId, now + 302_000, { created_at: now, ...current! })]);
       expect(sent).toEqual([{ id: firstId }, { id: "second" }, { id: firstId, delaySeconds: 2 }]);
 
       await env.DB.prepare("DROP TRIGGER reject_retry_deadline").run();
@@ -889,20 +1072,27 @@ describe("Queue dispatch cooldown ordering", () => {
     }
   });
 
-  it.each(["same", "newer", "older"])(
-    "rechecks a report for the %s revision before a later send in the same batch",
-    async (revision) => {
+  it.each(["same revision", "newer revision", "older revision", "recreated row"])(
+    "rechecks a cooldown for the %s before a later send in the same batch",
+    async (snapshot) => {
       const now = Date.now();
       const clock = vi.spyOn(Date, "now").mockReturnValue(now);
       const send = vi.fn<Queue["send"]>(async (message) => {
         const { platformJobId: id } = message as { platformJobId: string };
         if (id === "first") {
-          if (revision === "newer")
+          const row = dispatchRow("second");
+          if (snapshot === "newer revision") {
             await env.DB.prepare("UPDATE platform_jobs SET generation='2' WHERE id='second'").run();
-          const row =
-            revision === "newer"
-              ? { ...dispatchRow("second"), generation: "2", queue_dispatch_revision: 1 }
-              : dispatchRow("second");
+            row.generation = "2";
+            row.queue_dispatch_revision = 1;
+          }
+          if (snapshot === "recreated row") {
+            await env.DB.batch([
+              env.DB.prepare("DELETE FROM platform_jobs WHERE id='second'"),
+              recoveryJob("second", now - 1, null, "replacement"),
+            ]);
+            row.dispatch_incarnation = "replacement";
+          }
           await maintenance().recordQueueDispatchFailures([{ row, redispatchAt: now + 300_000 }]);
           throw new Error("fixture_queue_unavailable");
         }
@@ -911,10 +1101,10 @@ describe("Queue dispatch cooldown ordering", () => {
       const configured = queueRecoveryEnv(env as Env, send, () => false);
       try {
         await env.DB.batch([recoveryJob("first", now - 1), recoveryJob("second", now - 1)]);
-        if (revision === "older")
+        if (snapshot === "older revision" || snapshot === "recreated row")
           await env.DB.prepare("UPDATE platform_jobs SET generation='2' WHERE id='second'").run();
         await alarmAt(2, configured);
-        const skipsSecond = revision !== "older";
+        const skipsSecond = snapshot !== "older revision";
         expect(send.mock.calls.map(([message]) => message)).toEqual(
           skipsSecond ? [{ platformJobId: "first" }] : [{ platformJobId: "first" }, { platformJobId: "second" }],
         );

@@ -54,13 +54,19 @@ const maxReportedDispatchFailures = 10;
 
 const isSafeInteger = (value: unknown): value is number => Number.isSafeInteger(value);
 
-function dispatchIncarnationKey({ id, created_at }: QueueDispatchRow) {
-  return JSON.stringify([id, created_at]);
+type DispatchCooldownEvidence = {
+  minimumRevisions: ReadonlyMap<string, number>;
+  tokenizedIds: ReadonlySet<string>;
+};
+
+function dispatchIncarnationKey({ id, dispatch_incarnation }: QueueDispatchRow) {
+  return JSON.stringify([id, dispatch_incarnation]);
 }
 
 function reportedDispatchFailure(input: unknown): QueueDispatchDeadlineWrite | null {
   if (!input || typeof input !== "object") return null;
   const { row, redispatchAt } = input as { row?: Partial<QueueDispatchRow>; redispatchAt?: unknown };
+  const incarnation = row?.dispatch_incarnation ?? null;
   if (
     !row ||
     typeof row !== "object" ||
@@ -68,12 +74,16 @@ function reportedDispatchFailure(input: unknown): QueueDispatchDeadlineWrite | n
     !row.id ||
     typeof row.generation !== "string" ||
     !isSafeInteger(row.created_at) ||
+    (incarnation !== null && (typeof incarnation !== "string" || !incarnation)) ||
     !isSafeInteger(row.queue_dispatch_revision) ||
     !isSafeInteger(redispatchAt)
   )
     return null;
   const { id, generation, created_at, queue_dispatch_revision } = row;
-  return { row: { id, generation, created_at, queue_dispatch_revision }, redispatchAt };
+  return {
+    row: { id, generation, created_at, dispatch_incarnation: incarnation, queue_dispatch_revision },
+    redispatchAt,
+  };
 }
 
 export const platformHandlers: PlatformHandlers = {
@@ -200,7 +210,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
   private async recordDispatchCooldowns(outcomes: QueueDispatchOutcomes) {
     let saved = await this.mergeDispatchCooldowns(outcomes);
     if (typeof saved !== "boolean") {
-      const { candidates, minimumRevisions } = saved;
+      const { candidates, evidence } = saved;
       // The probe checks both stored and incoming snapshots without holding the storage lock.
       let stale = new Set<string>();
       try {
@@ -212,7 +222,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
           "Trimming Queue dispatch cooldowns without confirming which jobs have changed",
         );
       }
-      saved = await this.mergeDispatchCooldowns(outcomes, { stale, minimumRevisions });
+      saved = await this.mergeDispatchCooldowns(outcomes, { stale, evidence });
     }
     if (saved === true) return;
     logger.warn(
@@ -225,39 +235,51 @@ export class PlatformCoordinator extends DurableObject<Env> {
   }
   private mergeDispatchCooldowns(
     { failed, recorded }: QueueDispatchOutcomes,
-    checked?: { stale: ReadonlySet<string>; minimumRevisions: ReadonlyMap<string, number> },
-  ): Promise<boolean | { candidates: QueueDispatchCooldown[]; minimumRevisions: ReadonlyMap<string, number> }> {
+    checked?: { stale: ReadonlySet<string>; evidence: DispatchCooldownEvidence },
+  ): Promise<boolean | { candidates: QueueDispatchCooldown[]; evidence: DispatchCooldownEvidence }> {
     return this.ctx.blockConcurrencyWhile(async () => {
       // Catch storage errors here so a rejected operation does not escape the lock callback.
       try {
         const stored = await this.dispatchCooldowns();
         const now = Date.now();
-        // Keep the revision bounds learned before the probe even if another merge removed those entries.
-        const minimumRevisions = new Map(checked?.minimumRevisions);
+        // Keep evidence from before the probe even if another merge removed those entries.
+        const minimumRevisions = new Map(checked?.evidence.minimumRevisions);
+        const tokenizedIds = new Set(checked?.evidence.tokenizedIds);
         const rememberRevision = (row: QueueDispatchRow, revision = row.queue_dispatch_revision) => {
+          if (typeof row.dispatch_incarnation !== "string") return;
+          tokenizedIds.add(row.id);
           const key = dispatchIncarnationKey(row);
           minimumRevisions.set(key, Math.max(minimumRevisions.get(key) ?? revision, revision));
         };
         for (const entry of stored) rememberRevision(entry);
         for (const { row } of failed) rememberRevision(row);
+        const recordedLegacy = new Set<string>();
         // A successful write advances the revision of the snapshot it wrote.
-        for (const row of recorded) rememberRevision(row, row.queue_dispatch_revision + 1);
-        const superseded = (row: QueueDispatchRow) =>
-          row.queue_dispatch_revision <
-          (minimumRevisions.get(dispatchIncarnationKey(row)) ?? row.queue_dispatch_revision);
+        for (const row of recorded) {
+          if (typeof row.dispatch_incarnation === "string") rememberRevision(row, row.queue_dispatch_revision + 1);
+          else recordedLegacy.add(queueDispatchSnapshotKey(row));
+        }
+        const superseded = (row: QueueDispatchRow, key: string) => {
+          // A token proves this job ID no longer refers to a pre-migration row.
+          if (typeof row.dispatch_incarnation !== "string") return tokenizedIds.has(row.id) || recordedLegacy.has(key);
+          return (
+            row.queue_dispatch_revision <
+            (minimumRevisions.get(dispatchIncarnationKey(row)) ?? row.queue_dispatch_revision)
+          );
+        };
 
         const entries = new Map<string, QueueDispatchCooldown>();
         for (const entry of stored) {
-          if (entry.at + dispatchCooldownMaxMs <= now || superseded(entry)) continue;
+          if (entry.at + dispatchCooldownMaxMs <= now) continue;
           const key = queueDispatchSnapshotKey(entry);
-          if (!checked?.stale.has(key)) entries.set(key, entry);
+          if (!superseded(entry, key) && !checked?.stale.has(key)) entries.set(key, entry);
         }
         const activeIds = new Set([...entries.values()].filter(({ at }) => at > now).map(({ id }) => id));
         const added = new Set<string>();
         const conflicts = new Set<string>();
         for (const { row, redispatchAt } of failed) {
           const key = queueDispatchSnapshotKey(row);
-          if (superseded(row) || checked?.stale.has(key)) continue;
+          if (superseded(row, key) || checked?.stale.has(key)) continue;
           const prior = entries.get(key);
           const attempts = Math.min((prior?.attempts ?? 0) + 1, 7);
           const backoff = Math.min(dispatchCooldownMaxMs, 60_000 * 2 ** (attempts - 1));
@@ -267,7 +289,7 @@ export class PlatformCoordinator extends DurableObject<Env> {
         }
         const overflow = entries.size - maxDispatchCooldowns;
         if (overflow > 0) {
-          if (!checked) return { candidates: [...entries.values()], minimumRevisions };
+          if (!checked) return { candidates: [...entries.values()], evidence: { minimumRevisions, tokenizedIds } };
           // When D1 cannot resolve a conflict, keep the active stored snapshot ahead of the incoming one.
           const rank = ([key, entry]: [string, QueueDispatchCooldown]) =>
             entry.at <= now ? 0 : conflicts.has(key) ? 1 : 2;
@@ -364,15 +386,15 @@ export class PlatformCoordinator extends DurableObject<Env> {
               cooldowns,
               () => this.dispatchCooldowns(),
             );
-            await this.recordDispatchCooldowns(dispatchState);
             if (cooldownReadFailed) {
               logger.warn(
                 "platform.maintenance.dispatch_cooldown_read_failed",
                 "platform",
                 "Queue recovery stopped before the next send because it could not read dispatch cooldowns",
               );
-              throw new Error("platform_queue_cooldown_read_failed");
             }
+            await this.recordDispatchCooldowns(dispatchState);
+            if (cooldownReadFailed) throw new Error("platform_queue_cooldown_read_failed");
             if (queueAttempts > 0 && dispatchState.failed.length === queueAttempts) {
               logger.warn(
                 "platform.maintenance.dispatch_state_unavailable",

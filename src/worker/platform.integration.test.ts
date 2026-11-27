@@ -13,6 +13,7 @@ import {
   runPlatformJob,
   reservePlatformUsage,
   type QueueDispatchCooldown,
+  type QueueDispatchRow,
 } from "./platform-jobs";
 import { finalizeHeatmaps, heatmapWeek, readHeatmap } from "./heatmaps";
 import { backgroundUsage, withUsage } from "./usage";
@@ -322,8 +323,8 @@ describe("durable platform release", () => {
         expect(woke).toBe(true);
         expect(send).toHaveBeenCalledExactlyOnceWith({ platformJobId: id }, { delaySeconds: delay / 1000 });
         const row = await env.DB.prepare(
-          "SELECT generation,created_at,queue_dispatch_revision,queue_redispatch_at FROM platform_jobs",
-        ).first<{ generation: string; created_at: number; queue_dispatch_revision: number }>();
+          "SELECT id,generation,created_at,dispatch_incarnation,queue_dispatch_revision,queue_redispatch_at FROM platform_jobs",
+        ).first<QueueDispatchRow & { queue_redispatch_at: number }>();
         expect(row).toMatchObject({ queue_redispatch_at: 0 });
         const at = now + delay + 300_000;
         expect(await storedCooldowns()).toEqual([
@@ -331,6 +332,7 @@ describe("durable platform release", () => {
             id,
             generation: row!.generation,
             created_at: row!.created_at,
+            dispatch_incarnation: row!.dispatch_incarnation,
             queue_dispatch_revision: row!.queue_dispatch_revision,
             attempts: 1,
             at,
@@ -360,6 +362,7 @@ describe("durable platform release", () => {
       ).toBeUndefined();
       await maintenance().recordQueueDispatchFailures([
         { row: { ...row, created_at: "0" }, redispatchAt: Date.now() + 300_000 },
+        { row: { ...row, dispatch_incarnation: 42 }, redispatchAt: Date.now() + 300_000 },
         { row, redispatchAt: Number.NaN },
         { row: { ...row, id: "" }, redispatchAt: Date.now() + 300_000 },
       ] as never);
